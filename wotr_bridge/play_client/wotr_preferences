@@ -1,0 +1,57 @@
+;All the lines with ; at the start are comments and should be left at the top of the file
+
+;zoomlevels a list of zoom values to switch between when using mouse wheel zooming
+;font, fontsize - alters the chat text
+;xxxheight, xxxwidth - alter various right-hand side panel sizes
+;nopassword - change this to true if you want to play without passwords
+;showleadersip - change this to false will show number of leaders in a region, rather then leadership values
+;dicesorted - change this to true will show combat dice results in sorted order
+;language - blank (which is English) or Deutsch currently supported for the program displays
+;flashMandatory - mandatory actions 0=flash until next move, -1 = no flash or a number fior the number of flashes required
+;flashOptional - optional actions 0=flash until next move, -1 = no flash or a number fior the number of flashes required
+;shortGroupDesc - set this to get shorter group descriptions in the chat window
+;lastPasswordUsed - a record of the last password you used in case you forget it (I know I have)
+
+;aimute:false
+nick:Wey
+zoom:100
+zoomLevels:80,90,100,110,120,130,140,150,200
+winx:1933
+winy:1045
+port:4747
+addr:127.0.0.1
+font:SansSerif
+fontsize:15
+cardsWidth:360
+cardsHeight:160
+diceFPWidth:360
+diceFPHeight:38
+diceSAWidth:360
+diceSAHeight:72
+highlightWidth:360
+highlightHeight:448
+chatWidth:360
+chatHeight:200
+nopassword:false
+showLeadership:true
+dicesorted:false
+language:
+flashOptional:5
+translation:ENGLISH[en]
+shortGroupDesc:false
+lastPasswordUsed:ai
+lastGame:base2
+horizontalSpacing:2
+verticalSpacing:2
+myChatColour:0,0,255
+opponentChatColour:255,0,0
+myActionColour:0,0,150
+opponentActionColour:150,0,0
+noBorder:false
+showIPonstart:true
+boardfontsize:15
+boardfont:Monospaced
+boardfontbold:false
+boardfontxoffset:0
+boardfontyoffset:0
+boardfontseparator:/

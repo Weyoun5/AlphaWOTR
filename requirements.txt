@@ -1,0 +1,9 @@
+# AlphaWOTR play path - Python 3.10+ (verified with 3.11 / 3.12)
+# CPU torch is enough: the play path runs the nets on CPU (CUDA_VISIBLE_DEVICES=-1).
+#   pip install -r requirements.txt
+torch>=2.1
+numpy>=1.26
+shapely>=2.0
+Pillow>=10
+matplotlib>=3.8
+psutil>=5.9

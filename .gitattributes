@@ -1,0 +1,3 @@
+# bytes in = bytes out on every platform: the launcher pin and the
+# release manifest are byte-exact (LF files, generated)
+* -text

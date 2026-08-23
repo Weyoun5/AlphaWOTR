@@ -1,0 +1,14 @@
+# AlphaWOTR - session artifacts the live stack writes into the client dir
+# (the launcher clears them each session; never commit them)
+wotr_bridge/play_client/ai_*
+wotr_bridge/play_client/*.prev
+wotr_bridge/play_client/logs/**/*.log
+wotr_bridge/play_client/logs/**/*.vlog
+# the bundled Python runtime (ships in the GitHub Release zip, not the repo)
+python/
+# python bytecode
+__pycache__/
+*.pyc
+# editor / OS litter
+.DS_Store
+Thumbs.db
