@@ -5,8 +5,8 @@ data\wotr_map.png	aa53fc5d9acfd0e17d87540893ecf5dd247875c2	4337024
 data\wotr_map.txt	e1aed6191f26f7a303e50424faefa806b5851689	43570
 LICENSE	0d2bc2eb3d50ce5732aaedb851cdd6e53d2af2ba	1448
 Play_Engine_Only.bat	ae976a3f8b81f56d089ae3a062c40f4bdb768d50	4009
-Play_vs_AI.bat	70f83a986001bc0ab96b0282dcfeb360c8a17c68	10827
-README.txt	e429160546b9f9d12e2a79e2e3784f6981ee0422	6344
+Play_vs_AI.bat	a7a015cf57846d6896b38c2f21997f01c42cfeb2	12033
+README.txt	c6a3599eb1bb465f555ae914a815480733b730df	6609
 requirements.txt	d8e6118f1f4ef6f2a79a332c4e95b06d009fc280	261
 src\ai.py	394f150d00bd2b24b996a7885554414ba61fe55f	815738
 src\board.py	15c7145115c49bb5fb87532dda15f7ba6fdb24af	21825
@@ -590,7 +590,7 @@ src\wotr_native.cp311-win_amd64.pyd	d367dfe0d5998e743d313ccaa8428203e1cc27ba	539
 wotr_bridge\ai_panel.py	edbb2fa9cdca89e9d40be9a55a0d20a668d78abe	36409
 wotr_bridge\emitter.py	d465aa1b37dc8adfffc12a62a35d9322135dd229	128097
 wotr_bridge\initial_positions.json	aa54c464ced7ba6a9c8fcfc4e41fd4be10952a70	8204
-wotr_bridge\launch_head.py	bf09ef437e3dda0c258b452e8b5c329cfecf838a	23707
+wotr_bridge\launch_head.py	c768c19f11f43677bcf75dc1b3f4ec93bab64464	25230
 wotr_bridge\live\adopt.py	527ff9af1010dd3485ce00eece26bce72e340977	18861
 wotr_bridge\live\card_identity.py	037c5ba786d3650323bcd582721c16d088f25d52	9890
 wotr_bridge\live\chat.py	236a5678853972b9e88a16b03dac78f6c091251d	29762
@@ -626,7 +626,7 @@ wotr_bridge\play_client\2ndedition\images\smallcards\sa001b2.png	a3842de63462743
 wotr_bridge\play_client\2ndedition\images\smallcards\sa028b2.png	948a8b1adcce1e459e6b9a9dc806fee6a5c68cb3	11001
 wotr_bridge\play_client\2ndedition\images\smallcards\sa038b2.png	801f70624e8c86e94b0157b7ad5574745ad24028	10775
 wotr_bridge\play_client\2ndedition\messagesb2.properties	2a8ddd145abd561357e9f9a7a42367c140218c73	66986
-wotr_bridge\play_client\AiFeed.jar	c0976926b10a31b50803de0a079d7e7b1aa15262	14428
+wotr_bridge\play_client\AiFeed.jar	08450cbd35d9be6cd41358ef1b553ffb0f5c08d0	14162
 wotr_bridge\play_client\b5a\images\B5A_mask-5-curr.jpg	65b3b83438abd3a78a7b3aacb009ed4a87d73e50	339013
 wotr_bridge\play_client\b5a\images\B5A_mask-5-new.jpg	20ccb233e7d11c6764007c38cb33c3730e4e4978	372352
 wotr_bridge\play_client\b5a\images\B5A_mask-5.jpg	e39cc9fa2397bf22f98287cb124815b6b663ab44	153247
@@ -1590,7 +1590,7 @@ wotr_bridge\play_client\wome\images\smallcards\sa_Faction_back.png	2d0ae374c6b51
 wotr_bridge\play_client\wome\images\smallcards\ShadowSmallCardBack.png	68e98da80f6e5d74803c21774961c398d0fcaf6c	8889
 wotr_bridge\play_client\wome\images\units\Deadmen-F.png	527278a72dbc26081f01d78d1aacff93c63cc56d	5764
 wotr_bridge\play_client\wome\images\units\Spider-F.png	ee0e609bc9be67a4d4201b07aea2e7d917334a70	6026
-wotr_bridge\play_client\WOTR-Gandalf-AI.jar	410226491f104975419eb7fd77238fed85042add	352716
+wotr_bridge\play_client\WOTR-Gandalf-AI.jar	28b8658fd83b70fd63b6a1edace27459aa673621	353030
 wotr_bridge\play_client\WOTR-GandalfV8.jar	017266175c05269da36f293571cd590fe7cd5191	256322
 wotr_bridge\play_client\wotr_preferences	d2d729f958ee08628cf883b12b461e7957738712	1815
 wotr_fp_corpus_live.pt	9c57e112344e4d0d096c69552a28a04d03d0f63a	33993339

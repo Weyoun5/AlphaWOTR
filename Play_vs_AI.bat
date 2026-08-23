@@ -83,13 +83,38 @@ echo    AlphaWOTR  --  human vs AI
 echo   ================================================================
 echo.
 
+:: ---- which Java: JAVA_HOME first (the standard override), then PATH;
+::      the client mods are Java 11 class files - an older runtime
+::      dies with "class file versions up to 52.0" inside -javaagent
+if defined JAVA_HOME if exist "%JAVA_HOME%in\java.exe" set "PATH=%JAVA_HOME%in;%PATH%"
 where java >nul 2>&1
 if errorlevel 1 (
     echo   [X] Java was not found on PATH.
+    echo       Install Java 11 or newer ^(Temurin 17 or 21 from https://adoptium.net^),
+    echo       or set JAVA_HOME to an installed JDK/JRE folder.
     echo.
     pause
     exit /b 1
 )
+set "JV="
+for /f tokens^=3 %%v in ('java -version 2^>^&1 ^| findstr /i "version"') do if not defined JV set "JV=%%~v"
+set "JMAJ="
+for /f "tokens=1,2 delims=." %%a in ("%JV%") do (set "JMAJ=%%a" & set "JMIN=%%b")
+if "%JMAJ%"=="1" set "JMAJ=%JMIN%"
+set /a JMAJN=%JMAJ% 2>nul
+if not defined JMAJN set "JMAJN=0"
+set "JPATH="
+for /f "delims=" %%p in ('where java') do if not defined JPATH set "JPATH=%%p"
+if %JMAJN% LSS 11 (
+    echo   [X] Java %JV% found at %JPATH%
+    echo       AlphaWOTR needs Java 11 or newer.  Install Temurin 17 or 21 from
+    echo       https://adoptium.net - and if an old Java stays first on PATH,
+    echo       set JAVA_HOME to the new one ^(this launcher uses JAVA_HOME first^).
+    echo.
+    pause
+    exit /b 1
+)
+echo   Java %JV%
 if not exist "%PLAY%\WOTR-Gandalf-AI.jar" (
     echo   [X] Play client missing: %PLAY%
     echo.

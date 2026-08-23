@@ -86,6 +86,11 @@ SERVER_TOKENS = ('{py}', '-u', '-m', 'live.live_server',
 # the client: cwd = the client dir (resources load from the cwd).
 # -Dai.feed.aiside is what blinds the AI to the human's hand; the
 # client reads it and asks no side question.
+# the client mods + AiFeed agent are compiled --release 11 (2026-08-23:
+# testers on Java 8 / 17 died on the Java-21 class files); the launcher
+# refuses an older runtime with the reason
+JAVA_MIN = 11
+
 JAVA_TOKENS = ('java',
                '-javaagent:' + FEED_JAR + '={client}\\' + FEED_NAME,
                '-Dai.feed.aiside={side}',
@@ -260,13 +265,38 @@ echo    AlphaWOTR  --  human vs AI
 echo   ================================================================
 echo.
 
+:: ---- which Java: JAVA_HOME first (the standard override), then PATH;
+::      the client mods are Java {JAVA_MIN} class files - an older runtime
+::      dies with "class file versions up to 52.0" inside -javaagent
+if defined JAVA_HOME if exist "%JAVA_HOME%in\java.exe" set "PATH=%JAVA_HOME%in;%PATH%"
 where java >nul 2>&1
 if errorlevel 1 (
     echo   [X] Java was not found on PATH.
+    echo       Install Java {JAVA_MIN} or newer ^(Temurin 17 or 21 from https://adoptium.net^),
+    echo       or set JAVA_HOME to an installed JDK/JRE folder.
     echo.
     pause
     exit /b 1
 )
+set "JV="
+for /f tokens^=3 %%v in ('java -version 2^>^&1 ^| findstr /i "version"') do if not defined JV set "JV=%%~v"
+set "JMAJ="
+for /f "tokens=1,2 delims=." %%a in ("%JV%") do (set "JMAJ=%%a" & set "JMIN=%%b")
+if "%JMAJ%"=="1" set "JMAJ=%JMIN%"
+set /a JMAJN=%JMAJ% 2>nul
+if not defined JMAJN set "JMAJN=0"
+set "JPATH="
+for /f "delims=" %%p in ('where java') do if not defined JPATH set "JPATH=%%p"
+if %JMAJN% LSS {JAVA_MIN} (
+    echo   [X] Java %JV% found at %JPATH%
+    echo       AlphaWOTR needs Java {JAVA_MIN} or newer.  Install Temurin 17 or 21 from
+    echo       https://adoptium.net - and if an old Java stays first on PATH,
+    echo       set JAVA_HOME to the new one ^(this launcher uses JAVA_HOME first^).
+    echo.
+    pause
+    exit /b 1
+)
+echo   Java %JV%
 if not exist "%PLAY%\{JAR_NAME}" (
     echo   [X] Play client missing: %PLAY%
     echo.
@@ -490,6 +520,7 @@ ENGINE_BAT_PATH = os.path.join(ROOT, 'Play_Engine_Only.bat')
 def _render(template):
     txt = template
     for key, val in (('{PROBE}', _PROBE), ('{PY}', PY), ('{PYW}', PYW),
+                     ('{JAVA_MIN}', str(JAVA_MIN)),
                      ('{ENV_LINES}', bat_env_lines()),
                      ('{NET_TAG}', NET_TAG), ('{JAR_NAME}', JAR_NAME),
                      ('{LEFTOVER_FILES}', ' '.join(LEFTOVER_FILES)),
