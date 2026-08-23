@@ -205,8 +205,21 @@ if not defined PY (
     )
 )
 if not defined PY (
-    echo   [X] No Python with torch+numpy found. Install Python 3.10+ and run
-    echo       pip install -r requirements.txt   ^(or set ALPHAWOTR_PYTHON^)
+    echo   [X] No working Python found.
+    if exist "%~dp0python\python.exe" (
+        echo       The bundled runtime python\python.exe exists but cannot import
+        echo       torch+numpy.  Its error follows; send it with a bug report:
+        echo       ----------------------------------------------------------
+        "%~dp0python\python.exe" -c "import torch, numpy" 2>&1 | findstr /V /C:"^$"
+        echo       ----------------------------------------------------------
+        echo       Usual causes: the zip was not fully unpacked ^(use Explorer or
+        echo       7-Zip, to a SHORT path like C:\AlphaWOTR^), or a DLL load error
+        echo       ^(try: install the Microsoft Visual C++ Redistributable x64^).
+    ) else (
+        echo       No python\ runtime in this folder ^(it ships in the release
+        echo       zip^).  Install Python 3.10+ and run
+        echo       pip install -r requirements.txt   ^(or set ALPHAWOTR_PYTHON^)
+    )
     echo.
     pause
     exit /b 1
