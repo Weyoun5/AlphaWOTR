@@ -80,6 +80,14 @@ RESP_NAME = 'ai_bridge_move.txt'
 STATUS_NAME = 'ai_bridge_status.json'
 CONTROL_NAME = 'ai_panel_control.json'
 LOCK_NAME = 'ai_server.lock'
+# LIVENESS LOCK (2026-08-23, Java 8 support): a second file the server
+# keeps OPEN with an exclusive OS byte lock for its whole lifetime.  The
+# OS releases it the instant the process dies (crash included), so any
+# reader can prove "a live server is writing for this client dir" with
+# one non-blocking lock attempt - no pid API, no child process.  The
+# client's Java 8 path (no ProcessHandle) proves server ownership this
+# way; Java 9+ keeps its ProcessHandle proof unchanged.
+ALIVE_NAME = 'ai_server.alive'
 
 SIDE_HEADERS = ('SHADOW', 'FREE_PEOPLES', 'AUTO',
                 'LIVE_SHADOW', 'LIVE_FREE_PEOPLES')
@@ -194,11 +202,52 @@ class FileBridge(object):
             raise
         except Exception as _le:
             print('! server lock check skipped: %r' % (_le,))
+        self.hold_alive_lock()
         return how
+
+    def hold_alive_lock(self):
+        """Write our pid into ALIVE_NAME and keep the handle open with
+        an exclusive lock on its first byte (msvcrt.locking LK_NBLCK) for
+        the rest of the process - the liveness proof the client reads
+        (see ALIVE_NAME).  Never raises: a failure is printed and the
+        client falls back to its other proofs."""
+        try:
+            import msvcrt
+            path = os.path.join(self.client_dir, ALIVE_NAME)
+            fh = open(path, 'w+')
+            fh.write(str(os.getpid()))
+            fh.flush()
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            self._alive_fh = fh            # held for the process lifetime
+        except Exception as _ae:
+            print('! liveness lock not held: %r' % (_ae,))
+            self._alive_fh = None
+
+    def release_alive_lock(self):
+        fh = getattr(self, '_alive_fh', None)
+        if fh is None:
+            return
+        try:
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        except Exception:
+            pass
+        try:
+            fh.close()
+        except Exception:
+            pass
+        self._alive_fh = None
+        try:
+            os.remove(os.path.join(self.client_dir, ALIVE_NAME))
+        except OSError:
+            pass
 
     def release_lock(self):
         """Remove the lock ONLY if it names our pid (test teardown
         helper - production relies on the liveness proof, as always)."""
+        self.release_alive_lock()
         try:
             if os.path.exists(self.lock_path):
                 if open(self.lock_path).read().strip() == \

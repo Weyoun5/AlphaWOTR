@@ -16,7 +16,7 @@ WHAT THIS IS
 Please report strange moves or any bugs, I expect there are quite a few
 
 INSTALL
-  Java 11 or newer (17 or 21 recommended: https://adoptium.net).  The
+  Java 8 or newer (17 or 21 recommended: https://adoptium.net).  The
     launcher checks  java -version  and says so if yours is too old; an
     old Java first on PATH is overridden by setting JAVA_HOME.
   Release zip (AlphaWOTR_win64_*.zip, GitHub Releases): unzip anywhere,

@@ -71,7 +71,7 @@ LEFTOVER_FILES = (
     'ai_bridge_move.txt', 'ai_panel_control.json', 'ai_feed.txt',
     'ai_feed.txt.meta.jsonl', 'ai_client_board.txt',
     'ai_live_state.pkl', 'ai_live_status.json', 'ai_census.jsonl',
-    'ai_server.lock', 'ai_panel.pid',
+    'ai_server.lock', 'ai_server.alive', 'ai_panel.pid',
 )
 # diagnostics of the previous session: kept once as <name>.prev
 ROTATE_FILES = ('ai_boot.log', 'ai_server_console.log',
@@ -86,10 +86,11 @@ SERVER_TOKENS = ('{py}', '-u', '-m', 'live.live_server',
 # the client: cwd = the client dir (resources load from the cwd).
 # -Dai.feed.aiside is what blinds the AI to the human's hand; the
 # client reads it and asks no side question.
-# the client mods + AiFeed agent are compiled --release 11 (2026-08-23:
-# testers on Java 8 / 17 died on the Java-21 class files); the launcher
-# refuses an older runtime with the reason
-JAVA_MIN = 11
+# the client mods + AiFeed agent are compiled --release 8 (2026-08-23:
+# testers on Java 8 / 17 died on the Java-21 class files; the ownership
+# guard's Java-9 ProcessHandle is behind reflection with a file-lock
+# proof fallback, so the original client's own Java 8 is enough)
+JAVA_MIN = 8
 
 JAVA_TOKENS = ('java',
                '-javaagent:' + FEED_JAR + '={client}\\' + FEED_NAME,

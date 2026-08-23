@@ -84,13 +84,13 @@ echo   ================================================================
 echo.
 
 :: ---- which Java: JAVA_HOME first (the standard override), then PATH;
-::      the client mods are Java 11 class files - an older runtime
+::      the client mods are Java 8 class files - an older runtime
 ::      dies with "class file versions up to 52.0" inside -javaagent
 if defined JAVA_HOME if exist "%JAVA_HOME%in\java.exe" set "PATH=%JAVA_HOME%in;%PATH%"
 where java >nul 2>&1
 if errorlevel 1 (
     echo   [X] Java was not found on PATH.
-    echo       Install Java 11 or newer ^(Temurin 17 or 21 from https://adoptium.net^),
+    echo       Install Java 8 or newer ^(Temurin 17 or 21 from https://adoptium.net^),
     echo       or set JAVA_HOME to an installed JDK/JRE folder.
     echo.
     pause
@@ -105,9 +105,9 @@ set /a JMAJN=%JMAJ% 2>nul
 if not defined JMAJN set "JMAJN=0"
 set "JPATH="
 for /f "delims=" %%p in ('where java') do if not defined JPATH set "JPATH=%%p"
-if %JMAJN% LSS 11 (
+if %JMAJN% LSS 8 (
     echo   [X] Java %JV% found at %JPATH%
-    echo       AlphaWOTR needs Java 11 or newer.  Install Temurin 17 or 21 from
+    echo       AlphaWOTR needs Java 8 or newer.  Install Temurin 17 or 21 from
     echo       https://adoptium.net - and if an old Java stays first on PATH,
     echo       set JAVA_HOME to the new one ^(this launcher uses JAVA_HOME first^).
     echo.
@@ -179,7 +179,7 @@ move /Y "logs\auto\*.log" "logs\archive\" >nul 2>&1
 :: (locked by a process the sweep missed) would be adopted as THIS
 :: session's heartbeat, so a failed delete aborts loudly
 set "LEFTOVER="
-for %%f in (ai_bridge_status.json ai_bridge_request.log ai_bridge_move.txt ai_panel_control.json ai_feed.txt ai_feed.txt.meta.jsonl ai_client_board.txt ai_live_state.pkl ai_live_status.json ai_census.jsonl ai_server.lock ai_panel.pid) do (
+for %%f in (ai_bridge_status.json ai_bridge_request.log ai_bridge_move.txt ai_panel_control.json ai_feed.txt ai_feed.txt.meta.jsonl ai_client_board.txt ai_live_state.pkl ai_live_status.json ai_census.jsonl ai_server.lock ai_server.alive ai_panel.pid) do (
     if exist "%%f" del /F /Q "%%f" >nul 2>&1
     if exist "%%f" set "LEFTOVER=%%f"
 )

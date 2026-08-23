@@ -5,8 +5,8 @@ data\wotr_map.png	aa53fc5d9acfd0e17d87540893ecf5dd247875c2	4337024
 data\wotr_map.txt	e1aed6191f26f7a303e50424faefa806b5851689	43570
 LICENSE	0d2bc2eb3d50ce5732aaedb851cdd6e53d2af2ba	1448
 Play_Engine_Only.bat	ae976a3f8b81f56d089ae3a062c40f4bdb768d50	4009
-Play_vs_AI.bat	a7a015cf57846d6896b38c2f21997f01c42cfeb2	12033
-README.txt	c6a3599eb1bb465f555ae914a815480733b730df	6609
+Play_vs_AI.bat	2ddee27191195558a105625fc724efc47a9d4ff5	12045
+README.txt	f67efd17f512ef57b605fe15ccbc7b762e1dd11b	6608
 requirements.txt	d8e6118f1f4ef6f2a79a332c4e95b06d009fc280	261
 src\ai.py	394f150d00bd2b24b996a7885554414ba61fe55f	815738
 src\board.py	15c7145115c49bb5fb87532dda15f7ba6fdb24af	21825
@@ -590,7 +590,7 @@ src\wotr_native.cp311-win_amd64.pyd	d367dfe0d5998e743d313ccaa8428203e1cc27ba	539
 wotr_bridge\ai_panel.py	edbb2fa9cdca89e9d40be9a55a0d20a668d78abe	36409
 wotr_bridge\emitter.py	d465aa1b37dc8adfffc12a62a35d9322135dd229	128097
 wotr_bridge\initial_positions.json	aa54c464ced7ba6a9c8fcfc4e41fd4be10952a70	8204
-wotr_bridge\launch_head.py	c768c19f11f43677bcf75dc1b3f4ec93bab64464	25230
+wotr_bridge\launch_head.py	ad30f31458c1f2310865490102a454f63bbf6df3	25339
 wotr_bridge\live\adopt.py	527ff9af1010dd3485ce00eece26bce72e340977	18861
 wotr_bridge\live\card_identity.py	037c5ba786d3650323bcd582721c16d088f25d52	9890
 wotr_bridge\live\chat.py	236a5678853972b9e88a16b03dac78f6c091251d	29762
@@ -608,7 +608,7 @@ wotr_bridge\live\scenario.py	4aaa7094cf59616c9271f086270d0464b14fd661	36031
 wotr_bridge\live\segmenter.py	4cf8aeeb2d6faf8341ea5219abef15a0ca949878	11902
 wotr_bridge\live\sidecar.py	41d9acc2fca108501d3d6447dcae7a7922b17280	4825
 wotr_bridge\live\spectator.py	7ce53a044942e96cb61d493c08619d466cbb1604	41725
-wotr_bridge\live\transport.py	0b4a3da32ed4922ad074af860d8674f0cd29850e	21840
+wotr_bridge\live\transport.py	f46c8fee4a5f90aac5626550308ffdbc719ed866	24291
 wotr_bridge\live\undo_model.py	82c6c111ea0f5f5501c4c653a242a73c66beaab9	23906
 wotr_bridge\live_view.py	35794230f12761657a39946f46a0f475625345a5	18267
 wotr_bridge\parity_test.py	3ffbe73cc471616cc3a81a6d149139a20d440d2c	6856
@@ -1590,7 +1590,7 @@ wotr_bridge\play_client\wome\images\smallcards\sa_Faction_back.png	2d0ae374c6b51
 wotr_bridge\play_client\wome\images\smallcards\ShadowSmallCardBack.png	68e98da80f6e5d74803c21774961c398d0fcaf6c	8889
 wotr_bridge\play_client\wome\images\units\Deadmen-F.png	527278a72dbc26081f01d78d1aacff93c63cc56d	5764
 wotr_bridge\play_client\wome\images\units\Spider-F.png	ee0e609bc9be67a4d4201b07aea2e7d917334a70	6026
-wotr_bridge\play_client\WOTR-Gandalf-AI.jar	28b8658fd83b70fd63b6a1edace27459aa673621	353030
+wotr_bridge\play_client\WOTR-Gandalf-AI.jar	381595708578ae2cd942bbec1058e16a0e8f0ae0	349756
 wotr_bridge\play_client\WOTR-GandalfV8.jar	017266175c05269da36f293571cd590fe7cd5191	256322
 wotr_bridge\play_client\wotr_preferences	d2d729f958ee08628cf883b12b461e7957738712	1815
 wotr_fp_corpus_live.pt	9c57e112344e4d0d096c69552a28a04d03d0f63a	33993339
