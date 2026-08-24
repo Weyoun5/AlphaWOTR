@@ -16,10 +16,7 @@
 nick:Wey
 zoom:100
 zoomLevels:80,90,100,110,120,130,140,150,200
-winx:1933
-winy:1045
 port:4747
-addr:127.0.0.1
 font:SansSerif
 fontsize:15
 cardsWidth:360

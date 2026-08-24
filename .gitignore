@@ -6,6 +6,8 @@ wotr_bridge/play_client/logs/**/*.log
 wotr_bridge/play_client/logs/**/*.vlog
 # the bundled Python runtime (ships in the GitHub Release zip, not the repo)
 python/
+# the launcher's own step log (overwritten each start)
+launcher.log
 # python bytecode
 __pycache__/
 *.pyc

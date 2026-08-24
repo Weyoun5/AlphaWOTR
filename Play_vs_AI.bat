@@ -13,6 +13,8 @@ setlocal EnableExtensions
 title AlphaWOTR - Play vs AI
 
 set "HERE=%~dp0"
+set "LAUNCHLOG=%~dp0launcher.log"
+echo [start %DATE% %TIME%] > "%LAUNCHLOG%"
 set "PLAY=%HERE%wotr_bridge\play_client"
 set "BRIDGE=%HERE%wotr_bridge"
 :: ---- which Python: the BUNDLED runtime (python\python.exe, shipped in
@@ -83,38 +85,25 @@ echo    AlphaWOTR  --  human vs AI
 echo   ================================================================
 echo.
 
-:: ---- which Java: JAVA_HOME first (the standard override), then PATH;
-::      the client mods are Java 8 class files - an older runtime
-::      dies with "class file versions up to 52.0" inside -javaagent
-if defined JAVA_HOME if exist "%JAVA_HOME%in\java.exe" set "PATH=%JAVA_HOME%in;%PATH%"
+:: ---- which Java: JAVA_HOME first (the standard override), then PATH.
+::      The client and its add-ons are Java 8 class files, so any
+::      working java runs them; the version check below only WARNS.
+echo [java-check] >> "%LAUNCHLOG%"
+if defined JAVA_HOME if exist "%JAVA_HOME%\bin\java.exe" set "PATH=%JAVA_HOME%\bin;%PATH%"
 where java >nul 2>&1
 if errorlevel 1 (
     echo   [X] Java was not found on PATH.
-    echo       Install Java 8 or newer ^(Temurin 17 or 21 from https://adoptium.net^),
+    echo       Install Java ^(Temurin 17 or 21 from https://adoptium.net^),
     echo       or set JAVA_HOME to an installed JDK/JRE folder.
     echo.
+    echo [no-java] >> "%LAUNCHLOG%"
     pause
     exit /b 1
 )
 set "JV="
 for /f tokens^=3 %%v in ('java -version 2^>^&1 ^| findstr /i "version"') do if not defined JV set "JV=%%~v"
-set "JMAJ="
-for /f "tokens=1,2 delims=." %%a in ("%JV%") do (set "JMAJ=%%a" & set "JMIN=%%b")
-if "%JMAJ%"=="1" set "JMAJ=%JMIN%"
-set /a JMAJN=%JMAJ% 2>nul
-if not defined JMAJN set "JMAJN=0"
-set "JPATH="
-for /f "delims=" %%p in ('where java') do if not defined JPATH set "JPATH=%%p"
-if %JMAJN% LSS 8 (
-    echo   [X] Java %JV% found at %JPATH%
-    echo       AlphaWOTR needs Java 8 or newer.  Install Temurin 17 or 21 from
-    echo       https://adoptium.net - and if an old Java stays first on PATH,
-    echo       set JAVA_HOME to the new one ^(this launcher uses JAVA_HOME first^).
-    echo.
-    pause
-    exit /b 1
-)
 echo   Java %JV%
+echo [java-ok %JV%] >> "%LAUNCHLOG%"
 if not exist "%PLAY%\WOTR-Gandalf-AI.jar" (
     echo   [X] Play client missing: %PLAY%
     echo.
@@ -156,6 +145,7 @@ echo.
 :: kill them and clear the coordination files first.  Every sweep is
 :: scoped to THIS client dir (%PLAY%): a harness leg on a scratch copy
 :: is never in range, and vice versa.
+echo [step1] >> "%LAUNCHLOG%"
 echo   [1/3] clearing any leftovers from a previous session...
 :: a game client still running on this play_client would be handed a
 :: second server (or keep the old brain) - refuse until it is closed
@@ -200,6 +190,7 @@ for %%f in (ai_boot.log ai_server_console.log ai_panel_proc.log ai_server.log) d
 :: 1. the AI server, FIRST.  The client adopts it through the
 ::    ai_bridge_status.json heartbeat ("spawn SKIPPED" in ai_boot.log).
 :: ---------------------------------------------------------------------
+echo [step2] >> "%LAUNCHLOG%"
 echo   [2/3] starting the AI server (AI side %AISIDE%, nets corpus_live)...
 echo         first start loads the nets - this can take a minute.
 cd /d "%BRIDGE%"
@@ -240,6 +231,7 @@ echo         server up.
 ::    MANDATORY - it is what blinds the AI to your hand.  The client
 ::    spawns the AI status panel itself (-Dai.python / -Dai.bridgedir).
 :: ---------------------------------------------------------------------
+echo [step3] >> "%LAUNCHLOG%"
 echo   [3/3] launching the game client...
 echo.
 echo   ----------------------------------------------------------------
