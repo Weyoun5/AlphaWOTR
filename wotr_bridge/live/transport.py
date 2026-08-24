@@ -88,6 +88,15 @@ LOCK_NAME = 'ai_server.lock'
 # client's Java 8 path (no ProcessHandle) proves server ownership this
 # way; Java 9+ keeps its ProcessHandle proof unchanged.
 ALIVE_NAME = 'ai_server.alive'
+# The lock byte sits FAR past the pid text: msvcrt locks are MANDATORY
+# on Windows, so a lock on byte 0 blocked the client's READ of the pid
+# itself (tester 2026-08-24: 'The process cannot access the file
+# because another process has locked a portion of the file') and the
+# proof refused every LIVE server.  At 1 MiB no reader of the pid (an
+# 8 KiB FileReader buffer) can touch the locked byte; locking past EOF
+# is legal on Windows.  AiOpp.ownerHoldsAliveLock probes THIS offset -
+# the two constants must stay equal.
+ALIVE_LOCK_OFFSET = 1 << 20
 
 SIDE_HEADERS = ('SHADOW', 'FREE_PEOPLES', 'AUTO',
                 'LIVE_SHADOW', 'LIVE_FREE_PEOPLES')
@@ -207,17 +216,18 @@ class FileBridge(object):
 
     def hold_alive_lock(self):
         """Write our pid into ALIVE_NAME and keep the handle open with
-        an exclusive lock on its first byte (msvcrt.locking LK_NBLCK) for
-        the rest of the process - the liveness proof the client reads
-        (see ALIVE_NAME).  Never raises: a failure is printed and the
-        client falls back to its other proofs."""
+        an exclusive lock on the byte at ALIVE_LOCK_OFFSET (msvcrt
+        LK_NBLCK) for the rest of the process - the liveness proof the
+        client reads (see ALIVE_NAME/ALIVE_LOCK_OFFSET).  Never raises:
+        a failure is printed and the client falls back to its other
+        proofs."""
         try:
             import msvcrt
             path = os.path.join(self.client_dir, ALIVE_NAME)
             fh = open(path, 'w+')
             fh.write(str(os.getpid()))
             fh.flush()
-            fh.seek(0)
+            fh.seek(ALIVE_LOCK_OFFSET)
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
             self._alive_fh = fh            # held for the process lifetime
         except Exception as _ae:
@@ -230,7 +240,7 @@ class FileBridge(object):
             return
         try:
             import msvcrt
-            fh.seek(0)
+            fh.seek(ALIVE_LOCK_OFFSET)
             msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
         except Exception:
             pass

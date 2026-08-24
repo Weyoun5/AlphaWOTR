@@ -608,7 +608,7 @@ wotr_bridge\live\scenario.py	4aaa7094cf59616c9271f086270d0464b14fd661	36031
 wotr_bridge\live\segmenter.py	4cf8aeeb2d6faf8341ea5219abef15a0ca949878	11902
 wotr_bridge\live\sidecar.py	41d9acc2fca108501d3d6447dcae7a7922b17280	4825
 wotr_bridge\live\spectator.py	7ce53a044942e96cb61d493c08619d466cbb1604	41725
-wotr_bridge\live\transport.py	f46c8fee4a5f90aac5626550308ffdbc719ed866	24291
+wotr_bridge\live\transport.py	0ab09ef5c5b28aba0b4f3fca57bb299e0bc2ec4e	24919
 wotr_bridge\live\undo_model.py	82c6c111ea0f5f5501c4c653a242a73c66beaab9	23906
 wotr_bridge\live_view.py	35794230f12761657a39946f46a0f475625345a5	18267
 wotr_bridge\parity_test.py	3ffbe73cc471616cc3a81a6d149139a20d440d2c	6856
@@ -1590,7 +1590,7 @@ wotr_bridge\play_client\wome\images\smallcards\sa_Faction_back.png	2d0ae374c6b51
 wotr_bridge\play_client\wome\images\smallcards\ShadowSmallCardBack.png	68e98da80f6e5d74803c21774961c398d0fcaf6c	8889
 wotr_bridge\play_client\wome\images\units\Deadmen-F.png	527278a72dbc26081f01d78d1aacff93c63cc56d	5764
 wotr_bridge\play_client\wome\images\units\Spider-F.png	ee0e609bc9be67a4d4201b07aea2e7d917334a70	6026
-wotr_bridge\play_client\WOTR-Gandalf-AI.jar	381595708578ae2cd942bbec1058e16a0e8f0ae0	349756
+wotr_bridge\play_client\WOTR-Gandalf-AI.jar	027277659ea5a26c14de84c1520b4e755f0fcb1c	349797
 wotr_bridge\play_client\WOTR-GandalfV8.jar	017266175c05269da36f293571cd590fe7cd5191	256322
 wotr_bridge\play_client\wotr_preferences	82116439c2c067cede64ff28bb6f0cc7c0f97dd2	1780
 wotr_fp_corpus_live.pt	9c57e112344e4d0d096c69552a28a04d03d0f63a	33993339
