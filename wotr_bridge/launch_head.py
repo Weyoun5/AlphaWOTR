@@ -158,17 +158,17 @@ def _bat_tokens(tokens, **subs):
 
 
 def bat_java_line():
-    return ' '.join(_bat_tokens(JAVA_TOKENS, client='%PLAY%',
-                                side='%AISIDE%', pyw='%PYW%',
-                                bridge='%BRIDGE%'))
+    return ' '.join(_bat_tokens(JAVA_TOKENS, client='!PLAY!',
+                                side='%AISIDE%', pyw='!PYW!',
+                                bridge='!BRIDGE!'))
 
 
 def bat_server_line():
-    inner = ' '.join(_bat_tokens(SERVER_TOKENS, py='%PY%',
-                                 client='%PLAY%', side='%AISIDE%',
+    inner = ' '.join(_bat_tokens(SERVER_TOKENS, py='!PY!',
+                                 client='!PLAY!', side='%AISIDE%',
                                  sims=SERVER_SIMS))
     return ('start "AlphaWOTR AI server" /min cmd /c "' + inner
-            + ' 1>"%PLAY%\\' + SERVER_CONSOLE_LOG + '" 2>&1"')
+            + ' 1>"!PLAY!\\' + SERVER_CONSOLE_LOG + '" 2>&1"')
 
 
 def bat_env_lines():
@@ -186,13 +186,13 @@ _PROBE = r''':: ---- which Python: the BUNDLED runtime (python\python.exe, shipp
 ::      the release zip), then ALPHAWOTR_PYTHON, then python.exe on PATH,
 ::      then the developer runtime; the first that imports torch+numpy wins
 set "PY="
-if exist "%~dp0python\python.exe" (
-    "%~dp0python\python.exe" -c "import torch, numpy" >nul 2>&1
-    if not errorlevel 1 set "PY=%~dp0python\python.exe"
+if exist "!HERE!python\python.exe" (
+    "!HERE!python\python.exe" -c "import torch, numpy" >nul 2>&1
+    if not errorlevel 1 set "PY=!HERE!python\python.exe"
 )
 if not defined PY if defined ALPHAWOTR_PYTHON (
-    "%ALPHAWOTR_PYTHON%" -c "import torch, numpy" >nul 2>&1
-    if not errorlevel 1 set "PY=%ALPHAWOTR_PYTHON%"
+    "!ALPHAWOTR_PYTHON!" -c "import torch, numpy" >nul 2>&1
+    if not errorlevel 1 set "PY=!ALPHAWOTR_PYTHON!"
 )
 if not defined PY (
     set "PY_PROBE="
@@ -200,8 +200,8 @@ if not defined PY (
         if not defined PY_PROBE set "PY_PROBE=%%p"
     )
     if defined PY_PROBE (
-        "%PY_PROBE%" -c "import torch, numpy" >nul 2>&1
-        if not errorlevel 1 set "PY=%PY_PROBE%"
+        "!PY_PROBE!" -c "import torch, numpy" >nul 2>&1
+        if not errorlevel 1 set "PY=!PY_PROBE!"
     )
 )
 if not defined PY (
@@ -212,11 +212,11 @@ if not defined PY (
 )
 if not defined PY (
     echo   [X] No working Python found.
-    if exist "%~dp0python\python.exe" (
+    if exist "!HERE!python\python.exe" (
         echo       The bundled runtime python\python.exe exists but cannot import
         echo       torch+numpy.  Its error follows; send it with a bug report:
         echo       ----------------------------------------------------------
-        "%~dp0python\python.exe" -c "import torch, numpy" 2>&1 | findstr /V /C:"^$"
+        "!HERE!python\python.exe" -c "import torch, numpy" 2>&1 | findstr /V /C:"^$"
         echo       ----------------------------------------------------------
         echo       Usual causes: the zip was not fully unpacked ^(use Explorer or
         echo       7-Zip, to a SHORT path like C:\AlphaWOTR^), or a DLL load error
@@ -230,12 +230,12 @@ if not defined PY (
     pause
     exit /b 1
 )
-set "PYW=%PY:python.exe=pythonw.exe%"
-if not exist "%PYW%" set "PYW=%PY%"
+set "PYW=!PY:python.exe=pythonw.exe!"
+if not exist "!PYW!" set "PYW=!PY!"
 '''
 
 _BAT = r'''@echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 :: =====================================================================
 :: Play_vs_AI.bat -- THE ONE HEAD of AlphaWOTR.  GENERATED from
 :: wotr_bridge\launch_head.py (--write-bat); edit the module, never
@@ -250,9 +250,9 @@ title AlphaWOTR - Play vs AI
 
 set "HERE=%~dp0"
 set "LAUNCHLOG=%~dp0launcher.log"
-echo [start %DATE% %TIME%] > "%LAUNCHLOG%"
-set "PLAY=%HERE%wotr_bridge\play_client"
-set "BRIDGE=%HERE%wotr_bridge"
+echo [start %DATE% %TIME%] > "!LAUNCHLOG!"
+set "PLAY=!HERE!wotr_bridge\play_client"
+set "BRIDGE=!HERE!wotr_bridge"
 {PROBE}
 :: certified-path env (CPU pinned; '-1', never an empty string) and the
 :: v41 generation switch (the loader refuses the v41 nets without it)
@@ -271,24 +271,24 @@ echo.
 :: ---- which Java: JAVA_HOME first (the standard override), then PATH.
 ::      The client and its add-ons are Java 8 class files, so any
 ::      working java runs them; the version check below only WARNS.
-echo [java-check] >> "%LAUNCHLOG%"
-if defined JAVA_HOME if exist "%JAVA_HOME%\bin\java.exe" set "PATH=%JAVA_HOME%\bin;%PATH%"
+echo [java-check] >> "!LAUNCHLOG!"
+if defined JAVA_HOME if exist "!JAVA_HOME!\bin\java.exe" set "PATH=!JAVA_HOME!\bin;%PATH%"
 where java >nul 2>&1
 if errorlevel 1 (
     echo   [X] Java was not found on PATH.
     echo       Install Java ^(Temurin 17 or 21 from https://adoptium.net^),
     echo       or set JAVA_HOME to an installed JDK/JRE folder.
     echo.
-    echo [no-java] >> "%LAUNCHLOG%"
+    echo [no-java] >> "!LAUNCHLOG!"
     pause
     exit /b 1
 )
 set "JV="
 for /f tokens^=3 %%v in ('java -version 2^>^&1 ^| findstr /i "version"') do if not defined JV set "JV=%%~v"
 echo   Java %JV%
-echo [java-ok %JV%] >> "%LAUNCHLOG%"
-if not exist "%PLAY%\{JAR_NAME}" (
-    echo   [X] Play client missing: %PLAY%
+echo [java-ok %JV%] >> "!LAUNCHLOG!"
+if not exist "!PLAY!\{JAR_NAME}" (
+    echo   [X] Play client missing: !PLAY!
     echo.
     pause
     exit /b 1
@@ -326,9 +326,9 @@ echo.
 :: Fresh session.  An orphaned server or panel from a previous run
 :: would be ADOPTED by the new client - previous brain and all - so
 :: kill them and clear the coordination files first.  Every sweep is
-:: scoped to THIS client dir (%PLAY%): a harness leg on a scratch copy
+:: scoped to THIS client dir (!PLAY!): a harness leg on a scratch copy
 :: is never in range, and vice versa.
-echo [step1] >> "%LAUNCHLOG%"
+echo [step1] >> "!LAUNCHLOG!"
 echo   [1/3] clearing any leftovers from a previous session...
 :: a game client still running on this play_client would be handed a
 :: second server (or keep the old brain) - refuse until it is closed
@@ -336,7 +336,7 @@ powershell -NoProfile -Command "$j = Get-CimInstance Win32_Process | Where-Objec
 if errorlevel 3 (
     echo.
     echo   [X] a game client from a previous session is still open on
-    echo       %PLAY%
+    echo       !PLAY!
     echo       Close it, then run Play_vs_AI.bat again.
     echo.
     pause
@@ -344,7 +344,7 @@ if errorlevel 3 (
 )
 powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like ('*' + $env:PLAY + '*') -and ($_.Name -match 'python') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
 
-cd /d "%PLAY%"
+cd /d "!PLAY!"
 if not exist "logs\auto" mkdir "logs\auto"
 if not exist "logs\archive" mkdir "logs\archive"
 move /Y "logs\auto\*.log" "logs\archive\" >nul 2>&1
@@ -359,7 +359,7 @@ for %%f in ({LEFTOVER_FILES}) do (
 if defined LEFTOVER (
     echo.
     echo   [X] could not delete the leftover file %LEFTOVER%
-    echo       in %PLAY% - something still holds it.
+    echo       in !PLAY! - something still holds it.
     echo       Close any previous AI server / panel / client and retry.
     echo.
     pause
@@ -373,21 +373,21 @@ for %%f in ({ROTATE_FILES}) do (
 :: 1. the AI server, FIRST.  The client adopts it through the
 ::    {HEARTBEAT_FILE} heartbeat ("spawn SKIPPED" in ai_boot.log).
 :: ---------------------------------------------------------------------
-echo [step2] >> "%LAUNCHLOG%"
+echo [step2] >> "!LAUNCHLOG!"
 echo   [2/3] starting the AI server (AI side %AISIDE%, nets {NET_TAG})...
 echo         first start loads the nets - this can take a minute.
-cd /d "%BRIDGE%"
+cd /d "!BRIDGE!"
 {SERVER_LINE}
 
 set /a TRIES=0
 :waitbeat
-if exist "%PLAY%\{HEARTBEAT_FILE}" goto beatok
-findstr /C:"Traceback" "%PLAY%\{SERVER_CONSOLE_LOG}" >nul 2>&1
+if exist "!PLAY!\{HEARTBEAT_FILE}" goto beatok
+findstr /C:"Traceback" "!PLAY!\{SERVER_CONSOLE_LOG}" >nul 2>&1
 if not errorlevel 1 (
     echo.
     echo   [X] the AI server crashed on startup.  Last lines:
     echo.
-    powershell -NoProfile -Command "Get-Content -Tail 20 '%PLAY%\{SERVER_CONSOLE_LOG}'"
+    powershell -NoProfile -Command "Get-Content -Tail 20 '!PLAY!\{SERVER_CONSOLE_LOG}'"
     echo.
     pause
     goto cleanup
@@ -396,7 +396,7 @@ set /a TRIES+=1
 if %TRIES% GEQ {HEARTBEAT_WAIT_S} (
     echo.
     echo   [X] no server heartbeat after {HEARTBEAT_WAIT_S}s.
-    echo       See: %PLAY%\{SERVER_CONSOLE_LOG}
+    echo       See: !PLAY!\{SERVER_CONSOLE_LOG}
     echo.
     pause
     goto cleanup
@@ -414,7 +414,7 @@ echo         server up.
 ::    MANDATORY - it is what blinds the AI to your hand.  The client
 ::    spawns the AI status panel itself (-Dai.python / -Dai.bridgedir).
 :: ---------------------------------------------------------------------
-echo [step3] >> "%LAUNCHLOG%"
+echo [step3] >> "!LAUNCHLOG!"
 echo   [3/3] launching the game client...
 echo.
 echo   ----------------------------------------------------------------
@@ -433,7 +433,7 @@ echo    Chat words (attacks, combat cards): see README.txt.
 echo    Sound: menu  AI  ^>  "Mute sounds".
 echo   ----------------------------------------------------------------
 echo.
-cd /d "%PLAY%"
+cd /d "!PLAY!"
 {JAVA_LINE}
 {PAD}
 goto cleanup
@@ -456,7 +456,7 @@ endlocal
 
 
 _ENGINE_BAT = r'''@echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 :: =====================================================================
 :: Play_Engine_Only.bat -- the engine's OWN board GUI, no Java client.
 :: GENERATED from wotr_bridge\launch_head.py (--write-bat); edit the
@@ -469,8 +469,8 @@ setlocal EnableExtensions
 title AlphaWOTR - engine only (UNTESTED)
 
 set "HERE=%~dp0"
-set "PLAY=%HERE%wotr_bridge\play_client"
-set "BRIDGE=%HERE%wotr_bridge"
+set "PLAY=!HERE!wotr_bridge\play_client"
+set "BRIDGE=!HERE!wotr_bridge"
 
 {PROBE}
 :: certified-path env (CPU pinned; '-1', never an empty string) and the
@@ -500,8 +500,8 @@ set "REST=%REST% %1"
 shift
 goto guirest
 :guirun
-cd /d "%HERE%"
-"%PY%" "%HERE%src\gui.py" --live %SIDE% --net {NET_TAG}%REST%
+cd /d "!HERE!"
+"!PY!" "!HERE!src\gui.py" --live %SIDE% --net {NET_TAG}%REST%
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" pause
 endlocal & exit /b %RC%
@@ -529,7 +529,31 @@ def _render(template):
     if bad:
         raise ValueError('render: non-ascii or CONTROL character in the '
                          'bat: %r' % bad[:5])
+    _validate_paren_safety(txt)
     return txt.replace('\r\n', '\n')
+
+
+def _validate_paren_safety(txt):
+    """A ')' in the install folder (Windows' 'name (1)' duplicate
+    downloads) terminates a parse-time %-expansion inside any ( ) block
+    and ABORTS the batch (field failure 2026-08-23: every released bat
+    died right after the banner in such folders).  Path variables must
+    be delayed-expansion (!X!) everywhere; this refuses a render where
+    a %-form or %~dp0 appears inside a parenthesized block."""
+    import re
+    pat = re.compile(r'%(HERE|PLAY|BRIDGE|LAUNCHLOG|PY|PYW|PY_PROBE|'
+                     r'ALPHAWOTR_PYTHON|JAVA_HOME|JPATH)%|%~dp0')
+    depth = 0
+    for n, ln in enumerate(txt.split('\n'), 1):
+        if depth > 0 and pat.search(ln):
+            raise ValueError('render: parse-time path expansion inside a '
+                             'parenthesized block (breaks in "(1)" '
+                             'folders) at bat line %d: %s'
+                             % (n, ln.strip()[:80]))
+        depth += ln.count('(') - ln.count('^(')
+        depth -= ln.count(')') - ln.count('^)')
+        if depth < 0:
+            depth = 0
 
 
 def render_engine_bat():

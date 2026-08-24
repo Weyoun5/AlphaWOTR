@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 :: =====================================================================
 :: Play_Engine_Only.bat -- the engine's OWN board GUI, no Java client.
 :: GENERATED from wotr_bridge\launch_head.py (--write-bat); edit the
@@ -12,20 +12,20 @@ setlocal EnableExtensions
 title AlphaWOTR - engine only (UNTESTED)
 
 set "HERE=%~dp0"
-set "PLAY=%HERE%wotr_bridge\play_client"
-set "BRIDGE=%HERE%wotr_bridge"
+set "PLAY=!HERE!wotr_bridge\play_client"
+set "BRIDGE=!HERE!wotr_bridge"
 
 :: ---- which Python: the BUNDLED runtime (python\python.exe, shipped in
 ::      the release zip), then ALPHAWOTR_PYTHON, then python.exe on PATH,
 ::      then the developer runtime; the first that imports torch+numpy wins
 set "PY="
-if exist "%~dp0python\python.exe" (
-    "%~dp0python\python.exe" -c "import torch, numpy" >nul 2>&1
-    if not errorlevel 1 set "PY=%~dp0python\python.exe"
+if exist "!HERE!python\python.exe" (
+    "!HERE!python\python.exe" -c "import torch, numpy" >nul 2>&1
+    if not errorlevel 1 set "PY=!HERE!python\python.exe"
 )
 if not defined PY if defined ALPHAWOTR_PYTHON (
-    "%ALPHAWOTR_PYTHON%" -c "import torch, numpy" >nul 2>&1
-    if not errorlevel 1 set "PY=%ALPHAWOTR_PYTHON%"
+    "!ALPHAWOTR_PYTHON!" -c "import torch, numpy" >nul 2>&1
+    if not errorlevel 1 set "PY=!ALPHAWOTR_PYTHON!"
 )
 if not defined PY (
     set "PY_PROBE="
@@ -33,8 +33,8 @@ if not defined PY (
         if not defined PY_PROBE set "PY_PROBE=%%p"
     )
     if defined PY_PROBE (
-        "%PY_PROBE%" -c "import torch, numpy" >nul 2>&1
-        if not errorlevel 1 set "PY=%PY_PROBE%"
+        "!PY_PROBE!" -c "import torch, numpy" >nul 2>&1
+        if not errorlevel 1 set "PY=!PY_PROBE!"
     )
 )
 if not defined PY (
@@ -45,11 +45,11 @@ if not defined PY (
 )
 if not defined PY (
     echo   [X] No working Python found.
-    if exist "%~dp0python\python.exe" (
+    if exist "!HERE!python\python.exe" (
         echo       The bundled runtime python\python.exe exists but cannot import
         echo       torch+numpy.  Its error follows; send it with a bug report:
         echo       ----------------------------------------------------------
-        "%~dp0python\python.exe" -c "import torch, numpy" 2>&1 | findstr /V /C:"^$"
+        "!HERE!python\python.exe" -c "import torch, numpy" 2>&1 | findstr /V /C:"^$"
         echo       ----------------------------------------------------------
         echo       Usual causes: the zip was not fully unpacked ^(use Explorer or
         echo       7-Zip, to a SHORT path like C:\AlphaWOTR^), or a DLL load error
@@ -63,8 +63,8 @@ if not defined PY (
     pause
     exit /b 1
 )
-set "PYW=%PY:python.exe=pythonw.exe%"
-if not exist "%PYW%" set "PYW=%PY%"
+set "PYW=!PY:python.exe=pythonw.exe!"
+if not exist "!PYW!" set "PYW=!PY!"
 
 :: certified-path env (CPU pinned; '-1', never an empty string) and the
 :: v41 generation switch (the loader refuses the v41 nets without it)
@@ -96,8 +96,8 @@ set "REST=%REST% %1"
 shift
 goto guirest
 :guirun
-cd /d "%HERE%"
-"%PY%" "%HERE%src\gui.py" --live %SIDE% --net corpus_live%REST%
+cd /d "!HERE!"
+"!PY!" "!HERE!src\gui.py" --live %SIDE% --net corpus_live%REST%
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" pause
 endlocal & exit /b %RC%

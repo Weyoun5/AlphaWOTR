@@ -19,7 +19,7 @@ INSTALL
   Java 8 or newer (17 or 21 recommended: https://adoptium.net).  The
     launcher checks  java -version  and says so if yours is too old; an
     old Java first on PATH is overridden by setting JAVA_HOME.
-  Release zip (AlphaWOTR_win64_*.zip, GitHub Releases): unzip anywhere,
+  Release zip (AlphaWOTR.zip, GitHub Releases): unzip anywhere,
     done - it carries its own python\ runtime with every package.
   Git clone instead: Python 3.10+, then  pip install -r requirements.txt
     (CPU torch is enough; set ALPHAWOTR_PYTHON=<python.exe> to force one).

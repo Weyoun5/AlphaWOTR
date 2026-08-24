@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 :: =====================================================================
 :: Play_vs_AI.bat -- THE ONE HEAD of AlphaWOTR.  GENERATED from
 :: wotr_bridge\launch_head.py (--write-bat); edit the module, never
@@ -14,20 +14,20 @@ title AlphaWOTR - Play vs AI
 
 set "HERE=%~dp0"
 set "LAUNCHLOG=%~dp0launcher.log"
-echo [start %DATE% %TIME%] > "%LAUNCHLOG%"
-set "PLAY=%HERE%wotr_bridge\play_client"
-set "BRIDGE=%HERE%wotr_bridge"
+echo [start %DATE% %TIME%] > "!LAUNCHLOG!"
+set "PLAY=!HERE!wotr_bridge\play_client"
+set "BRIDGE=!HERE!wotr_bridge"
 :: ---- which Python: the BUNDLED runtime (python\python.exe, shipped in
 ::      the release zip), then ALPHAWOTR_PYTHON, then python.exe on PATH,
 ::      then the developer runtime; the first that imports torch+numpy wins
 set "PY="
-if exist "%~dp0python\python.exe" (
-    "%~dp0python\python.exe" -c "import torch, numpy" >nul 2>&1
-    if not errorlevel 1 set "PY=%~dp0python\python.exe"
+if exist "!HERE!python\python.exe" (
+    "!HERE!python\python.exe" -c "import torch, numpy" >nul 2>&1
+    if not errorlevel 1 set "PY=!HERE!python\python.exe"
 )
 if not defined PY if defined ALPHAWOTR_PYTHON (
-    "%ALPHAWOTR_PYTHON%" -c "import torch, numpy" >nul 2>&1
-    if not errorlevel 1 set "PY=%ALPHAWOTR_PYTHON%"
+    "!ALPHAWOTR_PYTHON!" -c "import torch, numpy" >nul 2>&1
+    if not errorlevel 1 set "PY=!ALPHAWOTR_PYTHON!"
 )
 if not defined PY (
     set "PY_PROBE="
@@ -35,8 +35,8 @@ if not defined PY (
         if not defined PY_PROBE set "PY_PROBE=%%p"
     )
     if defined PY_PROBE (
-        "%PY_PROBE%" -c "import torch, numpy" >nul 2>&1
-        if not errorlevel 1 set "PY=%PY_PROBE%"
+        "!PY_PROBE!" -c "import torch, numpy" >nul 2>&1
+        if not errorlevel 1 set "PY=!PY_PROBE!"
     )
 )
 if not defined PY (
@@ -47,11 +47,11 @@ if not defined PY (
 )
 if not defined PY (
     echo   [X] No working Python found.
-    if exist "%~dp0python\python.exe" (
+    if exist "!HERE!python\python.exe" (
         echo       The bundled runtime python\python.exe exists but cannot import
         echo       torch+numpy.  Its error follows; send it with a bug report:
         echo       ----------------------------------------------------------
-        "%~dp0python\python.exe" -c "import torch, numpy" 2>&1 | findstr /V /C:"^$"
+        "!HERE!python\python.exe" -c "import torch, numpy" 2>&1 | findstr /V /C:"^$"
         echo       ----------------------------------------------------------
         echo       Usual causes: the zip was not fully unpacked ^(use Explorer or
         echo       7-Zip, to a SHORT path like C:\AlphaWOTR^), or a DLL load error
@@ -65,8 +65,8 @@ if not defined PY (
     pause
     exit /b 1
 )
-set "PYW=%PY:python.exe=pythonw.exe%"
-if not exist "%PYW%" set "PYW=%PY%"
+set "PYW=!PY:python.exe=pythonw.exe!"
+if not exist "!PYW!" set "PYW=!PY!"
 
 :: certified-path env (CPU pinned; '-1', never an empty string) and the
 :: v41 generation switch (the loader refuses the v41 nets without it)
@@ -88,24 +88,24 @@ echo.
 :: ---- which Java: JAVA_HOME first (the standard override), then PATH.
 ::      The client and its add-ons are Java 8 class files, so any
 ::      working java runs them; the version check below only WARNS.
-echo [java-check] >> "%LAUNCHLOG%"
-if defined JAVA_HOME if exist "%JAVA_HOME%\bin\java.exe" set "PATH=%JAVA_HOME%\bin;%PATH%"
+echo [java-check] >> "!LAUNCHLOG!"
+if defined JAVA_HOME if exist "!JAVA_HOME!\bin\java.exe" set "PATH=!JAVA_HOME!\bin;%PATH%"
 where java >nul 2>&1
 if errorlevel 1 (
     echo   [X] Java was not found on PATH.
     echo       Install Java ^(Temurin 17 or 21 from https://adoptium.net^),
     echo       or set JAVA_HOME to an installed JDK/JRE folder.
     echo.
-    echo [no-java] >> "%LAUNCHLOG%"
+    echo [no-java] >> "!LAUNCHLOG!"
     pause
     exit /b 1
 )
 set "JV="
 for /f tokens^=3 %%v in ('java -version 2^>^&1 ^| findstr /i "version"') do if not defined JV set "JV=%%~v"
 echo   Java %JV%
-echo [java-ok %JV%] >> "%LAUNCHLOG%"
-if not exist "%PLAY%\WOTR-Gandalf-AI.jar" (
-    echo   [X] Play client missing: %PLAY%
+echo [java-ok %JV%] >> "!LAUNCHLOG!"
+if not exist "!PLAY!\WOTR-Gandalf-AI.jar" (
+    echo   [X] Play client missing: !PLAY!
     echo.
     pause
     exit /b 1
@@ -143,9 +143,9 @@ echo.
 :: Fresh session.  An orphaned server or panel from a previous run
 :: would be ADOPTED by the new client - previous brain and all - so
 :: kill them and clear the coordination files first.  Every sweep is
-:: scoped to THIS client dir (%PLAY%): a harness leg on a scratch copy
+:: scoped to THIS client dir (!PLAY!): a harness leg on a scratch copy
 :: is never in range, and vice versa.
-echo [step1] >> "%LAUNCHLOG%"
+echo [step1] >> "!LAUNCHLOG!"
 echo   [1/3] clearing any leftovers from a previous session...
 :: a game client still running on this play_client would be handed a
 :: second server (or keep the old brain) - refuse until it is closed
@@ -153,7 +153,7 @@ powershell -NoProfile -Command "$j = Get-CimInstance Win32_Process | Where-Objec
 if errorlevel 3 (
     echo.
     echo   [X] a game client from a previous session is still open on
-    echo       %PLAY%
+    echo       !PLAY!
     echo       Close it, then run Play_vs_AI.bat again.
     echo.
     pause
@@ -161,7 +161,7 @@ if errorlevel 3 (
 )
 powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like ('*' + $env:PLAY + '*') -and ($_.Name -match 'python') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
 
-cd /d "%PLAY%"
+cd /d "!PLAY!"
 if not exist "logs\auto" mkdir "logs\auto"
 if not exist "logs\archive" mkdir "logs\archive"
 move /Y "logs\auto\*.log" "logs\archive\" >nul 2>&1
@@ -176,7 +176,7 @@ for %%f in (ai_bridge_status.json ai_bridge_request.log ai_bridge_move.txt ai_pa
 if defined LEFTOVER (
     echo.
     echo   [X] could not delete the leftover file %LEFTOVER%
-    echo       in %PLAY% - something still holds it.
+    echo       in !PLAY! - something still holds it.
     echo       Close any previous AI server / panel / client and retry.
     echo.
     pause
@@ -190,21 +190,21 @@ for %%f in (ai_boot.log ai_server_console.log ai_panel_proc.log ai_server.log) d
 :: 1. the AI server, FIRST.  The client adopts it through the
 ::    ai_bridge_status.json heartbeat ("spawn SKIPPED" in ai_boot.log).
 :: ---------------------------------------------------------------------
-echo [step2] >> "%LAUNCHLOG%"
+echo [step2] >> "!LAUNCHLOG!"
 echo   [2/3] starting the AI server (AI side %AISIDE%, nets corpus_live)...
 echo         first start loads the nets - this can take a minute.
-cd /d "%BRIDGE%"
-start "AlphaWOTR AI server" /min cmd /c ""%PY%" -u -m live.live_server --client-dir "%PLAY%" --side %AISIDE% --sims 300 --net-tag corpus_live 1>"%PLAY%\ai_server_console.log" 2>&1"
+cd /d "!BRIDGE!"
+start "AlphaWOTR AI server" /min cmd /c ""!PY!" -u -m live.live_server --client-dir "!PLAY!" --side %AISIDE% --sims 300 --net-tag corpus_live 1>"!PLAY!\ai_server_console.log" 2>&1"
 
 set /a TRIES=0
 :waitbeat
-if exist "%PLAY%\ai_bridge_status.json" goto beatok
-findstr /C:"Traceback" "%PLAY%\ai_server_console.log" >nul 2>&1
+if exist "!PLAY!\ai_bridge_status.json" goto beatok
+findstr /C:"Traceback" "!PLAY!\ai_server_console.log" >nul 2>&1
 if not errorlevel 1 (
     echo.
     echo   [X] the AI server crashed on startup.  Last lines:
     echo.
-    powershell -NoProfile -Command "Get-Content -Tail 20 '%PLAY%\ai_server_console.log'"
+    powershell -NoProfile -Command "Get-Content -Tail 20 '!PLAY!\ai_server_console.log'"
     echo.
     pause
     goto cleanup
@@ -213,7 +213,7 @@ set /a TRIES+=1
 if %TRIES% GEQ 240 (
     echo.
     echo   [X] no server heartbeat after 240s.
-    echo       See: %PLAY%\ai_server_console.log
+    echo       See: !PLAY!\ai_server_console.log
     echo.
     pause
     goto cleanup
@@ -231,7 +231,7 @@ echo         server up.
 ::    MANDATORY - it is what blinds the AI to your hand.  The client
 ::    spawns the AI status panel itself (-Dai.python / -Dai.bridgedir).
 :: ---------------------------------------------------------------------
-echo [step3] >> "%LAUNCHLOG%"
+echo [step3] >> "!LAUNCHLOG!"
 echo   [3/3] launching the game client...
 echo.
 echo   ----------------------------------------------------------------
@@ -250,8 +250,8 @@ echo    Chat words (attacks, combat cards): see README.txt.
 echo    Sound: menu  AI  ^>  "Mute sounds".
 echo   ----------------------------------------------------------------
 echo.
-cd /d "%PLAY%"
-java -javaagent:AiFeed.jar="%PLAY%\ai_feed.txt" -Dai.feed.aiside=%AISIDE% -Dai.python="%PYW%" -Dai.bridgedir="%BRIDGE%" -Dai.net=corpus_live -Dai.pace=800 -jar WOTR-Gandalf-AI.jar
+cd /d "!PLAY!"
+java -javaagent:AiFeed.jar="!PLAY!\ai_feed.txt" -Dai.feed.aiside=%AISIDE% -Dai.python="!PYW!" -Dai.bridgedir="!BRIDGE!" -Dai.net=corpus_live -Dai.pace=800 -jar WOTR-Gandalf-AI.jar
 :: the game window closed - fall through to the cleanup below (this line is sized so that the jump sits at the byte where a running instance of the previous file resumes; launch_head.py BAT LAYOUT)
 goto cleanup
 
