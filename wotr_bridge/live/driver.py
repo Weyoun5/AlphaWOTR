@@ -4156,6 +4156,7 @@ class LiveDriver(object):
                 self._unreveal(w)
             except Exception:
                 pass
+            items.extend(self._lenient_hand_facts(w))
         items.extend(self._adopt_board_now('lenient'))
         from .undo_model import RestoreWatch as _RW
         self.restore_watch = _RW()
@@ -4164,6 +4165,68 @@ class LiveDriver(object):
                 self.rand.reset_feed()
             except Exception:
                 pass
+        return items
+
+    def _lenient_hand_facts(self, w):
+        """A lenient accept takes the window AS GIVEN - including the
+        cards the client showed LEAVING the human's hand (a rendered
+        title is public information; the count is board truth, and
+        _adopt_board_now never adopts hands).  Without this, every
+        leniently-accepted play kept its card in the engine's modeled
+        hand as a phantom; the next turn's draws then opened a
+        hand-limit pending the player could never satisfy (tester
+        2026-08-24 'prompted to discard at 6 cards': engine 7, player
+        6 - reproduced).  Every removal routes through
+        gl.discard_hand_card, THE discard funnel (conservation + the
+        pending re-derives).  Only the HUMAN's modeled hand: the AI's
+        own plays commit through the engine, never through here."""
+        import game_logic as gl
+        try:
+            f = gesture_match.window_facts(w)
+        except Exception as e:
+            self.findings.append(('lenient_hand_facts_unread',
+                                  repr(e)[:80]))
+            return []
+        side = self.human_side
+        tag = 'FP' if side.name == 'FREE_PEOPLES' else 'SH'
+        self.hands.es = self.es
+        titles = list(f.cards_played)
+        titles.extend(t for (s, t) in f.combat_cards if s == tag)
+        items = []
+        hand = self.es.hands[side].hand
+        for title in titles:
+            cid = self.hands.reveal(title)
+            if cid is None or cid not in hand:
+                # unresolvable title: the COUNT is still board truth -
+                # a placeholder of the hand leaves instead, loudly
+                cid = next((c for c in hand if isinstance(c, str)
+                            and c.startswith('HU_')), None)
+                self.findings.append(('lenient_hand_title_unresolved',
+                                      str(title)[:60]))
+            if cid is None:
+                self.findings.append(('lenient_hand_fact_unapplied',
+                                      str(title)[:60]))
+                continue
+            gl.discard_hand_card(self.es, side, cid)
+            items.append(('note', 'lenient: %s left the hand'
+                          % str(title)[:60]))
+        for (sname, deck), n in f.hand_discards.items():
+            if sname != side.name:
+                continue
+            for _ in range(int(n)):
+                ph = next((c for c in hand if isinstance(c, str)
+                           and c.startswith('HU_')
+                           and gl.card_deck_of(c) == deck), None) \
+                    or next((c for c in hand
+                             if gl.card_deck_of(c) == deck), None)
+                if ph is None:
+                    self.findings.append(
+                        ('lenient_hand_fact_unapplied',
+                         'discard %s' % deck))
+                    break
+                gl.discard_hand_card(self.es, side, ph)
+                items.append(('note',
+                              'lenient: %s discard applied' % deck))
         return items
 
     def _refuse(self, w, res, explain=None):

@@ -596,7 +596,7 @@ wotr_bridge\live\card_identity.py	037c5ba786d3650323bcd582721c16d088f25d52	9890
 wotr_bridge\live\chat.py	236a5678853972b9e88a16b03dac78f6c091251d	29762
 wotr_bridge\live\client_board.py	e40f32fdd48904ad0d2d901e584936ead3e26c44	31597
 wotr_bridge\live\client_view.py	759b2c5117b934a29c1a12b4730efef736b66df6	5514
-wotr_bridge\live\driver.py	2d680a699b4dc674c7ce16fb27d90aaa71d1f0ae	240862
+wotr_bridge\live\driver.py	9ec9a596fa2c73845849ba29e0237f9767002ffa	244048
 wotr_bridge\live\emission.py	ff456a945782c9a74cfae645e2296060a2719b15	81007
 wotr_bridge\live\emission_card.py	f4e6b50b1526021eb45ffdd7deb63a13eeca52d3	28750
 wotr_bridge\live\feed_reader.py	023ad2d3ddec920b3d3c5bf2a686cac85a49b66a	5974
