@@ -52,8 +52,8 @@ to this driver.
 
 PORTED FROM THE SPECTATOR (PHASE3-D mechanisms, hoisted into this base
 2026-08-20 so ONE implementation serves both drivers — defect-9 rule;
-SpectatorDriver's own copies still shadow these until they are deleted
-there):
+the spectator's shadow copies were DELETED in WAVE-G, it keeps
+re-export aliases only):
   1. RNG DEFERRAL + WINDOW-RNG FEEDING — a window's own recorded
      randomness is fed per matching attempt; a window whose rolls
      render AFTER its terminator (hunt rolls, tile draws, combat d6)
@@ -158,8 +158,8 @@ class PhaseWindow(object):
     engine pending decision (hunt consequences, hand-limit discards,
     guide changes...).  No die staging exists for these — the pending
     itself scopes the gesture; completeness is decided by the match.
-    (Hoisted from spectator.py PHASE3-D; spectator keeps a shadowing
-    twin until WAVE-F deletes it.)"""
+    (Hoisted from spectator.py PHASE3-D; the spectator's twin was
+    deleted in WAVE-G, an alias re-export remains.)"""
     die_side = None
     die_face = None
     closed = 'pending'
@@ -4814,10 +4814,12 @@ class LiveDriver(object):
         Fellowship using ANY Action die", ai.py:7334) is then refused,
         because that branch tests `'Strider' in guide.name`.
 
-        Why the button could not fix it: resync_recover adopts the
-        client board into the VIEW and leaves ENGINE state untouched
-        by design (I1).  The guide lives in engine state, so no amount
-        of resyncing reached it.
+        Why the button could not fix it AT THE TIME (pre-2026-08-21):
+        resync then adopted only into the VIEW.  Since the adopt.py
+        ruling ("the resync is supposed to take the CLIENT state and
+        give it to the engine"), resync_recover adopts the engine too
+        and routes the guide through THIS function as
+        adopt_client_board's guide_hook.
 
         Why this does not break I1: a guide choice is a DECISION, not
         client state being adopted - the Guide box is merely where the
@@ -4851,19 +4853,21 @@ class LiveDriver(object):
                 "human's choice" % (cur, want))
 
     def resync_recover(self, drain_feed=False):
-        """WAVE-J (ledger C-12, USER redefinition 2026-08-16): RESYNC
-        = RECOVERY, the adopt-and-keep-playing lever.  Adopts the
-        client's PHYSICAL board into the view model (hidden info stays
-        engine-side - and the notes say so), clears stuck expectation
-        machinery LOUDLY (census rows, never silence), reopens a
-        rules-owed hand-limit pending, and leaves the engine state
-        untouched (I1: the engine is never adopted FROM the client).
+        """RESYNC = RECOVERY, the adopt-and-keep-playing lever (WAVE-J
+        C-12; direction corrected by USER ruling 2026-08-21: "the
+        resync is supposed to take the CLIENT state and give it to the
+        engine").  Adopts the client's PHYSICAL board into the view
+        AND, transactionally (census-gated,
+        adopt.adopt_client_board), into the ENGINE - hidden info stays
+        engine-side, hands are never adopted.  Clears stuck
+        expectation machinery LOUDLY (census rows, never silence) and
+        reopens a rules-owed hand-limit pending.
         drain_feed: skip the un-ingested backlog (manual-edit release:
         the edited sequence must not be matched as gestures)."""
         import game_logic as gl
         items = [('note', 'resync-recovery: adopting the client '
-                          'board into the view; hidden info stays '
-                          'engine-side; engine state untouched')]
+                          'board into the view and (census-gated) '
+                          'the engine; hidden info stays engine-side')]
         if drain_feed:
             try:
                 skipped = len(self.feed.poll() or ())

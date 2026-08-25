@@ -136,12 +136,14 @@ class ShadowMinion:
     was_ever_in_play: bool = False  # Tracks if minion ever entered play (for Gandalf White check)
     # Special abilities
     immobile: bool = False  # Saruman can't leave Orthanc
-    moves_with_nazgul: bool = False  # Mouth of Sauron
     infinite_movement: bool = False  # Witch King
     # Combat abilities
     combat_card_draw: bool = False  # Witch King first round draw
     isengard_elite_leadership: bool = False  # Saruman grants elite leadership
-    muster_to_army: bool = False  # Mouth converts muster to army die
+    # (moves_with_nazgul / muster_to_army stubs DELETED 2026-08-24:
+    # Mouth movement = the 'mouth_move' action, USER 1.177b; the
+    # muster-as-army ability = sh_mouth_muster_used_this_turn +
+    # ai.get_legal_actions 'mouth_muster', amendment 1.2)
 
 
 @dataclass
@@ -924,8 +926,6 @@ def setup_initial_game(b: "board.Board") -> GameState:
     mouth = ShadowMinion(
         name="Mouth of Sauron", level=3, leadership=2,
         in_play=False,
-        moves_with_nazgul=True,  # Moves when Nazgûl move, subject to companion rules
-        muster_to_army=True,  # Can convert muster die to army die
     )
     gandalf_white = GandalfTheWhite(in_play=False)
     aragorn = Aragorn(crowned=False)

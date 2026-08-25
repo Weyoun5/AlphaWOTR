@@ -25,8 +25,9 @@ CONSUMERS
     harness leg launches the client exactly as the USER's bat does.
 
 BAT LAYOUT INVARIANT: the play path comes first and ends with the java
-line followed by `goto cleanup`; the gui/console sections sit between
-that jump and the `:cleanup` label.  cmd.exe resumes a running batch
+line followed by `goto cleanup`; the `:usage` section sits between
+that jump and the `:cleanup` label (the engine GUI is the separate
+generated Play_Engine_Only.bat; console mode was removed 2026-08-23).  cmd.exe resumes a running batch
 file at a byte offset after the foreground java exits, so a regenerated
 file must keep a line boundary followed by `goto cleanup` at the offset
 where the previous file's java line ended (PAD below is sized for

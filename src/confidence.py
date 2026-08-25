@@ -25,9 +25,10 @@ Artifacts (sha-manifested next to seeds):
   rnd_target.pt   K frozen random MLPs — the measurement frame,
                   seeded ONCE at reset, never retrained
   rnd_pred.pt     K predictors; seeded on the corpus, GROWN on
-                  Stage-A-PASSED batches (replay-mixed 50/50,
-                  lr 3e-4 — naive continuation is test-pinned
-                  forbidden: round-1 interference)
+                  self-play batches (census is telemetry-only under
+                  loop v2 — the caller chooses admission;
+                  replay-mixed 50/50, lr 3e-4 — naive continuation
+                  is test-pinned forbidden: round-1 interference)
   rnd_calib.json  novelty quantiles of a held-out reference slice;
                   confidence = P(calib novelty > x) in [0,1]
                   (parameter-free; 0.5 = median reference state)
@@ -172,7 +173,8 @@ class Familiarity:
 
     # ------------------------------------------------------ growth
     def grow(self, new_states, replay_states, seed=0):
-        """Loop op — call ONLY with Stage-A-PASSED batch states.
+        """Loop op — grow on self-play batch states (the caller
+        chooses admission; census is telemetry-only under loop v2).
         Replay-mixed continuation (round-1 interference lesson);
         caller re-derives calibration afterwards when the reference
         definition grows (recalibrate())."""

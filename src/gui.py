@@ -3364,9 +3364,14 @@ class WotrGUI:
                 for effect in result.get("effects", []):
                     self.log(f"  → {effect}")
 
-                # Check for Palantír of Orthanc card draw bonus (Shadow only)
+                # Check for Palantír of Orthanc card draw bonus (Shadow
+                # only; the Palantir never triggers on ITS OWN play -
+                # USER RULING 2026-08-15 no-self-trigger - and the
+                # bonus fires only on an EVENT die play, 1.208m)
                 if self.current_side == Side.SHADOW:
-                    self._check_palantir_card_draw(getattr(card, 'deck', None))
+                    self._check_palantir_card_draw(
+                        getattr(card, 'deck', None),
+                        played_card=card, die_face=die_face)
 
                 # Check for Gandalf's ability (FP only, Event/Will of the West die)
                 if self.current_side == Side.FREE_PEOPLES:
@@ -3707,15 +3712,28 @@ class WotrGUI:
         ok, blocker = can_shadow_move_to(self.state, region)
         return (not ok), blocker
 
-    def _check_palantir_card_draw(self, played_deck=None):
+    def _check_palantir_card_draw(self, played_deck=None,
+                                  played_card=None, die_face=None):
         """
-        The Palantír of Orthanc: each time Shadow plays a card, draw a
-        card of the SAME DECK as the one played (USER RULE 2026-07-08 —
-        no deck prompt).
+        The Palantír of Orthanc bonus draw for the GUI play path.
+        Rules (1.208m + USER 2026-08-15, superseding the 2026-07-08
+        immediate-draw model): fires only when the play used an EVENT
+        die, and NEVER on the Palantír's own play (no self-trigger).
+        The GUI keeps the same-deck default; the engine's learned
+        which-deck decision (_open_palantir_deck_choice) governs
+        self-play/live.
         """
         from persistent_effects import should_draw_extra_card_on_event
 
         if not should_draw_extra_card_on_event(self.state):
+            return
+        # no self-trigger (USER 2026-08-15): the just-played Palantir
+        # is already on the table when this check runs
+        _pname = str(getattr(played_card, 'card_name', '') or '').lower()
+        if 'palant' in _pname:
+            return
+        # 1.208m: the bonus keys on an EVENT die play
+        if die_face is not None and die_face != ActionDieFace.EVENT:
             return
 
         from game_logic import draw_event_card
@@ -4781,12 +4799,14 @@ class WotrGUI:
 
     @staticmethod
     def _current_net_paths():
-        """Newest current-generation checkpoint pair (jt > td > plain
-        v30) — the old wotr_*_value*.pt names died with the 2026-07
-        encoding generations (stale-path fix 2026-07-27)."""
+        """Newest current-generation checkpoint pair: corpus_live (the
+        v41 pair the live head runs) first, then the v41 chain — the
+        old per-generation names die with each encoding generation, so
+        this list must track the CURRENT one (v41 = brain everywhere,
+        USER 2026-08-22)."""
         import os
         project_root = os.path.dirname(BASE_DIR)
-        for sfx in ('v31jt', 'v31td', 'v31'):
+        for sfx in ('live', 'v41jt', 'v41td', 'v41'):
             fp = os.path.join(project_root, 'wotr_fp_corpus_%s.pt' % sfx)
             sh = os.path.join(project_root, 'wotr_sh_corpus_%s.pt' % sfx)
             if os.path.exists(fp) and os.path.exists(sh):

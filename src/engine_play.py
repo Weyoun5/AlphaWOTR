@@ -17,7 +17,8 @@ engine surfaces -- nothing here re-implements rules:
     game_logic.check_all_victory_conditions / should_game_end
     ai.mcts_action_with_policy        (the per-decision helper
         ai._run_single_episode uses internally; arena/eval config)
-    ai.load_value_net                 (packaged v37-generation nets)
+    ai.load_value_net                 (current-generation nets:
+                                       corpus_live / v41 chain)
 
 The turn/phase skeleton in _game_gen() mirrors ai._run_single_episode
 block-for-block (each block is annotated with its source lines); the
@@ -35,9 +36,9 @@ Enforcement: the interface makes illegal play impossible --
     routed to it, multi-step die actions, elven-ring free action,
     battle-attacker attribution) -- all decided by ai.py's routers.
 
-Runs unchanged in the production tree and the AlphaWOTR_v0 package:
-everything resolves relative to this file's own location (ai.py's
-_PROJECT_ROOT = parent of src/), exactly like wotr_bridge/ai_move_server.
+Runs unchanged in the production tree and the AlphaWOTR release
+bundle: everything resolves relative to this file's own location
+(ai.py's _PROJECT_ROOT = parent of src/).
 """
 
 import os
@@ -1016,7 +1017,12 @@ def _human_choose(session, dp, human_side):
 def _resolve_net_tag(tag):
     if tag != 'auto':
         return tag
-    for cand in ('corpus_v37jt', 'corpus_v37td', 'corpus_v37'):
+    # CURRENT generation first (v41 = brain everywhere, USER
+    # 2026-08-22; corpus_live IS the v41 pair the live head runs),
+    # then the retired v37 chain for old checkouts.
+    for cand in ('corpus_live', 'corpus_v41jt', 'corpus_v41td',
+                 'corpus_v41', 'corpus_v37jt', 'corpus_v37td',
+                 'corpus_v37'):
         if os.path.exists(ai._resolve_model_path('wotr_fp_%s.pt'
                                                  % cand)):
             return cand
@@ -1024,13 +1030,14 @@ def _resolve_net_tag(tag):
 
 
 def load_nets(tag='auto'):
-    """Load the packaged FP/SH nets via ai.load_value_net (same
-    resolution as the live bridge: jt > td > plain).  Fails LOUDLY --
-    no silent fallback policy."""
+    """Load the packaged FP/SH nets via ai.load_value_net (current
+    generation first: corpus_live / v41, then the retired v37 chain).
+    Fails LOUDLY -- no silent fallback policy."""
     tag = _resolve_net_tag(tag)
     if tag is None:
-        raise SystemExit('no v37-generation nets found next to the '
-                         'project root - expected wotr_fp_corpus_v37*.pt')
+        raise SystemExit('no nets found next to the project root - '
+                         'expected wotr_{fp,sh}_corpus_live.pt (the '
+                         'v41 pair) or wotr_fp_corpus_v41*/v37*.pt')
     fp_net = ai.load_value_net('wotr_fp_%s.pt' % tag, 'fp')
     sh_net = ai.load_value_net('wotr_sh_%s.pt' % tag, 'sh')
     if fp_net is None or sh_net is None:
@@ -1118,7 +1125,8 @@ def main(argv=None):
     ap.add_argument('--shadow-vp', type=int, default=10,
                     help='Shadow military victory threshold (default 10)')
     ap.add_argument('--net', default='auto',
-                    help='net tag (default auto: jt > td > plain v37)')
+                    help='net tag (default auto: corpus_live, then '
+                         'the v41/v37 chains)')
     ap.add_argument('--selfplay-temps', action='store_true',
                     help='use the self-play temperature schedule '
                          '(0.6/0.3/0.15) instead of eval temp 0.02')

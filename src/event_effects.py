@@ -722,11 +722,12 @@ def recruit_nazgul(state: "GameState", region: str) -> Optional["object"]:
 def advance_nation(state: "GameState", nation: Nation, steps: int = 1) -> int:
     """Advance a nation on the political track (event-card advancement).
 
-    USER RULING (2026-07): advancing the political counter does NOT
-    activate the nation. The only FP event card that activates a nation
-    is "Wisdom of Elrond" (which calls activate_nation explicitly).
-    Activation otherwise comes only from the legitimate mechanisms:
-    fellowship declaration, companion entry, or being attacked.
+    USER RULING (2026-07, revised): advancing the political counter
+    does NOT activate the nation.  Activation comes only from the
+    legitimate mechanisms (fellowship declaration, companion entry,
+    being attacked) or from cards whose printed text activates -
+    Wisdom of Elrond, There and Back Again's trigger, and the
+    Mazarbul/Fear-Fire-Foes At-War triggers (set_at_war activates).
 
     A passive nation's counter may never advance INTO "At War"
     (rulebook p.34) — clamp at box 2 while passive.
@@ -2606,8 +2607,9 @@ def _effect_power_too_great(state: "GameState", card, choices: dict) -> dict:
 def _effect_tom_bombadil(state: "GameState", card, choices: dict) -> dict:
     """Advance North on the track, protect Old Forest/Shire/Buckland.
 
-    USER RULING (2026-07): this card must NOT activate the North — the
-    only FP event card that activates a nation is "Wisdom of Elrond".
+    USER RULING (2026-07): this card must NOT activate the North
+    (activation comes only from the legitimate mechanisms or from
+    cards whose printed text activates - see advance_nation).
     The printed card advances the North political counter one step
     (advance_nation no longer auto-activates) and blocks Shadow armies
     from The Old Forest / The Shire / Buckland while on the table.
@@ -3587,8 +3589,10 @@ def _effect_help_unlooked_for(state: "GameState", card, choices: dict) -> dict:
     split makes the Shadow portion of the shared siege entry the
     defender and leaves the FP garrison out of the fight - with
     defender_dice_reduction wired through combat.  The attacking army
-    must contain at least one At-War unit.  Engine limitation
-    (documented in rules_amendments): single round, no press/advance.
+    must contain at least one At-War unit.  Multi-round interactive
+    field battle per USER 1.210(a) ("absolutely does not resolve in a
+    single round"): the dice reduction lasts until the combat ends;
+    full press/retreat/advance set.
     """
     from combat import garrison_side_for
     result = {"effects": []}
@@ -4358,8 +4362,10 @@ def _effect_isildurs_bane(state: "GameState", card, choices: dict) -> dict:
             # d6 for damage (the closed loop forces the logged roll —
             # 2023-08-13 HombreLobo T12: 'gg' after Shelob + d6=2 took
             # corruption 11 -> 13, the humans' Shadow Ring T12 win; the
-            # old flat tile.damage=0 read lost the kill shot); a Mordor
-            # Eye deals the Hunt Box count.
+            # old flat tile.damage=0 read lost the kill shot).  (Eyes
+            # never reach this branch - ruling 1.112.1: card-drawn
+            # Eyes have no effect, EVEN on the Mordor track; caught by
+            # the is_eye guard above.)
             if getattr(tile, 'is_dice_roll', False):
                 damage = _d6_batch(1, 'shelob d6 damage')[0]
             else:
@@ -5330,10 +5336,12 @@ def _effect_dreadful_spells(state: "GameState", card, choices: dict) -> dict:
 def _effect_grond(state: "GameState", card, choices: dict) -> dict:
     """Attack stronghold: 3 rounds, FP can't play card first round unless companion.
 
-    Requires a Shadow army with at least one Sauron unit adjacent to an FP
-    stronghold.  The battle is a siege lasting up to 3 rounds.  FP cannot play
-    a combat card in round 1 (enforced by passing no defender card for the
-    first round).
+    Requires a Shadow army with at least one Sauron unit adjacent to
+    an FP stronghold.  The battle is a siege lasting up to 3 rounds.
+    Round-1 FP combat card blocked UNLESS a Companion is in the battle
+    (printed exception; pc key no_def_card_r1_unless_companion on the
+    learned path - the legacy gl_battle fallback passes no defender
+    card at all, whole-battle).
     """
     from game_logic import battle as gl_battle
     result = {"effects": []}
@@ -5622,7 +5630,10 @@ def _exec_logged_nazgul_flights(state, moves, result):
 
 @register_effect("The Ringwraiths Are Abroad")
 def _effect_ringwraiths_abroad(state: "GameState", card, choices: dict) -> dict:
-    """Move up to 4 Nazgul to any region, then may attack with an army containing Nazgul.
+    """Move ANY OR ALL of the Nazgul (per-figure chain, 1.131 - the
+    old cap of 4 left the 5th+ behind, removed QA 2026-07-11 C5);
+    then move two Armies each containing a Nazgul OR attack with one
+    (the 'nazgul_armies' follow-up grant).
 
     Heuristic: gather all Nazgul into the Shadow army closest to the
     strongest FP army; the card's attack is the nazgul_armies follow-up
@@ -5949,13 +5960,12 @@ def _effect_return_to_valinor(state: "GameState", card, choices: dict) -> dict:
 
 @register_effect("The Fighting Uruk-hai")
 def _effect_fighting_uruk_hai(state: "GameState", card, choices: dict) -> dict:
-    """Shadow army with Isengard unit attacks; battle lasts up to 3 rounds.
-
-    Isengard Elites gain self-leadership (handled implicitly since the
-    combat engine already counts elite units for strength; the leadership
-    bonus from Saruman's isengard_elite_leadership flag is separate).
-    FP cannot play a combat card in round 1.
-    """
+    """Isengard army besieging a stronghold assaults it: 3 MANDATORY
+    rounds (USER 1.210d - after them the battle routes through NORMAL
+    siege_press decisions, never auto-press), and the round-1 FP
+    combat card is blocked UNLESS a Companion is in the battle (the
+    printed exception, ruling 1.121 - pc key
+    no_def_card_r1_unless_companion)."""
     result = {"effects": []}
 
     # REGRESSION FIX (canary games 0+5, 2026-07-21): on the TEACHER /

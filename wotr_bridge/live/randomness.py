@@ -1,8 +1,9 @@
 """Client-randomness funnel protocol for the THIN sided driver.
 
-LIFTED from wotr_bridge/ai_move_server.py (the monolith stays
-untouched; nothing here imports from it), decoupled from AiBrain into
-ONE class, ClientRandomness, that owns all of its state explicitly.
+LIFTED from the retired monolith ai_move_server.py (ARCHIVED
+2026-08-22 to lab retired_2026-08-22; nothing here ever imported from
+it), decoupled from AiBrain into ONE class, ClientRandomness, that
+owns all of its state explicitly.
 
 PROVENANCE MAP (old monolith line refs -> here):
   NeedClientCall                 :64-90      -> NeedClientCall (verbatim
@@ -72,13 +73,12 @@ NOT lifted here (different homes per REBUILD_PLAN):
     game_logic.adopt_rolled_faces (one answerer per quantity); this
     module only BUILDS the ask (directives_for supports the kind).
 
-WWSAT STATUS (measured 2026-08-19): game_logic._wwsat_resolve still
-makes its random FP-hand pick through raw random.choice
-(game_logic.py:2570) - the Phase-1 named funnel for it has NOT landed.
-Until it does, a live WWSAT hand discard on the real trajectory HALTS
-LOUDLY at the random.choice tripwire with a message naming exactly
-that (fail loud, never wait silently).  The old _feed_wwsat answerer
-is deliberately NOT carried over.
+WWSAT STATUS: LANDED 2026-08-19 (Phase-1 completion) -
+game_logic._wwsat_resolve picks through the named funnel
+game_logic.pick_random_card ('card_pick' kind); the CLIENT performs
+the random discard and its rendered line feeds the funnel
+(live_server._feed_random_discards); identity is never rendered.  The
+old _feed_wwsat answerer is deliberately NOT carried over.
 
 MEASURED CLIENT FACTS preserved (verify against REBUILD_PLAN registry):
   fact 19  d6 excess drops from the RIGHT within one roll line;

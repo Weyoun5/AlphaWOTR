@@ -259,10 +259,10 @@ def _card_pid(view, cid):
     """The client piece id for the AI's OWN card `cid`.
 
     Live card identity comes ONLY from commitment decode (client fact
-    10); ClientView does not carry that map yet (REPORTED gap), so this
-    accepts either a `card_pid(cid)` callable or a `card_pid_map` dict
-    on the view, both driver-supplied.  Returns None when unresolvable
-    -- callers HOLD, they never guess a pid."""
+    10); ClientView carries the map (card_pid() / card_pid_map, fed by
+    the harvest in live_server) and this helper accepts either
+    surface.  Returns None when unresolvable -- callers HOLD, they
+    never guess a pid."""
     fn = getattr(view, 'card_pid', None)
     if callable(fn):
         try:

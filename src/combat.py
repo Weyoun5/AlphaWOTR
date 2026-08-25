@@ -232,8 +232,10 @@ def setup_combat(state: "GameState", attacker_region: str, defender_region: str,
         for l in parent.leaders:
             (v_gar if _combat_leader_side(l) == garrison
              else v_bes).leaders.append(l)
-        # Rulebook p.31: no more than FIVE Army units may be inside a
-        # besieged Stronghold — excess units are removed from the game.
+        # Rulebook p.31 caps a besieged garrison at FIVE Army units;
+        # USER 1.181 overrules the printed removed-from-the-game
+        # destination — the excess returns to REINFORCEMENTS (an
+        # untracked removal IS the pool return), never casualties.
         # (game0 T9: Cirdan's Ships raised the DA garrison to 7; the
         # human removed 2 Gondor Regulars.)  Regulars removed first.
         # The cap binds the GARRISON portion whichever combat role it
@@ -256,9 +258,7 @@ def setup_combat(state: "GameState", attacker_region: str, defender_region: str,
             # ruling (2026-07-20, CL-147, game_logic siege re-clamp):
             # REINFORCEMENTS, never casualties — an untracked removal
             # IS a pool return (reinforcements = max - deployed -
-            # fp_casualties).  B2 2026-08-24: this site used to book
-            # the excess as permanent FP casualties at merge-back,
-            # contradicting the ruling the standing re-clamp applies.
+            # fp_casualties).
             _cap_removed9 = list(removable[:excess])
             _cap_removed_side9 = garrison
             for u in _cap_removed9:
@@ -2756,8 +2756,6 @@ def _resolve_combat_body(state, attacker_region, defender_region,
         # house ruling (2026-07-20, pinned CL-147) — the excess
         # returns to reinforcements, and an untracked removal IS the
         # return (reinforcements = max - deployed - fp_casualties).
-        # The old booking here contradicted the standing re-clamp in
-        # game_logic (B2, unified 2026-08-24).
 
     # Update game state - remove destroyed armies
     # Find the original army key matching each region (state.armies uses original names)
@@ -2911,8 +2909,11 @@ def set_active_state(state):
 
 def _live_reg_avail(state, nation) -> int:
     """Regulars currently free in REINFORCEMENTS for `nation`
-    (max - deployed - permanent FP casualties). POOL only: FP casualties
-    are PERMANENT and cannot source a downgrade (rulebook p.30)."""
+    (max - deployed - permanent FP casualties).  POOL ONLY BY DESIGN:
+    this counts reinforcements; the CASUALTY-BOX leg — which sources
+    downgrades FIRST (USER 2026-07-20d: "the downgrade is the ONLY
+    way casualties return") — is checked separately and live in
+    _downgrade_source_of / _cas_box_regulars."""
     # ONE ANSWERER (USER ruling 2026-08-18, strict component limits):
     # ai.figures_available carries this arithmetic now.  It used to be
     # copied here, in _capture_reg_baseline, in ai._can_recruit, in
@@ -3141,10 +3142,12 @@ def set_wipe_card_context(name):
 
 
 def wipe_spares_characters(card_name=None) -> bool:
-    """True when this destruction was caused by The Spirit of Mordor or
-    Dreadful Spells -- the ONLY exception in the ruling.  card_name=None
-    falls back to the published context (None outside those two cards,
-    i.e. battle rules: everybody dies)."""
+    """True when this destruction was caused by one of the
+    CHARACTER_SPARING_CARDS (Spirit of Mordor, Dreadful Spells, Return
+    to Valinor, Faramir's Rangers - USER rulings 2026-08-15, first
+    ruling + case-by-case follow-up).  card_name=None falls back to
+    the published context (None outside those cards, i.e. battle
+    rules: everybody dies)."""
     nm = card_name if card_name is not None else _WIPE_CARD_CONTEXT
     if not nm:
         return False
@@ -3195,7 +3198,8 @@ def classify_wipe_characters(leaders, dying_side=None, card_name=None):
             survivors.append(ld)
             continue
         if spare and not _is_plain_leader(ld):
-            # Spirit of Mordor / Dreadful Spells: Companions, Nazgul and
+            # CHARACTER_SPARING_CARDS (SoM / Dreadful Spells / Return
+            # to Valinor / Faramir's Rangers): Companions, Nazgul and
             # named Minions SURVIVE; only plain Leaders die (they may
             # never stand without an Army, rulebook p.8).
             survivors.append(ld)

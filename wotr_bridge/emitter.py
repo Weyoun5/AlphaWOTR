@@ -548,12 +548,14 @@ def render(op, fields, local=True):
 # contiguous, which is exactly why this must exist in ONE place: a
 # second transcription of 524/525/528/529/532/533 is a table nobody
 # would notice going stale.  Used by the fellowship_move planner and
-# by the per-action Mordor reconciler in ai_move_server.
+# by live_server's Mordor tile/slot choreography (historically the
+# retired monolith's per-action reconciler).
 MORDOR_TRACK_ZONES = ('Game.524', 'Game.525', 'Game.528', 'Game.529',
                       'Game.532', 'Game.533')
 
-# Set True by AiBrain._install_live_patches when the client-randomness
-# funnels go in.  Two planners below can SOURCE randomness themselves
+# Set True by live.randomness.ClientRandomness.install() when the
+# client-randomness funnels go in (historically the retired monolith's
+# AiBrain._install_live_patches).  Two planners below can SOURCE randomness themselves
 # (a die face, a drawn card identity); that is legitimate offline,
 # where there is no client to ask, and forbidden in live play, where
 # inventing a value the client never produced is the injected
@@ -838,12 +840,11 @@ def plan_roll(replayer, nick, side_name, state, rng):
 
     LIVE PLAY MAY NOT REACH HERE.  This picks the faces itself, so in
     live play it would be the bridge inventing dice the client never
-    rolled.  Both shipped paths already ask the client instead
-    (decide_auto and decide_sided emit '!CALL roll_action_dice' and the
-    client's own A.k() handler rolls); only the legacy AiBrain.decide
-    path still calls this.  Rather than rebuild a path nobody uses,
-    HALT - if it really is dead the halt costs nothing, and if it is
-    not, the halt says so immediately instead of letting
+    rolled.  The live head asks the client instead
+    (randomness.directives_for -> '!CALL roll_action_dice', the
+    client's own A.k() handler rolls); NO shipped path calls this.
+    The HALT stays - if it really is dead the halt costs nothing, and
+    if it is not, the halt says so immediately instead of letting
     self-generated dice pass for client dice.
     """
     if LIVE_MODE or rng is None:
@@ -851,9 +852,9 @@ def plan_roll(replayer, nick, side_name, state, rng):
             'LIVE HALT: plan_roll would invent action-die faces in '
             'live play. Action dice come from the client '
             "(!CALL roll_action_dice -> the client's own roller) and "
-            'the engine INGESTS them; it never sources them. This is '
-            'the legacy AiBrain.decide path - use decide_auto (AUTO) '
-            'or decide_sided (LIVE_<side>).')
+            'the engine INGESTS them; it never sources them. No '
+            'shipped path calls plan_roll - the live head asks via '
+            'randomness.directives_for.')
     from game_state import Side
     side = Side.FREE_PEOPLES if side_name == 'FREE_PEOPLES' \
         else Side.SHADOW
@@ -1792,11 +1793,13 @@ def plan_elven_ring(replayer, nick, side_name, params):
     # is a ZONE MOVE the client does render.
     #
     # FP legality use  -> the marker walk above IS the whole gesture.
-    # SH legality use  -> no ops here; the per-action ELVEN-RING DELTA
-    #   RECONCILER in ai_move_server (`[ring-dispose]`) emits the Dark
-    #   Ring -> SA Casualties walk off the `sh_elven_rings` delta, and
-    #   it is the ONE ledger for that departure.  Emitting a second
-    #   gesture here would be the auto69 double-departure again.
+    # SH legality use  -> no ops here.  HISTORICAL: the retired
+    #   monolith's `[ring-dispose]` reconciler emitted the Dark Ring
+    #   -> SA Casualties walk off the `sh_elven_rings` delta; the
+    #   live stack currently has NO caller of pick_sh_ring_dispose.
+    #   If a live SH ring-dispose render is owed it must get ONE
+    #   producer - never a second gesture here (the auto69
+    #   double-departure).
     face = str(getattr(params.get('new_face'), 'value',
                        params.get('new_face'))).upper() \
         .replace(' ', '_').replace('/', '_')

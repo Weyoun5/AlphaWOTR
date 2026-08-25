@@ -594,7 +594,9 @@ def can_play_combat_card(card: Card, combat_state: "CombatState",
             return False, "No Leader in battle"
 
     # Named character in battle (Gandalf / Strider-Aragorn class).
-    # Companions_in_battle covers both sides + fellowship co-location.
+    # companions_in_battle is BOARD-ONLY (USER 1.209 / CL-228:
+    # in-Fellowship companions are INVISIBLE to combat and never
+    # satisfy any gate); it holds both armies' separated companions.
     _req_chars = getattr(card, 'requires_character_in_battle', None)
     if _req_chars:
         _names = ' '.join(

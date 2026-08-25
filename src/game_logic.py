@@ -3549,13 +3549,11 @@ def _check_mordor_entry(state: gs.GameState) -> bool:
         # (and put a phantom progress into every in-Mordor training
         # state, since self-play/gui/engine_play share this function).
         state.fellowship.progress = 0
-        # NOTE (open rules question, data/rules_amendments.md): whether
-        # entry re-hides a revealed Fellowship is interpreted BOTH ways
-        # in the logs — four certified games spend a die hiding after a
-        # reveal-entry (entry does NOT hide), 2026-01-05 kapcerz T8
-        # moves immediately without hiding (entry hides).  The engine
-        # keeps the certified-majority reading; the kapcerz deviation is
-        # force-consumed in the harness ('mordor_entry_hide_forced').
+        # USER RULING (O.1 2026-07-07, re-affirmed in the FINAL
+        # Mordor-entry ruling 2026-08-16): entry does NOT re-hide a
+        # revealed Fellowship — there is NO re-hide requirement.  The
+        # kapcerz-style teacher force ('mordor_entry_hide_forced') is
+        # log-compatibility only, never a rules reading.
         _restore_hunt_pool_for_mordor(state)
         return True
     return False
@@ -4003,7 +4001,8 @@ def _muster_one(state: gs.GameState,
     • *typ* is 'elite', 'regular', or 'leader'
     • *nation* is the recruiting nation (defaults to Sauron/Gondor for backward compat)
     • Region must be a city / stronghold / town.
-    • Army cannot exceed 10 units (stacking limit).
+    • Stacking: 10 units normally, 5 when mustering into a BESIEGED
+      stronghold (MAX_SIEGE_UNITS below; rulebook p.31).
     """
     rkey = sanitize(region)
     meta = board.regions.get(rkey)
@@ -4244,9 +4243,8 @@ def can_muster_mouth_of_sauron(state: gs.GameState) -> Tuple[bool, str, List[str
     Check if Mouth of Sauron can be mustered.
     Returns (can_muster, reason, valid_regions)
 
-    Requirements (user ruling 2026-07-03, see data/rules_amendments.md):
+    Requirements (USER final ruling 2026-07-04, amendment 1.3):
     - ALL FIVE Free Peoples nations at war OR fellowship in Mordor
-      (the old check wrongly required all SHADOW nations at war)
     - Muster in unconquered shadow stronghold
     """
     if state.mouth_of_sauron and state.mouth_of_sauron.in_play:
@@ -4364,7 +4362,9 @@ def can_transform_gandalf_white(state: gs.GameState) -> Tuple[bool, str, List[st
     Returns (can_transform, reason, valid_regions)
 
     Requirements:
-    - At least one Shadow minion must be in play (Saruman, Witch-King, or Mouth of Sauron)
+    - At least one Shadow minion IS OR HAS BEEN in play (Saruman,
+      Witch-King, or Mouth of Sauron - was_ever_in_play, even if
+      eliminated; NOT the stricter in_play)
     - Gandalf the Grey is dead or left the fellowship
     - Use Will of the West die
     - If dead: bring to Fangorn or unconquered elven stronghold

@@ -122,111 +122,10 @@ def _get_card_idx_map():
         _CARD_ID_TO_IDX = _build_card_id_index()
     return _CARD_ID_TO_IDX
 
-# Map log_replay action types to canonical action type categories
-LOG_ACTION_TO_CANONICAL = {
-    'army_move': 'army_move',
-    'political': 'advance_political',
-    'muster': 'muster',
-    'draw_card': 'draw_card',
-    'play_event': 'play_event',
-    # 1.149: deliberate opponent table-card kill (die + payment)
-    'discard_table_card': 'play_event',
-    'fellowship_move': 'fellowship_move',
-    'fellowship_hide': 'fellowship_hide',
-    'fellowship_declare': 'fellowship_declare',
-    'eye_allocate': 'eye_allocate',
-    'pass': 'pass',
-    'skip': 'pass',  # Skip (discard die) maps to same category as pass
-    'mordor_move': 'fellowship_move',
-    'companion_separate': 'special_character',
-    'fellowship_reveal_place': 'fellowship_move',
-    # Non-decisions: map to None to exclude from policy training
-    'dice_roll': None,
-    'combat_casualties': None,
-    'hunt_tile_draw': None,
-    'combat_start': None,
-    # True 'other' actions (player decisions but no dedicated category)
-    'fellowship_reveal': 'other',
-    'companion_death': 'other',
-    'use_token': 'other',
-    'combat_card': 'combat_card',
-    # Combat-card decisions (engine pending phases; logged 'combat_card'
-    # rows = plays, parser-emitted 'combat_card_none' rows = 'nc' declines)
-    'combat_card_play': 'combat_card',
-    'combat_card_none': 'combat_card',
-    # Combat-card effect choices (Onslaught sacrifice etc.) — parser rows
-    # from units-to-Current-SA/FP-Card moves and 'ffN' forfeit chats
-    'combat_effect_choice': 'combat_card',
-    # Gandalf 'shining' pre-combat-card decision (item 11)
-    'shine': 'combat_card',
-    'shine_none': 'combat_card',
-    # Learned decisions (mapped to proper categories)
-    'elven_ring': 'special_character',
-    'dwarven_ring': 'other',
-    'siege_press': 'army_attack',
-    'combat_retreat': 'army_move',
-    'choose_guide': 'special_character',
-    'hunt_sacrifice_guide': 'special_character',
-    'hunt_sacrifice_random': 'special_character',
-    'hunt_guide_separate': 'special_character',
-    # Parser-overhaul additions (previously missing/mislabeled)
-    'army_attack': 'army_attack',
-    'retreat_into_siege': 'army_move',
-    'companion_move': 'special_character',
-    'transform_gandalf': 'special_character',
-    'crown_aragorn': 'special_character',
-    'hunt_take_corruption': 'special_character',
-    'nazgul_move': 'special_character',
-    # Post-battle move-in (a real decision — how many units advance —
-    # but no discrete engine action yet, so value-only)
-    'battle_advance': 'other',
-}
-
-def _find_mandatory_draws(action_log):
-    """Return set of action_log indices that are mandatory turn-start draws.
-
-    Every turn both players draw 1 Character + 1 Strategy card (= 4 draws
-    per turn) before dice are rolled.  These are not player decisions.
-
-    Detection: walk backwards from each dice_roll within a window of 12
-    actions, skipping turn-phase actions and tolerating small gaps (players
-    sometimes do a quick muster or other action between drawing cards and
-    rolling dice).  Collects up to 4 draw_card per turn boundary.
-    """
-    mandatory = set()
-    n = len(action_log)
-    if n == 0:
-        return mandatory
-
-    # Find first dice_roll of each turn.  dice_roll typically appears in
-    # pairs (SH then FP) -- we only need the first of each pair.
-    dice_roll_indices = []
-    prev_was_dice = False
-    for i, (at, _, _) in enumerate(action_log):
-        if at == 'dice_roll':
-            if not prev_was_dice:
-                dice_roll_indices.append(i)
-            prev_was_dice = True
-        else:
-            prev_was_dice = False
-
-    for dr_idx in dice_roll_indices:
-        draws_found = []
-        # Walk backwards up to 12 actions, collecting draw_card actions.
-        # Allow any actions in between (muster, fellowship_declare, etc.)
-        # since players sometimes interleave small actions with draws.
-        j = dr_idx - 1
-        limit = max(dr_idx - 12, -1)
-        while j > limit and len(draws_found) < 4:
-            at = action_log[j][0]
-            if at == 'draw_card':
-                draws_found.append(j)
-            j -= 1
-        for idx in draws_found:
-            mandatory.add(idx)
-
-    return mandatory
-
+# (LOG_ACTION_TO_CANONICAL and _find_mandatory_draws — consumer-less
+# leftovers of the CSV-export path removed 2026-07-27 — were DELETED
+# in the 2026-08-24 vestigial sweep; victor_advance is the discrete
+# post-battle decision.)
 
 # Per rulebook p.7: maximum figures available per nation (regular, elite, leader/nazgul)
 NATION_MAX_FIGURES = {
@@ -2080,7 +1979,8 @@ def _get_reveal_placement_actions(state: 'GameState') -> 'List[Action]':
     for dest in reachable:
         # USER RULING 2026-07-20b (w5_g2 T9): the pawn never
         # region-steps into Mordor's interior — reached only via the
-        # track after a turn-start gateway declaration (1.155).
+        # track, and entry fires at the turn-start entry check on gate
+        # POSITION, declared or revealed there (USER FINAL 2026-08-16).
         if sanitize(dest) in game_logic._MORDOR_INTERIOR:
             continue
         actions.append(Action(
@@ -2124,8 +2024,11 @@ def _apply_reveal_placement(state: 'GameState', dest: str):
         pass
     state.fellowship.progress = 0
     state._reveal_place_due = False
-    # No immediate Mordor entry on a gateway reveal: the pawn goes
-    # onto the track only via the turn-start declaration (1.155).
+    # No immediate Mordor entry on a gateway reveal (USER FINAL
+    # 2026-08-16: turn-start only, never mid-turn): the pawn stays;
+    # the next turn start's entry check (_check_mordor_entry, run
+    # AFTER that turn's declaration opportunity) puts it on the track
+    # — a gate position qualifies whether DECLARED or REVEALED there.
 
 
 def open_reveal_placement(state: 'GameState') -> bool:
@@ -3393,15 +3296,19 @@ if HAS_TORCH:
     _SUBTYPE_TO_IDX['casualty_allocate'] = \
         _SUBTYPE_TO_IDX['casualty_preserve_units']
     # iter 36 FULL-INFORMATION extension (user directive: "literally
-    # everything possible that the human sees") — ranges corrected
-    # 2026-07-27 (+1 vs the original comments; symbols are the truth):
-    # [56:60]  action-moved composition: n_regular/10, n_elite/10,
-    #          n_leaders/7, n_nazgul/8 (moves, attacks, musters,
-    #          retreats — R/E splits previously conflated in one total)
-    # [60:73]  CHARACTER IDENTITY multi-hot (13): which specific
+    # everything possible that the human sees").  SYMBOLS ARE THE
+    # TRUTH — never quote absolute indices here (they drift every time
+    # a subtype is appended; the 2026-07-27 and v32 shifts both proved
+    # it):
+    # [_ACT_COMP_OFF : +4]   action-moved composition: n_regular/10,
+    #          n_elite/10, n_leaders/7, n_nazgul/8 (moves, attacks,
+    #          musters, retreats)
+    # [_ACT_CHAR_OFF : +13]  CHARACTER IDENTITY multi-hot: which
     #          companions/minions this action moves/separates/sacrifices
-    # [73:76]  source-army own composition reg/10, elite/10, ldr+naz/8
-    # [76:79]  target-region enemy composition reg/10, elite/10, ldr+naz/8
+    # [_ACT_SRC_OFF : +3]    source-army own composition reg/10,
+    #          elite/10, ldr+naz/8
+    # [_ACT_TGT_OFF : +3]    target-region enemy composition reg/10,
+    #          elite/10, ldr+naz/8
     _ACTION_CHARACTERS = [
         'Gandalf the Grey', 'Strider', 'Legolas', 'Gimli', 'Boromir',
         'Meriadoc', 'Peregrin', 'Aragorn', 'Gandalf the White', 'Gollum',
@@ -3473,12 +3380,12 @@ if HAS_TORCH:
     # That gives the net a dedicated input to learn a table-kill
     # preference from, without a renumbering.
     #
-    # GATED, DEFAULT OFF.  Turning it on changes ACTION_ENCODING_DIM,
-    # and load_net's action_dim guard then REFUSES every existing
-    # checkpoint (wotr_{fp,sh}_corpus_live.pt are action_dim=92) - i.e.
-    # live play would stop dead.  The USER is testing on the current
-    # net right now, so the default stays 92 until a v41-generation net
-    # exists; set WOTR_ACT_GEN=v41 for extraction/training runs.
+    # GATED: the env default stays 92 for BACKWARD-COMPAT ONLY (an
+    # un-pinned tree computes dim 92 and still loads pre-v41 92-dim
+    # checkpoints).  The LIVE head (Play_vs_AI.bat, generated by
+    # wotr_bridge\launch_head.py) pins WOTR_ACT_GEN=v41 and runs the
+    # 93-dim corpus_live pair - v41 is the live generation.  The env
+    # var is the single generation switch (see swap_alphawotr_nets).
     ACT_GEN = os.environ.get('WOTR_ACT_GEN', '').strip().lower()
     _ACT_TABLEKILL_ON = (ACT_GEN == 'v41')
     _ACT_TABLEKILL_OFF = _ACT_TGT_MYSIDE_OFF + 1
@@ -4368,7 +4275,8 @@ if HAS_TORCH:
     #                                          tail (VALUE_CTX_DROPOUT
     #                                          masks this in BC value
     #                                          training)
-    # Current totals (v31): state 3742 dims, board 105x30, action 91
+    # Current totals: state 3742 dims, board 105x30, action 92 (93
+    # under WOTR_ACT_GEN=v41 - the live generation)
     # (all COMPUTED, never hardcoded - see the NOTE above).
     _CARD_IDX_START = NUM_REGIONS * NODE_FEAT_DIM + 32 + 8 + 2 + 10 + 16 + 8
     _CARD_IDX_END = _CARD_IDX_START + MAX_HAND_SIZE  # derived, no constant
@@ -5186,17 +5094,13 @@ def _get_companion_move_actions(state: GameState, die_idx: int) -> List[Action]:
         # P3 (USER ruling 1.112.4): PROPER subsets are explicit group
         # choices - each group moves with ITS OWN allowance (max level;
         # GtW-4 alone/with one hobbit via _companion_group_movement).
-        # Bounded: full subset lattice up to 4 companions, singles only
-        # beyond that.  CAP justification (task: companion-multigroup):
-        # only 7 companions exist, so a stack of >4 SEPARATED companions
-        # in one region is essentially never reached; the full lattice
-        # is 2**n (n=5 -> 30 proper subsets, n=7 -> 126) times reachable
-        # destinations, which makes an uncapped menu explode.  The
-        # '__companion_moves__' chain (rulebook p.20, added with this
-        # task) composes multi-group moves ACROSS decisions: after any
-        # group moves, the pending re-offers subsets of the still-
-        # unmoved companions, so partitions of a large stack stay
-        # reachable even though a single menu never enumerates them all.
+        # UNCAPPED (USER 2026-08-22, no-legal-surface-caps): every
+        # proper subset is offered; the cost is carried by the
+        # allowance-class memoization below, not by a bound.  The
+        # '__companion_moves__' chain (rulebook p.20) composes
+        # multi-group moves ACROSS decisions: after any group moves,
+        # the pending re-offers subsets of the still-unmoved
+        # companions, so partitions of a large stack stay reachable.
         if len(comps) > 1:
             from itertools import combinations
             # USER 2026-08-22: NO CAP on the legal surface ("why is
@@ -5311,25 +5215,18 @@ def _get_nazgul_move_actions(state: GameState, die_idx: int) -> List[Action]:
     if not sources:
         return actions
 
-    # Restrict destinations to the strategically meaningful set instead of
-    # all 105 regions (full enumeration made Shadow's action list ~600 long
-    # and dominated MCTS expansion cost). Covers the human uses: hunt
-    # support at the fellowship, leadership for armies, siege support, and
-    # screening at enemy settlements.
-    dests = set()
-    try:
-        fs = game_logic.fellowship_region(state)
-        dests.add(fs)
-        dests.update(sanitize(a) for a in state.board.adjacent(fs))
-    except Exception:
-        pass
-    for k, a in army_by_san.items():
-        if a.units:  # any army region (join/besiege/screen)
-            dests.add(k)
-    dests.update(getattr(state, 'besieged_strongholds', set()))
-    for rkey, meta in board.regions.items():
-        if meta.get('is_stronghold') or meta.get('is_city'):
-            dests.add(rkey)
+    # UNCAPPED (USER 2026-08-22, no-legal-surface-caps: "why is there
+    # a cap at all for anything, I don't want one"): Nazgul fly to ANY
+    # region (rulebook p.20, unlimited movement) - the old
+    # "strategically meaningful set" filter here was a legal-surface
+    # bound of exactly the class removed from the companion lattices
+    # the same day, and it was human-visible: the live matcher judges
+    # gestures from THIS menu, so a flight to an unlisted region was
+    # refused as illegal.  The legality gates below (no ending on an
+    # enemy field army; FP strongholds only under siege) are RULES,
+    # not strategy, and stay.  Search cost is the sliders' business
+    # (MCTS_MAX_CHILDREN prior-prunes wide menus), never the menu's.
+    dests = set(board.regions.keys())
 
     sh_captured = state.enemy_controlled.get(Side.SHADOW, set())
     besieged = getattr(state, 'besieged_strongholds', set())
@@ -5543,10 +5440,12 @@ def _get_army_move_actions(state: GameState, side: Side, die_idx: int,
                     # This is an attack, not a move
                     continue
 
-            # Split menu (rulebook p.25 "Splitting an Army"): moving any
-            # portion of the units is legal. Offer a compact menu — full
-            # stack, half, and a single-unit detachment — each validated
-            # against the destination stacking limit independently.
+            # Split menu (rulebook p.25 "Splitting an Army"): moving
+            # any portion of the units is legal — the FULL
+            # (n_regular, n_elite, take_leaders) composition grid is
+            # offered (USER 2026-07-08: the old full/half/single
+            # compact menu could not express human splits), each
+            # option validated against the destination stacking limit.
             # Stacking counts OWN units only: a besieged region's shared
             # army entry holds the enemy garrison too, which must not
             # count against the moving side's 10-unit limit.
@@ -6221,12 +6120,11 @@ def _event_state_signature(state: GameState, side: Side):
 
 
 def _event_card_has_effect(state: GameState, side: Side, card_id: str) -> bool:
-    """Dry-run an event card on a cloned state with empty choices.
-
-    The AI cannot supply interactive choices yet, so handlers that require
-    them silently do nothing. Playing such a card burns a die for zero
-    effect and teaches the net that play_event is a no-op — exclude those
-    cards from the legal action set instead.
+    """Dry-run an event card on a cloned state with empty choices to
+    detect TRUE no-ops: a card that changes nothing even best-case
+    burns a die for zero effect and is excluded from the menu.
+    Optioned cards are NOT pruned — an option spec yielding choices
+    defers into pending_card_option (a learned decision, see below).
     """
     # TEACHER MODE (iter 39): never prune — the humans DID play the card
     # and supplied choices; the closed loop replicates them from the
@@ -6366,11 +6264,13 @@ def _get_declare_actions(state: GameState,
                          allow_in_place: bool = False) -> List[Action]:
     """Enumerate fellowship declaration actions (no die cost).
 
-    Declaration does not consume a die -- it is a free action available
-    whenever the fellowship has accumulated progress > 0 and is not yet
-    inside Mordor.  Per the rulebook, the pawn may be placed in any region
-    at distance UP TO the progress counter (including staying in place).
-    The behavioral-cloning-trained policy decides WHEN and WHERE — no
+    Declaration does not consume a die.  It is offered in the
+    TURN-START Fellowship Phase ONLY (USER 2026-07-20c) — never
+    mid-turn.  Per the rulebook, the pawn may be placed in any region
+    at distance UP TO the progress counter (including staying in
+    place; effectful in-place declares at progress 0 are legal on the
+    self-play drivers via allow_in_place — see below).  The
+    behavioral-cloning-trained policy decides WHEN and WHERE — no
     hand-coded direction filter.
 
     Returns actions with die_idx=-1 (no die consumed) and action_type
@@ -6410,9 +6310,11 @@ def _get_declare_actions(state: GameState,
         reachable |= frontier
 
     # USER RULING 2026-07-20b (w5_g2 T9): never DECLARE into Mordor's
-    # interior — the pawn declares AT a gateway and enters via the
-    # track at the next turn start (1.155). Self-play only (humans
-    # never declare into gorgoroth, so the teacher loses nothing).
+    # interior — the pawn declares AT a gateway, and the SAME turn
+    # start's entry check (run after the declaration opportunity,
+    # USER FINAL 2026-08-16) puts it on the track.  Self-play only
+    # (humans never declare into gorgoroth, so the teacher loses
+    # nothing).
     reachable -= game_logic._MORDOR_INTERIOR
 
     # Rarity-audit fix (2026-07-28, skip-in-disguise doctrine — same
@@ -6474,10 +6376,10 @@ def companion_separate_action_for(state: GameState, die_idx: int,
     progress + the group's highest level; terminus per
     _companion_terminus_ok — USER 2026-08-17: a Shadow stronghold IS a
     legal terminus, stop-on-entry per action; Mordor bars separation),
-    shared by the menu's bounded lattice and the live matcher's
-    construct-then-verify (USER live 2026-08-17: a 7-companion
-    fellowship put pair-separations outside the menu's <=4 explosion
-    cap, and the LEGAL gesture refused - legality must not depend on
+    shared by the menu's (uncapped, USER 2026-08-22) subset lattice
+    and the live matcher's construct-then-verify (history: the old
+    <=4 cap put a legal pair-separation outside the menu on the real
+    client and the gesture was refused - legality must not depend on
     menu enumeration)."""
     act, _why = companion_separate_check(state, die_idx, names, dest)
     return act
@@ -7263,15 +7165,12 @@ def get_legal_actions(state: GameState, side: Side) -> List[Action]:
     _pd = getattr(state, 'pending_discard', None)
     if _pd is not None and side == _pd['side']:
         # The discard belongs to the hand's OWNER only.  A wrong-side
-        # ask FALLS THROUGH to the asker's own menu: the old loud raise
-        # here (v9 showcase bug: FP handed SH's discard, determinization
-        # discarded imaginary cards) also fired on a LEGITIMATE
-        # turn-start coexistence - one side over the hand limit while
-        # the other side's declare phase is armed (turn order D2-D4;
-        # reproduced 2026-08-24 from a tester soak crash).  The v9
-        # class stays dead because the wrong side never RECEIVES
-        # discard_card actions, and describe_pending still routes the
-        # discard to its owner first.
+        # ask FALLS THROUGH to the asker's own menu (B6 2026-08-24:
+        # the turn-start coexistence - one side over the hand limit
+        # while the other side's declare phase is armed - is
+        # legitimate, turn order D2-D4).  The wrong side never
+        # RECEIVES discard_card actions, and describe_pending still
+        # routes the discard to its owner first.
         _d_side = _pd['side']
         _d_tag = 'fp' if _d_side == Side.FREE_PEOPLES else 'sh'
         _seen = set()
@@ -15413,11 +15312,12 @@ def _safe_next_turn(state: GameState):
 
 
 def _ai_eye_allocation(state: 'GameState', net: 'WOTRValueNet'):
-    """Shadow AI pre-allocates eyes before rolling using value net evaluation.
-
-    Capped at 0-2 eyes max — real games almost never allocate more than 2.
-    The encoding now distinguishes allocated eyes vs rolled eyes vs FP hunt
-    dice, so the value net can properly evaluate this tradeoff.
+    """GUI-WATCH DEMO ONLY (gui.py watch mode): Shadow pre-allocates
+    eyes via value-net evaluation over a 0-2 range.  This is a demo
+    shortcut, NOT the rules: the real eye phase (the eye-allocation
+    menu, ai.py ~7292) enforces the companions-count maximum and the
+    mandatory 1-eye minimum after an FP hunt-box retrieval; the
+    production loops and live play use that menu, never this helper.
     """
     shadow_dice = [d for d in state.dice[Side.SHADOW] if not d.used]
     n_dice = len(shadow_dice)
@@ -15896,9 +15796,11 @@ def _auto_enter_mordor(state) -> bool:
         if dist is None or dist > f.progress:
             continue
         try:
-            # DECLARE only (ruling 1.155) — the fellowship sits at the
-            # gateway declared; _check_mordor_entry fires at the next
-            # turn's Fellowship-phase pre-step.
+            # DECLARE only — the fellowship sits at the gateway
+            # declared; the driver runs _check_mordor_entry AFTER the
+            # declaration opportunity IN THE SAME turn start (USER
+            # FINAL 2026-08-16 — never inside this action, never a
+            # full-turn wait).
             game_logic.declare_fellowship(state, region=gw)
             # 2026-07-20c: trace-visible (the w5_g2 T9 declare was a
             # silent unrecorded state jump attributed to the next

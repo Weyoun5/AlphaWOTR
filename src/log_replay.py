@@ -7447,10 +7447,11 @@ class LogReplayer:
             from_name = mordor_names.get(from_step, f'Mordor step {from_step}')
             if from_mordor is None:
                 # ENTRY drag (map region / elsewhere -> a Mordor box):
-                # housekeeping for the automatic Mordor entry (the rules
-                # enter the Fellowship when it is revealed or declared at
-                # Morannon/Minas Morgul — the engine does this inside
-                # fellowship_reveal_place/declare/move execution).  State
+                # housekeeping for Mordor entry (rule: entry is
+                # TURN-START ONLY, qualifying by being declared or
+                # revealed on a gate — USER FINAL 2026-08-16; the
+                # teacher merely mirrors the log's own entry
+                # housekeeping here).  State
                 # sync only when the pawn was already AT a gateway; from
                 # any other region the drag IMPLIES an unlogged DECLARE
                 # at the reachable gateway (2023-02-03 Wirbelwind line
