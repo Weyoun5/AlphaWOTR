@@ -1469,11 +1469,60 @@ class LiveDriver(object):
             return [('note', 'previous chat decision still awaiting '
                              'client randomness — chat ignored')]
         dp = ai.describe_pending(self.es, self.human_side)
+        if cmd is not None and cmd[0] == 'help':
+            # USER 2026-08-24: 'help' lists every chat the AI
+            # understands; with an open decision, lead with what the
+            # AI is waiting on
+            out9 = []
+            if dp is not None and dp['side'] is self.human_side:
+                out9.append(('chat', 'prompt', chat_mod.waiting_on(
+                    str(dp['kind']),
+                    self._pending_words(dp))))
+            out9.extend(('chat', 'prompt', l)
+                        for l in chat_mod.HELP_LINES)
+            return out9
         if dp is not None and dp['side'] is self.human_side:
             act = chat_mod.match_choice(rec.get('body', ''),
                                         dp['actions'])
             if act is not None:
                 return self._commit_human(act, via='chat')
+            # 'discarding card' with several possible targets: name it
+            _b9 = chat_mod.normalize_body(rec.get('body', ''))
+            if _b9.startswith('discard'):
+                _nds = [a for a in dp['actions']
+                        if a.action_type == 'card_option'
+                        and isinstance((a.params or {}).get('choices'),
+                                       dict)
+                        and (a.params or {}).get('choices').get(
+                            'action') == 'discard_table_card']
+                if len(_nds) > 1:
+                    return [('chat', 'prompt',
+                             chat_mod.discard_target_ambiguous())]
+        # CARD-PLAY WINDOW GUARD (tester 2026-08-24, The Fighting
+        # Uruk-hai: 'helm's deep' chatted mid-play was routed to the
+        # attack lane and refused 'no legal attack ... with the staged
+        # P die').  With an un-terminated window holding the human's
+        # staged die AND a card already dragged from hand, a region /
+        # attack chat is NARRATION of the card's own target, never an
+        # attack declaration - hold it with a note; the play resolves
+        # when the die is killed (a single-siege card needs no chat at
+        # all; a multi-choice pending then accepts the region by name
+        # via chat.match_choice).
+        if dp is None and kind in ('attack', 'attack_from', 'region'):
+            w9 = getattr(self.seg, 'window', None)
+            if w9 is not None and getattr(w9, 'die_side', None) \
+                    == self.human_side.name:
+                try:
+                    _wf9 = gesture_match.window_facts(w9)
+                except Exception:
+                    _wf9 = None
+                if _wf9 is not None and _wf9.cards_played:
+                    self.findings.append(
+                        ('card_play_region_chat_held',
+                         str(cmd[1])[:40]))
+                    return [('note', 'region chat held: a card-play '
+                                     'window is open - kill the die '
+                                     'to complete the play')]
         if kind == 'attack' and dp is None:
             return self._human_chat_attack(cmd[1])
         if kind == 'attack_from' and dp is None:
@@ -1493,6 +1542,66 @@ class LiveDriver(object):
             # driver counter) and committed; refused otherwise.
             return self._human_plain_pass()
         return []
+
+    def _pending_words(self, dp):
+        """A short slash-joined vocabulary for the open pending (help
+        + waiting-on announcements).  Never card names, never menus -
+        just the words match_choice understands for this shape."""
+        kinds = {a.action_type for a in (dp.get('actions') or ())}
+        chs = [(a.params or {}).get('choices') or {}
+               for a in (dp.get('actions') or ())
+               if a.action_type == 'card_option']
+        words = []
+        if any(isinstance(c, dict) and c.get('action') == 'hunt'
+               for c in chs):
+            words += ['rolling for hunt', 'discarding card <name>',
+                      'none']
+        if any(isinstance(c, dict)
+               and any(c.get(k) for k in chat_mod._LEG_TERMINATORS)
+               for c in chs):
+            words += ['done (after moving on the board)']
+        if 'hunt_take_corruption' in kinds:
+            words += ['corruption', 'guide', 'random']
+        if 'combat_card_none' in kinds:
+            words += ['nc', 'cc <card>']
+        if 'combat_retreat' in kinds:
+            words += ['retreat <region>', 'stand']
+        if 'discard_card' in kinds:
+            words += ['(discard on the board)']
+        if not words:
+            words = ['pick <number>', 'or answer on the board']
+        return ' / '.join(words[:5])
+
+    def _maybe_announce_pending(self):
+        """One-shot chat announce when a commit leaves a HUMAN-side
+        card_option pending open whose answer is chat-only (USER
+        2026-08-24: 'the AI should say what its waiting on in the
+        chat ... and give the options')."""
+        import ai
+        try:
+            dp = ai.describe_pending(self.es, self.human_side)
+        except Exception:
+            return []
+        if dp is None or dp['side'] is not self.human_side \
+                or str(dp['kind']) != 'card_option':
+            return []
+        pco = getattr(self.es, 'pending_card_option', None) or {}
+        key = (str(dp['kind']), str(pco.get('card_name')))
+        if getattr(self, '_announced_pending', None) == key:
+            return []
+        self._announced_pending = key
+        chs = [(a.params or {}).get('choices') or {}
+               for a in dp['actions']]
+        if any(isinstance(c, dict) and c.get('action') == 'hunt'
+               for c in chs):
+            txt = chat_mod.nazgul_strike_choice_note()
+        elif any(isinstance(c, dict)
+                 and any(c.get(k) for k in chat_mod._LEG_TERMINATORS)
+                 for c in chs):
+            txt = chat_mod.nazgul_chain_open_note()
+        else:
+            return []
+        return [('chat', 'prompt', txt)]
 
     def _region_keys(self):
         regs = getattr(self.es.board, '_regions', None) or {}
@@ -2760,6 +2869,14 @@ class LiveDriver(object):
         self._out_queue.extend(
             self.post_commit_sweep(pre, post, gesture=gesture,
                                    label=label))
+        # USER 2026-08-24: after every committed gesture, monitor and
+        # fix divergences.  FLAG ONLY here: adopting at the commit
+        # instant read a dump the client had not yet caught up to and
+        # erased fresh engine truth (the siege-withdraw pin caught it)
+        # - the server reconciles on the next QUIET tick instead.
+        self._reconcile_due = True
+        # a commit that leaves a chat-only human pending open says so
+        self._out_queue.extend(self._maybe_announce_pending())
         exc = self.rand.unconsumed()
         self.rand.step_commit()
         if any(exc.values()):
@@ -3964,7 +4081,13 @@ class LiveDriver(object):
             for a in acts:
                 ch = (a.params or {}).get('choices')
                 if isinstance(ch, dict) and ch \
-                        and not any(bool(v) for v in ch.values()):
+                        and (not any(bool(v) for v in ch.values())
+                             or ch.get('action') == 'none'):
+                    # wholly-falsy = the classic decline; an explicit
+                    # {'action': 'none'} (Nazgul Strike either/or) is
+                    # a decline too - 'none' is a truthy STRING and
+                    # the falsy probe could never pick it (USER
+                    # 2026-08-24, panel skip refused the either/or)
                     pick = a
                     break
         if pick is None and len(acts) == 1:
@@ -4166,6 +4289,8 @@ class LiveDriver(object):
         # markers) and sweeps here
         out.extend(self.post_commit_sweep(pre, post,
                                           label='chat:%s' % via))
+        self._reconcile_due = True
+        out.extend(self._maybe_announce_pending())
         return out
 
     def _explain_refusal(self, w):
@@ -4196,6 +4321,136 @@ class LiveDriver(object):
             self.findings.append(('refusal_explain_failed',
                                   repr(e)[:120]))
         return None
+
+    def _political_recon(self):
+        """ENGINE -> CLIENT political reconciler (USER trust ruling
+        2026-08-24: "trust engine for political track, client
+        otherwise").  Compares each nation's marker position in the
+        client dump against the engine box and emits ONE corrective
+        marker drag per mismatched nation.  An in-flight ledger keyed
+        (pid -> target code) stops re-emission while the client has
+        not yet applied a correction (dump staleness would otherwise
+        double-walk the marker).  Requires a fresh view dump (the
+        caller refreshed it)."""
+        import re as _re
+        from emitter import render
+        from log_replay import POLITICAL_MARKERS
+        items = []
+        inflight = getattr(self, '_pol_recon_inflight', None)
+        if inflight is None:
+            inflight = self._pol_recon_inflight = {}
+        pr = getattr(self.view, 'piece_region', {}) or {}
+        for pid, nation in POLITICAL_MARKERS.items():
+            zone = str(pr.get(str(pid), '') or '')
+            m = _re.match(r'^Political (\d)$', zone)
+            if not m:
+                continue
+            client_box = 3 - int(m.group(1))       # engine numbering
+            eng_box = self.es.political.boxes.get(nation)
+            if eng_box is None:
+                continue
+            tgt = 'Game.%d' % (2000 + int(eng_box))
+            cur = 'Game.%d' % (2000 + client_box)
+            if client_box == int(eng_box):
+                inflight.pop(str(pid), None)
+                continue
+            if inflight.get(str(pid)) == tgt:
+                continue                       # correction in flight
+            inflight[str(pid)] = tgt
+            items.append(('line', render(
+                'move', {'nick': self.nick, 'pieces': [str(pid)],
+                         'frm': cur, 'to': tgt}, local=False)))
+            self.findings.append(
+                ('political_recon',
+                 '%s client box %d -> engine %d'
+                 % (getattr(nation, 'value', nation), client_box,
+                    int(eng_box))))
+        return items
+
+    def _guide_box_recon(self):
+        """AI-FP guide-box reconciler (USER bug 2026-08-24: 'when AI
+        fp loses their guide, the new guide does not get moved to the
+        guide box').  When the AI plays Free Peoples and the engine's
+        guide is not the piece sitting in the client's Guide box, emit
+        the drag placing the right companion there (and the displaced
+        one back into the Fellowship box).  Human-FP games are the
+        human's own gesture space - untouched."""
+        import log_replay as lr
+        import game_state as gs
+        from emitter import render
+        if self.ai_side is not gs.Side.FREE_PEOPLES:
+            return []
+        g = getattr(self.es.fellowship, 'guide', None)
+        if g is None:
+            return []
+        gname = str(getattr(g, 'name', ''))
+        gpid = next((p for p in lr.COMPANIONS
+                     if gname in set(lr.names_for_pid(str(p)) or ())),
+                    None)
+        if gpid is None:
+            return []
+        pr = getattr(self.view, 'piece_region', {}) or {}
+        in_box = [str(p) for p, z in pr.items()
+                  if _zone_key(z) in _GUIDE_ZONES]
+        if str(gpid) in in_box and len(in_box) == 1:
+            self._guide_recon_inflight = None      # box correct
+            return []
+        if getattr(self, '_guide_recon_inflight', None) == str(gpid):
+            return []                              # correction in flight
+        self._guide_recon_inflight = str(gpid)
+        items = []
+        for p in in_box:
+            if str(p) != str(gpid):
+                items.append(('line', render(
+                    'move', {'nick': self.nick, 'pieces': [str(p)],
+                             'frm': 'Game.1999', 'to': 'Game.1998'},
+                    local=False)))
+        frm = 'Game.1998'
+        items.append(('line', render(
+            'move', {'nick': self.nick, 'pieces': [str(gpid)],
+                     'frm': frm, 'to': 'Game.1999'}, local=False)))
+        self.findings.append(('guide_box_recon',
+                              '%s -> Guide box' % gname))
+        return items
+
+    def reconcile_board_quiet(self):
+        """USER 2026-08-24: "after every die kill, monitor and fix
+        divergences ... consistently resync to ensure 0 divergences."
+        Called by the SERVER on a QUIET tick (chain closed, nothing
+        owed) after a commit flagged `_reconcile_due`: refresh the
+        dump; if the census shows the SAME non-empty divergence set on
+        two consecutive quiet reads (stability - a one-read divergence
+        is usually the client mid-apply), adopt the client board
+        (CLIENT truth - units/leaders/companions/sieges/fellowship
+        pawn/tracks; political excluded), then walk the political
+        markers and the AI-FP guide box to the ENGINE state (ENGINE
+        truth).  Returns driver items."""
+        if getattr(self, 'spectator', False):
+            self._reconcile_due = False
+            return []
+        if not self.view.refresh_dump():
+            return []
+        try:
+            rows = client_board.diff_engine_vs_dump(
+                self.es, self.view.piece_region,
+                dynamic_types=self.view.dynamic_types) or []
+        except Exception:
+            rows = []
+        items = []
+        sig = tuple(sorted(str(r) for r in rows))
+        if not rows:
+            self._reconcile_due = False
+            self._recon_prev_sig = None
+        elif sig == getattr(self, '_recon_prev_sig', None):
+            # stable divergence across two quiet reads: fix it
+            items.extend(self._adopt_board_now('auto-reconcile'))
+            self._reconcile_due = False
+            self._recon_prev_sig = None
+        else:
+            self._recon_prev_sig = sig      # wait one more quiet tick
+        items.extend(self._political_recon())
+        items.extend(self._guide_box_recon())
+        return items
 
     def _adopt_board_now(self, why):
         """Adopt the client's board into the engine (the resync adopter:
@@ -4933,6 +5188,10 @@ class LiveDriver(object):
             gl.open_hand_limit_discard(self.es)
         except Exception:
             pass
+        # ENGINE-truth surfaces walked back onto the client (USER
+        # 2026-08-24 trust ruling): political markers + AI-FP guide box
+        items.extend(self._political_recon())
+        items.extend(self._guide_box_recon())
         self.findings.append(('resync_recovery', 'completed'))
         return items
 

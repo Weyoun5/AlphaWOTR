@@ -91,6 +91,10 @@ def _snapshot_armies(state):
         'pending_guide': getattr(state, 'pending_guide_change', None),
         'besieged': set(getattr(state, 'besieged_strongholds', set())
                         or set()),
+        'fs_region': getattr(fs, 'region', None),
+        'fs_progress': getattr(fs, 'progress', None),
+        'mordor': (getattr(fs, 'mordor_entered', None),
+                   getattr(fs, 'mordor_step', None)),
     }
 
 
@@ -107,6 +111,10 @@ def _restore_armies(state, snap):
     fs.guide = snap['guide']
     state.pending_guide_change = snap['pending_guide']
     state.besieged_strongholds = set(snap.get('besieged', set()))
+    if 'fs_region' in snap:
+        fs.region = snap['fs_region']
+        fs.progress = snap['fs_progress']
+        fs.mordor_entered, fs.mordor_step = snap['mordor']
 
 
 def adopt_units(state, dump, dynamic_types=None):
@@ -309,6 +317,59 @@ def adopt_companions(state, dump, dynamic_types=None):
     return changed
 
 
+def adopt_minions(state, dump):
+    """Relocate the engine's EXISTING named-Minion objects (Witch-king
+    253 / Saruman 254 / Mouth 255) to the map region the client dump
+    shows (USER bug 2026-08-24: a leniently-accepted army move
+    stranded the Witch-King engine-side and no adopter leg could ever
+    repair it - client_leaders_by_region deliberately returns no named
+    figures).  RELOCATE ONLY, never fabricate: a minion pid the engine
+    holds no object for stays a reported census row.  Saruman is
+    adopted like the others (the immobility rule constrains legal
+    MOVES; adoption corrects the engine's picture of the physical
+    board, resync ruling 2026-08-21) with a loud report line."""
+    import board as bd
+    out = []
+    minion_pids = {'253': 'witch', '254': 'saruman', '255': 'mouth'}
+    for pid, tag in minion_pids.items():
+        zone = None
+        for p, z in (dump or {}).items():
+            if str(p) == pid:
+                zone = str(z)
+                break
+        if zone is None:
+            continue
+        base = cb._strip_sh(_norm(zone))
+        if base not in bd.regions:
+            continue                    # off-board box: not this leg's job
+        # find the engine's Minion object of this identity
+        holder_key, obj = None, None
+        for key, army in state.armies.items():
+            for l in list(army.leaders or []):
+                if type(l).__name__ == 'Minion' \
+                        and tag in str(getattr(l, 'name', '')).lower():
+                    holder_key, obj = key, l
+                    break
+            if obj is not None:
+                break
+        if obj is None:
+            continue                    # no object: report-only (census)
+        if _norm(holder_key) == base:
+            continue                    # already agreed
+        import game_logic as gl
+        army = state.armies.get(holder_key)
+        if army is not None and obj in army.leaders:
+            army.leaders.remove(obj)
+        gl.get_or_create_army(state, base).leaders.append(obj)
+        out.append('minion %s: %s -> %s%s'
+                   % (getattr(obj, 'name', tag), _norm(holder_key),
+                      base,
+                      ' (NOTE: Saruman is rules-immobile - the client'
+                      ' board is adopted as physical truth)'
+                      if tag == 'saruman' else ''))
+    return out
+
+
 def adopt_sieges(state, dump, dynamic_types=None):
     """Derive `state.besieged_strongholds` from the client dump.
 
@@ -413,27 +474,21 @@ def _stable_dump(dump, dump_path):
 
 
 def adopt_tracks(state, dump):
-    """The TRACK markers the client shows, taken as given: political
-    boxes (client 'Political N' = engine box 3-N; the active flag is
-    the human's separate flip and stays), the Fellowship progress
-    (FSP 247/248 on 'Track N') and the corruption marker (252).
-    Lenient-mode companion of the piece adopters (USER 2026-08-22:
-    'takes the new game state as given after each action')."""
+    """The TRACK markers the client shows, taken as given: the
+    Fellowship progress (FSP 247/248 on 'Track N') and the corruption
+    marker (252).  Lenient-mode companion of the piece adopters (USER
+    2026-08-22: 'takes the new game state as given after each
+    action').
+
+    POLITICAL boxes are NOT adopted (USER trust ruling 2026-08-24:
+    "trust engine for political track, client otherwise") - the
+    engine is the political authority and the driver's political
+    reconciler walks the CLIENT markers to match it, never the
+    reverse."""
     import re as _re
-    from log_replay import POLITICAL_MARKERS
     out = []
     for pid, zone in (dump or {}).items():
         z = str(zone)
-        m = _re.match(r'^Political (\d)$', z)
-        if m and str(pid) in POLITICAL_MARKERS:
-            nation = POLITICAL_MARKERS[str(pid)]
-            box = 3 - int(m.group(1))
-            if state.political.boxes.get(nation) != box:
-                out.append('political %s box %s -> %d'
-                           % (getattr(nation, 'value', nation),
-                              state.political.boxes.get(nation), box))
-                state.political.boxes[nation] = box
-            continue
         m = _re.match(r'^Track (\d+)$', z)
         if m and str(pid) in ('247', '248', '252'):
             n = int(m.group(1))
@@ -447,6 +502,55 @@ def adopt_tracks(state, dump):
                 out.append('fellowship progress %s -> %d'
                            % (getattr(fs, 'progress', None), n))
                 fs.progress = n
+    return out
+
+
+def adopt_fellowship_position(state, dump):
+    """Adopt the Fellowship PAWN's position from the client (USER bug
+    2026-08-24: 'the fellowship pawn was not tracked during resyncs' -
+    a manual edit moving the pawn never reached the engine).  The pawn
+    is pid 247: on a MAP REGION zone the engine fellowship moves
+    there; on a 'Mordor N' box the engine adopts the Mordor step
+    (entry is physical truth on the client per the resync direction
+    ruling 2026-08-21).  'Track N' zones are the PROGRESS marker's
+    home and are handled by adopt_tracks, not here."""
+    import re as _re
+    import board as bd
+    out = []
+    zone = None
+    for pid, z in (dump or {}).items():
+        if str(pid) == '247':
+            zone = str(z)
+            break
+    if zone is None:
+        return out
+    fs = state.fellowship
+    m = _re.match(r'^Mordor (\d)', zone)
+    if m:
+        step = int(m.group(1))
+        if not getattr(fs, 'mordor_entered', False) \
+                or getattr(fs, 'mordor_step', None) != step:
+            out.append('fellowship: Mordor step %s -> %d (pawn box)'
+                       % (getattr(fs, 'mordor_step', None), step))
+            fs.mordor_entered = True
+            fs.mordor_step = step
+            fs.progress = 0
+        return out
+    base = cb._strip_sh(_norm(zone))
+    if base not in bd.regions:
+        return out                 # a track/other box: nothing to do
+    import game_logic as gl
+    cur = _norm(str(gl.fellowship_region(state)))
+    if cur == base or getattr(fs, 'mordor_entered', False):
+        return out
+    try:
+        fs.region = state.board.region(base)
+        fs.progress = 0
+        out.append('fellowship pawn: %s -> %s (progress reset)'
+                   % (cur, base))
+    except Exception as _fe:
+        out.append('fellowship pawn NOT adopted (%s -> %s): %r'
+                   % (cur, base, _fe))
     return out
 
 
@@ -484,9 +588,14 @@ def adopt_client_board(state, dump, dynamic_types=None, ai_module=None,
         # Fellowship that already reflects who is still in it
         report.extend(adopt_companions(state, census_dump,
                                        dynamic_types))
+        # named minions relocate by object (never fabricated)
+        report.extend(adopt_minions(state, census_dump))
         # sieges BEFORE the guide/census: the flag gates siege-only
         # rules and the census's own siege-zone check reads it
         report.extend(adopt_sieges(state, census_dump, dynamic_types))
+        # the pawn's REGION/Mordor box (USER 2026-08-24: manual-edit
+        # resyncs never reached the fellowship position)
+        report.extend(adopt_fellowship_position(state, census_dump))
         if guide_hook is not None:
             note = guide_hook()
             if note:

@@ -366,11 +366,19 @@ class LiveServer(object):
         if getattr(self, '_manual_hold', False):
             return []
         # WAVE-J (C-12): a panel resync epoch runs the RECOVERY (adopt
-        # + clear + reopen), draining any manual-edit backlog unmatched
+        # + clear + reopen), draining any manual-edit backlog unmatched.
+        # USER 2026-08-24: resync means "reconcile engine and client
+        # board state" and NOTHING else - it must not trigger the AI's
+        # turn.  The human is marked as owed the next action and the
+        # AI step machinery sits out this tick.
         if getattr(self, '_resync_requested', False):
             self._resync_requested = False
             for it in self.driver.resync_recover(drain_feed=True):
                 out.extend(self._dispatch(it))
+            self.driver.last_actor = self.ai_side
+            self._resync_quiet = True
+            self.notes.append('resync: reconcile only - waiting for '
+                              'your next action')
         # SKIP DECISION (USER 2026-08-20).  Runs on the TICK, before
         # the feed is read, so the commit and its emission ride the
         # normal path.  The outcome is ANNOUNCED - the player must be
@@ -484,12 +492,18 @@ class LiveServer(object):
                 # played on and let FP heal out of a won game)
                 self._abandon_step('game over')
                 self._step_queue = []
-            if self._open_step is not None:
-                out.extend(self._run_open_step())
-            while self._open_step is None and self._step_queue:
-                self._open_step = self._step_queue.pop(0)
-                self._step_starved = 0
-                out.extend(self._run_open_step())
+            if getattr(self, '_resync_quiet', False):
+                # USER 2026-08-24: a resync tick reconciles ONLY -
+                # any open/queued AI step waits for the next tick
+                # (and the next tick acts only if the AI is truly due)
+                self._resync_quiet = False
+            else:
+                if self._open_step is not None:
+                    out.extend(self._run_open_step())
+                while self._open_step is None and self._step_queue:
+                    self._open_step = self._step_queue.pop(0)
+                    self._step_starved = 0
+                    out.extend(self._run_open_step())
         except DriverHalt as e:
             msg = 'AI step halted: %s' % e
             if not self.notes or self.notes[-1] != msg:
@@ -504,6 +518,23 @@ class LiveServer(object):
         out.extend(self._flush_owed_die_kills())
         out.extend(self._tile_mopup())
         out.extend(self._table_mopup())
+        # USER 2026-08-24 auto-reconcile: a committed gesture flags
+        # _reconcile_due; on a QUIET tick (chain closed, nothing owed)
+        # the driver censuses and fixes divergences (client truth;
+        # engine truth for political + the AI-FP guide box)
+        drv9 = self.driver
+        if getattr(drv9, '_reconcile_due', False) \
+                and self._open_step is None \
+                and drv9.deferred is None \
+                and drv9.pending_buf is None \
+                and drv9.chat_deferred is None \
+                and not drv9.owed_die_kills \
+                and not getattr(drv9, 'owed_card_kills', None) \
+                and getattr(drv9.es, 'pending_combat', None) is None:
+            import ai as _ai_rc
+            if _ai_rc.describe_pending(drv9.es) is None:
+                for it in drv9.reconcile_board_quiet():
+                    out.extend(self._dispatch(it))
         # WAVE-J (ledger rank 9): the continuous witness - every 30
         # cycles (~1 min at the 2s heartbeat), skipped once the game
         # is over
@@ -1773,6 +1804,15 @@ class LiveServer(object):
             self.notes.append('declined-leg chat failed: %r' % (_dle,))
         if _dl:
             out.append(self._say('leg_decline', _dl))
+        # outbound symmetry (USER 2026-08-24): the AI's OWN Nazgul
+        # Strike either/or pick is said with the same words the human
+        # would use (kinds registered long ago, no caller until now)
+        _ch9 = (getattr(act, 'params', {}) or {}).get('choices')
+        if isinstance(_ch9, dict):
+            if _ch9.get('action') == 'hunt':
+                out.append(self._say('hunt_roll', 'rolling for hunt'))
+            elif _ch9.get('action') == 'discard_table_card':
+                out.append(self._say('discarding', 'discarding card'))
         # G2 (WAVE-H): a combat round that resolved inside THIS apply
         # announces its hit counts (engine statement; one producer per
         # commit path - the driver's own commit paths mirror this)
@@ -1786,6 +1826,10 @@ class LiveServer(object):
                 pre, post, expressed=expressed_ops,
                 label='ai:%s' % dp['kind']):
             out.extend(self._dispatch(item))
+        # USER 2026-08-24 auto-reconcile: the AI's own commit can move
+        # engine-truth surfaces (its guide dies, politics advance) -
+        # flag the quiet-tick reconciler here too
+        self.driver._reconcile_due = True
         self.rand.step_commit()
         self._em_sent = False
         self._dirs_sent.clear()

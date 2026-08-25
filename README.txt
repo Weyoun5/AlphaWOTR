@@ -32,6 +32,8 @@ PLAY
   board.  The client rolls all dice and draws all cards.
 
 CHAT (only what the board cannot show)
+  help                   list every command the AI understands, and
+                         what it is currently waiting on
   <region>               declare an attack on that region
   from <region>          answer the AI's "from?" when it asks
   nc                     no combat card (or choose one with the client)
@@ -40,7 +42,11 @@ CHAT (only what the board cannot show)
   fp ok                  end your Fellowship phase (Free Peoples)
   0e / Ne                eyes into the Hunt Box (Shadow)
   pass                   pass your action
-  resync                 re-read the board if something looks off
+  done                   finished moving (nazgul/companion card chains)
+  rolling for hunt       Nazgul Strike: take the hunt roll
+  discarding card <name> Nazgul Strike: discard that table card
+  none                   decline an either/or card choice
+  resync                 reconcile the board (never triggers the AI)
 
 REGIONS (type them as below; case, accents and punctuation do not matter)
   Short forms: any unique start of a name works ("osg" = osgiliath,

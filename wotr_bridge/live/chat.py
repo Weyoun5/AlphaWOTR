@@ -231,6 +231,33 @@ def _cards_named(msg):
                 if n and n in t})
 
 
+_REGION_VOCAB = None
+
+
+def _region_vocab():
+    """Normalized board-region keys (lazy; empty set on any import
+    failure - the region-value lane then simply never fires)."""
+    global _REGION_VOCAB
+    if _REGION_VOCAB is None:
+        v = set()
+        try:
+            import os as _os
+            import sys as _sys
+            _src = _os.path.abspath(_os.path.join(
+                _os.path.dirname(_os.path.abspath(__file__)),
+                '..', '..', 'src'))
+            if _src not in _sys.path:
+                _sys.path.insert(0, _src)
+            import board as _bd
+            for k in _bd.regions:
+                v.add(re.sub(r'[^a-z0-9]+', ' ',
+                             _deaccent(str(k)).lower()).strip())
+        except Exception:
+            pass
+        _REGION_VOCAB = v
+    return _REGION_VOCAB
+
+
 # ---------------------------------------------------------------------
 # THE ONE EXIT
 class ChatOut(object):
@@ -318,6 +345,8 @@ def classify_command(body):
         return ('fp_ok', None)
     if txt == 'resync':
         return ('resync', None)
+    if txt in ('help', '?', 'commands'):       # USER 2026-08-24
+        return ('help', None)
     if txt.rstrip('.!') == 'pass':             # :1584
         return ('pass', None)
     m = re.fullmatch(r'(\d)e', txt)            # D3: '0e' / 'Ne'
@@ -436,6 +465,53 @@ def match_choice(body, menu, nice=None):
         return _first('hunt_gollum_reveal')
     if txt in ('no reveal', 'no') and _first('hunt_gollum_no_reveal'):
         return _first('hunt_gollum_no_reveal')
+    # NAZGUL-FAMILY CHAINS (USER 2026-08-24: "the chat it should be
+    # waiting for is 'done' / 'rolling for hunt' / 'hunt' /
+    # 'discarding card'").  These sit ABOVE the region-value lane so
+    # the words never fall through to region resolution.
+    def _copt_choice(pred):
+        hits = [a for a in menu
+                if a.action_type == 'card_option'
+                and isinstance((a.params or {}).get('choices'), dict)
+                and pred((a.params or {}).get('choices'))]
+        return hits[0] if len(hits) == 1 else None
+
+    if re.fullmatch(r"(all |i'?m |i am )?(done|finished)"
+                    r"( moving( nazgul)?)?", txt):
+        # the chain terminator (_naz_done and the whole family)
+        act = _copt_choice(lambda ch: any(ch.get(k)
+                                          for k in _LEG_TERMINATORS))
+        if act is not None:
+            return act
+    if re.fullmatch(r'(rolling for (the )?hunt|roll (for )?(the )?hunt'
+                    r'|hunt( roll)?)', txt):
+        act = _copt_choice(lambda ch: ch.get('action') == 'hunt')
+        if act is not None:
+            return act
+    m9 = re.fullmatch(r'discard(ing)?( (the )?card)?(:)?\s*'
+                      r'(?P<name>.*)', txt)
+    if m9 is not None:
+        _dts = [a for a in menu
+                if a.action_type == 'card_option'
+                and isinstance((a.params or {}).get('choices'), dict)
+                and (a.params or {}).get('choices').get('action')
+                == 'discard_table_card']
+        _nm9 = _deaccent(m9.group('name') or '').strip()
+        if _nm9:
+            _named = [a for a in _dts
+                      if _nm9 in _deaccent(nice(
+                          (a.params or {}).get('choices')
+                          .get('target_card'))).lower()]
+            if len(_named) == 1:
+                return _named[0]
+        elif len(_dts) == 1:
+            return _dts[0]
+        if _dts:
+            return None      # ambiguous: never guess (driver refuses)
+    if txt in ('none', 'neither', 'no card', 'decline'):
+        act = _copt_choice(lambda ch: ch.get('action') == 'none')
+        if act is not None:
+            return act
     # corpus A4: 'nc' matched on the LAST token too ('ok nc')
     if toks[0] == 'nc' or toks[-1] == 'nc':
         return _first('combat_card_none')
@@ -491,6 +567,39 @@ def match_choice(body, menu, nice=None):
             return None
         if len(rets) == 1:
             return rets[0]
+    # a REGION NAME answering the open pending (tester 2026-08-24:
+    # multi-siege Fighting Uruk-hai targets, and the Grond / Black
+    # Captain Commands / Ringwraiths-are-Abroad follow-up attack
+    # grants - 'pick N' indices are invisible to the human).  The ONE
+    # resolver runs over each action's own region-valued params
+    # (card_option choices + to/target fields); a UNIQUE hit answers.
+    def _region_vals(a):
+        # ONLY values that really are board regions (an 'action'
+        # value like 'hunt' must never be region-matched - it made
+        # bare 'hunt' an accidental, fragile hit before the explicit
+        # lanes above landed)
+        p = a.params or {}
+        vals = [str(v) for v in
+                (p.get('choices') or {}).values()
+                if isinstance(v, str)]
+        for k in ('to', 'to_region', 'region', 'attack_target',
+                  'target_region'):
+            v = p.get(k)
+            if isinstance(v, str):
+                vals.append(v)
+        _rv = _region_vocab()
+        return [v for v in vals
+                if re.sub(r'[^a-z0-9]+', ' ',
+                          _deaccent(v).lower()).strip() in _rv]
+    _hits = []
+    for a in menu:
+        _vals = _region_vals(a)
+        if _vals:
+            _k9, _c9 = resolve_region(txt, _vals)
+            if _k9 is not None:
+                _hits.append(a)
+    if len(_hits) == 1:
+        return _hits[0]
     # bare combat-card NAME, matched LAST so grammar words never
     # collide with card names
     cands = [a for a in menu
@@ -651,6 +760,42 @@ def pending_reminder(what):
     machine holds, it never decides for the human)."""
     return _register('your %s decision is still open - answer it '
                      'first (board or chat)' % _prose(what))
+
+
+def waiting_on(what, words):
+    """USER 2026-08-24: when the AI waits on a CHAT decision it says
+    so and names the words it understands.  `words` is a short
+    slash-separated vocabulary string (no card names, no menus)."""
+    return _register('waiting on your %s - say %s'
+                     % (_prose(what), str(words)))
+
+
+def nazgul_chain_open_note():
+    return _register('move nazgul on the board, then say done')
+
+
+def nazgul_strike_choice_note():
+    return _register('nazgul with the ring-bearers: say rolling for '
+                     'hunt or discarding card <name> (or none)')
+
+
+def discard_target_ambiguous():
+    return _register('several table cards can be discarded - say '
+                     'discard <card name>')
+
+
+HELP_LINES = (
+    'help 1/4: attack = <region> or <region> from <region>; from '
+    '<region> answers from?; pass; resync re-reads the board; help',
+    'help 2/4: combat = nc, cc <card>, press, stop, siege, field '
+    'battle, retreat <region>, stand',
+    'help 3/4: hunt = random, corruption, guide, reveal, no reveal; '
+    'fellowship = fp ok, fsp enters mordor',
+    'help 4/4: eyes = 0e or Ne; card chains = done, rolling for '
+    'hunt, discarding card <name>, none, or pick <number>',
+)
+for _hl in HELP_LINES:
+    _register(_hl)
 
 
 def undo_rebased():

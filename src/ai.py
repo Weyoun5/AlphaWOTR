@@ -9388,8 +9388,15 @@ def _execute_action_inner(state: GameState, action: Action):
             # split) pins the non-Nazgul leader figures precisely - an int,
             # never None, so take() cannot fall to its None->0 stranding
             # path.  Only the teacher sets n_leaders; self-play never does.
+            # WK-STRANDING FIX (tester 2026-08-24, the 1.150 pattern
+            # victor_advance already carries): with take_leaders=True
+            # and an explicit n_nazgul, move_leaders=None fell into
+            # take()'s None->ZERO path and STRANDED every non-Nazgul
+            # leader figure - the Witch-King Minion stayed behind on a
+            # C-die army move.  99 is clamped by move_army to the
+            # movable non-Nazgul figures.
             _ml9 = (int(_nl9) if _nl9 is not None
-                    else (None if take else 0))
+                    else (99 if take else 0))
             if _nn9 is not None:
                 # USER 2026-07-11: explicit nazgul count; plain leaders
                 # follow n_leaders (or take_leaders when unset)
