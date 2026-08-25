@@ -2884,7 +2884,13 @@ class LiveDriver(object):
                                   '%r after %s' % (
                                       {k: v for k, v in exc.items()
                                        if v}, label)))
-            self.rand.reset_feed()
+            if getattr(self, 'ai_step_open', False):
+                # same guard as the chat gate: never quarantine
+                # randomness an open AI step is still owed
+                self.findings.append(
+                    ('unconsumed_rng_kept_for_open_step', label))
+            else:
+                self.rand.reset_feed()
         return True
 
     # ---- WAVE-I: post-commit engine-event sweep -------------------------
@@ -4279,7 +4285,19 @@ class LiveDriver(object):
                 self.findings.append(
                     ('unconsumed_rng', '%r after chat:%s'
                      % ({k: v for k, v in exc.items() if v}, via)))
-                self.rand.reset_feed()
+                if getattr(self, 'ai_step_open', False):
+                    # AGENT-SEAT FINDING 2026-08-24: an AI step is
+                    # MID-FLIGHT (live_server maintains the flag) and
+                    # the "unconsumed" randomness may be exactly what
+                    # its outstanding directive is owed (a fast human
+                    # 'fp ok' during ai_draws quarantined the
+                    # just-drawn SA card and the step starved FOREVER
+                    # - the !CALL is deduped, never re-ordered).
+                    # Keep the feed; note loudly.
+                    self.findings.append(
+                        ('unconsumed_rng_kept_for_open_step', via))
+                else:
+                    self.rand.reset_feed()
         # G2: a round that resolved inside THIS apply announces its
         # hit counts (engine statement - see emission.round_hits_chat)
         out = [('chat', k, t) for k, t in
@@ -4356,6 +4374,13 @@ class LiveDriver(object):
                 continue
             if inflight.get(str(pid)) == tgt:
                 continue                       # correction in flight
+            # a recent feed line already moves this marker to the
+            # target (the AI's own play emission, not yet applied in
+            # the dump): the recon must not double-walk it (agent-seat
+            # smoke3: the Isengard advance rendered twice)
+            _tail = getattr(self.feed, 'lines', [])[-40:]
+            if any(str(pid) in l and tgt in l for l in _tail):
+                continue
             inflight[str(pid)] = tgt
             items.append(('line', render(
                 'move', {'nick': self.nick, 'pieces': [str(pid)],

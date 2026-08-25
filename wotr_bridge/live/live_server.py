@@ -441,6 +441,9 @@ class LiveServer(object):
                     % (_sc.gen_change[1], _sc.gen_change[2],
                        _sc.gen_change[0]))
         _undo0 = getattr(self.driver, 'undo_epoch', 0)
+        # the driver's honesty gates must know whether an AI step is
+        # mid-flight (its owed randomness is never quarantined)
+        self.driver.ai_step_open = self._open_step is not None
         try:
             items = self.driver.tick(lines)
         except DriverHalt as e:
