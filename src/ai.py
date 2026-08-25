@@ -3780,6 +3780,10 @@ if HAS_TORCH:
             elif _la9 == 'corruption':
                 feat[_ACT_OPTVAL_OFF] = -1.0
             elif _la9 == 'hide':
+                # RETIRED value (amendment 1.229: TIAW no longer
+                # offers hide) - the slot value stays RESERVED so old
+                # checkpoints/extractions keep their geometry; never
+                # reuse 1.0-on-'hide' for a new option
                 feat[_ACT_OPTVAL_OFF] = 1.0
             elif _la9 == 'move':
                 feat[_ACT_OPTVAL_OFF] = -1.0

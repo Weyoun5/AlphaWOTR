@@ -847,7 +847,10 @@ def setup_initial_game(b: "board.Board") -> GameState:
     gandalf_grey = Companion(
         name="Gandalf the Grey", level=3, leadership=1,
         captain_of_the_west=True,
-        guide_ability="palantir_draw",  # Draw same type card when playing palantir card
+        guide_ability="palantir_draw",  # ANNOTATION ONLY: the real
+        # Gandalf-guide same-deck draw is implemented BY NAME (ai.py
+        # play_event executor ~10571 + gui._check_gandalf_card_draw,
+        # USER RULE 2026-07-08); nothing consumes this string
         activates_nations=[],  # Empty = activates ANY nation
         activation_regions=[],  # Empty = anywhere
     )
