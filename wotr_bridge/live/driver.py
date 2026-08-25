@@ -2890,6 +2890,58 @@ class LiveDriver(object):
                     self.echo_ledger.append(
                         {'kind': 'named', 'side': hu_tag,
                          'region': reg, 'tkey': nm, 'n': 1})
+        # (2b) POLITICAL RIDER SWEEP (tester 2026-08-24, 'A Power too
+        # Great'): a card effect's automatic political advance the
+        # human did NOT drag is engine bookkeeping - _covers now
+        # tolerates it on card-play windows, and THIS leg walks the
+        # client marker for the un-voiced steps so the board ends
+        # right (left unrendered, the next resync's adopt_tracks
+        # would regress the ENGINE to the stale client marker).
+        voiced = None
+        if gesture is not None:
+            try:
+                _gf9 = gesture_match.window_facts(gesture)
+                # CARD-PLAY windows only: the AI's own commits and
+                # battle chains render their political deltas via
+                # their own planners - sweeping there would walk the
+                # marker twice
+                if _gf9.cards_played:
+                    voiced = dict(_gf9.political)
+            except Exception:
+                voiced = None
+        if voiced is not None:
+            try:
+                import emitter as _emt
+                from emitter import render as _prender
+                for nat, b1 in post.political.boxes.items():
+                    b0 = pre.political.boxes.get(nat, b1)
+                    key = getattr(nat, 'name', str(nat))
+                    extra = (int(b1) - int(b0)) \
+                        - int(voiced.get(key, 0))
+                    if extra <= 0:
+                        continue
+                    base = int(b1) - extra
+                    for step in range(extra):
+                        try:
+                            op9, f9 = _emt.plan_advance_political(
+                                self.view, self.nick,
+                                'fp' if self.human_side.name
+                                == 'FREE_PEOPLES' else 'shadow',
+                                {'nation': key, 'from': base + step})
+                        except LookupError as _pe:
+                            self.findings.append(
+                                ('political_sweep_hold',
+                                 '%s: %s' % (key, _pe)))
+                            break
+                        items.append(('line',
+                                      _prender(op9, f9, local=False)))
+                        self.findings.append(
+                            ('political_sweep_emitted',
+                             '%s %d->%d' % (key, base + step,
+                                            base + step + 1)))
+            except Exception as _pse:
+                self.alarms.append('POLITICAL SWEEP FAILED (%s): %r'
+                                   % (label, _pse))
         # (3) capture markers — engine event, ledger-reconciled
         em2, notes = em_mod.render_capture_markers(
             self.view, self.nick, post, self.ctrl_markers,

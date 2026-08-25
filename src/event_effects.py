@@ -1622,45 +1622,34 @@ def _effect_athelas(state: "GameState", card, choices: dict) -> dict:
 
 @register_effect("There is Another Way")
 def _effect_there_is_another_way(state: "GameState", card, choices: dict) -> dict:
-    """USER RULING 2026-07-21f: heal and the Gollum ability are
-    MUTUALLY EXCLUSIVE. No Gollum -> heal 1. Gollum guide -> hide OR
-    (hidden-only) move INSTEAD of the heal — NO heal on the Gollum
-    path."""
+    """USER RE-RULING 2026-08-24 (SUPERSEDES 2026-07-21f): the heal
+    ALWAYS applies (1 Corruption), and with Gollum as Guide the FP may
+    ALSO move the Fellowship with the same card - heal + move
+    together, NOT either/or.  The card move places NO die in the Hunt
+    Box (the die->box step lives only in the fellowship_move
+    executor; the USER pinned this explicitly).  Movement still
+    requires hidden (rulebook p.38): a revealed Fellowship gets the
+    heal only ('heal kept, illegal move skipped')."""
     result = {"effects": []}
+    state.fellowship.corruption = max(
+        0, state.fellowship.corruption - 1)
+    result["effects"].append("Healed 1 Corruption")
     guide_name = state.fellowship.guide.name if state.fellowship.guide else ""
     gollum = "Gollum" in guide_name
     _act9 = str((choices or {}).get('action', ''))
-
-    # ruling 21f
-    if not gollum:
-        state.fellowship.corruption = max(
-            0, state.fellowship.corruption - 1)
-        result["effects"].append("Healed 1 Corruption")
-        return result
-    if _act9 == 'hide':
-        if state.fellowship.hidden:
-            result["message"] = ("There is Another Way: already hidden "
-                                 "- not played")
-            return _selfplay_refund(result)
-        state.fellowship.hidden = True
-        result["effects"].append("Fellowship hidden (Gollum guide)")
-        return result
-    if _act9 == 'move':
+    if gollum and _act9 == 'move':
         if not state.fellowship.hidden:
-            # revealed -> movement needs hidden; no heal fallback now
-            result["message"] = ("There is Another Way: cannot move "
-                                 "while revealed - not played")
-            return _selfplay_refund(result)
+            result["effects"].append(
+                "Gollum move skipped: Fellowship revealed "
+                "(heal kept)")
+            return result
         import game_logic as _gl9
         _mv9 = _gl9.move_fellowship(state, skip_hunt=False,
                                     skip_auto_sacrifice=True)
         result["effects"].append(
-            "Fellowship moved (Gollum guide): "
-            + str(_mv9.get('message', '')))
-        return result
-    result["message"] = ("There is Another Way: no Gollum hide/move "
-                         "chosen - not played")
-    return _selfplay_refund(result)
+            "Fellowship moved (Gollum guide, no die to the Hunt "
+            "Box): " + str(_mv9.get('message', '')))
+    return result
 
 
 @register_effect("I Will Go Alone")

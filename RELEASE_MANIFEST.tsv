@@ -11,7 +11,7 @@ requirements.txt	d8e6118f1f4ef6f2a79a332c4e95b06d009fc280	261
 src\ai.py	ab5ac66184f04da79baeab5e5381e069b037e1a4	815891
 src\board.py	15c7145115c49bb5fb87532dda15f7ba6fdb24af	21825
 src\card_decoder.py	233d34fd412cea57ff88131a650870def9eb74b6	17551
-src\card_options.py	d614ca90b92b7e139cc824c0c2cde7bf10dc5788	38443
+src\card_options.py	a38c8c49d6bae27674b2b2e8fc2c472c36826128	38582
 src\cards.py	5a3d072f5c4d915cdca1d9e79fd1be92480e6082	29085
 src\combat.py	f8fc2e2cd9779987d2a4afa093e7d1a7d2a46c9c	173178
 src\combat_dist.py	47f16e624180eb17a0649fdb578946ea653675f5	54267
@@ -29,7 +29,7 @@ src\dice\ADSAeye.png	5367981d386fc6488b158dfaf038d309be8ffbfb	5910
 src\dice\ADSAmuster.png	6b40c784a376b315842a4532ad9dcf3efd206718	5876
 src\dice\blank.png	94050738c03814a4a3c38d5555e9513cebf0cbc3	689
 src\engine_play.py	7bb214d4e6cc571d03c80b0821d0656d54511b4d	48113
-src\event_effects.py	75d814979f2fd5d8a01a1266ed31cbb04149e611	421101
+src\event_effects.py	61f99282dd3534fd97b8cd058f01152949db825b	420753
 src\fellowship\corruption.png	7aa9fa143d6a3bfc69d57b0b905c7842b230ed70	945
 src\fellowship\FSP.png	fda24ca905d5b275b8f426d2b872752ee3c2d66b	760
 src\game_logic.py	ea346a6d491d0dcd2bbe0569b2427505c02d198e	226288
@@ -596,11 +596,11 @@ wotr_bridge\live\card_identity.py	037c5ba786d3650323bcd582721c16d088f25d52	9890
 wotr_bridge\live\chat.py	236a5678853972b9e88a16b03dac78f6c091251d	29762
 wotr_bridge\live\client_board.py	e40f32fdd48904ad0d2d901e584936ead3e26c44	31597
 wotr_bridge\live\client_view.py	759b2c5117b934a29c1a12b4730efef736b66df6	5514
-wotr_bridge\live\driver.py	ed643bc0001686d02f4b2d9c2eb20c7ce2dc86be	247018
+wotr_bridge\live\driver.py	7cb1f9cd69d293015cf2ee0efb53cda9503898dd	249719
 wotr_bridge\live\emission.py	ff456a945782c9a74cfae645e2296060a2719b15	81007
 wotr_bridge\live\emission_card.py	f4e6b50b1526021eb45ffdd7deb63a13eeca52d3	28750
 wotr_bridge\live\feed_reader.py	023ad2d3ddec920b3d3c5bf2a686cac85a49b66a	5974
-wotr_bridge\live\gesture_match.py	691213dcd7a1fb1512f041041f27b97c14a0cd6f	91042
+wotr_bridge\live\gesture_match.py	16c0d36ebd2fbd80f858b95e0679c79ca5c763ab	91578
 wotr_bridge\live\live_parser.py	bc2ea2606a3f004f5aae80d88597c9ed2b55faa7	5499
 wotr_bridge\live\live_server.py	fbeb7e3159356c27d857e4993a9f0f5c7eaa09dd	155069
 wotr_bridge\live\randomness.py	e8a6c009174ad31c6862761b8e2831dafde440cd	52403

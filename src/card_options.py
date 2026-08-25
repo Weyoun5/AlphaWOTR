@@ -711,15 +711,18 @@ def _companion_move_card(state, side):
 
 @_spec("There is Another Way")
 def _(state, side):
-    # USER RULING 2026-07-21f: with Gollum as Guide the card gives
-    # hide/move INSTEAD of the heal — heal_only is REMOVED from the
-    # Gollum menu. No Gollum -> [] (the handler heals directly).
-    # Revealed -> only 'hide' is legal (move needs hidden).
+    # USER RE-RULING 2026-08-24 (supersedes 2026-07-21f): the heal
+    # ALWAYS applies; with Gollum as Guide the FP may ALSO move the
+    # Fellowship on the same card (no die enters the Hunt Box).  The
+    # learned decision is move vs heal-only, and it exists only when
+    # a hidden move is possible; no Gollum, or revealed -> [] (the
+    # handler heals directly, nothing to decide).
     g = state.fellowship.guide
     if g is None or 'Gollum' not in getattr(g, 'name', ''):
         return []
-    return ([{"action": "hide"}] if not state.fellowship.hidden
-            else [{"action": "move"}])
+    if not state.fellowship.hidden:
+        return []
+    return [{"action": "move"}, {"action": "heal_only"}]
 
 
 CARD_OPTION_SPECS["book of mazarbul"] = _companion_move_card

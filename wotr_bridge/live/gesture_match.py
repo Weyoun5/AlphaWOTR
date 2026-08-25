@@ -838,9 +838,17 @@ def _covers(win, eng, relax_draws=False, fs_reset_relax=False,
         return False
     w_pol = {k: v for k, v in win.political.items() if v}
     e_pol = {k: v for k, v in eng.political.items() if v}
-    if combat_flux:
-        # voiced rows exact; engine-extra rows = the attacked nation's
-        # p.34 advance the client did not render (see docstring)
+    if combat_flux or win.cards_played:
+        # voiced rows exact; engine-extra rows = AUTOMATIC advances
+        # the client does not render for the human: the attacked
+        # nation's p.34 advance in battle chains (see docstring), and
+        # a CARD EFFECT'S political rider on a play window (tester
+        # 2026-08-24: the human's 'A Power too Great' was refused
+        # 'differs on the political track' + 5 undo presses because
+        # the Elves advance was not dragged in the same window; the
+        # play could never stay on the board).  The post-commit sweep
+        # walks the client marker for the un-voiced advance, so the
+        # board still ends right.
         for k, v in w_pol.items():
             if e_pol.get(k, 0) != v:
                 return False
