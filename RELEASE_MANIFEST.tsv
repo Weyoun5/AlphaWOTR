@@ -602,7 +602,7 @@ wotr_bridge\live\emission_card.py	f4e6b50b1526021eb45ffdd7deb63a13eeca52d3	28750
 wotr_bridge\live\feed_reader.py	023ad2d3ddec920b3d3c5bf2a686cac85a49b66a	5974
 wotr_bridge\live\gesture_match.py	16c0d36ebd2fbd80f858b95e0679c79ca5c763ab	91578
 wotr_bridge\live\live_parser.py	bc2ea2606a3f004f5aae80d88597c9ed2b55faa7	5499
-wotr_bridge\live\live_server.py	fbeb7e3159356c27d857e4993a9f0f5c7eaa09dd	155069
+wotr_bridge\live\live_server.py	f3feccb86cfdfaac7ec74270cda3e70dd789b132	154827
 wotr_bridge\live\randomness.py	a2198ad7a36aeb83353dcd66b9b193a9ea626dd3	52367
 wotr_bridge\live\scenario.py	4aaa7094cf59616c9271f086270d0464b14fd661	36031
 wotr_bridge\live\segmenter.py	4cf8aeeb2d6faf8341ea5219abef15a0ca949878	11902

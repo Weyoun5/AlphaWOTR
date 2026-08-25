@@ -63,13 +63,10 @@ def _fresh_state(seed=None):
 # the file (design rule 8): card-identity params are redacted at the
 # single exit below.
 # ----------------------------------------------------------------------
-_MENU_CAP = 900          # published army_move entries (counts stay
-#                          exact; sized over the largest measured live
-#                          menu - 861 Shadow army actions, gesture_match
-#                          log).  The cap is PER TYPE on army_move only:
-#                          every other action type is always published
-#                          whole (a 1183-action turn-1 Shadow menu lost
-#                          its advance_political entries to a flat cap)
+# (the published human_menu is UNCAPPED - USER ruling 2026-08-24
+# "there should be no caps", extending the 2026-08-22
+# no-legal-surface-caps ruling to the publication: every action of
+# every type is always published whole)
 
 
 def _json_safe(v):
@@ -2851,27 +2848,28 @@ class LiveServer(object):
                                                  x['region'],
                                                  x['d']))
             if menu is not None:
+                # UNCAPPED (USER 2026-08-24 "there should be no
+                # caps"): every action of every type is published
                 acts = []
                 by_type = {}
                 for i, a in enumerate(menu):
                     at = str(a.action_type)
                     by_type[at] = by_type.get(at, 0) + 1
-                    if at != 'army_move' or by_type[at] <= _MENU_CAP:
-                        entry = {
-                            'i': i, 'action_type': at,
-                            'die_idx': (int(a.die_idx)
-                                        if a.die_idx is not None
-                                        else None),
-                            'params': _menu_params_safe(a.params)}
-                        if cas_rows is not None \
-                                and at == 'casualty_allocate':
-                            entry['rows'] = cas_rows.get(
-                                int(a.params.get('count', 0) or 0))
-                        acts.append(entry)
+                    entry = {
+                        'i': i, 'action_type': at,
+                        'die_idx': (int(a.die_idx)
+                                    if a.die_idx is not None
+                                    else None),
+                        'params': _menu_params_safe(a.params)}
+                    if cas_rows is not None \
+                            and at == 'casualty_allocate':
+                        entry['rows'] = cas_rows.get(
+                            int(a.params.get('count', 0) or 0))
+                    acts.append(entry)
                 out['n_actions'] = len(menu)
                 out['by_type'] = by_type
                 out['actions'] = acts
-                out['truncated'] = len(menu) > len(acts)
+                out['truncated'] = False    # kept for readers; never true
             dice = []
             for i, d in enumerate(es.dice.get(self.human_side, [])):
                 try:
