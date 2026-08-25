@@ -6089,17 +6089,31 @@ def _effect_denethors_folly(state: "GameState", card, choices: dict) -> dict:
 
 @register_effect("The Day Without Dawn")
 def _effect_day_without_dawn(state: "GameState", card, choices: dict) -> dict:
-    """Discard all unused FP Will of the West dice."""
+    """Discard all unused FP Will of the West dice.  Removal is correct
+    (the RESULTS are lost this turn; calculate_bonus_dice rebuilds the
+    pool to target count at the next turn boundary) but it SHIFTS the
+    indices of every later FP die, and two pendings store an integer
+    die index across applies (pending_army_move_die /
+    pending_muster_die, B1 2026-08-24) - re-point them."""
     from game_state import ActionDieFace
     result = {"effects": []}
-    # Remove unused Will of the West dice from FP dice pool
-    removed = 0
     fp_dice = state.dice.get(Side.FREE_PEOPLES, [])
-    for die in fp_dice[:]:  # Iterate over copy
-        if die.current == ActionDieFace.WILL_OF_WEST and not die.used:
-            fp_dice.remove(die)
-            removed += 1
-    if removed > 0:
+    removed_idx = [i for i, die in enumerate(fp_dice)
+                   if die.current == ActionDieFace.WILL_OF_WEST
+                   and not die.used]
+    for i in reversed(removed_idx):
+        fp_dice.pop(i)
+    removed = len(removed_idx)
+    if removed:
+        for _attr, _sattr in (
+                ('pending_army_move_die', 'pending_army_move_side'),
+                ('pending_muster_die', 'pending_muster_side')):
+            _v = getattr(state, _attr, None)
+            if isinstance(_v, int) \
+                    and getattr(state, _sattr, None) \
+                    == Side.FREE_PEOPLES:
+                setattr(state, _attr,
+                        _v - sum(1 for i in removed_idx if i < _v))
         result["effects"].append(
             f"Discarded {removed} Will of the West dice")
     else:

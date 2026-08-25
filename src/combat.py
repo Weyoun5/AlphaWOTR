@@ -252,9 +252,13 @@ def setup_combat(state: "GameState", attacker_region: str, defender_region: str,
                           if u.kind == UnitKind.REGULAR]
                          + [u for u in v_gar.units
                             if u.kind == UnitKind.ELITE])
-            # 'Removed from the game' = permanent: FP removals must be
-            # booked into the casualty box (at merge-back — setup_combat
-            # itself must stay state-mutation-free for enumeration).
+            # WHICH box the excess goes to is the USER 1.181 house
+            # ruling (2026-07-20, CL-147, game_logic siege re-clamp):
+            # REINFORCEMENTS, never casualties — an untracked removal
+            # IS a pool return (reinforcements = max - deployed -
+            # fp_casualties).  B2 2026-08-24: this site used to book
+            # the excess as permanent FP casualties at merge-back,
+            # contradicting the ruling the standing re-clamp applies.
             _cap_removed9 = list(removable[:excess])
             _cap_removed_side9 = garrison
             for u in _cap_removed9:
@@ -480,7 +484,8 @@ def setup_combat(state: "GameState", attacker_region: str, defender_region: str,
         if gtw_shines else 0)
 
     combat.coloc_parent = _coloc_parent
-    # 5-unit siege-cap removals (permanent; booked at merge-back)
+    # 5-unit siege-cap removals (informational: excess is a pool
+    # return per USER 1.181 — never booked as casualties, B2)
     combat.cap_removed = locals().get('_cap_removed9') or []
     combat.cap_removed_side = locals().get('_cap_removed_side9')
     combat.away_atk_parent = _away_atk_parent
@@ -2747,15 +2752,12 @@ def _resolve_combat_body(state, attacker_region, defender_region,
                              combat.attacker_side)
         _track_fp_casualties(state, combat.defender_casualties,
                              combat.defender_side)
-        # 5-unit siege-cap removals are 'removed from the game'
-        # (rulebook p.31): book FP removals so they never re-enter
-        # the reinforcement pool (max - deployed - fp_casualties).
-        _capr9 = getattr(combat, 'cap_removed', None)
-        if _capr9:
-            _track_fp_casualties(state, _capr9,
-                                 getattr(combat, 'cap_removed_side',
-                                         None))
-            combat.cap_removed = []
+        # 5-unit siege-cap removals are NOT casualties: USER 1.181
+        # house ruling (2026-07-20, pinned CL-147) — the excess
+        # returns to reinforcements, and an untracked removal IS the
+        # return (reinforcements = max - deployed - fp_casualties).
+        # The old booking here contradicted the standing re-clamp in
+        # game_logic (B2, unified 2026-08-24).
 
     # Update game state - remove destroyed armies
     # Find the original army key matching each region (state.armies uses original names)

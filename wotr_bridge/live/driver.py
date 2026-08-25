@@ -550,7 +550,16 @@ class LiveDriver(object):
         if self.pending_buf is not None and self.pending_buf.records:
             import ai as _ai
             _dp = _ai.describe_pending(self.es)
-            if _dp is None:
+            if _dp is None and (
+                    isinstance(getattr(self.es, 'pending_combat', None),
+                               dict)
+                    or self.human_cc_committed):
+                # K1 reveal gap (Scouts fix 2026-08-24): dp is None
+                # because the battle is parked on a hidden combat
+                # card, and the buffer holds battle-gap records for
+                # the decision the reveal opens NEXT - not orphaned
+                pass
+            elif _dp is None:
                 # the pending this buffer was collected FOR resolved
                 # by another route (chat pick, force): the records can
                 # never match anything — expire them LOUDLY, never an
@@ -773,6 +782,27 @@ class LiveDriver(object):
                     self.pending_buf = self._new_phase_window()
                 self.pending_buf.records.append(payload)
                 self._try_pending()
+                return []
+            if dp is None \
+                    and not getattr(self, 'spectator', False) \
+                    and (isinstance(getattr(self.es, 'pending_combat',
+                                            None), dict)
+                         or self.human_cc_committed):
+                # K1 REVEAL GAP (tester 2026-08-24, Scouts): while a
+                # committed combat card is still hidden the round
+                # parks with deciding_side None - describe_pending is
+                # None for a full server round-trip, and a human board
+                # record here (the Scouts retreat drag racing the
+                # reveal line) used to fall through to _on_phase's
+                # bare return and VANISH; the retreat pending then
+                # opened over an empty buffer, unresolvable forever.
+                # HOLD the record; _poke_pending_buffer retries it the
+                # moment the reveal opens the decision.
+                if self.pending_buf is None:
+                    self.pending_buf = self._new_phase_window()
+                self.pending_buf.records.append(payload)
+                self.findings.append(('battle_gap_buffered',
+                                      str(payload.get('norm', ''))[:80]))
                 return []
         out = self._route_event(ev, payload)
         # rng-bearing phase records may unblock the pending buffer or
@@ -1052,6 +1082,9 @@ class LiveDriver(object):
                                        'reflected: %r' % title[:60])
                 else:
                     ai.reveal_combat_card(self.es, self.ai_side, cid)
+                    # the reveal may have opened the decision a
+                    # battle-gap-held record answers (Scouts retreat)
+                    self._poke_pending_buffer()
             return []
         if side is not self.human_side:
             return None
@@ -1092,6 +1125,7 @@ class LiveDriver(object):
                 'it goes back to your hand; choose another or say nc')))
             return items
         self.findings.append(('cc_reveal', '%s %s' % (human.name, cid)))
+        self._poke_pending_buffer()
         return items
 
     def _on_chosen_nonhand(self, rec, tag):
@@ -3440,6 +3474,18 @@ class LiveDriver(object):
                  % (len(menu) - len(kept))))
         return kept or menu
 
+    def _poke_pending_buffer(self):
+        """Battle-gap records held while NO decision was open (the K1
+        reveal gap - see _route): retry them the moment the open
+        pending became the human's (the reveal opened the retreat
+        decision the held drag answers)."""
+        import ai
+        if self.pending_buf is None or not self.pending_buf.records:
+            return
+        dp = ai.describe_pending(self.es)
+        if dp is not None and self._pending_buffer_applies(dp):
+            self._try_pending()
+
     def _try_pending(self):
         """Match the buffered phase records against the open pending's
         menu; commit on full coverage.  Returns True when the pending
@@ -3447,6 +3493,13 @@ class LiveDriver(object):
         import ai
         dp = ai.describe_pending(self.es)
         if dp is None:
+            if self.pending_buf is not None and self.pending_buf.records \
+                    and (isinstance(getattr(self.es, 'pending_combat',
+                                            None), dict)
+                         or self.human_cc_committed):
+                # K1 reveal gap: the buffer holds battle-gap records
+                # awaiting the reveal - do NOT discard them
+                return False
             self.pending_buf = None
             return True
         if self.pending_buf is None or not self.pending_buf.records:

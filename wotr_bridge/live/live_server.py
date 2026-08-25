@@ -2520,31 +2520,51 @@ class LiveServer(object):
         Current Action forever and, worse, its unclosed segmenter
         window swallowed the human's next records.)"""
         drv = self.driver
+        out = []
+        # TABLE SEAT AT COMMIT (2026-08-24, tester 'A Power too Great
+        # never reached the board'): the Board-slot seat must NOT wait
+        # for chain closure - a long-lived pending (the discard-at-6
+        # phantom held one open forever) kept the seat banked
+        # silently, so the played table card never left the
+        # Current-Card slot.  Seat as soon as the engine files the
+        # card in persistent_cards and the AI step is closed; only the
+        # DIE kill stays deferred (die -> play -> resolve -> kill).
+        # Decoupling also kills the slot-drift latent (a die-kill HOLD
+        # after seating used to re-book the pid into the next slot).
+        if self._open_step is None and drv.owed_die_kills:
+            _seated = []
+            for ent in drv.owed_die_kills:
+                if len(ent) > 3 and ent[2] is not None \
+                        and ent[3] is not None \
+                        and self._cid_on_table(ent[3]):
+                    out.append(self._table_seat_line(ent[0], ent[2],
+                                                     ent[3]))
+                    ent = (ent[0], ent[1])
+                _seated.append(ent)
+            drv.owed_die_kills = _seated
         owed_cards = getattr(drv, 'owed_card_kills', None) or []
         if (not drv.owed_die_kills and not owed_cards)                 or self._open_step is not None:
-            return []
+            return out
         if drv.deferred is not None or drv.pending_buf is not None \
                 or drv.chat_deferred is not None:
-            return []
+            return out
         import ai
         if ai.describe_pending(drv.es) is not None:
-            return []
+            return out
         # an OPEN BATTLE is an unclosed chain even with no deciding
         # side (K1 reveal phase: hidden commits awaiting the client's
         # reveal / a refused reveal re-opening a window) - the battle
         # die stays staged until the engine closes pending_combat
         if isinstance(getattr(drv.es, 'pending_combat', None), dict):
-            return []
-        out = []
+            return out
         still = []
         for ent in drv.owed_die_kills:
             # entries: (side, die_idx[, card_pid[, cid]]) - WAVE-J:
             # the played card dies WITH the die (one E1 group kill),
             # clearing the Current-Card slot.  EXCEPTION: a card the
             # engine holds in persistent_cards STAYS on the table -
-            # it seats into a Board slot instead (donor table-card
-            # wave grammar) and dies in its slot when the effect
-            # expires (_table_mopup).
+            # it seats into a Board slot at COMMIT (sweep above) and
+            # dies in its slot when the effect expires (_table_mopup).
             side_name, die_idx = ent[0], ent[1]
             card_pid = ent[2] if len(ent) > 2 else None
             cid = ent[3] if len(ent) > 3 else None

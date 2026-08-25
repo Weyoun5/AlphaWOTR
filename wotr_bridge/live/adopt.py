@@ -79,7 +79,7 @@ def _snapshot_armies(state):
     only armies and its rollback silently left adopted companions and
     a recomputed guide in place.  The decline gate is worthless if the
     rollback is partial, so this must track every field the adopters
-    touch.
+    touch (besieged_strongholds since adopt_sieges, 2026-08-24).
     """
     fs = state.fellowship
     return {
@@ -89,6 +89,8 @@ def _snapshot_armies(state):
         'companions': list(getattr(fs, 'companions', []) or []),
         'guide': getattr(fs, 'guide', None),
         'pending_guide': getattr(state, 'pending_guide_change', None),
+        'besieged': set(getattr(state, 'besieged_strongholds', set())
+                        or set()),
     }
 
 
@@ -104,6 +106,7 @@ def _restore_armies(state, snap):
     fs.companions = list(snap['companions'])
     fs.guide = snap['guide']
     state.pending_guide_change = snap['pending_guide']
+    state.besieged_strongholds = set(snap.get('besieged', set()))
 
 
 def adopt_units(state, dump, dynamic_types=None):
@@ -306,6 +309,69 @@ def adopt_companions(state, dump, dynamic_types=None):
     return changed
 
 
+def adopt_sieges(state, dump, dynamic_types=None):
+    """Derive `state.besieged_strongholds` from the client dump.
+
+    The dump distinguishes inside-the-walls ('<region> Stronghold'
+    zone) from the field ('<region>'), so a siege is directly readable:
+    exactly one side's UNITS inside, none of that side's units in the
+    field, and at least one opposing unit in the field.  Before this
+    (2026-08-24, tester 'can't play The Fighting Uruk-hai'), the flag
+    was written ONLY by the engine's own combat path - a siege formed
+    through a leniently-accepted window existed on the client but not
+    in the engine, so every siege-gated rule (the card's besieging
+    requirement, the 5-unit cap, sortie direction) silently misjudged,
+    and RESYNC could not repair it because nothing adopted the flag.
+
+    Cleanly-shaped sieges are added; a flagged region the dump no
+    longer shows siege-shaped is dropped (the CHAOS-1 stale-flag class
+    on the adoption path); a messy shape (one side split inside AND
+    outside) is left untouched and reported."""
+    import board as bd
+    from combat import side_of_nation
+    bs = getattr(state, 'besieged_strongholds', None)
+    if bs is None:
+        bs = state.besieged_strongholds = set()
+    inside = {}
+    field = {}
+    for pid, zone in (dump or {}).items():
+        z = _norm(zone)
+        base = cb._strip_sh(z)
+        if base not in bd.regions:
+            continue
+        try:
+            nat, ut = cb.unit_type(pid, dynamic_types)
+        except Exception:
+            continue
+        if ut not in ('regular', 'elite'):
+            continue
+        side = side_of_nation(nat)
+        (inside if z != base else field).setdefault(
+            base, set()).add(side)
+    changed = []
+    strongholds = {r for r in (set(inside) | set(field) | set(bs))
+                   if bd.regions.get(r, {}).get('is_stronghold')}
+    for r in sorted(strongholds):
+        ins = inside.get(r, set())
+        fld = field.get(r, set())
+        shaped = (len(ins) == 1
+                  and not (ins & fld)
+                  and bool(fld - ins))
+        if shaped and r not in bs:
+            bs.add(r)
+            changed.append('siege adopted: %s' % r)
+        elif r in bs and not ins:
+            # nobody inside the walls: no siege (lifted / vacated)
+            bs.discard(r)
+            changed.append('siege dropped: %s (no garrison inside)' % r)
+        elif not shaped and (ins & fld):
+            changed.append('siege NOT adopted at %s: %s units both '
+                           'inside and outside (messy shape, left '
+                           'as-is)' % (r, '/'.join(sorted(
+                               s.name for s in (ins & fld)))))
+    return changed
+
+
 class AdoptionRefused(RuntimeError):
     """The dump is not a full, stable client read: adopting it would
     rewrite engine regions to an ABSENT roster.  Raised BEFORE any
@@ -418,6 +484,9 @@ def adopt_client_board(state, dump, dynamic_types=None, ai_module=None,
         # Fellowship that already reflects who is still in it
         report.extend(adopt_companions(state, census_dump,
                                        dynamic_types))
+        # sieges BEFORE the guide/census: the flag gates siege-only
+        # rules and the census's own siege-zone check reads it
+        report.extend(adopt_sieges(state, census_dump, dynamic_types))
         if guide_hook is not None:
             note = guide_hook()
             if note:

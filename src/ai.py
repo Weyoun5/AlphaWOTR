@@ -6301,7 +6301,13 @@ def _event_card_has_effect(state: GameState, side: Side, card_id: str) -> bool:
         # OWN removal from the actor's hand (that is not an "effect").
         after = _event_state_signature(clone, side)
         _hkey = 'hand_fp' if side == Side.FREE_PEOPLES else 'hand_sh'
-        after[_hkey] += 1
+        # Discount the played card's own hand exit by RE-ADDING its
+        # name to the after-hand.  The 2026-08-17 signature extension
+        # made hand_fp/hand_sh tuples of names; the old `+= 1` then
+        # raised TypeError into the blanket except -> True, so the
+        # whole delta check was dead and genuinely no-op cards were
+        # offered again (fail-open; found 2026-08-24).
+        after[_hkey] = tuple(sorted(after[_hkey] + (str(card_id),)))
         return after != before
     except Exception:
         return True  # On dry-run failure, fall back to offering the card
@@ -7251,25 +7257,18 @@ def get_legal_actions(state: GameState, side: Side) -> List[Action]:
 
     # --- Hand-limit discard (learned decision: which card to give up) ---
     _pd = getattr(state, 'pending_discard', None)
-    if _pd is not None:
+    if _pd is not None and side == _pd['side']:
+        # The discard belongs to the hand's OWNER only.  A wrong-side
+        # ask FALLS THROUGH to the asker's own menu: the old loud raise
+        # here (v9 showcase bug: FP handed SH's discard, determinization
+        # discarded imaginary cards) also fired on a LEGITIMATE
+        # turn-start coexistence - one side over the hand limit while
+        # the other side's declare phase is armed (turn order D2-D4;
+        # reproduced 2026-08-24 from a tester soak crash).  The v9
+        # class stays dead because the wrong side never RECEIVES
+        # discard_card actions, and describe_pending still routes the
+        # discard to its owner first.
         _d_side = _pd['side']
-        if side != _d_side:
-            # v9 showcase bug: FP was handed SH's hand-limit discard and
-            # determinization made it discard imaginary cards. The
-            # decision belongs to the hand's owner — a wrong-side ask is
-            # a routing bug upstream; surface it loudly.
-            _pco9 = getattr(state, 'pending_card_option', None)
-            _pcf9 = getattr(state, 'pending_card_followup', None)
-            raise RuntimeError(
-                f"pending_discard belongs to {_d_side.name}, "
-                f"but {side.name} was asked for legal actions "
-                f"(coexisting: card_option="
-                f"{(_pco9 or {}).get('card_name')}/"
-                f"{(_pco9 or {}).get('side')}, followup="
-                f"{(_pcf9 or {}).get('card_id')}/"
-                f"{(_pcf9 or {}).get('side')}, "
-                f"combat={state.pending_combat is not None}, "
-                f"hunt={state.pending_hunt is not None})")
         _d_tag = 'fp' if _d_side == Side.FREE_PEOPLES else 'sh'
         _seen = set()
         _acts = []
