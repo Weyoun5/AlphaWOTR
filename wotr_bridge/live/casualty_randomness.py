@@ -58,6 +58,11 @@ def completed_payment_key(state, side, window, chain, call):
     if (context is None or context['kind'] != 'combat' or context['side'] is not side
             or not chain or any(a.action_type != 'casualty_allocate' for a in chain)):
         return None
+    if not _authenticated_continuation(state, call):
+        return None
+    stopped = getattr(call, '_casualty_pre_request_state', None)
+    if stopped is None:
+        return None
     clone = ai.clone_state(state)
     clone._casualty_operations = []
     remaining = context['hits']
@@ -69,9 +74,25 @@ def completed_payment_key(state, side, window, chain, call):
             remaining -= ai._apply_casualty_operation(clone, context['region'], side, remaining, action.params)
             rows = event_flow(clone._casualty_operations[-1], gm._unit_type_key, gm.sanitize)
             events.extend(rows); flow.update(rows)
+        # The last chosen operation can force the remaining unit losses before
+        # the engine requests a Witch-king draw or a post-casualty roll. Replay
+        # those recorded primitives deterministically, without repeating RNG.
+        forced = list(getattr(stopped, '_casualty_operations', ()) or ())
+        if not forced or forced[0] != clone._casualty_operations[-1]:
+            return None
+        for event in forced[1:]:
+            if (event.get('side') is not side or event.get('remaining_before') != remaining
+                    or gm.sanitize(str(event.get('region'))) != gm.sanitize(str(context['region']))):
+                return None
+            params = dict(nation=event['nation'], operation=event['operation'], casualties=remaining)
+            remaining -= ai._apply_casualty_operation(clone, context['region'], side, remaining, params)
+            if clone._casualty_operations[-1] != event:
+                return None
+            rows = event_flow(event, gm._unit_type_key, gm.sanitize)
+            events.extend(rows); flow.update(rows)
     except (KeyError, TypeError, ValueError, StopIteration):
         return None
-    if remaining != 0:
+    if remaining < 0 or (remaining and ai._alloc_side_units(clone, context['region'], side)):
         return None
     from .casualty_gestures import observed_unit_flow
     records, _required = observed_unit_flow(window.records)
@@ -79,9 +100,8 @@ def completed_payment_key(state, side, window, chain, call):
     if flow != observed or not prefix_matches(events, records):
         return None
     facts = gm.window_facts(window)
-    if not gm._covers(facts, gm.delta_facts(state, clone)):
-        return None
-    if not _authenticated_continuation(state, call):
+    if not gm._covers(facts, gm.delta_facts(state, stopped), combat_flux=True,
+                      follow_through=gm.follow_through_for(chain, live=True)):
         return None
     return gm._semantic_state_key(equivalence_state(clone, chain))
 

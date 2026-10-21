@@ -176,7 +176,7 @@ def _family(row):
     return None
 
 
-def _owed_rows(chain, window, baseline, rows):
+def _owed_rows(chain, window, baseline, rows, post=None):
     """Only existing matcher-authorized, unvoiced automatic consequences.
 
     The native surface must still match the BEFORE state for that exact row.
@@ -185,6 +185,13 @@ def _owed_rows(chain, window, baseline, rows):
     """
     from .gesture_match import follow_through_for, window_facts
     allowed = set(follow_through_for(chain, live=True))
+    # A revealing Hunt result changes the engine's visibility before the
+    # human places and flips the pawn. In particular 0r opens reveal_place
+    # immediately, without a damage choice in between. Retain that pending
+    # choice while accepting its still-hidden physical marker.
+    if (post is not None and getattr(post, '_reveal_place_due', False)
+            and not post.fellowship.hidden):
+        allowed.add('hidden_marker')
     # Captures and score markers are consequences, never separately chosen
     # moves. Political changes caused by a completed movement/attack likewise
     # belong to the post-commit marker renderer, not the human gesture grammar.
@@ -238,7 +245,7 @@ def filter(driver, window, candidates):
             # Deck lengths are model fiction; they are measured for diagnostics
             # but cannot disprove an otherwise completed physical action.
             rows = [item for item in rows if not item.startswith('deck ')]
-            owed = _owed_rows(row['chain'], window, baseline, rows)
+            owed = _owed_rows(row['chain'], window, baseline, rows, row['post'])
             unresolved = [item for item in rows if item not in owed]
             if not unresolved:
                 survivors.append((bool(owed), len(owed), key, execution, row, index))

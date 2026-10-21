@@ -925,6 +925,9 @@ FOLLOW_THROUGH = {
     # placement choreography's marker flip is the client catching up,
     # not a toggle demand.
     'fellowship_reveal_place': frozenset(('hidden_marker',)),
+    # Ending a battle can grant the Witch-king's Sorcerer draw. The engine
+    # owns that draw; removing casualties need not also voice the AI's card.
+    'casualty_allocate': frozenset(('draws',)),
     # FLD-4b (par5b_g2 siege_trim stall): the garrison's
     # seat-into-the-box drag is CLIENT choreography for a siege the
     # engine ALREADY holds - the trim option itself moves no siege
@@ -1476,7 +1479,7 @@ def _semantic_state_key(post, paid_ring=None):
         return None
 
 
-def _continuation_execution(rng):
+def _continuation_execution(rng, *, include_probe_index=True):
     import random
     if rng is None:
         return ('global rng', random.getstate())
@@ -1489,7 +1492,7 @@ def _continuation_execution(rng):
         r._feed, r._feed_pos,
         None if pending is None else (pending.kind, pending.kw),
         r._pending_got, r.shim_uses, r.reroll_decline_shim,
-        r._step_open, r._step_seed, r._probe_ix, r._step_rng_cur,
+        r._step_open, r._step_seed, r._probe_ix if include_probe_index else None, r._step_rng_cur,
         r._journal[r._journal_ix:], r.sticky_halt,
         None if r._step_open else random.getstate())
 
@@ -2670,7 +2673,12 @@ def match_window(state, side, window, menu=None, budget=DEFAULT_BUDGET,
                                 stopped = getattr(e, '_casualty_pre_request_state', None)
                                 from .casualty_gestures import equivalence_state
                                 demand_key = _typed_value_key((e.kind, e.kw))
-                                cursor_key = _continuation_execution(rng)
+                                # Equivalent, completed casualty paths may
+                                # enumerate different numbers of legal menus.
+                                # That probe count is not a consumed outcome.
+                                # Keep the actual RNG/feed/journal strict and
+                                # resume the chosen representative's own path.
+                                cursor_key = _continuation_execution(rng, include_probe_index=False)
                                 counter.setdefault('proven_starves', []).append(
                                     ((paid_key, demand_key, cursor_key,
                                       _semantic_state_key(equivalence_state(stopped, chain + [a]))

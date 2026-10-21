@@ -8064,6 +8064,7 @@ class LiveDriver(object):
         and its engine continuation rather than adopting a board and losing
         the die, card, or remaining decision that produced it.
         """
+        import ai
         if getattr(self, 'spectator', False) or result.status not in ('match', 'ambiguous'):
             return result
         from .decision_endpoint import completed, filter as filter_endpoint
@@ -8091,6 +8092,11 @@ class LiveDriver(object):
                                         note=resolved.reason)
         held.endpoint_wait = True
         held.endpoint_unavailable = resolved.status == 'unavailable'
+        # A candidate may have opened a Hunt/combat/card choice even though
+        # the pre-action state had no pending decision. A board-only fallback
+        # must not discard that unfinished effect on a temporary mismatch.
+        held.endpoint_pending = any(ai.describe_pending(row['post']) is not None
+                                    for row in candidates)
         held.endpoint_evidence = resolved.evidence
         # A newer export may have arrived during comparison. It still needs
         # to be examined on the next tick, even with no further human input.
@@ -8215,7 +8221,8 @@ class LiveDriver(object):
             return []
         self.uncommitted.extend(w_norms)
         if (res.status in ('hold', 'ambiguous') and not self.enforce_human
-                and not getattr(res, 'endpoint_unavailable', False)):
+                and not getattr(res, 'endpoint_unavailable', False)
+                and not getattr(res, 'endpoint_pending', False)):
             self.window_stats['none'] += 1
             self._out_queue.extend(self._lenient_accept(
                 w, res.note or res.status))

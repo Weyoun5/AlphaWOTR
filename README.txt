@@ -9,7 +9,7 @@ WHAT THIS IS
   tree search pick the AI's moves.
   Goal: a strong, rules-exact opponent for human play and, from there,
   a self-improving one.
-  Release v0.1.6: v52 rules engine, native search, and self-play-trained
+  Release v0.1.6.1: v52 rules engine, native search, and self-play-trained
   models (Free Peoples gen5, Shadow league gen24).
   Model encoding: 4647 observation features and 157 action features.
   See RELEASE_MANIFEST.tsv for the packaged file hashes.
