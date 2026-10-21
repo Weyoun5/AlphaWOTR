@@ -113,6 +113,42 @@ ENGINE-ONLY BOARD (no Java)
   UNTESTED: only the real-client path above has been played and
   certified.
 
+PLAY THROUGH THE WotR BOT PROTOCOL (other bots, hosted matches)
+  protocol/wotr_protocol_bot.py lets the AI play through the WotR Bot
+  Protocol (draft 0.1, github.com/behindmedia/wotr-protocol): a
+  REFEREE (any rules engine that speaks the protocol) runs the game,
+  rolls every die and draws every card; at each decision it sends the
+  AI its view of the position and the list of legal options, and the
+  AI answers with one of them.  No Java client and no .bat file are
+  involved; the same engine, nets and search as Play_vs_AI.bat.
+  Git clone + requirements.txt as above (Python 3.10+).  From the
+  folder of this README:
+
+    python -I protocol/wotr_protocol_bot.py
+        the protocol on stdin/stdout: a referee starts it as its child
+        process (stderr is the log)
+    python -I protocol/wotr_protocol_bot.py --connect wss://wotr.behindmedia.com/referee --token TOKEN
+        dial a referee's WebSocket with a seat token (the hosted
+        referee: a match and its two tokens are made on that site)
+
+  Options: --sims N (MCTS sims, default 300 as in the panel; a referee
+  may also set it as the protocol option "sims"), --max-seconds S
+  (cap per decision; the referee's clock is respected anyway),
+  --verbose (each decision on stderr), --log FILE (one JSON line per
+  decision).
+
+  How it works: at each decision the engine's state is rebuilt from
+  the referee's view (the opponent's hidden cards are sampled by the
+  search as usual), the engine's pending decision is set up to match
+  the question (a battle round, a Hunt, a discard ...), and MCTS picks
+  one of the engine's own actions.  That action is matched to the
+  referee's option; actions the referee does not offer (the two
+  engines differ in a few map borders and rules) are kept out of the
+  search.  The referee asks in small steps (the die, then the Army,
+  then its units); the engine's action answers all of them.  Where the
+  engine has no matching decision a plain rule answers, and the log
+  says so ("fallbacks" in the end-of-game line).
+
 CREDITS / LICENSE
   AlphaWOTR code (engine, bridge, panel, nets): MIT - see LICENSE.
   War of the Ring is a board game by Ares Games (Roberto Di Meglio,
