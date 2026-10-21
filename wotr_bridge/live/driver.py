@@ -788,6 +788,8 @@ class LiveDriver(object):
         distinct from a still-unanswered engine choice. Claims decrement or
         remove the existing echo ledger entries; silence never satisfies them.
         """
+        if getattr(self, '_lenient_board_wait', None) is not None:
+            return True
         from .siege_seating import waiting as seating_waiting
         if seating_waiting(self):
             return True
@@ -1687,6 +1689,8 @@ class LiveDriver(object):
         # BRLANE-2: held windows whose blocking condition cleared are
         # retried BEFORE the queue drains (their items ride this tick)
         out.extend(self._retry_holds('tick'))
+        from .lenient_board import poll as reconcile_lenient_board
+        out.extend(reconcile_lenient_board(self))
         endpoint_buffer = self.pending_buf
         if getattr(endpoint_buffer, '_victor_close_record', None) is not None:
             self._try_pending()
@@ -8086,6 +8090,7 @@ class LiveDriver(object):
         held = gesture_match.MatchResult('hold', applies=result.applies,
                                         note=resolved.reason)
         held.endpoint_wait = True
+        held.endpoint_unavailable = resolved.status == 'unavailable'
         held.endpoint_evidence = resolved.evidence
         # A newer export may have arrived during comparison. It still needs
         # to be examined on the next tick, even with no further human input.
@@ -8209,7 +8214,8 @@ class LiveDriver(object):
                                                   'randomness')))
             return []
         self.uncommitted.extend(w_norms)
-        if res.status in ('hold', 'ambiguous') and not self.enforce_human:
+        if (res.status in ('hold', 'ambiguous') and not self.enforce_human
+                and not getattr(res, 'endpoint_unavailable', False)):
             self.window_stats['none'] += 1
             self._out_queue.extend(self._lenient_accept(
                 w, res.note or res.status))
@@ -11575,7 +11581,7 @@ class LiveDriver(object):
                 # 'yes' are CONSENT forms (rules flags + tracks follow
                 # the board); any other call adopts PIECES only
                 consent=(why in ('lenient', 'consented')),
-                dice_pids=(self._resync_dice_pids() if why in ('consented', 'manual') else None),
+                dice_pids=(self._resync_dice_pids() if why in ('consented', 'manual', 'lenient') else None),
                 dice_phase=self.phase,
                 pending_fields=self._PENDING_FIELDS)
             self._last_board_adoption = self._adoption_outcome(_rep)
@@ -11685,13 +11691,11 @@ class LiveDriver(object):
                                   str(line).strip()[:80]))
 
     def _lenient_accept(self, w, why):
-        """Legality enforcement OFF (USER 2026-08-22): a gesture the
-        matcher would refuse or hold is ACCEPTED AS GIVEN - never an
-        undo press, never a chat refusal, never a hold.  The staged
-        die (if the window had one) is spent on the engine side, the
-        human counts as having acted, the client's board is adopted
-        into the engine, every expectation of a restore is dropped.
-        The panel note says what happened (a finding, not an alarm)."""
+        """Reconcile a completed human action silently from its native board.
+
+        Wait for complete export evidence before recording costs or handing
+        play to the AI. Unresolved Hunt/combat choices retain their handlers.
+        """
         why = str(why or 'gesture')[:120]
         # BL-97 mode-gate: under ENFORCEMENT no path may reach the
         # lenient accept - a caller that does is a routing bug and
@@ -11716,46 +11720,8 @@ class LiveDriver(object):
             self.findings.append(('lenient_empty_window_unstaged',
                                   why[:80]))
             return items12
-        self.findings.append(('lenient_accept', why))
-        # BL-32b: the degrade must be VISIBLE on the human's surface
-        # (chat), not only in the server log
-        items = [('note', 'accepted as given (legality enforcement '
-                          'OFF): %s' % why),
-                 ('chat', 'prompt', chat_mod.lenient_accept_note())]
-        side = self.human_side
-        if w is not None and getattr(w, 'die_face', None):
-            letter_face = {v: k for k, v in
-                           gesture_match.FACE_LETTER.items()}
-            want = letter_face.get(str(w.die_face))
-            dice = self.es.dice.get(side, [])
-            idx = next((i for i, d in enumerate(dice)
-                        if not d.used and getattr(d.current, 'name',
-                                                  None) == want), None)
-            if idx is None:
-                idx = next((i for i, d in enumerate(dice)
-                            if not d.used), None)
-            if idx is not None:
-                dice[idx].used = True
-                items.append(('note', 'lenient: %s die #%d spent'
-                              % (w.die_face, idx)))
-            self.last_actor = side
-            self.n_commits_total = getattr(self, 'n_commits_total',
-                                           0) + 1
-        if w is not None:
-            try:
-                self._unreveal(w)
-            except Exception:
-                pass
-            items.extend(self._lenient_hand_facts(w))
-        items.extend(self._adopt_board_now('lenient'))
-        from .undo_model import RestoreWatch as _RW
-        self.restore_watch = _RW()
-        if self.rand is not None:
-            try:
-                self.rand.reset_feed()
-            except Exception:
-                pass
-        return items
+        from .lenient_board import accept
+        return accept(self, w, why)
 
     def _lenient_hand_facts(self, w):
         """A lenient accept takes the window AS GIVEN - including the
@@ -12509,7 +12475,7 @@ class LiveDriver(object):
         attacker-action rule, dice exhaustion -> None); the driver
         contributes only WHO JUST ACTED (its own commit bookkeeping),
         never a turn rule."""
-        if self.forced_ai_rows_pending():
+        if self.forced_ai_rows_pending() or getattr(self, '_lenient_board_wait', None) is not None:
             return None
         import ai
         import game_state as gs

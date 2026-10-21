@@ -557,6 +557,15 @@ def diff_engine_vs_dump(state, dump, dynamic_types=None, ai_module=None,
         c_used = cl_dice.get((tag, 'used'), 0)
         c_hunt = cl_dice.get((tag, 'hunt'), 0)
         c_stg = cl_dice.get((tag, 'staged'), 0)
+        # Players put the payment die in the Hunt Box before resolving the
+        # Hunt. The rules engine queues that addition until damage, reveal
+        # and Guide choices finish, so it cannot affect this Hunt's modifier.
+        # This is a physical-zone projection only; never alter hunt_box.
+        if s is Side.FREE_PEOPLES and c_hunt == hunt + 1:
+            from fellowship_action_timing import pending_die
+            if pending_die(st) is not None:
+                hunt += 1
+                used -= 1
 
         def _dpids(*boxes, _tag=tag):
             return ' '.join(p for b in boxes

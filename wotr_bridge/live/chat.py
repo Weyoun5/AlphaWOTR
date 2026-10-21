@@ -1033,15 +1033,6 @@ def stronghold_tile_note():
                      'stronghold hunt tile')
 
 
-def lenient_accept_note():
-    """BL-32b (2026-08-25): a lenient degrade of a refused gesture
-    must be VISIBLE - the fpgame3 tester's published fellowship row
-    was silently adopted with no engine execution and no hunt."""
-    return _register('your gesture did not match my rules read - '
-                     'accepted as given; check the board and say '
-                     'resync if it looks wrong')
-
-
 def undo_took_ai_line():
     """BL-26 (2026-08-25): the client's undo stack is global - a
     human undo can take back the AI's own line while the engine
