@@ -9,9 +9,10 @@ WHAT THIS IS
   tree search pick the AI's moves.
   Goal: a strong, rules-exact opponent for human play and, from there,
   a self-improving one.
-  Status: the nets shipped here are trained ONLY on ~10,800 logged
-  human games (behavioural cloning, corpus v41).  Self-play
-  reinforcement learning is still in progress.  The AI is just OK right now. 
+  Release v0.1.6: v52 rules engine, native search, and self-play-trained
+  models (Free Peoples gen5, Shadow league gen24).
+  Model encoding: 4647 observation features and 157 action features.
+  See RELEASE_MANIFEST.tsv for the packaged file hashes.
 
 Please report strange moves or any bugs, I expect there are quite a few
 
@@ -52,7 +53,8 @@ REGIONS (type them as below; case, accents and punctuation do not matter)
   Short forms: any unique start of a name works ("osg" = osgiliath,
   "tirith" = minas tirith, "n ithilien" = north ithilien, "shire",
   "helms deep").  If it fits several regions the AI lists them
-  ("fords" -> fords of bruinen / fords of isen) - type more of the name.
+  Common aliases include dg, hd, mt, da, mg, mm, lor, wlr, ofr,
+  pel, shire, riv, ereb and gh. "fords" means Fords of Isen.
   andrast                  fords of bruinen         northern rhovanion
   anfalas                  fords of isen            nurn
   angmar                   forlindon                old ford

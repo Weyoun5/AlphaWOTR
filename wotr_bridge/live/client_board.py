@@ -44,6 +44,7 @@ DEVIATIONS from the donor (each documented at its site):
     answerer for the projection (defect-9 shape).
 """
 import os
+import re
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -56,11 +57,35 @@ for _p in (_SRC, _BRIDGE):
 # Client fact #14: full dump ~428 pieces; below this it is torn.
 MIN_DUMP_PIECES = 400
 
-# named minion pids (log_replay.MINION_PIECES keys; kept as the
-# engine-name -> pid mapping the donor used at :11177-11179)
-_MINION_PIDS = (('253', 'witch'), ('254', 'saruman'), ('255', 'mouth'))
+# CLIENT-SIDE zone names the DUMP reader keeps (BRCMP-2, 2026-08-29).
+# The corpus parser's hand-tuned log_replay.LOCATION_CODES maps the
+# client's Current Action slot (Game.2035) to 'Used' - right for the
+# corpus kill grammar ('kills <die> in Current Action' = spent), WRONG
+# for a board dump, where a die parked there is merely STAGED (the
+# human's open window; the AI's die awaiting its chain-close kill).  A
+# killed die shows in the side's Dead zone.  The dump reader consults
+# this table FIRST so the client's own name survives (the authoritative
+# messages.properties name).
+LOCATION_CODES = {'Game.2035': 'Current Action'}
 
-_UNIT_KINDS = ('regular', 'elite', 'leader', 'nazgul', 'companion',
+# Row classes (BRCMP design 2): the two ASYNC-written families - the
+# action dice (pool / used / hunt / staged) and the deck counts - plus
+# the hand SIZE are STAGING rows: published, never escalated, never a
+# divergence.  Everything else is a BOARD row.  ONE classifier for the
+# live lane (test_live_session_census keeps the offline twin).
+_STAGING_ROW_RE = re.compile(r'^(dice |deck |hand size )')
+
+
+def is_staging_row(row):
+    return bool(_STAGING_ROW_RE.match(str(row)))
+
+
+def classify_row(row):
+    """'staging' | 'board' for one census row."""
+    return 'staging' if is_staging_row(row) else 'board'
+
+
+_UNIT_KINDS =('regular', 'elite', 'leader', 'nazgul', 'companion',
                'minion')
 
 
@@ -108,11 +133,10 @@ def _parse_dump(path):
             for line in f:
                 if line.startswith('#HAND') \
                         and '<blinded>' not in line:
-                    # WAVE-J (ledger F-06/A-23, rule 8 FAIL-CLOSED):
-                    # an un-blinded whole-hand snapshot in a dump
-                    # means the blinding flag is missing - no reader
-                    # may consume this file.  Raise, never skip: a
-                    # silent None reads as 'no dump yet'.
+                    # design rule 8 FAIL-CLOSED: an un-blinded #HAND
+                    # snapshot means the blinding flag is missing - no
+                    # reader may consume this file (raise, never a
+                    # silent None that reads as 'no dump yet')
                     raise RuntimeError(
                         'BLINDING VIOLATION: un-blinded #HAND '
                         'snapshot in the board dump (missing '
@@ -120,12 +144,40 @@ def _parse_dump(path):
                 parts = line.rstrip('\n').split('\t')
                 if len(parts) < 3:
                     continue
-                region = lr.decode_location(parts[1].strip('<~>'))
+                code = parts[1].strip('<~>')
+                region = (LOCATION_CODES.get(code)
+                          or lr.decode_location(code))
                 rk = str(region) if region else parts[1]
                 for pid in parts[2].split():
                     out[pid] = rk
     except RuntimeError:
         raise               # the blinding violation must stay LOUD
+    except Exception:
+        return None
+    return out or None
+
+
+def read_board_flags(path):
+    """Read native fourth-column masks, aligned with piece IDs.
+
+    Mask meanings depend on piece type. Political activation comes from
+    the fifth-column H.k() state, not these masks. None when unreadable.
+    """
+    if not os.path.exists(path):
+        return None
+    out = {}
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            for line in f:
+                if line.startswith('#'):
+                    continue
+                parts = line.rstrip('\n').split('\t')
+                if len(parts) < 4:
+                    continue
+                pids = parts[2].split()
+                flags = parts[3].split()
+                for i, pid in enumerate(pids):
+                    out[pid] = flags[i] if i < len(flags) else ''
     except Exception:
         return None
     return out or None
@@ -156,7 +208,7 @@ def read_board(path, min_pieces=MIN_DUMP_PIECES, retries=3, delay=0.05,
 
 
 # ---------------------------------------------------------------------
-# board projection / delta (donor :3135-3281, verbatim semantics)
+# board projection / delta (increment semantics)
 # ---------------------------------------------------------------------
 def proj_board(st):
     """Comparable board projection for gesture matching and the census.
@@ -280,7 +332,7 @@ def board_delta(pre, post):
 
 
 # ---------------------------------------------------------------------
-# the direct engine<->client witness (donor :11042-11510)
+# the direct engine<->client witness
 # ---------------------------------------------------------------------
 def _leader_side(leader):
     """'fp' | 'shadow' of a leader object (donor :9976-9984)."""
@@ -294,21 +346,46 @@ def _leader_side(leader):
     return 'fp'      # companions carry no nation
 
 
+def fellowship_marker_hidden(marker_states):
+    """Native bR.k(): 0 draws Fellowship.png, 1 Fellowship_revealed.png.
+
+    This is the marker's public face, not the legacy selection/masking flag.
+    Missing or unfamiliar exports cannot establish visibility.
+    """
+    value = (marker_states or {}).get('247')
+    return value == 0 if type(value) is int and value in (0, 1) else None
+
+
+def political_marker_active(pid, marker_states):
+    """Native political face, or None when the dump cannot establish it."""
+    if str(pid) in ('256', '261', '262', '263'):
+        return True
+    face = (marker_states or {}).get(str(pid))
+    return bool(face) if face in (0, 1) else None
+
+
 def diff_engine_vs_dump(state, dump, dynamic_types=None, ai_module=None,
                         initial_dump=None, granted_pids=None,
-                        revoked_pids=None):
+                        revoked_pids=None, client_turn=None, marker_states=None,
+                        pid_to_cid=None):
     """DIRECT engine<->client verification (no parser in between):
     armies per region, leaders per region+side, nazgul counts + named
     minions, dice zones, deck sizes, siege sub-boxes, companions,
-    control markers, elven rings; optional per-nation FORCE POOLS
-    (needs ai_module) and PIECE CONSERVATION (needs initial_dump).
+    fellowship tracks / pawn / political boxes and native activation faces,
+    control markers, elven
+    rings; optional per-nation FORCE POOLS (needs ai_module), PIECE
+    CONSERVATION (needs initial_dump) and the turn counter (needs the
+    caller's client_turn channel).
 
     Returns a list of issue strings; empty = the client board IS the
     engine state.  Never mutates anything (witnesses notice, the
     engine owns).  Donor: verify_client_vs_engine (:11042-11510),
     decoupled: dynamic_types replaces the replayer, ai_module replaces
     self.ai, initial_dump replaces self._client_initial, granted/
-    revoked pid sets replace the die-registration driver fields."""
+    revoked pid sets replace the die-registration driver fields.
+
+    Rows name their client pids ('pids=<pid>@<zone> ...') so every
+    surface can print WHO disagrees, not just how many (BRCMP-6)."""
     if not dump or state is None:
         return None
     from board import sanitize
@@ -318,9 +395,17 @@ def diff_engine_vs_dump(state, dump, dynamic_types=None, ai_module=None,
     st = state
     regions = bd.regions
     issues = []
+    from .shadow_siege_slots import GENERIC_SLOTS
+    for pid, zone in dump.items():
+        if sanitize(str(zone)).lower() in GENERIC_SLOTS:
+            _, kind = unit_type(pid, dynamic_types)
+            if kind in _UNIT_KINDS:
+                issues.append('unbound generic stronghold: piece %s in %s requires its observed origin' % (pid, zone))
     cl_units, cl_leaders, cl_pool = {}, {}, {}
+    cl_leader_nations, cl_leader_nation_pids = {}, {}
     cl_naz, cl_minion = {}, {}
     cl_dice, cl_decks = {}, {}
+    cl_dice_pids, cl_unit_pids, cl_leader_pids = {}, {}, {}
     fp_dice, sh_dice = set(em._FP_DIE_IDS), set(em._SH_DIE_IDS)
     deckz = {'fp char deck', 'fp strat deck',
              'sa char deck', 'sa strat deck'}
@@ -331,21 +416,26 @@ def diff_engine_vs_dump(state, dump, dynamic_types=None, ai_module=None,
             if pid in rvd:
                 # revocation-display window: the revoked die's PIECE
                 # rides the dead pile until the next recovery while the
-                # engine dropped the die entirely (donor :11077-11085)
+                # engine dropped the die entirely
                 continue
             if granted_pids is not None and int(pid) >= 300 \
                     and pid not in granted_pids:
-                # DEVIATION (documented): a never-granted BONUS die
-                # parks in a Dead/Reinf box from setup; counting it as
-                # 'used' misreads the box.  The donor shielded only the
-                # roster check this way (:11249-11259); with a granted
-                # set available the count check gets the same shield.
+                # a never-granted BONUS die parks in a Dead/Reinf box
+                # from setup; counting it as 'used' misreads the box
+                # (the granted set shields the count check as it
+                # shields the roster check)
                 continue
             s = 'fp' if pid in fp_dice else 'shadow'
             if z in ('fp dice', 'sa dice'):
                 box = 'pool'
             elif 'hunt' in z:
                 box = 'hunt'
+            elif z == 'current action':
+                # BRCMP-2: the client's FOURTH die state - STAGED (a
+                # human window open, or the AI's die awaiting its
+                # chain-close kill).  Compatible with engine pool OR
+                # used; never a disagreement by itself.
+                box = 'staged'
             elif z in ('used', 'fp dead', 'sa dead'):
                 # the client's kill routes a spent die to the side's
                 # Dead zone - same meaning as the Used box
@@ -353,6 +443,8 @@ def diff_engine_vs_dump(state, dump, dynamic_types=None, ai_module=None,
             else:
                 continue   # bonus die not yet in play (reinf box)
             cl_dice[(s, box)] = cl_dice.get((s, box), 0) + 1
+            cl_dice_pids.setdefault((s, box), []).append(
+                '%s@%s' % (pid, z))
             continue
         if z in deckz:
             cl_decks[z] = cl_decks.get(z, 0) + 1
@@ -367,11 +459,17 @@ def diff_engine_vs_dump(state, dump, dynamic_types=None, ai_module=None,
             if ut in ('regular', 'elite'):
                 k = (base, (natv, ut))
                 cl_units[k] = cl_units.get(k, 0) + 1
+                cl_unit_pids.setdefault(k, []).append(pid)
             elif ut in ('leader', 'nazgul', 'minion', 'companion'):
                 s = ('shadow' if ut in ('nazgul', 'minion')
                      else 'fp' if ut == 'companion'
                      else em._side_of_nation(nat))
                 cl_leaders[(base, s)] = cl_leaders.get((base, s), 0) + 1
+                cl_leader_pids.setdefault((base, s), []).append(pid)
+                if ut == 'leader':
+                    nk = (base, natv)
+                    cl_leader_nations[nk] = cl_leader_nations.get(nk, 0) + 1
+                    cl_leader_nation_pids.setdefault(nk, []).append(pid)
                 if ut == 'nazgul':
                     cl_naz[base] = cl_naz.get(base, 0) + 1
                 elif ut == 'minion':
@@ -383,7 +481,7 @@ def diff_engine_vs_dump(state, dump, dynamic_types=None, ai_module=None,
             k = ('shadow', (natv, ut))
             cl_pool[k] = cl_pool.get(k, 0) + 1
     # engine views
-    en_units, en_leaders = {}, {}
+    en_units, en_leaders, en_leader_nations = {}, {}, {}
     for key, army in st.armies.items():
         k = sanitize(str(key))
         for u in army.units:
@@ -392,16 +490,27 @@ def diff_engine_vs_dump(state, dump, dynamic_types=None, ai_module=None,
         for ld in army.leaders:
             s = _leader_side(ld)
             en_leaders[(k, s)] = en_leaders.get((k, s), 0) + 1
+            if type(ld).__name__ == 'Leader':
+                nk = (k, _nv(ld.nation))
+                en_leader_nations[nk] = en_leader_nations.get(nk, 0) + 1
     for kk in sorted(set(en_units) | set(cl_units)):
         a, b = en_units.get(kk, 0), cl_units.get(kk, 0)
         if a != b:
-            issues.append('units %s %s/%s: engine=%d client=%d'
-                          % (kk[0], kk[1][0], kk[1][1], a, b))
+            issues.append('units %s %s/%s: engine=%d client=%d pids=%s'
+                          % (kk[0], kk[1][0], kk[1][1], a, b,
+                             ' '.join(cl_unit_pids.get(kk, ())) or '-'))
     for kk in sorted(set(en_leaders) | set(cl_leaders)):
         a, b = en_leaders.get(kk, 0), cl_leaders.get(kk, 0)
         if a != b:
-            issues.append('leaders %s (%s): engine=%d client=%d'
-                          % (kk[0], kk[1], a, b))
+            issues.append('leaders %s (%s): engine=%d client=%d pids=%s'
+                          % (kk[0], kk[1], a, b,
+                             ' '.join(cl_leader_pids.get(kk, ())) or '-'))
+    for nk in sorted(set(en_leader_nations) | set(cl_leader_nations)):
+        a, b = en_leader_nations.get(nk, 0), cl_leader_nations.get(nk, 0)
+        if a != b:
+            issues.append('leader nation %s %s: engine=%d client=%d pids=%s'
+                          % (nk[0], nk[1], a, b,
+                             ' '.join(cl_leader_nation_pids.get(nk, ())) or '-'))
     # nazgul per-region counts + named minions (wrong-piece renders)
     try:
         en_naz, en_min = {}, {}
@@ -432,19 +541,48 @@ def diff_engine_vs_dump(state, dump, dynamic_types=None, ai_module=None,
                               % (mn, mp, er or '-', cr or '-'))
     except Exception as e:
         issues.append('character check unavailable: %r' % (e,))
-    # dice zones
+    # dice zones.  BRCMP-2: the client has FOUR die states - pool,
+    # hunt, used (killed -> Dead zone) and STAGED (Current Action).  A
+    # staged die is an unspent pool die (human window open) or a spent
+    # die not yet killed (the AI's chain-close kill), so the engine's
+    # pool/used counts may each exceed the client's by up to the
+    # staged count.  Rows print pid@zone (BRCMP-6).
     for s, tag in ((Side.FREE_PEOPLES, 'fp'), (Side.SHADOW, 'shadow')):
         total = len(st.dice.get(s, []))
         hunt = sum(1 for d in st.hunt_box
                    if getattr(d, 'side', None) is s)
         used = sum(1 for d in st.dice.get(s, []) if d.used) - hunt
         pool = total - used - hunt
-        for box, want in (('pool', pool), ('used', used),
-                          ('hunt', hunt)):
-            got = cl_dice.get((tag, box), 0)
-            if got != want:
-                issues.append('dice %s %s: engine=%d client=%d'
-                              % (tag, box, want, got))
+        c_pool = cl_dice.get((tag, 'pool'), 0)
+        c_used = cl_dice.get((tag, 'used'), 0)
+        c_hunt = cl_dice.get((tag, 'hunt'), 0)
+        c_stg = cl_dice.get((tag, 'staged'), 0)
+
+        def _dpids(*boxes, _tag=tag):
+            return ' '.join(p for b in boxes
+                            for p in cl_dice_pids.get((_tag, b), ())) \
+                or '-'
+        if c_hunt != hunt:
+            issues.append('dice %s hunt: engine=%d client=%d pids=%s'
+                          % (tag, hunt, c_hunt, _dpids('hunt')))
+        pool_ok = c_pool <= pool <= c_pool + c_stg
+        used_ok = c_used <= used <= c_used + c_stg
+        if not pool_ok:
+            issues.append('dice %s pool: engine=%d client=%d (+%d '
+                          'staged) pids=%s'
+                          % (tag, pool, c_pool, c_stg,
+                             _dpids('pool', 'staged')))
+        if not used_ok:
+            issues.append('dice %s used: engine=%d client=%d (+%d '
+                          'staged) pids=%s'
+                          % (tag, used, c_used, c_stg,
+                             _dpids('used', 'staged')))
+        if pool_ok and used_ok \
+                and c_pool + c_used + c_stg != pool + used:
+            issues.append('dice %s count: engine=%d client=%d '
+                          '(pool+used+staged) pids=%s'
+                          % (tag, pool + used, c_pool + c_used + c_stg,
+                             _dpids('pool', 'used', 'staged')))
     # decks
     for name, lst in (('fp char deck', st.fp_char_deck),
                       ('fp strat deck', st.fp_strat_deck),
@@ -479,7 +617,7 @@ def diff_engine_vs_dump(state, dump, dynamic_types=None, ai_module=None,
             issues.append('pool check unavailable: %r' % (e,))
     # SIEGE ZONES: inside-vs-outside a besieged settlement are
     # DIFFERENT client zones of one region; garrison side INSIDE the
-    # stronghold box, besieger OUTSIDE (donor :11270-11311)
+    # stronghold box, besieger OUTSIDE
     try:
         for breg in sorted(
                 {sanitize(str(b9)) for b9 in
@@ -530,6 +668,8 @@ def diff_engine_vs_dump(state, dump, dynamic_types=None, ai_module=None,
                 'board: %s' % (len(gone), ' '.join(gone[:12])))
     # companion zone classes: in-fellowship -> Fellowship/Guide box;
     # separated -> its map region; dead/out -> casualty or reinf zones
+    from .promotion_recovery import identity_rows
+    issues.extend(identity_rows(st, dump, marker_states))
     try:
         import log_replay as lr
         fs = st.fellowship
@@ -544,8 +684,15 @@ def diff_engine_vs_dump(state, dump, dynamic_types=None, ai_module=None,
                 nm9 = str(getattr(ld9, 'name', ''))
                 if nm9:
                     sep[nm9] = sanitize(str(k9))
+        # BRCMP-5: the client's PARKING slots count as dead/out-
+        # compatible - the client's own random-companion draw ('draws
+        # Boromir') parks the drawn piece in the drawer's Card Play
+        # zone; the corpus parser's _COMPANION_DEATH_AREAS calls that
+        # a death area (log_replay), the comparator must too
         deadish = {'fp casualties', 'sa casualties', 'dead',
-                   'fp dead', 'sa dead'}
+                   'fp dead', 'sa dead',
+                   'fp card play', 'sa card play', 'current action',
+                   'current fp card', 'current sa card'}
         fsbox = {'fellowship of the ring', 'guide of the fellowship',
                  'fellowship box', 'guide box'}
         for pid9, nm_t9 in sorted(lr.COMPANIONS.items()):
@@ -575,10 +722,86 @@ def diff_engine_vs_dump(state, dump, dynamic_types=None, ai_module=None,
                         % (nm_t9, zs))
     except Exception as e:
         issues.append('companion check unavailable: %r' % (e,))
+    # FELLOWSHIP TRACKS / PAWN / POLITICAL BOXES (BRCMP-7): the fields
+    # the adopters WRITE were never compared, so an adoption triggered
+    # by an unrelated row rewrote them with no row before and none
+    # after.  Rows here make them visible on every surface (and count
+    # for the adoption oracle); the driver's owed-track / owed-pawn
+    # holds keep an in-flight marker walk out of the census.
+    try:
+        import game_logic as _gl7
+        import log_replay as _lr7
+        fs7 = st.fellowship
+        physical_hidden = fellowship_marker_hidden(marker_states)
+        if physical_hidden is not None and bool(fs7.hidden) != physical_hidden:
+            issues.append('fellowship visibility: engine=%s client=%s pids=247'
+                          % ('hidden' if fs7.hidden else 'revealed',
+                             'hidden' if physical_hidden else 'revealed'))
+        in_mordor = bool(getattr(fs7, 'mordor_entered', False))
+        z248 = str(dump.get('248', '') or '')
+        m248 = re.match(r'^Track (\d+)$', z248)
+        if m248 and not in_mordor:
+            cp7 = int(m248.group(1))
+            ep7 = int(getattr(fs7, 'progress', 0) or 0)
+            if cp7 != ep7:
+                issues.append('track progress: engine=%d client=%d '
+                              'pids=248@%s' % (ep7, cp7, sanitize(z248)))
+        z252 = str(dump.get('252', '') or '')
+        m252 = re.match(r'^Track (\d+)$', z252)
+        if m252:
+            cc7 = int(m252.group(1))
+            ec7 = int(getattr(fs7, 'corruption', 0) or 0)
+            if cc7 != ec7:
+                issues.append('track corruption: engine=%d client=%d '
+                              'pids=252@%s' % (ec7, cc7, sanitize(z252)))
+        z247 = str(dump.get('247', '') or '')
+        zs247 = sanitize(z247)
+        m247 = re.match(r'^Mordor (\d)', z247)
+        if m247:
+            cstep = int(m247.group(1))
+            estep = getattr(fs7, 'mordor_step', None)
+            if not in_mordor or estep != cstep:
+                issues.append('pawn mordor step: engine=%s client=%d '
+                              'pids=247@%s'
+                              % (estep if in_mordor else 'not in mordor',
+                                 cstep, zs247))
+        elif z247 and _strip_sh(zs247) in regions and in_mordor:
+            issues.append('pawn mordor exit: engine=Mordor client=%s pids=247@%s'
+                          % (_strip_sh(zs247), zs247))
+        elif z247 and _strip_sh(zs247) in regions and not in_mordor:
+            ereg = sanitize(str(_gl7.fellowship_region(st)))
+            if ereg != _strip_sh(zs247):
+                issues.append('pawn region: engine=%s client=%s '
+                              'pids=247@%s' % (ereg, _strip_sh(zs247),
+                                               zs247))
+        pol7 = getattr(st, 'political', None)
+        if pol7 is not None:
+            for pid7, nation7 in _lr7.POLITICAL_MARKERS.items():
+                zp7 = str(dump.get(str(pid7), '') or '')
+                mp7 = re.match(r'^Political (\d)$', zp7)
+                if not mp7:
+                    continue
+                cbox7 = 3 - int(mp7.group(1))
+                ebox7 = pol7.boxes.get(nation7)
+                if ebox7 is not None and int(ebox7) != cbox7:
+                    issues.append('political %s: engine=%d client=%d '
+                                  'pids=%s@%s'
+                                  % (_nv(nation7), int(ebox7), cbox7,
+                                     pid7, sanitize(zp7)))
+                active7 = (political_marker_active(pid7, marker_states)
+                           if marker_states is not None else None)
+                if active7 is not None and bool(pol7.active.get(nation7, False)) != active7:
+                    issues.append('political activation %s: engine=%s client=%s '
+                                  'pids=%s@%s'
+                                  % (_nv(nation7), bool(pol7.active.get(nation7, False)),
+                                     active7, pid7, sanitize(zp7)))
+    except Exception as e:
+        issues.append('track/pawn/political check unavailable: %r'
+                      % (e,))
     # CONTROL MARKERS vs the engine's enemy_controlled sets.  Marker
     # supply is PHYSICAL (10 SH / 6 FP): controlling more regions than
     # markers is correct board state, so a shortfall of that size is
-    # tolerated, never an issue row (donor :11400-1474).
+    # tolerated, never an issue row.
     try:
         for key9, rng9 in (('sh', range(411, 421)),
                            ('fp', range(405, 411))):
@@ -613,28 +836,19 @@ def diff_engine_vs_dump(state, dump, dynamic_types=None, ai_module=None,
                               '%s' % (key9, ' '.join(off9)))
     except Exception as e:
         issues.append('control check unavailable: %r' % (e,))
-    # WAVE-J: the CLIENT'S OWN TURN COUNTER (fact 15, '<~Game.7~>N').
-    # The hand-built recover bypassed the client's menu handler and
-    # the marker NEVER ticked (wjg7: client 1 vs engine 6, invisible
-    # to every witness).  One contract: after both sides recover,
-    # client turn == engine turn.
-    try:
-        import re as _re9
-        tm9 = None
-        for _pid9, _z9 in dump.items():
-            _m9 = _re9.search(r'<~Game\.7~>(\d+)', str(_z9))
-            if _m9:
-                tm9 = int(_m9.group(1))
-                break
-        if tm9 is not None \
-                and int(getattr(st, 'turn', 0) or 0) != tm9:
-            issues.append('turn counter: engine=%s client=%s'
-                          % (getattr(st, 'turn', '?'), tm9))
-    except Exception:
-        pass
+    # the CLIENT'S OWN TURN COUNTER (fact 15): after both sides recover,
+    # client turn == engine turn.  BRCMP-8: the dump carries NO Game.7
+    # row (the client does not export the turn marker), so the leg
+    # reads the CALLER's client-turn channel (`client_turn`) and is
+    # NOT-MEASURED (no row) without one - never a dead check posing as
+    # a passing one.
+    if client_turn is not None \
+            and int(getattr(st, 'turn', 0) or 0) != int(client_turn):
+        issues.append('turn counter: engine=%s client=%s'
+                      % (getattr(st, 'turn', '?'), int(client_turn)))
     # ELVEN-RING BOXES: pids 249-251 in the Vilya/Nenya/Narya Slots =
     # available, Used Ring / Dark Ring = Sauron-held, SA casualties =
-    # disposed; conservation closes the face (donor :11477-11509)
+    # disposed; conservation closes the face
     try:
         av = us = dis = 0
         for rp in ('249', '250', '251'):
@@ -658,7 +872,83 @@ def diff_engine_vs_dump(state, dump, dynamic_types=None, ai_module=None,
                           'held + %d disposed != 3' % (av, us, dis))
     except Exception as e:
         issues.append('elven-ring check unavailable: %r' % (e,))
+    from .table_recovery import rows as table_card_rows
+    issues.extend(table_card_rows(state, dump, pid_to_cid))
     return issues
+
+
+def captured_garrison_conflicts(state):
+    """Captured settlements still occupied by their original garrison.
+
+    Siege armies share one engine region entry. At a captured stronghold,
+    the original owner's units may legally besiege the capturing side's
+    garrison. Require the stronghold, siege flag and both unit sides before
+    treating those units as besiegers; a stale flag alone proves nothing.
+    """
+    import game_state as gs
+    from board import regions, sanitize
+    from combat import side_of_nation
+    armies = {sanitize(str(k)): army for k, army in
+              getattr(state, 'armies', {}).items()}
+    sieges = {sanitize(str(k)) for k in
+              (getattr(state, 'besieged_strongholds', None) or ())}
+    conflicts = []
+    for captor in (gs.Side.SHADOW, gs.Side.FREE_PEOPLES):
+        owner = (gs.Side.FREE_PEOPLES if captor is gs.Side.SHADOW
+                 else gs.Side.SHADOW)
+        captured = (getattr(state, 'enemy_controlled', None) or {}).get(captor)
+        for key in list(captured or ()):
+            region = sanitize(str(key))
+            army = armies.get(region)
+            if army is None or not army.units:
+                continue
+            sides = [side_of_nation(unit.nation) for unit in army.units]
+            count = sides.count(owner)
+            if not count:
+                continue
+            if (region in sieges and regions.get(region, {}).get('is_stronghold')
+                    and captor in sides):
+                continue
+            conflicts.append((captor, owner, key, count))
+    return conflicts
+
+
+def rules_invariant_rows(state):
+    """BL-21(4) (2026-08-25): agreed-wrong states the piece diff can
+    NEVER see (engine == client on the same impossible board).  Rows
+    ride the witness cadence into ai_census.jsonl, so the tester's
+    DIVERGENCE=STOP rule fires on a rules-impossible state exactly
+    like on a desync.  First invariant: a captured settlement whose
+    original owner's units still stand (the Woodland Realm chimera)."""
+    import game_state as gs
+    rows = []
+    for cap_side, owner, rkey, n in captured_garrison_conflicts(state):
+        rows.append('INVARIANT captured-with-garrison: %d %s '
+                    'unit(s) stand in %s-captured %s'
+                    % (n, owner.name, cap_side.name, rkey))
+    # BL-21(5) (2026-08-25): a broken figure conservation (deployed +
+    # casualties > the physical components) is another agreed-wrong
+    # state the piece diff never sees - a resync that resurrected a
+    # dead FP garrison without rolling back fp_casualties.  It rides
+    # the witness cadence so the tester STOPs on it live.
+    try:
+        import ai as _ai
+        dep = _ai._count_deployed_all(state)
+        fcas = getattr(state, 'fp_casualties', None) or {}
+        for nat, maxes in _ai.NATION_MAX_FIGURES.items():
+            fp = _ai._side_of_nation(nat) == gs.Side.FREE_PEOPLES
+            d = dep.get(nat, {})
+            c = fcas.get(nat, {}) if fp else {}
+            for kind, mx in maxes.items():
+                tot = d.get(kind, 0) + c.get(kind, 0)
+                if tot > mx:
+                    rows.append('INVARIANT conservation %s %s: %d '
+                                'deployed + %d casualties > %d'
+                                % (getattr(nat, 'name', nat), kind,
+                                   d.get(kind, 0), c.get(kind, 0), mx))
+    except Exception as _ce:
+        rows.append('conservation check unavailable: %r' % (_ce,))
+    return rows
 
 
 def card_census(state, dump, hand_cids=None):
@@ -693,11 +983,11 @@ def card_census(state, dump, hand_cids=None):
                           % (tag[s], eng_n, len(in_hand),
                              ' '.join(in_hand) or '(none)'))
         if hand_cids is not None and s in hand_cids:
-            # WAVE-J (wjg5 false alarm): SIDE-SCOPED identity - a side
-            # absent from hand_cids is size-only.  Under blinding the
-            # HUMAN side's client identities are structurally unknown
-            # (engine holds placeholders); comparing them produced
-            # 'engine-only=[HU_FR_*]' rows that escalated a NON-desync.
+            # SIDE-SCOPED identity: a side absent from hand_cids is
+            # size-only (under blinding the HUMAN side's client
+            # identities are structurally unknown - the engine holds
+            # placeholders - and comparing them would escalate a
+            # NON-desync)
             eng = sorted(c for c in state.hands[s].hand
                          if isinstance(c, str))
             cli = sorted(hand_cids.get(s, []))

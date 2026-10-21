@@ -240,6 +240,8 @@ def build_hunt_state(ctx: HuntContext):
     st._mithril_stash = None
     st._wizardstaff_stash = None
     st._reveal_place_due = False
+    st._fellowship_route_event = None
+    st._pending_reveal_strongholds = ()
     st._hobbit_place_queue = []
     st._sh_tile_drawn_regions = None
     st._crebain_hunt_bonus = ctx.crebain_bonus
@@ -271,7 +273,9 @@ def observe(st, pre: dict) -> tuple:
             or st.pending_guide_change is not None \
             or getattr(st, '_pending_hunt_damage', 0) > 0 \
             or getattr(st, '_hobbit_place_queue', None) \
-            or getattr(st, '_reveal_place_due', False):
+            or getattr(st, '_reveal_place_due', False) \
+            or getattr(st, '_fellowship_route_event', None) \
+            or getattr(st, '_pending_reveal_strongholds', None):
         raise RuntimeError('observe() on unresolved hunt state')
     remaining = {c.name for c in st.fellowship.companions}
     placed = set()
@@ -324,6 +328,11 @@ class HuntDriver:
         self.source = source
 
     def choose(self, options):
+        # Action-finally upkeep can request another draw while HuntFork is
+        # unwinding. Preserve the FIRST unresolved draw and its branch menu;
+        # this partial walk must be discarded before any later draw runs.
+        if self.pending is not None:
+            raise HuntFork()
         if self.ptr < len(self.plan):
             i = self.plan[self.ptr]
             self.ptr += 1
@@ -544,6 +553,7 @@ def drive_hunt_event(st, ctx: HuntContext):
             gl._settle_hunt_damage(st)
     first_sacrifice = True
     for _ in range(200):
+        gl.settle_hunt_reveal(st)
         if st.pending_card_option is not None:
             _resolve_pco(st, ctx)
             continue
@@ -581,10 +591,7 @@ def drive_hunt_event(st, ctx: HuntContext):
                 and not getattr(st, '_pending_hunt_damage', 0):
             # mirror ai fellowship_move 1.132 tail
             st._reveal_place_due = False
-            try:
-                gl._auto_reveal_place(st)
-            except Exception:
-                pass
+            gl._auto_reveal_place(st)
             if getattr(st, '_pending_hunt_damage', 0) > 0:
                 if not gl._offer_hunt_reduction(st):
                     gl._settle_hunt_damage(st)
@@ -600,6 +607,12 @@ def drive_hunt_event(st, ctx: HuntContext):
         if getattr(st, '_hobbit_place_queue', None):
             gl.pop_hobbit_place_queue(st)
             continue
+        if (getattr(st, '_fellowship_route_event', None)
+                or getattr(st, '_pending_reveal_strongholds', None)):
+            from fellowship_reveal_route import drain
+            drain(st)
+            continue
+        gl.return_mithril_tile_if_settled(st)
         return
     raise RuntimeError('drive_hunt_event: no quiescence in 200 steps')
 

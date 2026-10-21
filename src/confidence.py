@@ -44,7 +44,6 @@ ASCII only.
 import json
 import os
 
-D_ENC_DEFAULT = 3742
 HID = 256
 OUT_D = 64
 GROW_LR = 3e-4
@@ -256,9 +255,8 @@ def seed_from_ds(ds_dir, tag, n_ref=60000, seed=0, epochs=2,
     X = np.load(os.path.join(ds_dir, '%s_X.npy' % tag),
                 mmap_mode='r')
     n = X.shape[0]
-    # reserve at most 200k tail rows but never starve the reference:
-    # the old arithmetic collapsed the fit zone to CALIB_N+1024 rows
-    # for every dataset under ~205k, defeating n_ref
+    # reserve at most 200k tail rows but never starve the reference
+    # (n_ref)
     tail = min(200000, max(0, n - (n_ref + CALIB_N)))
     zone = n - tail
     take = min(n_ref + CALIB_N, zone)

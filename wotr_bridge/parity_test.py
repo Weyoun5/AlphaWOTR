@@ -1,40 +1,16 @@
-"""AI-vs-AI client<->engine parity harness.
+"""State summaries shared by the bridge's comparators.
 
-The Java client (WOTR-Gandalf) is a PURE RENDERER: it applies whatever
-well-formed log lines it is given, rolls dice with its own RNG, and
-stores the log.  It enforces NO War-of-the-Ring rules.  So "the bridge
-is wired correctly" means two independent things:
+summarize(state) is the comparable projection of an engine state (armies
+by region/type, fellowship, table, political, VP) that
+client_board.proj_board / board_delta and gesture_match key on - the ONE
+answerer for the projection; diff_summ(a, b) names the first cross-model
+difference.
 
-  (A) ROUND-TRIP FIDELITY: for every action the engine takes, the client
-      lines the emitter produces, once parsed back, reconstruct the SAME
-      game state the engine's own forward model (apply_action) produced.
-      If these ever disagree, a move would render on the client board
-      differently from what the AI believes it did.
-
-  (B) CLIENT RENDER FIDELITY: the client, fed that same line stream,
-      writes back a log identical (modulo per-line checksum tokens) to
-      what we injected -- i.e. it dropped/garbled nothing.
-
-This module proves (A) fully in-process (no client needed): it self-
-plays a whole AI-vs-AI game, and at EVERY step cross-checks
-    engine_forward = apply_action(state, action)
-against
-    round_trip     = replay(log + emitted_lines_for(action))
-comparing a high-level state summary (armies by region/type, fellowship,
-political track, VP, minions, dice).  The identical RNG requirement is
-met by construction: the SAME seeded rolls drive both the engine
-forward model and the emitted Controls.345 lines, so both consume the
-same dice -- exactly "run the same RNG on our engine and compare".
-
-(B) is checked by inject_and_verify() once a client log is captured.
-
-Usage:
-  python wotr_bridge/parity_test.py --game --seed 0 --max-turns 8
-  python wotr_bridge/parity_test.py --verify-client <client_log.txt>
+The AI-vs-AI parity harness that once lived here (ParityGame /
+inject_and_verify / the --game and --verify-client CLI) was retired with
+the monolith on 2026-08-22.
 """
-import argparse
 import os
-import random
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,9 +18,6 @@ SRC = os.path.abspath(os.path.join(HERE, '..', 'src'))
 for p in (HERE, SRC):
     if p not in sys.path:
         sys.path.insert(0, p)
-
-import emitter                                       # noqa: E402
-from emitter import render, strip_tail, classify_line  # noqa: E402
 
 
 # ------------------------------------------------------- state summary
@@ -145,10 +118,3 @@ def diff_summ(a, b):
             return '%s: engine=%s roundtrip=%s' % (key, a.get(key),
                                                    b.get(key))
     return None
-
-
-# ------------------------------------------------------- self-play loop
-
-# The monolith-driven ParityGame / inject_and_verify / main that followed
-# were retired with wotr_bridgei_move_server.py (archived
-# 2026-08-22); summarize/diff_summ above are the live imports.

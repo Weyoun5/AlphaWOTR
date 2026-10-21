@@ -108,10 +108,14 @@ def meta_side(meta):
 
 
 def meta_pids(meta):
-    """The record's exact piece ids (list of str), or None when absent
-    OR REDACTED (blinding fail-closed: redaction is never a value)."""
+    """Exact known piece ids, or None when absent, empty, or redacted.
+
+    Native rendered-only commands carry ``pids: []``. They provide no
+    identity evidence; callers may use public side/face/name matching, but
+    must not interpret the empty channel as proof that no piece can match.
+    """
     p = (meta or {}).get('pids')
-    if isinstance(p, list):
+    if isinstance(p, list) and p:
         return [str(x) for x in p]
     return None
 

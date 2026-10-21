@@ -29,17 +29,12 @@ for _p in (_SRC, _BRIDGE):
 
 from . import gesture_match
 from . import live_parser
-from .driver import DriverHalt, HandModel, LiveDriver, PhaseWindow
+from .driver import DriverHalt, HandModel, LiveDriver
 
 
-# _RandCtl hoisted into driver.py (WAVE-E/coordinator 2026-08-20);
-# the alias keeps existing references working (test_live_spectator
-# builds a ctl through it).  PhaseWindow likewise
+# _RandCtl is re-exported for test_live_spectator (it builds a ctl
+# through this module)
 from .driver import _RandCtl  # noqa: F401  (re-export)
-# (WAVE-G 2026-08-20: the shadow class + 14 shadow method copies were
-# deleted per WAVE-E's list; base deltas adopted knowingly — alarms on
-# expiries/commit-halts, _out_queue outputs.  Overrides that REMAIN
-# below have genuinely diverged from the base and say why.)
 
 
 class SpectatorDriver(LiveDriver):
@@ -59,8 +54,6 @@ class SpectatorDriver(LiveDriver):
                                             gs.Side.FREE_PEOPLES),
             gs.Side.SHADOW: HandModel(engine_state, gs.Side.SHADOW),
         }
-        # (census/deferral/pending/nick state is seeded by
-        # LiveDriver.__init__ — the WAVE-E hoist; no re-seeds here)
         # PER-TURN RESYNC (USER 2026-08-19: "resync every turn, so we
         # can narrow down where divergences occur and what is broken
         # vs messy piece movement"): a Mirror — the corpus-proven
@@ -332,6 +325,8 @@ class SpectatorDriver(LiveDriver):
         roster and the A-die windows matched nothing."""
         import ai
         import game_logic as gl
+        if self.game_over is not None:
+            return []
         if self.deferred is not None:
             self._retry_blocked()
         if self.deferred is not None:
@@ -347,10 +342,12 @@ class SpectatorDriver(LiveDriver):
         self._snapshot([rec.get('norm', '')], 'rollover')
         ended = gl.begin_turn_reset(self.es, self.es.turn + 1,
                                     deal_cards=False, bonus_dice=True)
+        if ended:
+            self.game_over = gl.check_all_victory_conditions(self.es)
+            return [('note', 'game over: %s (%s)' %
+                     (self.game_over['victory'], self.game_over['victory_type']))]
         self.phase = 'draws'
         self.turn_draws = {}
-        if ended:
-            return [('note', 'game over: corruption')]
         return []
 
     def _on_chat(self, rec):
@@ -375,16 +372,6 @@ class SpectatorDriver(LiveDriver):
         return []
 
     # ---- windows: either seat, rng-fed matching -----------------------
-    # (_attempt_pin / _feed_window_rng / _feed_draw_rec / _commit_chain
-    # inherit from LiveDriver — WAVE-E hoist, shadows deleted WAVE-G.
-    # Adopted base deltas: _commit_chain also alarms on a replay halt.)
-
-    # (_expire_deferred / _retry_skip_draw_grants inherit from
-    # LiveDriver — WAVE-I hoist of the WAVE-F growth (starve-note,
-    # draws-grant retry, _unreveal rollback), bodies verbatim; the
-    # base's live-only alarms are gated on the spectator flag, proven
-    # by the g1-census byte-A/B.)
-
     def _retry_ring_waiver_pick(self, w, side):
         """ENGINE GAP (reported, engine FROZEN): the A7 ring waiver is
         honored by ai._consume_die_for_face but NOT by game_logic.
@@ -448,9 +435,8 @@ class SpectatorDriver(LiveDriver):
         if ai.describe_pending(self.es) is not None:
             self._expire_pending('unresolved at next window')
         # an expiry that RESOLVED the pending (silent no-op, forced
-        # discard) unblocks this window — hold only when one is still
-        # genuinely open (the old unconditional hold let one jammed
-        # discard eat every later window)
+        # discard) unblocks this window - hold only when one is still
+        # genuinely open
         if ai.describe_pending(self.es) is not None:
             w_norms = [r.get('norm', '') for r in w.records]
             self.uncommitted.extend(w_norms)
@@ -486,10 +472,6 @@ class SpectatorDriver(LiveDriver):
         self._feed_window_rng(w)
         return self._match_window_now(w, side)
 
-    # (_unreveal inherits from LiveDriver — WAVE-I hoist; the base
-    # tolerates a missing per-side hand model, which the spectator
-    # never has.)
-
     def _match_window_now(self, w, side):
         res = gesture_match.match_window(self.es, side, w,
                                          rng=self.rctl)
@@ -515,12 +497,10 @@ class SpectatorDriver(LiveDriver):
             # that is not this gesture, and deferring on it turned
             # plain non-matches into deferral noise on every army-move
             # window near a siege.  The HUNT-ROLL kind gets the same
-            # precision (WAVE-G): a die_killed window with NO
-            # fellowship content can never be awaiting its own hunt
-            # roll — the starving candidates are fellowship-move
-            # probes, not this gesture (game 2023-01-31: four FP
-            # ring/muster/crown windows deferred on probe noise and
-            # expired, burying their real causes).
+            # precision: a die_killed window with NO fellowship
+            # content can never be awaiting its own hunt roll - the
+            # starving candidates are fellowship-move probes, not this
+            # gesture.
             facts = gesture_match.window_facts(w)
             fs_windowed = bool(facts.fel_moves or facts.fel_flips
                                or facts.fs_progress)
@@ -743,8 +723,7 @@ class SpectatorDriver(LiveDriver):
             # a CARD window: card effects place units regardless of
             # At-War (Thranduil's Archers class) — the window failed
             # for some other reason; naming it a dice-muster misplay
-            # would be a false accusation (first cut fired 12 times on
-            # game 2023-01-28's failed card windows)
+            # would be a false accusation
             return
         rows = []
         for rec in w.body_records():
@@ -783,21 +762,6 @@ class SpectatorDriver(LiveDriver):
                 % (side.name, w.die_face, rows, caveat)))
 
     # ---- pending phase-buffer + blocked-item retry ----------------------
-    # (_rec_inert / _is_dice_bookkeeping / _pending_menu / _try_pending
-    # inherit from LiveDriver — WAVE-E hoist, shadows deleted WAVE-G.
-    # _try_pending equivalence note: the base omits stop_kinds=() but
-    # match_window neutralizes stop_kinds for every non-die_to_hunt
-    # window, and PhaseWindow.closed == 'pending'.)
-
-    # (_try_pending_prefixes inherits from LiveDriver — WAVE-I hoist,
-    # body verbatim.)
-
-    # (_expire_pending inherits from LiveDriver - WAVE-I hoist of the
-    #  WAVE-F/G growth: prefix consumption, generalized silent-noop,
-    #  discard force, second-empty-expiry force; body verbatim, live
-    #  alarm gated on the spectator flag - g1-census byte-A/B proven.)
-
-
     def _on_undo(self, ev, rec):
         """Head kept for the PENDING BUFFER only: a buffered-but-
         uncommitted pending record undone by the client dissolves,
@@ -816,15 +780,6 @@ class SpectatorDriver(LiveDriver):
                     self.pending_buf = None
                 return []
         return LiveDriver._on_undo(self, ev, rec)
-
-    # (_retry_blocked / _flush_deferred_tail inherit from LiveDriver —
-    # WAVE-E hoist, shadows deleted WAVE-G; base delta adopted
-    # knowingly: replayed tail handler outputs ride _out_queue, which
-    # the spectator ingest loop never drains.)
-
-    # (_replay_records inherits from LiveDriver — WAVE-I hoist, body
-    # verbatim: it routes via LiveDriver._route directly, so the
-    # spectator's mirror never double-tracks a replayed record.)
 
     # ---- report --------------------------------------------------------
     def census(self):

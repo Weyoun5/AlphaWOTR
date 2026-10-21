@@ -12,14 +12,13 @@
 ;shortGroupDesc - set this to get shorter group descriptions in the chat window
 ;lastPasswordUsed - a record of the last password you used in case you forget it (I know I have)
 
-;aimute:false
-nick:Wey
-zoom:100
+nick:Player
+zoom:110
 zoomLevels:80,90,100,110,120,130,140,150,200
-winx:1933
-winy:1045
+winx:1936
+winy:1048
 port:4747
-addr:127.0.0.1
+addr:
 font:SansSerif
 fontsize:15
 cardsWidth:360
@@ -39,7 +38,7 @@ language:
 flashOptional:5
 translation:ENGLISH[en]
 shortGroupDesc:false
-lastPasswordUsed:ai
+lastPasswordUsed:
 lastGame:base2
 horizontalSpacing:2
 verticalSpacing:2

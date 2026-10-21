@@ -14,3 +14,9 @@ __pycache__/
 # editor / OS litter
 .DS_Store
 Thumbs.db
+
+# Local installation evidence and live search traces
+LOCAL_*
+CANDIDATE_*
+launcher.log
+wotr_bridge/play_client/own_search_calls.jsonl

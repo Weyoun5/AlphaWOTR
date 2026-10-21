@@ -154,8 +154,6 @@ class NeedClientCall(BaseException):
 #           through the single whitelisted chat exit (design rule 7)
 Directive = namedtuple('Directive', ('kind', 'text'))
 
-_SIDE_NAMES = ('FREE_PEOPLES', 'SHADOW')
-_DECK_KEYS = ('character', 'strategy')
 _CARD_ATTR = {('FREE_PEOPLES', 'character'): 'fp_char_deck',
               ('FREE_PEOPLES', 'strategy'): 'fp_strat_deck',
               ('SHADOW', 'character'): 'sh_char_deck',
@@ -229,13 +227,10 @@ def _is_wwsat_seq(seq):
 
 
 # ---- one install per process, current-instance dispatch -------------
-# The patch targets are MODULE globals; a per-instance guard with
-# closures frozen on one instance stacked funnel layers whose inner
-# layer consulted a STALE instance's depth (always 0) - the real
-# trajectory fell through to raw random.randint and the tripwire
-# halted the game (synth probe14, 2026-08-16).  The funnels install
-# once per process and every closure consults the instance that is
-# CURRENTLY deciding via _ACTIVE.
+# The patch targets are MODULE globals: the funnels install once per
+# process and every closure consults the instance that is CURRENTLY
+# deciding via _ACTIVE (a closure frozen on a stale instance reads
+# depth 0 forever and falls through to raw random.randint).
 _INSTALLED = False
 _ACTIVE = None
 
@@ -277,7 +272,6 @@ class ClientRandomness(object):
     # engine checks `valid` is non-empty first), so the loop terminates
     # with probability 1 - the cap exists so a face-table bug becomes a
     # loud halt instead of an infinite drain on the client feed.
-    # (Provenance: ai_move_server.py:11896-11901.)
     DWARVEN_REROLL_CAP = 24
 
     def __init__(self, human_side=None, seed=None):
@@ -306,6 +300,7 @@ class ClientRandomness(object):
         # other queues keep prefix cursors.
         self._feed = {'d6': [], 'tiles': [], 'cards': {},
                       'companion': [], 'card_pick': []}
+        self._card_feed_raw = {}
         self._feed_pos = {'d6': set(), 'tiles': 0, 'cards': {},
                           'companion': 0, 'card_pick': 0}
         # the NeedClientCall currently starving the engine
@@ -355,7 +350,10 @@ class ClientRandomness(object):
             return
         _INSTALLED = True
         import game_logic as gl
+        import game_state as gs
         import combat as cb
+        import event_effects as ee
+        import onslaught_choices as oc
 
         orig_gl_batch = gl.roll_d6_batch
         orig_cb_batch = cb.roll_d6_batch
@@ -365,18 +363,238 @@ class ClientRandomness(object):
         orig_dwarf = gl.use_dwarven_ring
         orig_pick_comp = gl.pick_random_companion
         orig_pick_card = gl.pick_random_card
+        orig_pre_combat = cb._apply_pre_combat_for_side
+        orig_post_casualty = cb._apply_post_casualty_for_side
+        orig_onslaught = cb.apply_onslaught_choice
+        orig_onslaught_advance = oc._advance
+        orig_words = cb.apply_words_of_power
+        orig_terrible = cb.apply_they_are_terrible
+        orig_dice_modifiers = cb.apply_dice_modifiers
+        orig_mighty_attack = cb.apply_mighty_attack
+        orig_resume_combat = cb.resume_combat
+        orig_resolve_combat = cb.resolve_combat
+        orig_round_annotations = cb._emit_round_annotations
+        orig_event_card = ee.play_event_card
+        orig_dead_men = ee.effect_dead_men_of_dunharrow
+
+        def _words(combat, choices=None):
+            before = getattr(combat, '_wop_cancelled', None)
+            result = orig_words(combat, choices)
+            active = _active_live()
+            if active is not None:
+                from .automatic_combat_reports import words_observation
+                observed = words_observation(combat, before, choices)
+                if observed is not None:
+                    active._automatic_words_reports.append(observed)
+            return result
+
+        def _fixed_forfeit(original, combat, effect):
+            active = _active_live()
+            if active is None:
+                return original(combat)
+            from .fixed_forfeit_reports import snapshot, observations
+            before = snapshot(combat)
+            result = original(combat)
+            observed = observations(combat, before, effect)
+            active._automatic_forfeit_reports.extend(observed)
+            # The next boundary may be a real human choice rather than a
+            # random request (They are Terrible precedes Mighty Attack).
+            # Keep only these actually resolved public facts on this round's
+            # owning cursor so the subsequent resume can report them.
+            if observed:
+                from .fixed_forfeit_reports import remember
+                remember(combat, observed)
+            return result
+
+        def _terrible(combat):
+            return _fixed_forfeit(orig_terrible, combat, 'They are Terrible')
+
+        def _dice_modifiers(combat):
+            return _fixed_forfeit(orig_dice_modifiers, combat, 'Cruel as Death')
+
+        def _mighty_attack(combat, rolls, threshold, modifier, is_attacker, choices=None):
+            active = _active_live()
+            if active is None:
+                return orig_mighty_attack(combat, rolls, threshold, modifier, is_attacker, choices)
+            role = 'attacker' if is_attacker else 'defender'
+            before = (getattr(combat, role + '_leadership'),
+                      list(getattr(combat, '_round_paid_leadership', ())))
+            result = orig_mighty_attack(combat, rolls, threshold, modifier, is_attacker, choices)
+            if active is not None:
+                from .anduril_reports import observe
+                observed = observe(combat, before, rolls, threshold, modifier, is_attacker, result)
+                if observed is not None:
+                    active._automatic_anduril_reports.append(observed)
+            return result
+
+        def _round_annotations(state, combat, *args, **kwargs):
+            result = orig_round_annotations(state, combat, *args, **kwargs)
+            active = _active_live()
+            if active is not None:
+                # Observe the actual owning round before the engine clears its
+                # cursor. A pre-combat wipe also increments rounds_fought, but
+                # its zero ordinary totals are not a rolled zero-hit result.
+                active._combat_summary_rolls.append((
+                    combat.attacker_region, combat.defender_region,
+                    bool(combat.attacker_combat_rolls or combat.defender_combat_rolls)))
+            return result
+
+        def _attach_summary_rolls(result, observed):
+            from .automatic_combat_reports import region_key
+            if (not getattr(result, 'round_paused', False)
+                    and len(observed) == result.rounds_fought
+                    and all(region_key(origin) == region_key(result.attacker_region)
+                            and region_key(destination) == region_key(result.defender_region)
+                            for origin, destination, _ in observed)):
+                result._bridge_ordinary_round_rolls = tuple(row[2] for row in observed)
+
+        def _resume_combat(state, payload, decision):
+            active = _active_live()
+            summary_start = len(active._combat_summary_rolls) if active is not None else 0
+            if active is not None:
+                from .fixed_forfeit_reports import retained
+                battle = getattr(payload.get('cursor'), 'combat', None) if isinstance(payload, dict) else None
+                for observed in retained(battle):
+                    if observed not in active._automatic_forfeit_reports:
+                        active._automatic_forfeit_reports.append(observed)
+                from .anduril_reports import retained as retained_anduril
+                for observed in retained_anduril(battle):
+                    if observed not in active._automatic_anduril_reports:
+                        active._automatic_anduril_reports.append(observed)
+            from .anduril_reports import result_context, attach_result
+            context = result_context(state) if active is not None else None
+            result = orig_resume_combat(state, payload, decision)
+            if active is not None:
+                attach_result(result, context, active._automatic_anduril_reports)
+                attach_result(result, context, active._automatic_forfeit_reports,
+                              attribute='_bridge_fixed_forfeit_reports')
+                _attach_summary_rolls(result, active._combat_summary_rolls[summary_start:])
+            return result
+
+        def _resolve_combat(state, *args, **kwargs):
+            active = _active_live()
+            summary_start = len(active._combat_summary_rolls) if active is not None else 0
+            from .anduril_reports import result_context, attach_result
+            context = result_context(state) if active is not None else None
+            result = orig_resolve_combat(state, *args, **kwargs)
+            if active is not None:
+                attach_result(result, context, active._automatic_anduril_reports)
+                attach_result(result, context, active._automatic_forfeit_reports,
+                              attribute='_bridge_fixed_forfeit_reports')
+                _attach_summary_rolls(result, active._combat_summary_rolls[summary_start:])
+            return result
 
         def _gl_batch(n, ctx='', side=None):
             a = _active_live()
             if a is not None:
+                # The engine's Hunt helper predates side-tagged batches.
+                # Shadow owns both the initial Hunt roll and its rerolls,
+                # regardless of which side initiated the Fellowship move.
+                if side is None and ctx in ('hunt roll', 'hunt reroll', 'shelob d6 damage'):
+                    side = gs.Side.SHADOW
+                scope = getattr(a, '_roll_context', None) or {}
+                if side is None:
+                    side = scope.get('side')
+                if ctx == 'card effect' and scope:
+                    ctx = 'event card'
                 return a._consume_d6(n, ctx, side=side)
             return orig_gl_batch(n, ctx)
 
         def _cb_batch(n, ctx='', side=None):
             a = _active_live()
             if a is not None:
-                return a._consume_d6(n, ctx, side=side)
+                scope = getattr(a, '_roll_context', None) or {}
+                return a._consume_d6(n, scope.get('ctx', ctx),
+                                     side=side if side is not None else scope.get('side'),
+                                     role=scope.get('role'))
             return orig_cb_batch(n, ctx)
+
+        @contextlib.contextmanager
+        def _effect_scope(combat, is_attacker, timing):
+            a = _active_live()
+            if a is None:
+                yield
+                return
+            previous = getattr(a, '_roll_context', None)
+            role = 'attacker' if is_attacker else 'defender'
+            card = getattr(combat, role + '_card', None)
+            a._roll_context = dict(side=getattr(combat, role + '_side'),
+                                   role=role, ctx=timing + ' ' + str(getattr(card, 'combat_name', '')))
+            try:
+                yield
+            finally:
+                a._roll_context = previous
+
+        def _pre_combat(combat, is_attacker):
+            with _effect_scope(combat, is_attacker, 'pre-combat'):
+                return orig_pre_combat(combat, is_attacker)
+
+        def _post_casualty(combat, is_attacker, choices=None):
+            with _effect_scope(combat, is_attacker, 'post-casualty'):
+                try:
+                    return orig_post_casualty(combat, is_attacker, choices)
+                except NeedClientCall as request:
+                    active = _active_live()
+                    state = getattr(combat, '_live_state', None)
+                    if state is None:
+                        state = getattr(cb, '_ACTIVE_STATE', None)
+                    if active is not None and state is not None:
+                        # The deferred combat tail has already applied ordinary
+                        # losses. Retain that actual clone before the effect's
+                        # active-state scope unwinds, without committing it.
+                        request._physical_pre_request_state = state
+                        request._physical_request_owner = active
+                    raise
+
+        def _onslaught(*args, **kwargs):
+            a = _active_live()
+            if a is None:
+                return orig_onslaught(*args, **kwargs)
+            previous = getattr(a, '_roll_context', None)
+            a._roll_context = dict(side=kwargs.get('own_side', args[3] if len(args) > 3 else None),
+                                   ctx='post-casualty Onslaught')
+            try:
+                return orig_onslaught(*args, **kwargs)
+            finally:
+                a._roll_context = previous
+
+        def _onslaught_advance(state, pc):
+            # Staged unit payments use a different engine entry point from
+            # apply_onslaught_choice. Its final combat_roll is the card's
+            # additional 4+ attack, not another ordinary combat round.
+            a = _active_live()
+            if a is None:
+                return orig_onslaught_advance(state, pc)
+            payment = pc['_onslaught_payment']
+            role, _ = oc._roles(payment)
+            previous = getattr(a, '_roll_context', None)
+            a._roll_context = dict(side=pc[role + '_side'], role=role,
+                                   ctx='post-casualty Onslaught')
+            try:
+                return orig_onslaught_advance(state, pc)
+            finally:
+                a._roll_context = previous
+
+        @contextlib.contextmanager
+        def _owner_scope(side):
+            a = _active_live()
+            if a is None:
+                yield
+                return
+            previous = getattr(a, '_roll_context', None)
+            a._roll_context = dict(side=side)
+            try:
+                yield
+            finally:
+                a._roll_context = previous
+
+        def _event_card(state, side, *args, **kwargs):
+            with _owner_scope(side):
+                return orig_event_card(state, side, *args, **kwargs)
+
+        def _dead_men(*args, **kwargs):
+            with _owner_scope(gs.Side.FREE_PEOPLES):
+                return orig_dead_men(*args, **kwargs)
 
         def _tile(state):
             a = _active_live()
@@ -413,9 +631,8 @@ class ClientRandomness(object):
                               forced_face=forced_face, **kw)
 
         def _pick_comp(candidates, ctx=''):
-            # the NAMED companion funnel (Phase 1, 2026-08-19):
-            # replaces the old random.choice sequence-type sniffing -
-            # ONE patched site, the engine names the draw itself
+            # the NAMED companion funnel: ONE patched site, the engine
+            # names the draw itself
             a = _active_live()
             if a is not None:
                 return a._consume_companion(candidates, ctx)
@@ -433,6 +650,19 @@ class ClientRandomness(object):
 
         gl.roll_d6_batch = _gl_batch
         cb.roll_d6_batch = _cb_batch
+        cb._apply_pre_combat_for_side = _pre_combat
+        cb._apply_post_casualty_for_side = _post_casualty
+        cb.apply_onslaught_choice = _onslaught
+        oc._advance = _onslaught_advance
+        cb.apply_words_of_power = _words
+        cb.apply_they_are_terrible = _terrible
+        cb.apply_dice_modifiers = _dice_modifiers
+        cb.apply_mighty_attack = _mighty_attack
+        cb.resolve_combat = _resolve_combat
+        cb.resume_combat = _resume_combat
+        cb._emit_round_annotations = _round_annotations
+        ee.play_event_card = _event_card
+        ee.effect_dead_men_of_dunharrow = _dead_men
         gl.pick_hunt_tile = _tile
         gl.pop_hunt_tile = _pop
         gl.draw_event_card = _draw
@@ -527,12 +757,20 @@ class ClientRandomness(object):
         def _cm():
             self._adv_depth += 1
             if self._adv_depth == 1:
+                self._automatic_words_reports = []
+                self._automatic_forfeit_reports = []
+                self._automatic_anduril_reports = []
+                self._combat_summary_rolls = []
                 self._rng_outer = random.getstate()
                 random.setstate(self._step_rng_cur)
             try:
                 yield
             finally:
                 if self._adv_depth == 1:
+                    self._automatic_words_reports = []
+                    self._automatic_forfeit_reports = []
+                    self._automatic_anduril_reports = []
+                    self._combat_summary_rolls = []
                     self._step_rng_cur = random.getstate()
                     random.setstate(self._rng_outer)
                 self._adv_depth -= 1
@@ -576,7 +814,11 @@ class ClientRandomness(object):
         f['companion'] = f['companion'][p['companion']:]
         f['card_pick'] = f['card_pick'][p['card_pick']:]
         for key in list(f['cards']):
-            f['cards'][key] = f['cards'][key][p['cards'].get(key, 0):]
+            consumed = p['cards'].get(key, 0)
+            f['cards'][key] = f['cards'][key][consumed:]
+            origins = getattr(self, '_card_feed_raw', {})
+            if key in origins:
+                origins[key] = origins[key][consumed:]
         self._feed_pos = {'d6': set(), 'tiles': 0, 'cards': {},
                           'companion': 0, 'card_pick': 0}
         self._step_open = False
@@ -636,6 +878,24 @@ class ClientRandomness(object):
                           'companion': 0, 'card_pick': 0}
         self._pending = None
         self._pending_got = 0
+        self._card_feed_raw = {}
+
+    def retire_cards_before(self, raw_count):
+        """Retire draw outcomes already represented by an adopted board.
+
+        Preserve later/unknown-origin draws and all unrelated random outcomes;
+        a successful resync is not a cancellation of outstanding requests.
+        """
+        origins = getattr(self, '_card_feed_raw', {})
+        for key, items in self._feed['cards'].items():
+            positions = origins.get(key, [])
+            keep = [i for i in range(len(items))
+                    if i >= len(positions) or positions[i] is None
+                    or not 0 <= positions[i] < raw_count]
+            consumed = self._feed_pos['cards'].get(key, 0)
+            self._feed['cards'][key] = [items[i] for i in keep]
+            origins[key] = [positions[i] if i < len(positions) else None for i in keep]
+            self._feed_pos['cards'][key] = sum(i < consumed for i in keep)
 
     # ---- pending + feeding ---------------------------------------------
     def pending(self):
@@ -643,11 +903,30 @@ class ClientRandomness(object):
         return self._pending
 
     def _starve(self, exc):
+        # Capture this consumer's position before speculative/retry contexts
+        # restore the shared feed cursor. Merely receiving an outcome does not
+        # prove it was consumed or authorize another identical native request.
+        pos = self._feed_pos
+        if exc.kind == 'd6':
+            exc._automatic_words_reports = tuple(getattr(self, '_automatic_words_reports', ()))
+            exc._automatic_forfeit_reports = tuple(getattr(self, '_automatic_forfeit_reports', ()))
+            exc._automatic_anduril_reports = tuple(getattr(self, '_automatic_anduril_reports', ()))
+            want = _side_name(exc.kw.get('side'))
+            exc._request_cursor = tuple(i for i in sorted(pos['d6'])
+                if want is None or self._feed['d6'][i][0] in (None, want))
+        elif exc.kind == 'tile':
+            exc._request_cursor = pos['tiles']
+        elif exc.kind == 'randomcomp':
+            exc._request_cursor = pos['companion']
+        elif exc.kind == 'card_pick':
+            exc._request_cursor = pos['card_pick']
+        elif exc.kind in ('card', 'draws'):
+            exc._request_cursor = tuple(sorted(pos['cards'].items()))
         self._pending = exc
         self._pending_got = 0
         raise exc
 
-    def feed(self, kind, payload, side=None):
+    def feed(self, kind, payload, side=None, raw_index=None):
         """Supply ONE harvested client outcome.  The router calls this
         exactly once per client log line/outcome (scan-cursor
         discipline - never re-ingesting a line - is the router's).
@@ -669,10 +948,10 @@ class ClientRandomness(object):
                        RIGHTMOST'): while a d6 ask is pending, a line
                        longer than the remaining need is trimmed from
                        the RIGHT; whole lines arriving after the need
-                       is met are kept UNTRIMMED as cross-line surplus
-                       feeding the step's next consumer (gesture-
-                       granular acceptance; honesty rides the driver's
-                       unconsumed() gate at step end).
+                       is met remain available to interleaved corpus
+                       consumers. LIVE human replies first pass the
+                       emitted-request budget in pending_roll_wait;
+                       that boundary discards duplicate later lines.
                        Returns {'kept': [...], 'dropped': [...]} so
                        the router can chat the ignore notice.
                        Dwarven-ring reroll outcomes arrive HERE: the
@@ -710,7 +989,9 @@ class ClientRandomness(object):
                         'parse defect, refusing to bank it' % (v,))
             kept, dropped = list(vals), []
             p = self._pending
-            if p is not None and p.kind == 'd6':
+            if p is not None and p.kind == 'd6' and (
+                    _side_name(side) is None or _side_name(p.kw.get('side')) is None
+                    or _side_name(side) == _side_name(p.kw.get('side'))):
                 left = int(p.kw.get('need', 1)) - self._pending_got
                 if left > 0 and len(kept) > left:
                     dropped = kept[left:]
@@ -756,6 +1037,9 @@ class ClientRandomness(object):
                 raise ValueError('feed card: unknown deck %r'
                                  % ((side_name, deck),))
             key = (side_name, deck)
+            origins = self.__dict__.setdefault('_card_feed_raw', {}).setdefault(key, [])
+            origins.extend([None] * (len(self._feed['cards'].get(key, [])) - len(origins)))
+            origins.append(raw_index)
             self._feed['cards'].setdefault(key, []).append((cid, pid))
             p = self._pending
             if p is not None and p.kind == 'draws' \
@@ -836,6 +1120,11 @@ class ClientRandomness(object):
             out.append(Directive('call', '!CALL hunt_tile'))
         elif k == 'draws':
             for side_name, deck in call.kw['items']:
+                if _side_name(side_name) == self.human_side:
+                    from .chat import draw_ask
+                    label = ('free' if side_name == 'FREE_PEOPLES' else 'shadow')
+                    out.append(Directive('chat', draw_ask(label + ' ' + deck)))
+                    continue
                 out.append(Directive('call', '!CALL draw_%s_%s' % (
                     'fp' if side_name == 'FREE_PEOPLES' else 'sa',
                     'char' if deck == 'character' else 'strat')))
@@ -923,7 +1212,7 @@ class ClientRandomness(object):
         return ranked
 
     # ---- consumers (called by the installed patches) ---------------------
-    def _consume_d6(self, n, ctx='', side=None):
+    def _consume_d6(self, n, ctx='', side=None, role=None):
         """(Provenance: ai_move_server.py:11803-11813.)  G1: WHOSE dice
         these are rides the starve, so directives_for can ask the
         right person to roll."""
@@ -946,8 +1235,10 @@ class ClientRandomness(object):
                 vals.extend([1] * (n - len(picks)))
                 self.shim_uses.append((ctx, n - len(picks)))
                 return vals
-            self._starve(NeedClientCall('d6', need=n - len(picks),
-                                        ctx=ctx, side=side))
+            metadata = dict(need=n - len(picks), ctx=ctx, side=side)
+            if role is not None:
+                metadata['role'] = role
+            self._starve(NeedClientCall('d6', **metadata))
         take = picks[:n]
         pos.update(take)
         return [feed[i][1] for i in take]
@@ -1039,7 +1330,13 @@ class ClientRandomness(object):
         pos = self._feed_pos['cards'].get(key, 0)
         items = self._feed['cards'].get(key, [])
         if pos >= len(items):
-            self._starve(NeedClientCall('draws', items=[key]))
+            request = NeedClientCall('draws', items=[key])
+            # The real draw can follow a forced combat loss inside one apply.
+            # Keep its stopped clone as evidence, never as a committed state.
+            # Only the owning live transaction may expose its physical costs.
+            request._physical_pre_request_state = state
+            request._physical_request_owner = self
+            self._starve(request)
         cid, pid = items[pos]
         self._feed_pos['cards'][key] = pos + 1
         if cid not in deck_list:
@@ -1084,7 +1381,7 @@ class ClientRandomness(object):
             raise RuntimeError(
                 'No valid reroll result exists for this die')
         for _ in range(self.DWARVEN_REROLL_CAP):
-            v = int(self._consume_d6(1, ctx='dwarven_ring')[0])
+            v = int(self._consume_d6(1, ctx='dwarven_ring', side=side)[0])
             face = faces[(v - 1) % len(faces)]
             if face in valid:
                 print('    [dwarven] client d6 %d -> face %r (reroll '

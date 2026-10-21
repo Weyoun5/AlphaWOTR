@@ -51,6 +51,7 @@ cp1252-safe: no unicode in prints.
 from __future__ import annotations
 
 import math
+import copy
 import unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -546,7 +547,10 @@ def _mk_side_params(c, is_attacker: bool, ch: dict,
                 s.ma_pay = getattr(comp, 'leadership', 1)
             # no Strider/Aragorn -> card refuses (returns 0)
         elif avail:
-            target = min(avail, key=lambda x: getattr(x, 'leadership', 1))
+            named = ch.get('atk_effect_target' if is_attacker else 'def_effect_target')
+            target = cb._pick_named_companion(avail, named) if named is not None else min(avail, key=lambda x: getattr(x, 'leadership', 1))
+            if target is None:
+                raise ValueError('Mighty Attack payer is not currently eligible')
             s.ma_kind = 'ma'
             s.ma_max = 1
             s.ma_pay = getattr(target, 'leadership', 1)
@@ -558,11 +562,10 @@ def stage0(ctx: ExchangeContext):
     c = build_round(ctx)
     ch = round_choices(ctx)
     cb.apply_cancel_effects(c)
-    cb.apply_words_of_power(c)
+    cb.apply_words_of_power(c, ch)
     cb.apply_dice_modifiers(c)
     cb.apply_dice_count_modifiers(c)
     cb.apply_dread_and_despair(c, ch)
-    cb.apply_relentless_assault(c, ch)
 
     p = _RoundParams()
     p.choices = ch
@@ -716,7 +719,13 @@ def exact_distribution(ctx: ExchangeContext,
             else:                      # Durin's Bane
                 dice = 3
                 t = 4
-            n = max(1, dice)
+            if dice <= 0:
+                # no dice = no roll and NO engine batch (audit CB-3); the plan
+                # carries no entry for it
+                nxt[st_] = nxt.get(st_, 0.0) + pr
+                nxt_p.setdefault(st_, base_plan)
+                continue
+            n = dice
             ph = _hit_faces(t, 0) / 6.0
             for h, ppr in _binom_terms(n, ph):
                 ra2, ea2, rd2, ed2 = ra, ea, rd, ed
@@ -751,7 +760,9 @@ def exact_distribution(ctx: ExchangeContext,
             reroll_memo[key] = _binom_terms(k, h6 / 6.0)
         return reroll_memo[key]
 
+    base_params = p
     for st_, pr0 in a_states.items():
+        p = base_params
         ra0, ea0, rd0, ed0, preA, preD, over, dA0, dD0 = st_
         planA = a_plans[st_]
         if over:
@@ -760,6 +771,28 @@ def exact_distribution(ctx: ExchangeContext,
                  ra0, ea0, rd0, ed0, dA0, dD0, (), (),
                  on_def=preA, on_atk=preD)
             continue
+
+        # Initiative3 Relentless Assault uses surviving units AFTER pre-attacks.
+        if any(sp.name == 'relentless assault' for sp in (p.atk, p.dfn)):
+            p = copy.copy(base_params)
+            p.atk, p.dfn = copy.copy(base_params.atk), copy.copy(base_params.dfn)
+            for is_att, sp in ((True,p.atk),(False,p.dfn)):
+                if sp.name != 'relentless assault' or not sp.has_card:
+                    continue
+                r,e = (ra0,ea0) if is_att else (rd0,ed0)
+                selected = ch.get('atk_effect_count' if is_att else 'def_effect_count')
+                k = (max(0,min(int(selected),2,r+2*e)) if selected is not None
+                     else min(2,max(0,r+e-2)))
+                r,e = _apply_hits(r,e,k,'preserve_elites')
+                sp.m += k
+                sp.track_ones = sp.confused or p.atk.confused or p.dfn.confused or (1+sp.m>=sp.t)
+                if is_att:ra0,ea0 = r,e
+                else:rd0,ed0 = r,e
+            if ra0+ea0 == 0 or rd0+ed0 == 0:
+                _cur_plan[0] = planA
+                emit(pr0,0,0,preA,preD,0,0,0,0,ra0,ea0,rd0,ed0,
+                     ra0+ea0==0,rd0+ed0==0,(),(),on_def=preA,on_atk=preD)
+                continue
 
         # ---- Stage B: combat rolls ----
         def _n_dice(sp, units, capt):
@@ -798,8 +831,6 @@ def exact_distribution(ctx: ExchangeContext,
             oth = n - hits - ones
             if sp.confused:
                 pool0 = oth
-            elif 1 + m >= t:
-                pool0 = oth
             else:
                 pool0 = oth + ones
             pool = max(0, pool0 - conv)
@@ -823,8 +854,9 @@ def exact_distribution(ctx: ExchangeContext,
                 for rrA, prra in _reroll_terms(kA, h6Ar):
                     for rrD, prrd in _reroll_terms(kD, h6Dr):
                         prob = pr0 * prA * prD * prra * prrd
-                        _cur_plan[0] = (planA + (statA, statD)
+                        _cur_plan[0] = (planA + (statA,)
                                         + ((rrA,) if kA > 0 else ())
+                                        + (statD,)
                                         + ((rrD,) if kD > 0 else ()))
                         _finish(p, ch, dist, emit, prob,
                                 ra0, ea0, rd0, ed0, preA, preD,
@@ -850,13 +882,25 @@ def _finish(p, ch, dist, emit, prob, ra, ea, rd, ed, preA, preD,
     cancA = cancD = 0          # cancX protects side X
 
     # ---- Phase 5d: Fateful Strike then Blade of Westernesse ----
-    def _fs(sp, rh, enemy_rost, enemy_fx):
+    def _fs(sp, rh, enemy_rost, enemy_fx, tgt=None):
         nonlocal naz
         if not sp.has_card:
             return
-        if "re-roll" not in sp.eff or "nazg" not in sp.eff:
+        # card-identity exact (audit CB-6): Foul Stench / They are
+        # Terrible also print "re-roll" + "Nazgul"
+        if "re-roll" not in sp.eff or "nazg" not in sp.eff \
+                or "fateful strike" not in sp.name:
             return
         if rh >= 1:
+            if tgt is not None:
+                eligible = [l for l in enemy_rost if
+                    (tgt == 'nazgul' and isinstance(l,Nazgul)) or
+                    (tgt != 'nazgul' and rh >= 2 and type(l).__name__ == 'Minion' and l.name == tgt)]
+                if not eligible:
+                    raise ValueError('Fateful Strike target is not currently eligible')
+                victim=eligible[0];enemy_rost.remove(victim);enemy_fx.append(_fx_desc(victim))
+                if isinstance(victim,Nazgul):naz=max(0,naz-1)
+                return
             if rh >= 2:
                 for l in list(enemy_rost):
                     if type(l).__name__ == 'Minion':
@@ -870,23 +914,27 @@ def _finish(p, ch, dist, emit, prob, ra, ea, rd, ed, preA, preD,
                     naz = max(0, naz - 1)
                     return
 
-    def _bow(sp, rh, enemy_rost, enemy_fx):
+    def _bow(sp, rh, enemy_rost, enemy_fx, tgt=None):
+        nonlocal atkH, defH
         if not sp.has_card:
             return
         if "eliminate" not in sp.eff or "minion" not in sp.eff \
                 or "westernesse" not in sp.name:
             return
         if rh >= 1:
-            for l in list(enemy_rost):
-                if type(l).__name__ == 'Minion':
-                    enemy_rost.remove(l)
-                    enemy_fx.append(_fx_desc(l))
-                    return
-
-    _fs(p.atk, rrA, rostD, fxd)
-    _fs(p.dfn, rrD, rostA, fxa)
-    _bow(p.atk, rrA, rostD, fxd)
-    _bow(p.dfn, rrD, rostA, fxa)
+            # the FP's named Minion first (1.254 target hook), else
+            # roster order (engine apply_blade_of_westernesse)
+            minions = [l for l in enemy_rost if type(l).__name__ == 'Minion']
+            named = [l for l in minions
+                     if tgt and getattr(l, 'name', '') == tgt]
+            if tgt is not None and minions and not named:
+                raise ValueError("Blade target is not a participating Minion")
+            for l in (named or minions):
+                if sp is p.atk:atkH=max(0,atkH-1)
+                else:defH=max(0,defH-1)
+                enemy_rost.remove(l)
+                enemy_fx.append(_fx_desc(l))
+                return
 
     # ---- Phase 6: bonus hits window (defender side always first) ----
     def _bonus(sp, is_att):
@@ -929,10 +977,10 @@ def _finish(p, ch, dist, emit, prob, ra, ea, rd, ed, preA, preD,
         if atkH >= 2:
             cancD += 1
 
-    def _bb(sp, rh, enemy_rost, enemy_fx):
+    def _bb(sp, rh, enemy_rost, enemy_fx, tgt=None):
         if not sp.has_card:
             return
-        if naz < 1:
+        if p.naz < 1:
             return
         if "re-roll" not in sp.eff or "eliminate" not in sp.eff \
                 or "leader" not in sp.eff:
@@ -941,9 +989,14 @@ def _finish(p, ch, dist, emit, prob, ra, ea, rd, ed, preA, preD,
             return
         if rh < 1:
             return
+        # the Shadow's named pick (1.254 target hook: a Companion name
+        # or 'leader'), else the engine heuristic
         viable = [x for x in comps if x.level <= rh]
+        if tgt == 'leader':
+            viable = []
         if viable:
-            target = max(viable, key=lambda x: x.level)
+            target = (cb._pick_named_companion(viable, tgt)
+                      or max(viable, key=lambda x: x.level))
             comps.remove(target)
             for l in list(enemy_rost):
                 if isinstance(l, Companion) and l.name == target.name:
@@ -957,11 +1010,11 @@ def _finish(p, ch, dist, emit, prob, ra, ea, rd, ed, preA, preD,
                 enemy_fx.append(_fx_desc(l))
                 return
 
-    def _hd_sac(is_atk, rost, fx, fc, total_enemy):
+    def _hd_sac(is_atk, rost, fx, fc, total_enemy, tgt=None):
         nonlocal cancA, cancD
         if fc <= 0 or total_enemy <= 0:
             return
-        if fc == 1:
+        if (fc == 1 and tgt is None) or tgt == 'leader':
             for l in list(rost):
                 if not isinstance(l, Companion) \
                         and not isinstance(l, Nazgul):
@@ -972,13 +1025,16 @@ def _finish(p, ch, dist, emit, prob, ra, ea, rd, ed, preA, preD,
                     else:
                         cancD += 1
                     return
+        # the owner's named Companion (1.254 target hook), else the
+        # engine heuristic (_heroic_death_sacrifice)
+        named = cb._pick_named_companion(comps, tgt)
         viable = sorted((x for x in comps if x.level >= max(1, fc)),
                         key=lambda x: x.level)
         if not viable:
             viable = sorted(comps, key=lambda x: -x.level)
-        if not viable:
+        if named is None and not viable:
             return
-        target = viable[0]
+        target = named if named is not None else viable[0]
         comps.remove(target)
         for l in list(rost):
             if isinstance(l, Companion) and l.name == target.name:
@@ -995,15 +1051,21 @@ def _finish(p, ch, dist, emit, prob, ra, ea, rd, ed, preA, preD,
         nonlocal cancA, cancD
         if not sp.has_card or "heroic death" not in sp.name:
             return
+        # Cancellable scope = the opponent's Combat roll + Leader re-roll
+        # (+ bonus hits) only; pre-combat additional-attack hits were
+        # already applied as casualties at Phase 3 and cannot be
+        # cancelled (card text; engine _heroic_death_for_side; audit CB-2).
         if is_atk:
-            total_enemy = defH + preD + bonusD - cancA
+            total_enemy = defH + bonusD - cancA
         else:
-            total_enemy = atkH + preA + bonusA - cancD
+            total_enemy = atkH + bonusA - cancD
         total_enemy = max(0, total_enemy)
         army_size = (ra + ea) if is_atk else (rd + ed)
         fc = ch.get('atk_effect_count' if is_atk else 'def_effect_count')
         if fc is not None:
-            _hd_sac(is_atk, rost, fx, int(fc), total_enemy)
+            _hd_sac(is_atk, rost, fx, int(fc), total_enemy,
+                    ch.get('atk_effect_target' if is_atk
+                           else 'def_effect_target'))
             return
         if total_enemy <= army_size // 2:
             return
@@ -1038,10 +1100,16 @@ def _finish(p, ch, dist, emit, prob, ra, ea, rd, ed, preA, preD,
 
     def _bb_hd_side(is_att):
         if is_att:
-            _bb(p.atk, rrA, rostD, fxd)
+            _fs(p.atk, rrA, rostD, fxd, ch.get('atk_effect_target'))
+            _bow(p.atk, rrA, rostD, fxd, ch.get('atk_effect_target'))
+            if ch.get('atk_effect_count') != 0:
+                _bb(p.atk, rrA, rostD, fxd, ch.get('atk_effect_target'))
             _hd(p.atk, True, rostA, fxa)
         else:
-            _bb(p.dfn, rrD, rostA, fxa)
+            _fs(p.dfn, rrD, rostA, fxa, ch.get('def_effect_target'))
+            _bow(p.dfn, rrD, rostA, fxa, ch.get('def_effect_target'))
+            if ch.get('def_effect_count') != 0:
+                _bb(p.dfn, rrD, rostA, fxa, ch.get('def_effect_target'))
             _hd(p.dfn, False, rostD, fxd)
 
     if p.def_first:
@@ -1096,6 +1164,9 @@ def _finish(p, ch, dist, emit, prob, ra, ea, rd, ed, preA, preD,
         eff = sp.eff
         my_r, my_e = (sra, sea) if is_att else (srd, sed)
         en_r, en_e = (srd, sed) if is_att else (sra, sea)
+        # 1.254: each side's casualties under its OWNER's policy (engine
+        # _apply_post_casualty_for_side own_policy / enemy_policy)
+        en_pol = p.dfn.policy if is_att else p.atk.policy
 
         is_onslaught = (("up to four additional hits" in eff
                          and "4+" in eff.replace("result of ", ""))
@@ -1108,13 +1179,12 @@ def _finish(p, ch, dist, emit, prob, ra, ea, rd, ed, preA, preD,
                 return [state]          # deferred to the decision node
             if en_r + en_e == 0 or k <= 0:
                 return [state]
-            m_r, m_e = _apply_hits(my_r, my_e, k, 'preserve_elites')
+            m_r, m_e = _apply_hits(my_r, my_e, k, sp.policy)
             out = []
             for succ, spr in _binom_terms(k, 0.5):
                 e_r, e_e = en_r, en_e
                 for _ in range(succ):
-                    e_r, e_e = _apply_hits(e_r, e_e, 1,
-                                           'preserve_elites')
+                    e_r, e_e = _apply_hits(e_r, e_e, 1, en_pol)
                 ndA = m_r + m_e == 0 if is_att else e_r + e_e == 0
                 ndD = e_r + e_e == 0 if is_att else m_r + m_e == 0
                 nover = ndA or ndD
@@ -1140,7 +1210,7 @@ def _finish(p, ch, dist, emit, prob, ra, ea, rd, ed, preA, preD,
             out = []
             for h, spr in _binom_terms(ec, _hit_faces(5, 0) / 6.0):
                 e_r, e_e = (en_r, en_e) if h == 0 else \
-                    _apply_hits(en_r, en_e, h, 'preserve_elites')
+                    _apply_hits(en_r, en_e, h, en_pol)
                 nb_A = sbA + (h if is_att else 0)
                 nb_D = sbD + (0 if is_att else h)
                 dead = e_r + e_e == 0
@@ -1158,7 +1228,7 @@ def _finish(p, ch, dist, emit, prob, ra, ea, rd, ed, preA, preD,
             if en_r + en_e == 0:
                 return [state]
             if (my_r + my_e) >= 2 * (en_r + en_e):
-                e_r, e_e = _apply_hits(en_r, en_e, 1, 'preserve_elites')
+                e_r, e_e = _apply_hits(en_r, en_e, 1, en_pol)
                 dead = e_r + e_e == 0
                 if is_att:
                     return [(sra, sea, e_r, e_e, sbA + 1, sbD,
@@ -1254,7 +1324,8 @@ def run_with_plan(plan, conf_case, thunk):
     o_cr = cb.combat_roll
     o_lr = cb.leader_reroll
 
-    def p_roll(n, ctx=''):
+    # The shims mirror the engine signatures INCLUDING `side=` (audit CB-1)
+    def p_roll(n, ctx='', side=None):
         spec = spec_box['spec']
         if spec is None:
             if ctx == 'sacrifice hits':
@@ -1274,23 +1345,25 @@ def run_with_plan(plan, conf_case, thunk):
             h, o = val, 0
         return _witness_faces(n, h, o, t, m)
 
-    def p_combat_roll(dice_count, threshold, modifier=0, cap=None):
+    def p_combat_roll(dice_count, threshold, modifier=0, cap=None,
+                      side=None):
         prev = spec_box['spec']
         spec_box['spec'] = (threshold, modifier,
                             conf_case or (1 + modifier >= threshold))
         try:
-            return o_cr(dice_count, threshold, modifier, cap)
+            return o_cr(dice_count, threshold, modifier, cap, side=side)
         finally:
             spec_box['spec'] = prev
 
     def p_leader_reroll(rolls, threshold, leadership, modifier=0,
                         confused=False, miss_modifier=None,
-                        exclude_misses=0):
+                        exclude_misses=0, side=None):
         prev = spec_box['spec']
         spec_box['spec'] = (threshold, modifier, False)
         try:
             return o_lr(rolls, threshold, leadership, modifier,
-                        confused, miss_modifier, exclude_misses)
+                        confused, miss_modifier, exclude_misses,
+                        side=side)
         finally:
             spec_box['spec'] = prev
 

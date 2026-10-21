@@ -652,7 +652,6 @@ class ScenarioDriver(SpectatorDriver):
         self.view.dump_path = self._dump_path
         if self.rand is not None:
             self.rand.reset_feed()
-        del gs
 
     def _rebuild_ai_decks(self, ai_side, hand):
         """The AI side's two decks after the flip = the card table

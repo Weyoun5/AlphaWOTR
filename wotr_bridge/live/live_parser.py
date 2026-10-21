@@ -33,6 +33,10 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 import rendered_replay as rr
+if __package__:
+    from .action_die_zones import temporary as temporary_die_zone
+else:  # The standalone native Undo model also imports this grammar.
+    from action_die_zones import temporary as temporary_die_zone
 
 # live chat line: "<Nick> body" — but NOT "<auto>"/"<game>" (board/system)
 _CHAT_RE = re.compile(r'^<([^>]+)>\s?(.*)$')
@@ -57,7 +61,7 @@ def normalize(raw):
       kind 'chat'   -> text is the raw line (caller extracts nick/body)
       kind 'blank'  -> ignorable
     """
-    s = raw.strip()
+    s = rr.canonical_automatic_line(raw.strip())
     if not s:
         return ('blank', '')
     if s.startswith('$'):
@@ -95,10 +99,28 @@ def parse(raw):
         m = _CHAT_RE.match(text)
         return {'op': 'chat', 'nick': m.group(1), 'body': m.group(2),
                 'raw': raw}
+    if text == '!!! Warning no units available in casualties, elite was downgraded from reinforcements':
+        # Native Downgrade/Upgrade explains where it obtained the Regular.
+        # The following kill and move records carry the actual payment; this
+        # notice neither pays a hit nor changes the engine by itself.
+        return {'op': 'system', 'raw': raw}
     rec = rr.parse_line(text)
     if rec is not None:
         rec.setdefault('raw', raw)
         rec.setdefault('norm', text)     # prefix-stripped board text
+        # Native players may stage through either Current Card slot before
+        # moving the same die into Current Action. This first hop opens an
+        # unpaid window; the normal matching die terminator still completes
+        # it. Keep the prefix in that window for cancellation and native Undo.
+        if rec.get('op') == 'move' and not rec.get('die_stage'):
+            staged = rr._DIE_TO_CARD_RE.match(text)
+            if staged:
+                shadow = staged.group(1).lower() == 'shadow'
+                prefix = 'SA' if shadow else 'FP'
+                if (rec['from'].lower() == (prefix + ' Dice').lower()
+                        and temporary_die_zone(rec['to'])):
+                    rec['die_stage'] = ('SHADOW' if shadow else 'FREE_PEOPLES',
+                                        staged.group(2).upper())
     if rec is None:
         if text.startswith('<'):
             # parse_line's documented '<'-skip class: <game>/<replay>/
@@ -113,6 +135,7 @@ def parse(raw):
         md = _DIECHANGE_RE.match(s)
         if md:
             rec2 = {'op': 'die_change', 'raw': raw, 'norm': text,
+                    'player': text.split(None, 1)[0],
                     'side': ('SHADOW' if md.group(1) == 'Shadow'
                              else 'FREE_PEOPLES')}
             if md.group(2) and md.group(3):

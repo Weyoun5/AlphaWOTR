@@ -19,6 +19,7 @@ Format:
     }
 """
 import gzip
+import copy
 import os
 import pickle
 
@@ -27,7 +28,7 @@ def _side_tag(side):
     if side is None:
         return None
     # Avoid importing Side here; accept the enum name AND the
-    # canonical short tag ('FP' used to misclassify as 'SH')
+    # canonical short tag
     s = getattr(side, 'name', str(side)).upper()
     return 'FP' if s in ('FP', 'FREE_PEOPLES') else 'SH'
 
@@ -50,13 +51,48 @@ class TraceRecorder:
     def __init__(self, path):
         self.path = path
         self.steps = []
-        self.meta = {}
+        import ai
+        from trace_decisions import current_learning_context
+        self.meta = {'source_integrity_version': 1, 'source_errors': [],
+                     **current_learning_context()}
+        from selector_contract import training_identity
+        self.meta.update(training_identity())
+        self._execution_start = None
+        self._source_cursor = self._source_count()
         # Annotation rows fired DURING an action's execution (a hunt
-        # roll consumed inside fellowship_move) used to land BEFORE the
-        # action's own row — the GUI log showed the Shadow hunt roll
-        # before the FP move.  Nested rows (params carry 'ctx') are
-        # deferred and flushed right AFTER the action that consumed
-        # them; turn-level rolls (no ctx) stay immediate.
+        # roll consumed inside fellowship_move) are deferred and flushed
+        # right AFTER the action that consumed them (nested rows carry
+        # 'ctx'); turn-level rolls (no ctx) stay immediate.
+
+    @staticmethod
+    def _source_count():
+        import state_invariants
+        return len(state_invariants.VIOLATIONS)
+
+    def _source_error(self, code, detail, step=None):
+        self.meta['source_errors'].append(
+            {'code': str(code), 'detail': str(detail),
+             'step': len(self.steps) if step is None else step})
+
+    def _capture_source_errors(self, start, step=None, only=None):
+        """Capture real execution/rollover notices, never search notices."""
+        import state_invariants
+        for record in state_invariants.VIOLATIONS[start:]:
+            code = str(record.get('code') or 'source_error_unknown')
+            if only is not None and code not in only:
+                continue
+            self._source_error(code, record.get('detail') or record.get('ctx') or code,
+                               step=step)
+        self._source_cursor = self._source_count()
+
+    def _abandon_action_buffer(self):
+        if self._execution_start is not None:
+            self._capture_source_errors(self._execution_start)
+            self._source_error('uncommitted_action',
+                               'real action began but no post-action row was recorded')
+            self._execution_start = None
+            self._ann_buffer = []
+            self.buffering = False
 
     def record_initial(self, state):
         self.steps.append({
@@ -67,24 +103,45 @@ class TraceRecorder:
 
     def begin_action_buffer(self):
         """Buffer annotations until the causing action's row lands."""
-        # flush any orphaned buffer from an aborted action first
-        # (a raise between buffer and record_action used to silently
-        # delete those annotation rows)
-        _orphan9 = getattr(self, '_ann_buffer', None)
-        if _orphan9:
-            self.steps.extend(_orphan9)
+        # The old orphan path appended (side, action) tuples to `steps`,
+        # whose schema requires dictionaries. An interrupted transaction
+        # has no truthful post-state to attach: retain a failure record.
+        self._abandon_action_buffer()
         self.buffering = True
         self._ann_buffer = []
+        self._execution_start = self._source_count()
 
     def record_action(self, state, side, action, note='',
-                      search_stats=None, regret=None):
+                      search_stats=None, regret=None, decision_context=None,
+                      forced_policy=None):
         """Record a snapshot of the state AFTER `action` was executed.
 
         search_stats / regret (item 5 instrumentation, 2026-08-02):
         optional per-decision root-search statistics — a dict
         {'ae','ri','p','q','n','played'} (see ai._search_stats_payload)
         and the scalar completed-Q regret of the executed pick.  Only
-        stamped when provided (annotation rows carry neither)."""
+        stamped when provided (annotation rows carry neither).
+        forced_policy records a fixed AI transition without learning targets.
+        Its state and annotations remain in chronological game history."""
+        role = {}
+        if forced_policy is not None:
+            from trace_decisions import forced_policy_reason
+            role = {'policy_forced': True, 'forced_policy_reason': forced_policy}
+            forced_policy_reason(dict(kind='action', side=_side_tag(side), **role))
+            if search_stats is not None or regret is not None:
+                raise ValueError('forced policy actions cannot carry search targets or regret')
+        if self._execution_start is not None and side is None:
+            # A later turn/phase snapshot is not the missing decision's
+            # commit. Phase exception handlers can resume at this anchor.
+            self._abandon_action_buffer()
+        if self._execution_start is not None:
+            self._capture_source_errors(self._execution_start)
+            self._execution_start = None
+        else:
+            # This diagnostic is emitted only by the actual episode's
+            # phase dispatcher, outside _traced_execute's action window.
+            self._capture_source_errors(self._source_cursor,
+                                        only={'eye_phase_hijacked'})
         step = {
             'kind': 'action', 'turn': state.turn, 'side': _side_tag(side),
             'action_type': action.action_type,
@@ -93,18 +150,23 @@ class TraceRecorder:
             'note': note,
             'state': snapshot_state(state),
         }
+        step.update(role)
         if search_stats is not None:
-            step['search_stats'] = search_stats
+            # Search arrays and resolved settings are evidence for this action,
+            # not a live view of a mutable caller payload.
+            step['search_stats'] = copy.deepcopy(search_stats)
         if regret is not None:
             step['regret'] = float(regret)
+        if decision_context is not None:
+            # Context describes the state BEFORE this action. The producer
+            # owns its schema/phase timing; copy mutable arrays and mappings
+            # so later execution cannot change recorded training inputs.
+            step['decision_context'] = copy.deepcopy(decision_context)
         # SINGLE ordering mechanism (USER 2026-07-09: 'why does there
-        # have to be this buffering'): the old _pending queue diverted
-        # ctx-annotations until AFTER THE NEXT action row — one action
-        # too late, with stale snapshots (the hunt tile landed after
-        # the hunt decision = the GUI flicker). The execution-scoped
-        # buffer in _traced_execute already places annotations right
-        # after their causing action; rows are otherwise written in
-        # true chronological order.
+        # have to be this buffering'): the execution-scoped buffer in
+        # _traced_execute places annotations right after their causing
+        # action; rows are otherwise written in true chronological
+        # order.
         self.steps.append(step)
 
         if getattr(self, 'buffering', False):
@@ -115,6 +177,8 @@ class TraceRecorder:
                 self.record_action(state, _bside, _bns)
 
     def record_new_turn(self, state):
+        self._abandon_action_buffer()
+        self._capture_source_errors(self._source_cursor)
         self.steps.append({
             'kind': 'new_turn', 'turn': state.turn, 'side': None,
             'action_type': None, 'params': {}, 'die_idx': None,
@@ -123,6 +187,7 @@ class TraceRecorder:
 
     def save(self, **meta):
         """Write the trace to self.path (creates parent dir if needed)."""
+        self._abandon_action_buffer()
         self.meta.update(meta)
         os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
         with gzip.open(self.path, 'wb') as f:
@@ -159,8 +224,10 @@ def emit_annotation(state, atype, params, side=None):
             t._ann_buffer.append((side, ns))
         else:
             t.record_action(state, side, ns)
-    except Exception:
-        pass
+    except Exception as exc:
+        # A missing annotation can omit exogenous outcomes or a source
+        # failure. Preserve a rejectable marker even if gameplay continues.
+        t._source_error('annotation_failed', '%s: %s' % (type(exc).__name__, exc))
 
 
 def load_trace(path):
@@ -172,6 +239,9 @@ def load_trace(path):
     for step in trace['steps']:
         if step.get('state') is not None:
             step['state'].board = b
+        context = step.get('decision_context')
+        if isinstance(context, dict) and context.get('state') is not None:
+            context['state'].board = b
     return trace
 
 
@@ -248,6 +318,8 @@ def describe_step(step):
         return "Game start"
     if step['kind'] == 'new_turn':
         return f"--- Turn {step['turn']} begins ---"
+    if step['kind'] == 'final':
+        return f"Game end - turn {step['turn']}"
     params = step.get('params') or {}
     atype = step.get('action_type')
     side = _step_side_tag(step, params)

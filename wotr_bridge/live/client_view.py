@@ -45,13 +45,10 @@ class ClientView(object):
         self.dump_path = dump_path
         self.piece_region = {}           # pid -> zone name (client)
         self.die_id_map = {}             # pid -> (Side, idx)
-        # BASE action-die pieces, known at birth (client fact 11; the
-        # donor pre-seeded these in its constructor, log_replay.py:
-        # 726-730 -- the lift dropped the seed and the very first
-        # pre-roll die-carrying emission, the D3 eye allocation, died
-        # with 'no die piece for SHADOW die 0' before any roll had
-        # bound a pid).  Bonus dice (358/359, 360-362) enter the pool
-        # later and stay roll-adoption-bound.
+        # BASE action-die pieces, known at birth (client fact 11): the
+        # pre-roll die-carrying emissions (the D3 eye allocation) need a
+        # binding before any roll has bound a pid.  Bonus dice (358/359,
+        # 360-362) enter the pool later and stay roll-adoption-bound.
         from game_state import Side
         for _i in range(7):
             self.die_id_map['%03d' % (99 + _i)] = (Side.SHADOW, _i)
@@ -60,7 +57,7 @@ class ClientView(object):
         self.ai_drawn_pids = set()
         self.dynamic_types = {}          # pid -> swapped unit type
         self.card_pid_map = {}           # cid -> pid (commitment decode
-        #                                  inverse; the AI's OWN cards)
+        #                                  inverse; known cards of either seat)
         self.fellowship_location = None  # pawn continuity for planners
 
     # ---- the emitter read surface ------------------------------------
@@ -77,8 +74,8 @@ class ClientView(object):
         return self.dynamic_types
 
     def card_pid(self, cid):
-        """cid -> client pid for the AI's OWN cards (commitment-decode
-        inverse; fact 10: the static alphabetical map is WRONG once
+        """cid -> client pid for authenticated cards of either seat
+        (commitment-decode inverse; fact 10: the static alphabetical map is WRONG once
         the hands are claimed).  None = unknown (emission HOLDS)."""
         return self.card_pid_map.get(str(cid))
 
@@ -99,27 +96,36 @@ class ClientView(object):
         d = client_board.read_board(self.dump_path)
         if d is None:
             return False
-        self.piece_region = d
+        from .shadow_siege_slots import project_dump
+        self.native_piece_region = dict(d)
+        from .temporary_combat_figures import project_dump as project_combat_figures
+        self.piece_region = project_combat_figures(self, project_dump(self, d))
         return True
 
     def bind_die(self, pid, side, idx):
-        self.die_id_map[str(pid)] = (side, int(idx))
-
-    def bind_roll_line(self, pids, side_of, idx_of):
-        """Bind every pid of one client roll line: side_of/idx_of are
-        callables the driver supplies from its adoption bookkeeping."""
-        for p in pids:
-            s = side_of(p)
-            i = idx_of(p)
-            if s is not None and i is not None:
-                self.bind_die(p, s, i)
+        """Registration slots are UNIQUE per (side, idx).  BL-25
+        (shgame3): the client's Allocate Eye picked pid 105 while the
+        static seed still held 105 -> reg6; binding without evicting
+        left TWO pids on one reg and none on another, and
+        die_piece_for's last-wins inversion then shifted every
+        published index (idx6 fell off the end and the whole seat
+        wedged).  Binding P to a slot evicts any other pid on that
+        slot; P's own old slot is released by the dict overwrite."""
+        pid = str(pid)
+        key = (side, int(idx))
+        old = self.die_id_map.get(pid)
+        for _p2 in [p for p, k in self.die_id_map.items()
+                    if p != pid and k == key]:
+            if old is not None and old != key:
+                # SWAP: the displaced pid takes P's old slot, so a
+                # bind never reduces registration coverage (a
+                # transient hole would publish pid:null)
+                self.die_id_map[_p2] = old
+                old = None
+            else:
+                del self.die_id_map[_p2]
+        self.die_id_map[pid] = key
 
     def note_drawn(self, pid):
         if pid:
             self.ai_drawn_pids.add(str(pid))
-
-    def note_type_swap(self, pid, new_type):
-        """A rendered kill/place pair swapped a piece's effective type
-        (elite downgrade etc.) — track it so fungible resolution stays
-        correct (A17/A28)."""
-        self.dynamic_types[str(pid)] = new_type

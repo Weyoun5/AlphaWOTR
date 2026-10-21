@@ -111,7 +111,7 @@ for _p in (_SRC, _BRIDGE, _HERE):
 import live_parser
 
 # what the client pushes an undo snapshot for - READ OUT OF THE CLIENT
-# (ay_0.java k()/h(); donor :3065-3096).  CLIENT-TRUE: includes 'draws'.
+# (ay_0.java k()/h()).  CLIENT-TRUE: includes 'draws'.
 CLIENT_SNAP_VERBS = ('moves', 'kills', 'flips', 'allocates', 'draws')
 
 # collateral-reverted lines: no snapshot of their own; their board
@@ -171,7 +171,7 @@ _REVEAL_MARK = 'Hand (chosen) to Current'
 
 
 def _is_auto(line):
-    s = str(line).lstrip()
+    s = live_parser.rr.canonical_automatic_line(str(line).lstrip())
     return s.startswith(('<auto>', '%auto>', 'auto>'))
 
 
@@ -199,6 +199,8 @@ def is_own_line(line, nick):
     prefix-match a longer nick ('WOTR_AI' vs '<WOTR_AI_FP>')."""
     if not nick:
         return False
+    if _is_auto(line):
+        return False  # display attribution does not change native undo ownership
     s = str(line).lstrip()
     if s.startswith('!CALL'):
         return True
@@ -259,7 +261,7 @@ def stack_after(lines, start=0):
         elif verb in _PASS_VERBS:
             # collateral: reverts with the preceding snapshot; folds
             # there when one exists, otherwise it is invisible to the
-            # stack (donor parity: 'changes' was never appended)
+            # stack
             if entries and entries[-1].modelled:
                 e = entries[-1]
                 entries[-1] = e._replace(folds=e.folds + (k,))
@@ -285,7 +287,7 @@ def presses_to_revert(lines, window, own_nick=None):
     w0, w1 = max(0, w0), min(len(lines), w1)
     # the UNDO SPAN: trailing run of non-own lines in the window.
     # Presses pop from the tail, so older un-ingested lines below w0
-    # are never reached (donor :3672-3688).
+    # are never reached.
     span = []
     j = w1 - 1
     while j >= w0 and not is_own_line(lines[j], own_nick):
@@ -330,14 +332,14 @@ def presses_to_revert(lines, window, own_nick=None):
         if verb in CLIENT_SNAP_VERBS:
             _push(entries, i, verb)
         elif verb in _PASS_VERBS:
-            pass                      # collateral-reverted (donor :3708)
+            pass                      # collateral-reverted
         else:
             return None               # rolls/unknown/undoes/...
     if first_state_verb not in CLIENT_SNAP_VERBS + ('<auto>',):
-        return None               # leading residue (donor :3713)
+        return None               # leading residue
     if not entries:
         return None
-    # ---- THE STACK IS NOT THE HUMAN'S (donor :3715-3743) ----
+    # ---- THE STACK IS NOT THE HUMAN'S ----
     # the lines above the window continue the SAME stack: an own
     # snapshot above eats a press first (and absorbs the window's
     # trailing <auto> run into its press); a human or unmodelled
@@ -373,9 +375,47 @@ def presses_to_revert(lines, window, own_nick=None):
     for e in entries:
         if not e.modelled:
             return None
-        if e.index >= w1 and e.verb != '<auto>'                 and not is_own_line(lines[e.index], own_nick):
+        if e.index >= w1 and e.verb != '<auto>' \
+                and not is_own_line(lines[e.index], own_nick):
             return None               # his later gesture: never re-forged
     return len(entries)
+
+
+# BRLANE-8 / M3 (USER 08-22 22:25 + 23:31: both games abandoned on a
+# 'RESTORE DID NOT LAND' that named the SAME zone under its dump
+# spelling).  The client's dump decodes zones through log_replay's
+# code table ('Fellowship Box', 'Guide Box', 'FP Dead', 'Used', 'FP Card
+# Play', 'Track N'); the rendered chat line names the same zones the
+# way the module labels them ('Fellowship Of The Ring', 'Guide Of The
+# Fellowship', 'FP Casualties', 'Current Action', 'Current FP Card',
+# 'Fellowship Track N').  Invariant: a zone has ONE canonical key here,
+# whatever channel spelled it.
+_ZONE_ALIASES = {
+    'fellowship box': 'fellowship of the ring',
+    'guide box': 'guide of the fellowship',
+    'fp dead': 'fp casualties', 'sa dead': 'sa casualties',
+    'fp reinf': 'fp reinforcements', 'sa reinf': 'sa reinforcements',
+    'used': 'current action',
+    'fp card play': 'current fp card', 'sa card play': 'current sa card',
+    'hunt box': 'the hunt for the ring',
+    'fp hand': 'free peoples hand', 'sa hand': 'shadow hand',
+}
+
+
+def canonical_zone(v):
+    """The one canonical key of a client zone, whichever channel
+    spelled it (dump decode table or rendered line)."""
+    import re as _re
+    from board import sanitize
+    x = sanitize(str(v if v is not None else '')).strip()
+    if x.endswith(' stronghold'):
+        x = x[:-11]
+    if _re.fullmatch(r'track \d+', x):
+        x = 'fellowship ' + x
+    m = _re.fullmatch(r'political (\d+)', x)
+    if m:
+        x = 'political track ' + m.group(1)
+    return _ZONE_ALIASES.get(x, x)
 
 
 class RestoreWatch(object):
@@ -436,8 +476,12 @@ class RestoreWatch(object):
         from board import sanitize
 
         def _norm(v):
-            x = sanitize(str(v))
-            return x[:-11] if x.endswith(' stronghold') else x
+            # BRLANE-8 / M3: ONE zone alias table (canonical_zone) -
+            # the dump and the rendered line spell the same zone two
+            # ways; both sides canonicalize, so equality is only ever
+            # WIDENED by the identification, never crossed between
+            # families.
+            return canonical_zone(v)
         bad = []
         for pid, want in self._watch['expect'].items():
             got = dump.get(str(pid))
@@ -507,6 +551,14 @@ def expectations_from_window(lines, resolve=None, pids=None):
     import rendered_replay as rr
     resolve = resolve or resolve_named
     expect, notat, unver = {}, {}, []
+    # BRLANE-9 / M3 (USER 08-22 23:31): a piece that hops TWICE inside
+    # the window (hand -> Current FP Card -> Board1) is restored to its
+    # EARLIEST origin by the full undo - and the first hop's pids may be
+    # redacted (a hidden hand exit), so the origin is booked by the
+    # piece's NAME and a later pid-carrying hop expects the hand, never
+    # its own 'from'.
+    origin = {}
+    resolved_names = set()
     for j, ln in enumerate(lines):
         verb, rec = classify(ln)
         op = rec.get('op')
@@ -522,11 +574,14 @@ def expectations_from_window(lines, resolve=None, pids=None):
             exact = (line_pids if line_pids is not None
                      and len(line_pids) == len(pieces) else None)
             for k, nm in enumerate(pieces):
+                key = str(nm).strip().lower()
+                frm0 = origin.setdefault(key, str(rec.get('from')))
                 pid = exact[k] if exact is not None else resolve(nm)
                 if pid is None:
                     unver.append((nm, rec.get('from')))
                 else:
-                    expect.setdefault(str(pid), str(rec.get('from')))
+                    resolved_names.add(key)
+                    expect.setdefault(str(pid), frm0)
         elif op == 'kill':
             pieces = list(rec.get('pieces', []) or [])
             exact = (line_pids if line_pids is not None
@@ -537,6 +592,9 @@ def expectations_from_window(lines, resolve=None, pids=None):
                     unver.append((nm, rec.get('zone')))
                 else:
                     notat.setdefault(str(pid), str(rec.get('zone')))
+    # a piece whose later hop resolved its pid is verifiable after all
+    unver = [u for u in unver
+             if str(u[0]).strip().lower() not in resolved_names]
     if unver:
         print('    [restore-watch] %d window piece(s) unverifiable by '
               'name (fungible or unknown): %s'

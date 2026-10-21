@@ -17,14 +17,14 @@ set "BRIDGE=!HERE!wotr_bridge"
 
 :: ---- which Python: the BUNDLED runtime (python\python.exe, shipped in
 ::      the release zip), then ALPHAWOTR_PYTHON, then python.exe on PATH,
-::      then the developer runtime; the first that imports torch+numpy wins
+::      then the developer runtime; require all play dependencies, not only torch
 set "PY="
 if exist "!HERE!python\python.exe" (
-    "!HERE!python\python.exe" -c "import torch, numpy" >nul 2>&1
+    "!HERE!python\python.exe" -c "import torch, numpy, shapely, PIL, matplotlib, psutil, tkinter" >nul 2>&1
     if not errorlevel 1 set "PY=!HERE!python\python.exe"
 )
 if not defined PY if defined ALPHAWOTR_PYTHON (
-    "!ALPHAWOTR_PYTHON!" -c "import torch, numpy" >nul 2>&1
+    "!ALPHAWOTR_PYTHON!" -c "import torch, numpy, shapely, PIL, matplotlib, psutil, tkinter" >nul 2>&1
     if not errorlevel 1 set "PY=!ALPHAWOTR_PYTHON!"
 )
 if not defined PY (
@@ -33,23 +33,23 @@ if not defined PY (
         if not defined PY_PROBE set "PY_PROBE=%%p"
     )
     if defined PY_PROBE (
-        "!PY_PROBE!" -c "import torch, numpy" >nul 2>&1
+        "!PY_PROBE!" -c "import torch, numpy, shapely, PIL, matplotlib, psutil, tkinter" >nul 2>&1
         if not errorlevel 1 set "PY=!PY_PROBE!"
     )
 )
 if not defined PY (
     if exist "C:\ProgramData\spyder-6\envs\spyder-runtime\python.exe" (
-        "C:\ProgramData\spyder-6\envs\spyder-runtime\python.exe" -c "import torch, numpy" >nul 2>&1
+        "C:\ProgramData\spyder-6\envs\spyder-runtime\python.exe" -c "import torch, numpy, shapely, PIL, matplotlib, psutil, tkinter" >nul 2>&1
         if not errorlevel 1 set "PY=C:\ProgramData\spyder-6\envs\spyder-runtime\python.exe"
     )
 )
 if not defined PY (
-    echo   [X] No working Python found.
+    echo   [X] No Python with all play dependencies found.
     if exist "!HERE!python\python.exe" (
         echo       The bundled runtime python\python.exe exists but cannot import
-        echo       torch+numpy.  Its error follows; send it with a bug report:
+        echo       all play dependencies. Its error follows:
         echo       ----------------------------------------------------------
-        "!HERE!python\python.exe" -c "import torch, numpy" 2>&1 | findstr /V /C:"^$"
+        "!HERE!python\python.exe" -c "import torch, numpy, shapely, PIL, matplotlib, psutil, tkinter" 2>&1 | findstr /V /C:"^$"
         echo       ----------------------------------------------------------
         echo       Usual causes: the zip was not fully unpacked ^(use Explorer or
         echo       7-Zip, to a SHORT path like C:\AlphaWOTR^), or a DLL load error
@@ -59,19 +59,30 @@ if not defined PY (
         echo       zip^).  Install Python 3.10+ and run
         echo       pip install -r requirements.txt   ^(or set ALPHAWOTR_PYTHON^)
     )
+    echo       Required: torch, numpy, shapely, Pillow, matplotlib, psutil, tkinter.
+    echo       PIL is provided by the Pillow package in requirements.txt.
     echo.
     pause
     exit /b 1
 )
 set "PYW=!PY:python.exe=pythonw.exe!"
 if not exist "!PYW!" set "PYW=!PY!"
+echo   Python: "!PY!"
 
 :: certified-path env (CPU pinned; '-1', never an empty string) and the
 :: v41 generation switch (the loader refuses the v41 nets without it)
 set "CUDA_VISIBLE_DEVICES=-1"
 set "KMP_DUPLICATE_LIB_OK=TRUE"
+set "KMP_BLOCKTIME=0"
+set "OMP_WAIT_POLICY=PASSIVE"
 set "PYTHONHASHSEED=0"
-set "WOTR_ACT_GEN=v41"
+set "WOTR_ACT_GEN=v52"
+set "WOTR_REWARD_CONTRACT=predecision_profile_v1"
+set "WOTR_NATIVE=0"
+set "WOTR_LIVE_SEARCH_BACKEND=native"
+set "WOTR_LIVE_INFERENCE_THREADS=1"
+set "WOTR_LIVE_INFERENCE_CACHE=1"
+set "WOTR_LIVE_POLICY_THREADS=8"
 
 echo.
 echo   ================================================================

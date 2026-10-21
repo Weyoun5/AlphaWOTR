@@ -100,7 +100,7 @@ def _sims_for_kind(kind, base):
     base = int(base)
     if kind == 'discard':
         return max(20, base // 4)
-    if kind == 'declare':
+    if kind in ('declare', 'guide', 'fellowship_tail'):
         return max(30, base // 3)
     return base
 
@@ -265,6 +265,9 @@ def describe_action(state, side, action):
     elif t == 'combat_effect_choice':
         body = ('Combat-card effect: count=%s (%s)'
                 % (p.get('count', '?'), _card_name(p)))
+        if p.get('target') is not None:
+            # 1.254: WHICH figure the card effect takes
+            body += ' target=%s' % (p.get('target'),)
     elif t == 'combat_continue':
         body = 'Continue the battle (another round)'
     elif t == 'combat_cease':
@@ -289,8 +292,10 @@ def describe_action(state, side, action):
     elif t == 'victor_stay':
         body = 'Stay (do not advance after victory)'
     elif t == 'casualty_allocate':
-        body = ('Allocate casualties: %s elite downgrade(s)'
-                % p.get('count', '?'))
+        operation = {'remove_regular': 'Remove Regular',
+                     'reduce_elite': 'Reduce Elite',
+                     'remove_elite': 'Remove whole Elite'}.get(p.get('operation'), 'Invalid allocation')
+        body = '%s (%s)' % (operation, getattr(p.get('nation'), 'value', p.get('nation', '?')))
     elif t == 'casualty_preserve_units':
         body = 'Casualty policy: preserve unit count (downgrade elites)'
     elif t == 'casualty_preserve_elites':
@@ -342,7 +347,8 @@ class EngineSession(object):
 
     def __init__(self, seed=None, mcts_sims=300, max_turns=40,
                  shadow_vp=10, temperature=0.02, add_noise=False,
-                 selfplay_temps=False, log=None, human_side=None):
+                 selfplay_temps=False, log=None, human_side=None,
+                 max_turn_decisions=10000):
         # human_side: the seat a HUMAN plays (None = watch / AI-vs-AI).
         # Player-owned learned decisions on that seat are never taken
         # by a self-play hardcode (the gateway auto-declare).
@@ -352,6 +358,9 @@ class EngineSession(object):
         self.seed = int(seed)
         self.sims = int(mcts_sims)
         self.max_turns = int(max_turns)
+        if type(max_turn_decisions) is not int or max_turn_decisions < 1:
+            raise ValueError('max_turn_decisions must be a positive integer')
+        self.max_turn_decisions = max_turn_decisions
         self.temperature = float(temperature)
         self.add_noise = bool(add_noise)
         self.selfplay_temps = bool(selfplay_temps)
@@ -433,7 +442,10 @@ class EngineSession(object):
             raise IllegalPlay(
                 'illegal action index %d: the legal menu has %d entries '
                 '(only actions from get_legal_actions are playable)'
-                % (index, len(dp.actions)))
+                         % (index, len(dp.actions)))
+        current_actions = ai.get_legal_actions(ai.clone_state(self.state), side)
+        if dp.actions[index] not in current_actions:
+            raise IllegalPlay('selected action is stale for the current state')
         self.decisions += 1
         try:
             self._current = self._gen.send(index)
@@ -498,40 +510,20 @@ class EngineSession(object):
                     idx = i
                     break
         if idx is None:
-            # Mirrors _run_single_episode's off-menu handling: a
-            # declare-phase non-declare result means "don't declare"
-            # (pick pass); anything else falls back to the first entry
-            # and is logged loudly (episode logs an invariant).
-            if dp.kind == 'declare':
-                for i, a in enumerate(dp.actions):
-                    if a.action_type == 'pass':
-                        idx = i
-                        break
-            if idx is None:
-                self.log('! search returned an off-menu action (%s) - '
-                         'falling back to menu[0]'
-                         % (action.action_type if action else None))
-                idx = 0
+            raise IllegalPlay('Search did not return a legal current decision')
         return idx
 
     # -- internals ----------------------------------------------------
 
     def _execute(self, action, side):
-        """Execute via the engine's own executor with the episode's
-        failure recovery (ai.py ~14968-14984): a rare enumeration/
-        execution mismatch consumes the die as a pass instead of
-        killing the game -- never silent."""
+        """Execute the selected public action; errors stop the session."""
         try:
             ai._traced_execute(self.state, action, self._annotator)
             return action
         except Exception as err:
             ai._record_exec_failure(self.state, action, err)
-            ai._recover_from_failed_action(self.state, action, side)
-            self.log('! execution failed (%s: %s) - recovered by '
-                     'consuming the die as a pass'
-                     % (type(err).__name__, err))
-            return ai.Action(die_idx=action.die_idx, action_type='pass',
-                             params={})
+            self.log('! execution failed (%s: %s)' % (type(err).__name__, err))
+            raise
 
     def _note_pending(self):
         """Display-only context line for the open pending phase."""
@@ -615,19 +607,15 @@ class EngineSession(object):
                 act = self._execute(acts[idx], d_side)
                 self._record(d_side, act)
 
-            # Phase 2 pre-step: Balrog stationary trigger (episode
-            # twin).  FINAL RULING (USER 2026-08-16): Mordor entry is
-            # TURN-START ONLY and POSITIONAL, and the DECLARATION
-            # OPPORTUNITY COMES FIRST - the entry check runs AFTER the
-            # Fellowship phase below, in this same turn start.
-            if not state.fellowship.mordor_entered:
-                ai._balrog_stationary_turn_start(state)
+            # Declaration finishes before begin_fellowship_tail exposes
+            # the stationary Balrog opportunity (Almanac C17).
 
             # Gateway auto-declare, TURN-START only (episode twin).
             # Self-play hardcode: never on a human FP seat - the declare
             # DecisionPoint below already offers the gateway declare.
             _auto_declared = False
-            if not state.fellowship.mordor_entered                     and self.human_side is not FP:
+            if not state.fellowship.mordor_entered \
+                    and self.human_side is not FP:
                 _auto_declared = ai._auto_enter_mordor(state)
                 if _auto_declared:
                     self.log('  Fellowship declared at the gateway')
@@ -656,14 +644,45 @@ class EngineSession(object):
                     act = self._execute(act, FP)
                     self._record(FP, act)
 
-            # Mordor entry check - AFTER the declaration opportunity,
-            # same turn start (USER FINAL 2026-08-16): a gate position
-            # reached by a fresh declaration, standing from an earlier
-            # one, or by a REVEAL enters NOW.  _check_mordor_entry is
-            # positional and idempotent - the single answerer.
-            if not state.fellowship.mordor_entered:
-                if game_logic._check_mordor_entry(state):
-                    self.log('  Fellowship enters Mordor (turn start)')
+            was_mordor = state.fellowship.mordor_entered
+            game_logic.begin_fellowship_tail(state)
+            for _tail_step in range(128):
+                if not getattr(state, '_fellowship_tail_phase', False):
+                    break
+                owner = ai._pending_decision_side(state)
+                if owner is None:
+                    raise RuntimeError('Unresolved Fellowship tail has no decision owner')
+                acts = ai.get_legal_actions(state, owner)
+                if not acts:
+                    raise RuntimeError('Required Fellowship effect has no legal choice')
+                idx = yield DecisionPoint(
+                    'fellowship_tail', owner, acts, note=self._note_pending(),
+                    sims=_sims_for_kind('fellowship_tail', sims),
+                    temp=fp_temp if owner is FP else sh_temp,
+                    noise=self.add_noise, turn=state.turn)
+                act = self._execute(acts[idx], owner)
+                self._record(owner, act)
+                game_logic.resume_fellowship_tail(state)
+            if getattr(state, '_fellowship_tail_phase', False):
+                raise RuntimeError('Fellowship tail exceeded 128 decisions')
+            if game_logic.should_game_end(game_logic.check_all_victory_conditions(state), end_of_turn=False):
+                game_over = True
+                break
+            if state.fellowship.mordor_entered and not was_mordor:
+                self.log('  Fellowship enters Mordor (turn start)')
+            if state.pending_guide_change is not None:
+                acts = ai.get_legal_actions(state, FP)
+                if not acts or any(a.action_type != 'choose_guide' for a in acts):
+                    raise RuntimeError('Required Fellowship Guide menu is unavailable')
+                idx = yield DecisionPoint(
+                    'guide', FP, acts,
+                    note='End Fellowship phase - keep or choose a highest-level Guide',
+                    sims=_sims_for_kind('guide', sims), temp=fp_temp,
+                    noise=self.add_noise, turn=state.turn)
+                act = self._execute(acts[idx], FP)
+                self._record(FP, act)
+                if state.pending_guide_change is not None:
+                    raise RuntimeError('Fellowship Guide selection did not resolve')
 
             # Phase 3: Shadow eye allocation, pre-roll (episode
             # 14827-14876); menu/executor are the engine's own.
@@ -683,16 +702,12 @@ class EngineSession(object):
                     state._eye_allocation_phase = False
                 act = acts[idx]
                 n_eyes = act.params.get('count', 0)
-                if n_eyes > 0:
-                    indices = [i for i, d in
-                               enumerate(state.dice[SH])
-                               if not d.used][:n_eyes]
-                    game_logic.allocate_eyes(state, n_eyes,
-                                             indices=indices)
+                act = self._execute(act, SH)
                 self._record(SH, act)
                 self.log('  Shadow allocates %d eye(s) to the Hunt Box'
                          % n_eyes)
 
+            state._eye_allocation_phase = False
             # Phase 3: roll action dice (episode 14878-14879)
             game_logic.roll_action_dice(state, pool=FP)
             game_logic.roll_action_dice(state, pool=SH)
@@ -704,12 +719,11 @@ class EngineSession(object):
                 return sum(1 for d in state.dice.get(side, [])
                            if not d.used and d.current is not None)
 
-            # Phase 4-5: action resolution (episode 14885-15052).
-            # 200 = the episode's runaway-loop valve (F-3), far above
-            # any legal turn; alternation/pending routing below is
-            # line-for-line the episode's, via ai.py's shared routers.
+            # Action resolution uses a diagnostic cap, never a victory trigger.
+            # Long combat/casualty chains remain in this same action phase.
             active = FP
-            for _ in range(200):
+            _empty9 = set()   # MC6: sides whose menu came back empty
+            for _ in range(self.max_turn_decisions):
                 has_pending = (
                     state.pending_combat is not None
                     or state.pending_hunt is not None
@@ -744,7 +758,18 @@ class EngineSession(object):
 
                 actions = ai.get_legal_actions(state, active)
                 if not actions:
+                    # MC6 (rulebook 1681-1683, ai.py episode twin): a
+                    # side with no legal action left hands the rest of
+                    # the round to its opponent; the round ends only
+                    # when NEITHER side can act
+                    _oth9 = SH if active is FP else FP
+                    _empty9.add(active)
+                    if (not has_pending and _oth9 not in _empty9
+                            and _unused(_oth9) > 0):
+                        active = _oth9
+                        continue
                     break
+                _empty9.clear()
 
                 temp = fp_temp if active is FP else sh_temp
                 idx = yield DecisionPoint(
@@ -783,14 +808,11 @@ class EngineSession(object):
 
             if game_over:
                 break
-            # Victory Check phase (episode 15057-15060)
-            _end_vc = game_logic.check_all_victory_conditions(state)
-            if game_logic.should_game_end(_end_vc, end_of_turn=True):
-                game_over = True
-                break
+            blockers = ai._turn_end_blockers(state)
+            if blockers:
+                raise RuntimeError('unfinished_turn: ' + ', '.join(blockers))
             if ai._safe_next_turn(state):
-                # P0 2026-08-15: rollover corruption 12 = immediate
-                # ring victory; the game must not play on
+                # Resolve inactivity before the military Victory Check.
                 game_over = True
                 break
 
@@ -1043,6 +1065,15 @@ def load_nets(tag='auto'):
     if fp_net is None or sh_net is None:
         raise SystemExit('net load failed for tag %r (file missing or '
                          'torch unavailable)' % tag)
+    from reward_contract import current_contract, PROFILE, validate_net_profile
+    if current_contract() == PROFILE:
+        # Validate the complete pair before replacing an existing objective.
+        profiles = {}
+        for side, net in (('fp', fp_net), ('sh', sh_net)):
+            profile = getattr(net, 'reward_profile', None)
+            validate_net_profile(net, side, profile)
+            profiles[side] = profile
+        ai.PLAYER_PROFILES.update(profiles)
     _p('nets loaded: wotr_{fp,sh}_%s.pt' % tag)
     return fp_net, sh_net
 

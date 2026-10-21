@@ -1,12 +1,11 @@
 """Emission: engine action -> client gesture lines for the thin driver.
 
-DESIGN RULE 6 (REBUILD_PLAN.md, paid for by the phantom/mis-pair defect
-family): emission renders ENGINE EVENTS -- the action the engine
-applied, with its params -- NEVER a re-inference from state diffs.  The
-old monolith's `_emit_board_diff` generative differ (ai_move_server.py
-:8940-9759) is the disease and is NOT lifted.  When no planner can
-render an action type this module returns a loud HOLD naming the type;
-it never falls back to diffing.
+Emission renders an engine-approved decision from its action parameters
+or its committed before/after states. The latter covers card effects and
+automatic consequences. Equivalent groupings and source pairings of
+interchangeable pieces reproduce the same final board. Physical piece
+availability, identity, casualty destination and field/stronghold ownership
+must still agree; rendering never invents pieces or legal game actions.
 
 WHAT IS LIFTED (donor: wotr_bridge/ai_move_server.py, read-only; all
 line refs are into that file):
@@ -54,9 +53,9 @@ WHAT IS DELIBERATELY NOT LIFTED (per the rebuild plan):
     emit-completeness) -- rule 6.  `card_option` decisions render via
     emission_card.render_card_effect, the SANCTIONED bounded exception
     (coordinator, 2026-08-19): a delta between the DRIVER's own
-    pre/post engine states around ONE decision, literal rows only,
-    every ambiguity a loud HOLD -- see emission_card's docstring for
-    why that is allowed while the generative differ was not.  Other
+    pre/post engine states around ONE decision, with count-conserving
+    transfers for interchangeable figures. See emission_card's endpoint
+    contract for casualty and physical-supply handling. Other
     `card_*` actions still HOLD from render_action (plays route
     through render_decision).
   * the after-the-fact delta strata (_track_delta_lines,
@@ -103,18 +102,18 @@ for _p in (_SRC, _BRIDGE):
 import emitter
 from emitter import render
 
-# donor :18150 -- die-carrying actions whose die goes to the HUNT BOX
-# (via the planner's die_to_hunt / eye_alloc grammar), never to Used.
+# die-carrying actions whose die goes to the HUNT BOX (via the
+# planner's die_to_hunt / eye_alloc grammar), never to Used.
 _DIE_TO_HUNT_ACTIONS = frozenset(('fellowship_move', 'eye_allocate'))
 
 # actions whose FIRST die-carrying leg opens an engine multi-step
-# (ai.py :9136 pending_army_move_die, :9909 pending_muster_die): the
-# die kill is deferred until the step closes, so rendering them without
-# `post` cannot answer "is the kill due" -- HOLD instead of guessing.
+# (pending_army_move_die / pending_muster_die): the die kill is deferred
+# until the step closes, so rendering them without `post` cannot answer
+# "is the kill due" -- HOLD instead of guessing.
 _MULTISTEP_TYPES = frozenset(('army_move', 'muster_recruit'))
 
-# donor :15783-15785 -- the chain-open predicate's pending fields.
-_CHAIN_PENDINGS = ('pending_combat', 'pending_hunt',
+# the chain-open predicate's pending fields.
+_CHAIN_PENDINGS =('pending_combat', 'pending_hunt',
                    'pending_guide_change', 'pending_card_option',
                    'pending_card_followup', 'pending_discard')
 
@@ -143,8 +142,8 @@ class Emission(object):
         self.calls = list(calls or [])
         self.chat = list(chat or [])
         self.hold = hold
-        # WAVE-I: the planner ops behind self.lines (attached by
-        # _ops_to_emission) — the forced-casualty sweep subtracts the
+        # the planner ops behind self.lines (attached by
+        # _ops_to_emission) - the forced-casualty sweep subtracts the
         # rows THIS emission already expressed before rendering the
         # residual, so a planner-rendered allocation is never
         # double-killed client-side.
@@ -162,7 +161,7 @@ def _hold(reason):
 
 
 # --------------------------------------------------------------------
-# the refund predicate (donor :15929-15949, decoupled from self)
+# the refund predicate
 # --------------------------------------------------------------------
 def play_was_refunded(pre, post, action):
     """True iff the engine REFUNDED a play_event: the card is still in
@@ -337,7 +336,7 @@ def _retrack_ops(view, ops):
             continue
         if op in _RETRACK_DEAD:
             for p in pids:
-                view.piece_region[p] = 'dead'
+                view.piece_region[p] = emitter._native_kill_zone(view, p, default='dead')
         elif op in _RETRACK_TO and f.get('to'):
             name = _lr.decode_location(str(f['to'])) or str(f['to'])
             for p in pids:
@@ -397,9 +396,10 @@ def render_die_kill(view, nick, side, die_idx, extra_pids=()):
 
 
 def _pool_growth_lines(view, nick, pre, post):
-    """Bonus dice granted by this action join the side's dice pool
-    (donor :13196-13232 minus the driver ledgers): one move line per
-    NEW engine die index, piece id from the emitter's base tables."""
+    """Render a newly earned die using its observed spare, if already bound.
+
+    An earned piece already in a playable/recoverable zone needs no move.
+    """
     from game_state import Side
     out = []
     for s in (Side.FREE_PEOPLES, Side.SHADOW):
@@ -413,8 +413,19 @@ def _pool_growth_lines(view, nick, pre, post):
                     'bonus die index %d beyond known %s piece ids'
                     % (i, s.name))
             is_fp = s is Side.FREE_PEOPLES
+            # The player may have taken a different interchangeable spare.
+            # Use its observed identity, and do not create another die when
+            # that earned piece is already on the table for recovery.
+            by_index = {index: str(pid) for pid, (owner, index) in view.die_id_map.items()
+                        if owner is s}
+            pid = by_index.get(i, base[i])
+            zone = str((getattr(view, 'piece_region', {}) or {}).get(pid, '')).lower()
+            prefix = 'fp' if is_fp else 'sa'
+            if zone in (prefix + ' dice', prefix + ' dead', prefix + ' casualties',
+                        'hunt box', 'the hunt for the ring'):
+                continue
             out.append(render('move', {
-                'nick': nick, 'pieces': [base[i]],
+                'nick': nick, 'pieces': [pid],
                 'frm': emitter.FP_POOL if is_fp else emitter.SH_POOL,
                 'to': (emitter.FP_DICE_POOL if is_fp
                        else emitter.SH_DICE_POOL)}, local=False))
@@ -438,9 +449,8 @@ def _deferred_die_kill(view, nick, side_name, pre, post, action):
 
 
 # --------------------------------------------------------------------
-# engine-truth param threading (post-dependent members only; the
-# parser-lag members of donor :16059-16206 die here because view.state
-# IS the engine state)
+# engine-truth param threading (post-dependent members only:
+# view.state IS the engine state, so no parser-lag member exists)
 # --------------------------------------------------------------------
 def _threaded_params(view, side_name, action, post):
     a = action
@@ -449,8 +459,8 @@ def _threaded_params(view, side_name, action, post):
     st = view.state
 
     if at in ('muster_recruit', 'muster_elite', 'transform_gandalf'):
-        # SIEGE musters join the garrison INSIDE (donor :16161-16181;
-        # asked through the ONE function, of the ENGINE's state).
+        # SIEGE musters join the garrison INSIDE (asked through the ONE
+        # function, of the ENGINE's state).
         from board import sanitize
         reg = sanitize(str(params.get('region', '')))
         if emitter.garrison_side_of(st, reg) == \
@@ -460,13 +470,10 @@ def _threaded_params(view, side_name, action, post):
 
     if at in ('army_move', 'victor_advance') and post is not None \
             and not params.get('moved_by_nation'):
-        # WAVE-K K5 (wkg5 LIVE: 'units dimrill dale isengard/regular:
-        # engine=0 client=1'): the ENGINE moves SPECIFIC units - the
-        # exact per-(nation, kind) composition that LEFT the source
-        # between pre and post (donor _moved_by_nation, ported) rides
-        # the params; plan_army_move honours 'moved_by_nation' and a
-        # nation-blind pick shipped an Isengard regular where the
-        # engine moved a Sauron one (the donor's t131 class).
+        # K5: the ENGINE moves SPECIFIC units - the exact per-(nation,
+        # kind) composition that LEFT the source between pre and post
+        # rides the params; plan_army_move honours 'moved_by_nation'
+        # (a nation-blind pick would ship the wrong nation's regular)
         from board import sanitize as _san
         _src = _san(str(params.get('from', '')))
 
@@ -495,18 +502,17 @@ def _threaded_params(view, side_name, action, post):
 
     if at == 'hunt_take_corruption' and post is not None \
             and 'corruption_target' not in params:
-        # the ENGINE's true landing spot (donor :16123-16131); without
-        # post the planner reads the ENGINE pending_hunt damage, which
-        # is already the rules answer -- the old parser-lag walk-one-
-        # step bug cannot recur.
+        # the ENGINE's true landing spot; without post the planner
+        # reads the ENGINE pending_hunt damage, which is already the
+        # rules answer
         params = dict(params)
         params['corruption_target'] = int(post.fellowship.corruption)
 
     if at == 'fellowship_move' \
             and getattr(st.fellowship, 'mordor_entered', False):
         # Mordor track: the pawn advances only when the ENGINE's step
-        # advanced (donor :16101-16114).  Needs post; callers HOLD when
-        # it is absent (checked in render_action).
+        # advanced.  Needs post; callers HOLD when it is absent
+        # (checked in render_action).
         params = dict(params)
         params['from_step'] = int(getattr(st.fellowship,
                                           'mordor_step', 0))
@@ -515,9 +521,8 @@ def _threaded_params(view, side_name, action, post):
                 getattr(post.fellowship, 'mordor_step', 0))
 
     if at == 'hunt_sacrifice_guide':
-        # name the ENGINE's guide (donor :16059-16067) and, given post,
-        # the engine's true ALIVE-SEPARATION placement region (donor
-        # :16068-16088; USER ruling 2026-08-15).
+        # name the ENGINE's guide and, given post, the engine's true
+        # ALIVE-SEPARATION placement region (USER ruling 2026-08-15).
         params = dict(params)
         g = getattr(st.fellowship, 'guide', None)
         if g is not None and not params.get('companion'):
@@ -571,20 +576,12 @@ def _norm_card_name(s):
     return _re.sub(r'[^a-z0-9]+', ' ', s.lower()).strip()
 
 
-# The three deliberately-killable play-on-table cards, by CLIENT piece
-# id.  Exactly the set log_replay._TABLE_KILL_PIDS parses for ruling
-# 1.149 (106 / 145 / 202); keyed by NAME here because the engine action
-# carries card_name, not a pid.  These pieces exist once per game, so
-# the ids are fixed -- no dump lookup and no fungible pick.
-# (REMOVED 2026-08-20) a static card-pid table used to live here.
-# It claimed 145 was "The Power of Tom Bombadil"; this client
-# renders 145 as "Kindred of Glorfindel", so the AI dragged that
-# out of the FP Strategy Deck and killed it in front of the USER.
-# Piece ids are the CLIENT's to state, never ours to hardcode:
-# the target now comes from driver.table_seats (the slot we
-# watched the card go into) resolved against the client dump.
-# The actor's own Current-Card zone (log_replay:158 -- 2036 renders as
-# 'Current SA Card', 2037 as 'Current FP Card').
+# no static card-pid table (USER 2026-08-20): piece ids are the
+# CLIENT's to state, never ours to hardcode - a table-kill target comes
+# from driver.table_seats (the slot we watched the card go into)
+# resolved against the client dump.
+# The actor's own Current-Card zone (2036 renders as 'Current SA Card',
+# 2037 as 'Current FP Card').
 _CARD_PLAY_ZONE = {'SHADOW': 'Game.2036', 'FREE_PEOPLES': 'Game.2037'}
 
 
@@ -719,6 +716,46 @@ def _plan_discard_table_card(view, nick, side_name, a, die_idx, st,
     return em
 
 
+def _forced_guide_lines(view, nick, pre, post):
+    """Seat an engine-resolved replacement after the previous Guide leaves.
+
+    A remaining tie still has a pending choice and emits nothing here. The
+    departing Guide's own action already emits its death/separation; only the
+    forced surviving replacement needs this additional physical gesture.
+    """
+    if post is None or getattr(post, 'pending_guide_change', None):
+        return []
+    before = getattr(pre.fellowship, 'guide', None)
+    after = getattr(post.fellowship, 'guide', None)
+    old_name = getattr(before, 'name', None)
+    new_name = getattr(after, 'name', None)
+    # Gollum enters as Guide after the last Companion leaves. Unlike an
+    # ordinary successor he is not a member of fellowship.companions, so the
+    # living-companion guard below intentionally cannot handle this entry.
+    if new_name == 'Gollum' and old_name != 'Gollum' and not post.fellowship.companions:
+        pid = emitter._companion_pid('Gollum')
+        source = emitter._piece_zone_code(view, pid)
+        if source == emitter.GUIDE_BOX:
+            return []
+        if source not in (emitter.FP_POOL, emitter.FELLOWSHIP_BOX):
+            raise LookupError('Entering Gollum is not in FP reinforcements or Fellowship box')
+        return [render('move', {'nick': nick, 'pieces': [pid],
+                                'frm': source, 'to': emitter.GUIDE_BOX}, local=False)]
+    living = {c.name for c in post.fellowship.companions}
+    if not old_name or not new_name or old_name == new_name \
+            or old_name in living or new_name not in living:
+        return []
+    pid = emitter._companion_pid(new_name)
+    source = emitter._piece_zone_code(view, pid,
+                                     default=emitter.FELLOWSHIP_BOX)
+    if source == emitter.GUIDE_BOX:
+        return []
+    if source != emitter.FELLOWSHIP_BOX:
+        raise LookupError('forced Guide %s is not in the Fellowship box' % new_name)
+    return [render('move', {'nick': nick, 'pieces': [pid],
+                            'frm': source, 'to': emitter.GUIDE_BOX}, local=False)]
+
+
 def render_action(view, nick, side, action, post=None, ring_paid=None):
     """Render the client gestures for ONE applied engine action.
 
@@ -744,9 +781,8 @@ def render_action(view, nick, side, action, post=None, ring_paid=None):
 
     # ---- pass: chat only + a possibly owed multi-step die kill ------
     if at == 'pass':
-        # kind 'pass' (WAVE-H): the old ('nc', 'pass') pair failed the
-        # 'nc' kind's ^nc$ validator at the ChatOut exit - the FIRST AI
-        # pass in any live game raised ChatPolicyError
+        # kind 'pass': a ('nc', 'pass') pair fails the 'nc' kind's
+        # ^nc$ validator at the ChatOut exit
         em = Emission(chat=[('pass', 'pass')])
         if pre_pending:
             if post is None:
@@ -770,7 +806,7 @@ def render_action(view, nick, side, action, post=None, ring_paid=None):
                 return _hold('pass deferred die kill: %s' % e)
         return em
 
-    # ---- play_event: staged prologue (donor :15874-15900) -----------
+    # ---- play_event: staged prologue ----------------------------------
     if at == 'play_event':
         cid = a.params.get('card_id', '')
         pid = _card_pid(view, cid)
@@ -791,9 +827,9 @@ def render_action(view, nick, side, action, post=None, ring_paid=None):
                         'plays %s' % parser_card_name(cid).lower()))
         em.calls.append('!CALL play_card %s' % pid)
         # NO die kill here: the kill must FOLLOW the play's resolution
-        # (USER invariant 'die -> play -> resolve -> kill', donor
-        # :15760-15829) and the resolution rides the !CALL -- the
-        # driver flushes render_die_kill when the chain closes.
+        # (USER invariant 'die -> play -> resolve -> kill') and the
+        # resolution rides the !CALL -- the driver flushes
+        # render_die_kill when the chain closes.
         return em
 
     # ---- army_attack: declaration only (no board lines) -------------
@@ -811,9 +847,8 @@ def render_action(view, nick, side, action, post=None, ring_paid=None):
         to = sanitize(str(a.params.get('to', '')))
         msg = to if frm == to else '%s from %s' % (to, frm)
         em.chat.append(('attack_declare', msg))
-        # the battle die is killed at battle END (donor :8558-8570);
-        # political activation/advance is ENGINE-side state -- each
-        # subsequent chain decision renders separately.
+        # The battle die is killed at battle end. The shared commit
+        # sweep emits declaration-triggered political activation/advance.
         return em
 
     # ---- draw_card: the CLIENT draws (directive), engine ingests ----
@@ -843,8 +878,7 @@ def render_action(view, nick, side, action, post=None, ring_paid=None):
                          % (cid[:48],))
         hand = ('Controls.46' if side_name == 'SHADOW'
                 else 'Controls.45')
-        # G19 (donor :715-718): discards ride the 296 kill-in-hand
-        # grammar (piece, hand).
+        # G19: discards ride the 296 kill-in-hand grammar (piece, hand).
         em = Emission(lines=[render('hand_exit_b', {
             'nick': nick, 'pieces': [pid], 'frm': hand}, local=False)])
         return em
@@ -912,7 +946,7 @@ def render_action(view, nick, side, action, post=None, ring_paid=None):
                      % (at, e))
 
     # second leg of a multi-step die: the die was already dragged on
-    # the first leg (donor :16210-16216)
+    # the first leg
     if pre_pending:
         ops = [(op, f) for op, f in ops
                if not str(op).startswith('die_spend')]
@@ -924,7 +958,7 @@ def render_action(view, nick, side, action, post=None, ring_paid=None):
     if at == 'eye_allocate' and int(params.get('count') or 0) == 0:
         em.chat.append(('zero_eyes', '0e'))
 
-    # ---- die kill to the Used box (donor :16363-16375) ---------------
+    # ---- die kill to the Used box --------------------------------------
     if die_idx >= 0 and at not in _DIE_TO_HUNT_ACTIONS:
         due = True
         if post is not None:
@@ -944,6 +978,7 @@ def render_action(view, nick, side, action, post=None, ring_paid=None):
             em.lines += _deferred_die_kill(view, nick, side_name, st,
                                            post, a)
             em.lines += _pool_growth_lines(view, nick, st, post)
+            em.lines += _forced_guide_lines(view, nick, st, post)
         except LookupError as e:
             return _hold('%s post bookkeeping: %s' % (at, e))
     return em
@@ -952,6 +987,59 @@ def render_action(view, nick, side, action, post=None, ring_paid=None):
 # --------------------------------------------------------------------
 # render_decision: one pending-chain DECISION -> Emission
 # --------------------------------------------------------------------
+def dead_men_arrival_prologue(view, nick, side, action):
+    """Render the validated initial Dead Men movement before requesting dice.
+
+    Return the reached engine clone and its emission. Other card decisions
+    return None. The live step retains this clone only to subtract the already
+    acknowledged arrival from its eventual post-roll rendering.
+    """
+    import ai
+    import event_effects
+    from board import sanitize
+    from game_state import Companion, Side
+    from . import emission_card
+    params = getattr(action, 'params', {}) or {}
+    cid = 'FREE_PEOPLES_Character_Dead_Men_of_Dunharrow'
+    choices = params.get('choices')
+    if (getattr(action, 'action_type', None) != 'card_option'
+            or params.get('card_id') != cid or not isinstance(choices, dict)
+            or 'companions' not in choices or 'target_region' not in choices):
+        return None
+    pre = view.state
+    pending = getattr(pre, 'pending_card_option', None) or {}
+    if (side is not Side.FREE_PEOPLES or pending.get('card_id') != cid
+            or choices not in pending.get('options', ())):
+        raise LookupError('Dead Men arrival is not the current legal option')
+    names = choices['companions']
+    if (not isinstance(names, (list, tuple)) or not names
+            or len(set(names)) != len(names)):
+        raise LookupError('Dead Men arrival has an invalid companion group')
+    sources = []
+    for name in names:
+        found = [region for region, army in pre.armies.items()
+                 for companion in army.leaders
+                 if isinstance(companion, Companion) and companion.name == name]
+        if len(found) != 1:
+            raise LookupError('Dead Men companion %r has no unique source' % name)
+        sources.append(sanitize(str(found[0])))
+    if len(set(sources)) != 1 or sources[0] == sanitize(choices['target_region']):
+        raise LookupError('Dead Men companions do not share the departure region')
+    # The explicit planner checks each selected identity against the actual
+    # client source; the card delta renderer alone can otherwise use any seat.
+    emitter.plan_companion_move(view, nick, 'FREE_PEOPLES', {
+        'from': sources[0], 'to': choices['target_region'], 'companions': names})
+    arrival = ai.clone_state(pre)
+    if not event_effects.dead_men_arrival_before_roll(
+            arrival, choices['target_region'], names):
+        return None
+    em = emission_card.render_card_effect(view, nick, side, 'card_option',
+                                          action, pre, arrival)
+    if em.hold:
+        raise LookupError('Dead Men arrival: %s' % em.hold)
+    return arrival, em
+
+
 def render_decision(view, nick, side, kind, action, post=None,
                     pre=None):
     """Render one pending-chain decision (combat / hunt / casualty /
@@ -972,9 +1060,8 @@ def render_decision(view, nick, side, kind, action, post=None,
     a = action
     at = a.action_type
 
-    # ---- the AI's own hand-limit discard (cbt8: the DECISION path
-    # lacked the branch render_action already had - the eye step
-    # halted on 'no L2 planner for discard_card' every tick) ----------
+    # ---- the AI's own hand-limit discard: the DECISION path renders
+    # it exactly as render_action does ----------------------------------
     if at == 'discard_card':
         return render_action(view, nick, side, a, post=post)
 
@@ -995,29 +1082,23 @@ def render_decision(view, nick, side, kind, action, post=None,
         # (ay_0.l(): the first chooser's nick fills slot J, a second
         # nick fills K, the SAME nick replaces its own card), so the
         # F1 handler ('!CALL choose_card', local nick) would overwrite
-        # the human's pending commit on a one-client board - measured:
-        # the reveal then showed the AI's card only and the round
-        # parked for ever.
+        # the human's pending commit on a one-client board.
         return Emission(lines=[render('combat_card_pick',
                                       {'nick': nick, 'piece': str(pid)},
                                       local=False)])
 
     # combat protocol chats: each text under ITS OWN registered kind
-    # (WAVE-H: 'stop'/'press'/'gandalf shines'/'ffN' all rode the 'nc'
-    # or unregistered kinds and the ChatOut validators refused them -
-    # the two-vocabularies seam defect, third specimen)
+    # (the ChatOut validators refuse a text under another kind's form)
     if at == 'siege_assault':
-        # WAVE-K K8 (wkg6 LIVE WEDGE: the AI's own siege ASSAULT of a
-        # besieged stronghold): the attacker_siege_decision -> assault
-        # has NO board gesture of its own - the region was already
-        # declared by the army_attack that OPENED the pending (corpus
-        # 2023-01-02: after the withdrawal into Lorien Stronghold the
-        # attacker chats the region, then the assault round rolls); the
-        # engine runs a combat round here, whose d6 rolls the funnel
-        # asks and whose hits/casualties get their own producers.  An
-        # empty emission lets the round proceed instead of DriverHalt
-        # ('no L2 planner for siege_assault').  siege_continue (maintain,
-        # no round) likewise emits nothing new here.
+        # K8: the attacker_siege_decision -> assault has NO board
+        # gesture of its own - the region was already declared by the
+        # army_attack that OPENED the pending (corpus: after the
+        # withdrawal into the Stronghold the attacker chats the region,
+        # then the assault round rolls); the engine runs a combat round
+        # here, whose d6 rolls the funnel asks and whose
+        # hits/casualties get their own producers.  An empty emission
+        # lets the round proceed.  siege_continue (maintain, no round)
+        # likewise emits nothing new here.
         return Emission()
     if at == 'combat_card_none':
         return Emission(chat=[('nc', 'nc')])
@@ -1030,44 +1111,50 @@ def render_decision(view, nick, side, kind, action, post=None,
     if at == 'shine_none':
         return Emission()
     if at == 'combat_effect_choice':
-        # WAVE-I (WAVE-H blocker 3): the non-dread magnitude classes
-        # (Relentless Assault self-hits, Onslaught sacrifice, Heroic
-        # Death leader/companion forfeit) no longer wedge.  The DECISION
-        # itself has NO physical gesture: the engine only RECORDS the
-        # count here (combat.py choices['*_effect_count']) and applies
-        # the sacrifice later, inside the round-resolution apply — the
-        # corpus confirms the chat-first shape (2023-01-13 Relentless
-        # Assault: the owner says 'I wont inflict a hit', no drag; the
-        # sacrifice kills render inside the round: 'kills Isengard
-        # Regular in Orthanc', 2023-01-02).  So this decision emits the
-        # G3 magnitude statement ONLY (a decision of 0 must still be
-        # stated — chat.py kind 'magnitude'); the physical kill lines
-        # are rendered when they materialize, by the post-commit
-        # forced-casualty sweep (render_forced_rows) on whichever apply
-        # fights the round.  Dread and Despair keeps its dedicated ffN
-        # grammar (leadership forfeit has no board form at all).
-        cid = str(a.params.get('card_id', ''))
-        cnt = int(a.params.get('count', 0) or 0)
-        # the effect CLASS comes from the engine's own classifier over
-        # the card's printed COMBAT name (combat.combat_effect_kind) —
-        # 'dread' never appears in a live card_id ('Grond, Hammer of
-        # the Underworld' CARRIES Dread and Despair), so the donor's
-        # substring test would have mislabeled every live dread choice
-        eff = None
+        # Count decisions announce a magnitude. Exact round payment choices
+        # change pieces through the driver's existing post-commit forced rows;
+        # they must not invent an additional zero-magnitude announcement.
+        if all(key in a.params for key in ('nation', 'kind', 'operation')):
+            return Emission()
+        from .chat import combat_effect_choice_note
+        return Emission(chat=[('prompt', combat_effect_choice_note(a.params))])
+
+    # ---- EX-8 (2026-08-29): the Shadow's table-kill PAYMENT pair is a
+    # learned card_option (ai._open_table_kill_payment -> the chosen
+    # pair leaves the hand via ai.pay_table_card_kill).  The corpus
+    # renders the payment as MASKED hand kills (one per card, the
+    # identities never revealed) - the same lines the action path
+    # rendered when the engine auto-paid.  Rendered by the DECISION,
+    # never by a hand diff.
+    _chx = (a.params or {}).get('choices')
+    if at == 'card_option' and isinstance(_chx, dict) \
+            and _chx.get('army_card') and _chx.get('character_card'):
+        em = Emission()
+        for cid in (_chx['army_card'], _chx['character_card']):
+            cpid = _card_pid(view, cid)
+            if cpid is None:
+                return _hold(
+                    'table-kill payment: no client pid for the AI\'s own '
+                    'card %r (commitment-decode gap) - refusing to '
+                    'discard a guessed piece' % (str(cid)[:48],))
+            em.lines.append(render('hand_exit_b', {
+                'nick': nick, 'pieces': [cpid],
+                'frm': 'Controls.46' if side_name == 'SHADOW'
+                else 'Controls.45'}, local=False))
+        return em
+    _card_casualty = getattr(st, 'pending_card_option', None) or {}
+    if at == 'card_option' and _card_casualty.get('card_casualty'):
+        params = emitter.casualty_action_params(a)
+        if params is None or a.params.get('card_id') != _card_casualty.get('card_id'):
+            return _hold('card casualty action does not identify this pending allocation')
+        if post is not None:
+            n0 = len(getattr(st, '_dg_src_log', None) or [])
+            params['_dg_srcs'] = list(getattr(post, '_dg_src_log', None) or [])[n0:]
         try:
-            from cards import get_card
-            from combat import combat_effect_kind
-            card = get_card(cid)
-            eff = combat_effect_kind(
-                getattr(card, 'combat_name', '') or '')
-        except Exception:
-            eff = None
-        if eff == 'dread_despair' or 'dread' in cid.lower():
-            return Emission(chat=[(
-                'ff', 'ff%d' % int(a.params.get('count', 1) or 1))])
-        title = parser_card_name(cid).strip().lower() or 'combat card'
-        return Emission(chat=[('magnitude',
-                               '%s: i choose %d' % (title[:40], cnt))])
+            ops = emitter.plan_casualty_operation(params, view, nick, side_name)
+        except (LookupError, ValueError) as error:
+            return _hold('card casualty operation: %s' % error)
+        return _ops_to_emission(view, nick, at, ops)
 
     # ---- card_option: the SANCTIONED delta-scoped row renderer ------
     # (bounded exception to rule 6, coordinator 2026-08-19; provenance
@@ -1076,8 +1163,14 @@ def render_decision(view, nick, side, kind, action, post=None,
     # and ride their own planners below.)
     if at == 'card_option':
         from . import emission_card
-        return emission_card.render_card_effect(view, nick, side, kind,
-                                                a, pre, post)
+        em = emission_card.render_card_effect(view, nick, side, kind,
+                                              a, pre, post)
+        if not em.hold:
+            try:
+                em.lines += _forced_guide_lines(view, nick, pre or st, post)
+            except LookupError as e:
+                return _hold('%s forced Guide: %s' % (at, e))
+        return em
     if at.startswith('card_'):
         return _hold(
             "no planner renders %r (pending kind %r) -- the old "
@@ -1140,19 +1233,19 @@ def render_decision(view, nick, side, kind, action, post=None,
             return _hold('%s: boards cannot supply the pieces: %s'
                          % (at, e))
         em = _ops_to_emission(view, nick, at, ops)
-        # the press announce disambiguates the swap (donor :8610-8614)
+        # the press announce disambiguates the swap
         em.chat.insert(0, ('press', 'press'))
         return em
 
     # ---- everything else rides the planner table ---------------------
     plan_at = at
     if at == 'hunt_sacrifice_random':
-        # WAVE-K K7 (wkf2 LIVE WEDGE): the victim is the CLIENT's own
-        # random draw (randomcomp funnel) - live_server defers this
-        # render until the apply succeeded; the POST state names the
-        # companion that LEFT the fellowship and the physical grammar
-        # is the guide-sacrifice one (death drag to FP Casualties, or
-        # the ALIVE separation onto the map - USER ruling 2026-08-16).
+        # K7: the victim is the CLIENT's own random draw (randomcomp
+        # funnel) - live_server defers this render until the apply
+        # succeeded; the POST state names the companion that LEFT the
+        # fellowship and the physical grammar is the guide-sacrifice
+        # one (death drag to FP Casualties, or the ALIVE separation
+        # onto the map - USER ruling 2026-08-16).
         if post is None:
             return _hold('hunt_sacrifice_random needs the post state '
                          '(the client draw names the victim)')
@@ -1185,7 +1278,26 @@ def render_decision(view, nick, side, kind, action, post=None,
     except LookupError as e:
         return _hold('%s: boards cannot supply the pieces: %s'
                      % (at, e))
-    return _ops_to_emission(view, nick, at, ops)
+    em40 = _ops_to_emission(view, nick, at, ops)
+    if not em40.hold:
+        try:
+            em40.lines += _forced_guide_lines(view, nick, st, post)
+        except LookupError as e:
+            return _hold('%s forced Guide: %s' % (at, e))
+    try:
+        _ch40 = (a.params or {}).get('choices') or {}
+        if str(at) == 'card_option' and isinstance(_ch40, dict) \
+                and _ch40.get('action') == 'discard_table_card' \
+                and not em40.hold:
+            # BL-40: the AI discarding its OWN table card to cancel an
+            # effect (Wizard's Staff eating a hunt hit) must be SAID,
+            # or it reads as a broken hunt
+            from .chat import table_discard_cancel_note
+            em40.chat = list(em40.chat or ()) + [
+                ('prompt', table_discard_cancel_note())]
+    except Exception:
+        pass
+    return em40
 
 
 # --------------------------------------------------------------------
@@ -1218,7 +1330,7 @@ def render_hits(atk_hits, def_hits, attacker_is_human):
                            % (_p(you), _p(me)))])
 
 
-def round_hits_chat(post, human_side):
+def round_hits_chat(post, human_side, pre=None):
     """G2 hit announcement for a combat round that resolved INSIDE the
     apply that produced `post` (WAVE-H wiring - nothing called
     render_hits).
@@ -1231,28 +1343,64 @@ def round_hits_chat(post, human_side):
     r = getattr(post, '_last_battle_result', None)
     if r is None:
         return []
+    observed_rounds = getattr(r, '_bridge_ordinary_round_rolls', None)
+    if observed_rounds is not None and not any(observed_rounds):
+        # A live pre-combat wipe or retreat can finish the engine round before
+        # normal dice. Its ordinary 0/0 totals would misleadingly deny the
+        # already resolved additional attack. Actual rolled 0/0 stays visible.
+        return []
+    if getattr(r, 'round_paused', False):
+        # A paused result's totals cover only completed rounds. Initiative-six
+        # prevention has not produced this round's final casualty count yet.
+        pending = getattr(r, 'round_pending', None) or {}
+        if pending.get('effect') != 'heroic_death':
+            return []
+        resume = getattr(r, 'round_resume', None) or {}
+        combat = getattr(resume.get('cursor'), 'combat', None)
+        if combat is None:
+            return []
+        role = 'attacker' if pending.get('owner') == 'atk' else 'defender'
+        enemy = 'defender' if role == 'attacker' else 'attacker'
+        incoming = max(0, int(getattr(combat, enemy + '_hits', 0))
+                       + int(getattr(combat, enemy + '_bonus_hits', 0))
+                       - int(getattr(combat, role + '_hits_cancelled', 0)))
+        from . import chat
+        return [('prompt', chat.heroic_death_incoming_note(
+            incoming, getattr(combat, role + '_side', None) is human_side))]
     call = getattr(post, '_last_round_call', None) or {}
     atk_side = call.get('atk_side')
+    if atk_side is None and getattr(post, '_last_round_phase_call', False):
+        # Resuming a saved cursor deliberately drops the old transient call.
+        # The enclosing pre-commit combat still authoritatively names its side.
+        prior_combat = getattr(pre, 'pending_combat', None) or {}
+        atk_side = prior_combat.get('attacker_side')
     if atk_side is None or human_side is None:
         return []
-    em = render_hits(int(getattr(r, 'attacker_total_hits', 0) or 0),
-                     int(getattr(r, 'defender_total_hits', 0) or 0),
+
+    def _tot60(prefix):
+        # BL-60: one answerer - the announce totals what the casualty
+        # stage consumes (PRE-COMBAT hits included); absent fields
+        # cost nothing
+        return (int(getattr(r, prefix + '_total_hits', 0) or 0)
+                + int(getattr(r, prefix + '_pre_combat_hits', 0)
+                      or 0))
+    em = render_hits(_tot60('attacker'), _tot60('defender'),
                      attacker_is_human=(atk_side is human_side))
     return list(em.chat)
 
 
 # ====================================================================
-# WAVE-I: forced-allocation rows + settlement-capture markers
-# (WAVE-H blockers 1 and 2).  Both are ENGINE EVENTS a committed apply
-# resolved that NO gesture or decision-planner rendered:
+# forced-allocation rows + settlement-capture markers.  Both are
+# ENGINE EVENTS a committed apply resolved that NO gesture or
+# decision-planner rendered:
 #   * forced casualties: the engine auto-allocates a side's hits when
-#     the allocation is no choice — those unit removals were UNEMITTED
-#     (the cbt10 class) and the client board kept dead units alive;
+#     the allocation is no choice (unemitted, the client board would
+#     keep dead units alive);
 #   * settlement captures: enemy_controlled/VP move engine-side with
-#     no marker lines, drifting the client's control/VP markers.
+#     no marker lines (the client's control/VP markers would drift).
 # Rendering follows emission_card's SANCTIONED bounded pattern: the
 # delta between the driver's own pre/post states around ONE apply,
-# literal row rules only, every ambiguity a loud HOLD.
+# Committed endpoint rows, preserving actual identity and physical supply.
 # ====================================================================
 def _row_side(nation_or_tkey):
     n = str(nation_or_tkey).split(':', 1)[0]
@@ -1273,8 +1421,6 @@ def removal_rows(pre, post, side_tag):
       unexplained: [(region, leader_delta)] rows that do not decompose
     """
     from . import emission_card as emc
-    from board import sanitize
-    delta = None
     from . import client_board
     delta = client_board.board_delta(pre, post)
     out = {'units': {}, 'naz': {'minus': [], 'plus': []},
@@ -1284,11 +1430,30 @@ def removal_rows(pre, post, side_tag):
         return out
     cas_inc = emc._cas_increments(pre, post)
     if side_tag == 'fp':
+        # The casualty box is a stock, not a count of deaths in this apply.
+        # An Elite reduction may borrow a dead Regular and automatic casualty
+        # follow-through then kill that same replacement (net box delta zero).
+        # Add only the engine's new, explicit casualty-box withdrawals so the
+        # forced-row renderer can distinguish that genuine loss from a return.
+        before_sources = list(getattr(pre, '_dg_src_log', None) or [])
+        after_sources = list(getattr(post, '_dg_src_log', None) or [])
+        if after_sources[:len(before_sources)] != before_sources:
+            raise ValueError('Downgrade source log is not an append-only continuation')
+        sources = []
+        for nation, source in after_sources[len(before_sources):]:
+            key = '%s:regular' % str(getattr(nation, 'value', nation)).lower()
+            if source == 'cas' and _row_side(key) == 'fp':
+                cas_inc[key] = cas_inc.get(key, 0) + 1
+            if source in ('cas', 'pool') and _row_side(key) == 'fp':
+                sources.append((key.rsplit(':', 1)[0], source))
         out['cas'] = dict(cas_inc)
+        if sources:
+            out['downgrade_sources'] = sources
     named = delta.get('__named__', ()) or ()
     named_delta = {}
     for region, before, after in named:
-        b, a2 = set(before), set(after)
+        b = {emc._named_identity(name) for name in before}
+        a2 = {emc._named_identity(name) for name in after}
         named_delta[region] = named_delta.get(region, 0) \
             + len(after) - len(before)
         for nm in b - a2:
@@ -1301,9 +1466,40 @@ def removal_rows(pre, post, side_tag):
             if (pside or '').upper().startswith(
                     'S' if side_tag == 'shadow' else 'F'):
                 out['named']['joins'].setdefault(nm, []).append(region)
-    for region in sorted(k for k in delta
-                         if not str(k).startswith('__')):
-        ud, ld = delta[region]
+    # FLA-3 (par5 g3#6): ShadowMinion figures are INVISIBLE in
+    # __named__ (the projector's type check predates the class name),
+    # so a minion relocation vanished from the row space entirely -
+    # no demand, no render, no hold (the Return of the Witch-king
+    # divergence).  Derive their identity rows directly from the
+    # states; _leader_comp now excludes them so the leader-delta
+    # decomposition stays consistent.
+    if side_tag == 'shadow':
+        from board import sanitize as _snMi
+
+        def _minion_regions(st):
+            out9 = {}
+            for k9, a9 in st.armies.items():
+                for l9 in (getattr(a9, 'leaders', None) or ()):
+                    if type(l9).__name__ == 'ShadowMinion':
+                        out9.setdefault(
+                            str(getattr(l9, 'name', '')),
+                            []).append(_snMi(str(k9)))
+            return out9
+        m0 = _minion_regions(pre)
+        m1 = _minion_regions(post)
+        for nm in sorted(set(m0) | set(m1)):
+            r0, r1 = set(m0.get(nm, ())), set(m1.get(nm, ()))
+            for region in sorted(r0 - r1):
+                out['named']['leaves'].setdefault(nm,
+                                                  []).append(region)
+                named_delta[region] = named_delta.get(region, 0) - 1
+            for region in sorted(r1 - r0):
+                out['named']['joins'].setdefault(nm,
+                                                 []).append(region)
+                named_delta[region] = named_delta.get(region, 0) + 1
+    for region in sorted({k for k in delta if not str(k).startswith('__')}
+                         | set(named_delta)):
+        ud, ld = delta.get(region, ((), 0))
         for tkey, n in ud:
             if _row_side(tkey) != side_tag:
                 continue
@@ -1313,7 +1509,10 @@ def removal_rows(pre, post, side_tag):
                 slot['plus'].append((region, int(n)))
             else:
                 slot['minus'].append((region, -int(n)))
-        if ld:
+        if ld or named_delta.get(region, 0):
+            # Named arrivals can cancel generic losses in the aggregate
+            # leader count (Dead Men companions replacing killed Nazgul).
+            # Decompose that zero net change before emitting the aftermath.
             naz0, pl0 = emc._leader_comp(pre, region)
             naz1, pl1 = emc._leader_comp(post, region)
             naz_d = naz1 - naz0
@@ -1359,6 +1558,7 @@ def expressed_rows(view, ops, side_tag):
     decode_failed=True means a dead/moved pid could not be typed — the
     caller must then HOLD the sweep rather than risk a double kill."""
     import log_replay as _lr
+    from .emission_card import _named_identity
     from board import sanitize
     rows = {'units': {}, 'naz': {'minus': [], 'plus': []},
             'named': {'leaves': {}, 'joins': {}},
@@ -1406,12 +1606,13 @@ def expressed_rows(view, ops, side_tag):
                     rows['naz']['minus'].append((reg, 1))
                 elif ut in ('companion', 'minion'):
                     rows['named']['leaves'].setdefault(
-                        str(nat), []).append(reg)
+                        _named_identity(str(nat)), []).append(reg)
                 elif ut in ('regular', 'elite', 'leader'):
                     if emitter._side_of_nation(nat) == side_tag:
-                        _add('minus', '%s:%s' % (
-                            str(getattr(nat, 'value', nat)).lower(),
-                            ut), reg)
+                        key = '%s:%s' % (str(getattr(nat, 'value', nat)).lower(), ut)
+                        _add('minus', key, reg)
+                        if side_tag == 'fp' and reg is not None:
+                            rows['cas'][key] = rows['cas'].get(key, 0) + 1
         elif op in _RETRACK_TO:
             frm_r = _reg_of(f.get('frm') or '')
             to_r = _reg_of(f.get('to') or '')
@@ -1428,10 +1629,10 @@ def expressed_rows(view, ops, side_tag):
                 elif ut in ('companion', 'minion'):
                     if frm_r:
                         rows['named']['leaves'].setdefault(
-                            str(nat), []).append(frm_r)
+                            _named_identity(str(nat)), []).append(frm_r)
                     if to_r:
                         rows['named']['joins'].setdefault(
-                            str(nat), []).append(to_r)
+                            _named_identity(str(nat)), []).append(to_r)
                 elif ut in ('regular', 'elite', 'leader'):
                     if emitter._side_of_nation(nat) == side_tag:
                         key = '%s:%s' % (
@@ -1439,8 +1640,15 @@ def expressed_rows(view, ops, side_tag):
                             ut)
                         if frm_r:
                             _add('minus', key, frm_r)
+                            if side_tag == 'fp' and f.get('to') == emitter.FP_DEAD:
+                                rows['cas'][key] = rows['cas'].get(key, 0) + 1
                         if to_r:
                             _add('plus', key, to_r)
+                            if side_tag == 'fp' and ut == 'regular' and op == 'swap_remove':
+                                source = {emitter.FP_DEAD: 'cas', emitter.FP_POOL: 'pool'}.get(f.get('frm'))
+                                if source is not None:
+                                    rows.setdefault('downgrade_sources', []).append(
+                                        (key.rsplit(':', 1)[0], source))
     return rows, failed[0]
 
 
@@ -1464,19 +1672,35 @@ def subtract_rows(rows, sub):
            'named': {'leaves': {}, 'joins': {}},
            'cas': dict(rows.get('cas') or {}),
            'unexplained': list(rows.get('unexplained') or [])}
-    for tkey, slot in rows['units'].items():
-        s2 = (sub['units'].get(tkey) if sub else None) or \
-            {'minus': [], 'plus': []}
-
-        def _cnt(pairs):
-            d = {}
-            for r, n in pairs:
-                d[r] = d.get(r, 0) + n
-            return d
-        m = _sub_pairs(slot['minus'], _cnt(s2['minus']))
-        p = _sub_pairs(slot['plus'], _cnt(s2['plus']))
-        if m or p:
-            out['units'][tkey] = {'minus': m, 'plus': p}
+    # Unit rows are signed changes. A selected Regular removal followed by
+    # an automatic Elite reduction has net Regular delta zero, but after
+    # rendering that removal the residual must still place one Regular.
+    # Clipping subtraction within separate +/- lists silently lost it.
+    from collections import Counter
+    # Death evidence is consumed with the already rendered loss. Leaving the
+    # original total here either rejects a valid residual loss (Great Host)
+    # or credits that same death twice and permits an unproved second kill.
+    out['cas'] = {key: int(rows.get('cas', {}).get(key, 0))
+                 - int((sub or {}).get('cas', {}).get(key, 0))
+                 for key in set(rows.get('cas', {})) | set((sub or {}).get('cas', {}))}
+    owed_sources = [tuple(source) for source in rows.get('downgrade_sources', ())]
+    for source in (sub or {}).get('downgrade_sources', ()):
+        source = tuple(source)
+        if source in owed_sources:
+            owed_sources.remove(source)
+    if 'downgrade_sources' in rows:
+        out['downgrade_sources'] = owed_sources
+    for tkey in sorted(set(rows['units']) | set((sub or {}).get('units', {}))):
+        delta = Counter()
+        for source, multiplier in ((rows, 1), (sub or {}, -1)):
+            slot = source.get('units', {}).get(tkey, {})
+            for direction, sign in (('plus', 1), ('minus', -1)):
+                for region, count in slot.get(direction, []):
+                    delta[region] += multiplier * sign * count
+        minus = [(region, -count) for region, count in sorted(delta.items()) if count < 0]
+        plus = [(region, count) for region, count in sorted(delta.items()) if count > 0]
+        if minus or plus:
+            out['units'][tkey] = {'minus': minus, 'plus': plus}
     for b in ('minus', 'plus'):
         d = {}
         for r, n in (sub['naz'][b] if sub else ()):
@@ -1496,13 +1720,40 @@ def subtract_rows(rows, sub):
     return out
 
 
-def render_forced_rows(view, nick, side, rows, pre, label=''):
+def _companion_out_of_play(post, pid):
+    """Known Companion absent from every live or deferred engine location."""
+    if post is None:
+        return False
+    import log_replay
+    if str(pid) not in log_replay.COMPANIONS:
+        return False
+    names = set(log_replay.names_for_pid(str(pid)) or ())
+    if not names:
+        return False
+    fellowship = post.fellowship
+    living = {str(c.name) for c in fellowship.companions}
+    guide = getattr(fellowship, 'guide', None)
+    if guide is not None:
+        living.add(str(guide.name))
+    for army in post.armies.values():
+        living.update(str(getattr(figure, 'name', '')) for figure in army.leaders)
+    living.update(str(getattr(figure, 'name', figure))
+                  for figure in (getattr(post, '_hobbit_place_queue', None) or ()))
+    pending = getattr(post, 'pending_hunt', None) or {}
+    if pending.get('phase') == 'hobbit_place':
+        living.add(str(pending.get('companion', '')))
+        living.add(str(getattr(pending.get('companion_obj'), 'name', '')))
+    return not names.intersection(living)
+
+
+def render_forced_rows(view, nick, side, rows, pre, label='', post=None):
     """Render residual side-owned rows as that side's own physical
     lines (the bounded emission_card row rules, applied to the
     forced-allocation class).  Returns (Emission, ledger_rows):
     ledger_rows = the REMOVAL fingerprints rendered (echo-ledger
     entries).  Any row outside the literal rules => HOLD naming it."""
     from . import emission_card as emc
+    from .board_transfers import balanced_transfers, physical_move_ops
     from board import sanitize
     side_name = emitter.canon_side(side)
     side_tag = 'shadow' if side_name == 'SHADOW' else 'fp'
@@ -1539,10 +1790,40 @@ def render_forced_rows(view, nick, side, rows, pre, label=''):
         if emitter.garrison_side_of(pre, params['region']) \
                 == side_name:
             params['_besieged_garrison'] = True
+        # The engine records the exact replacement source for FP reductions.
+        # Consume each residual proof once across arrivals; ordinary recruits
+        # keep their existing pool policy. Never substitute another source.
+        if not hasattr(_recruit, 'sources'):
+            _recruit.sources = list(rows.get('downgrade_sources') or [])
         for _ in range(n):
             try:
-                op = emitter.plan_muster(scratch, nick, side_name,
-                                         params, unit_kind)
+                source_index = next((i for i, (nat, source) in
+                    enumerate(_recruit.sources)
+                    if side_tag == 'fp' and unit_kind == 'regular'
+                    and str(nat).lower() == str(nation).lower()), None)
+                if source_index is None:
+                    op = emitter.plan_muster(scratch, nick, side_name,
+                                             params, unit_kind)
+                else:
+                    _, source = _recruit.sources.pop(source_index)
+                    if source not in ('cas', 'pool'):
+                        raise LookupError('invalid recorded downgrade source %r' % (source,))
+                    source_zone = emitter.FP_DEAD if source == 'cas' else emitter.FP_POOL
+                    candidates = []
+                    for pid in sorted(scratch.piece_region):
+                        nat, kind = emitter._unit_type(pid, scratch, side_hint='fp')
+                        if kind != 'regular' or str(getattr(nat, 'value', nat)).lower() != str(nation).lower():
+                            continue
+                        try:
+                            if emitter._piece_zone_code(scratch, pid) == source_zone:
+                                candidates.append(pid)
+                        except LookupError:
+                            pass
+                    if not candidates:
+                        raise LookupError('recorded %s source has no observed %s Regular' % (source, nation))
+                    op = ('move', {'nick': nick, 'pieces': candidates[:1],
+                        'frm': source_zone, 'to': emitter.garrison_arrival_zone(
+                            pre, params['region'], side_tag)})
                 ops.append(op)
                 emc._retrack_scratch(scratch, [op])
             except LookupError as e:
@@ -1553,14 +1834,10 @@ def render_forced_rows(view, nick, side, rows, pre, label=''):
     def _move(frm, to, n, nation, unit_kind, tname):
         try:
             pids = _pick(frm, unit_kind, n, nation)
-            op = ('move', {
-                'nick': nick, 'pieces': pids,
-                'frm': emitter.zone_code_for(sanitize(str(frm))),
-                'to': emitter._garrison_dest(scratch,
-                                             sanitize(str(to)),
-                                             side_name)})
-            ops.append(op)
-            emc._retrack_scratch(scratch, [op])
+            transfers = physical_move_ops(scratch, nick, pids,
+                emitter._garrison_dest(scratch, sanitize(str(to)), side_name))
+            ops.extend(transfers)
+            emc._retrack_scratch(scratch, transfers)
         except LookupError as e:
             holds.append('%s: cannot supply the %d-piece move '
                          '%s -> %s: %s' % (tname, n, frm, to, e))
@@ -1574,11 +1851,9 @@ def render_forced_rows(view, nick, side, rows, pre, label=''):
         if not M:
             for r, n in P:
                 _recruit(r, n, nation, unit_kind, tkey)
-        elif len(M) == 1 and len(P) == 1 and M[0][1] == P[0][1] \
-                and cas == 0:
-            # the auto-advance / forced-relocation shape (post-retreat
-            # victor advance: one army, one source, one destination)
-            _move(M[0][0], P[0][0], M[0][1], nation, unit_kind, tkey)
+        elif cas == 0 and balanced_transfers(M, P) is not None:
+            for source, target, count in balanced_transfers(M, P):
+                _move(source, target, count, nation, unit_kind, tkey)
         elif side_tag == 'fp' and cas == tm:
             for r, n in M:
                 _kill(r, n, nation, unit_kind, tkey)
@@ -1600,8 +1875,9 @@ def render_forced_rows(view, nick, side, rows, pre, label=''):
         if not M:
             for r, n in P:
                 _recruit(r, n, None, 'leader', 'nazgul')
-        elif len(M) == 1 and len(P) == 1 and M[0][1] == P[0][1]:
-            _move(M[0][0], P[0][0], M[0][1], None, 'nazgul', 'nazgul')
+        elif balanced_transfers(M, P) is not None:
+            for source, target, count in balanced_transfers(M, P):
+                _move(source, target, count, None, 'nazgul', 'nazgul')
         elif not P:
             for r, n in M:
                 try:
@@ -1627,9 +1903,7 @@ def render_forced_rows(view, nick, side, rows, pre, label=''):
                      | set(rows['named']['joins'])):
         ls = rows['named']['leaves'].get(nm, [])
         js = rows['named']['joins'].get(nm, [])
-        pid, pside = None, None
-        from . import emission_card as _emc
-        pid, pside = _emc._named_pid_side(nm)
+        pid, pside = emc._named_pid_side(nm)
         if pid is None:
             holds.append('named: unknown figure %r' % (nm,))
             continue
@@ -1648,6 +1922,24 @@ def render_forced_rows(view, nick, side, rows, pre, label=''):
                                scratch, sanitize(str(js[0])), pside)})
             ops.append(op)
             emc._retrack_scratch(scratch, [op])
+        elif ls and not js and pside == 'FREE_PEOPLES' and _companion_out_of_play(post, pid):
+            # An army Companion has no separate casualty-counter stock.
+            # The committed post-state distinguishes elimination from a
+            # return to the Fellowship or an outstanding Hobbit placement.
+            try:
+                frm = emitter._piece_zone_code(scratch, pid)
+            except LookupError:
+                frm = None
+            if frm is None or frm == emitter.FP_DEAD:
+                holds.append('named: no live client source for eliminated %r' % (nm,))
+                continue
+            op = ('move', {'nick': nick, 'pieces': [pid], 'frm': frm,
+                           'to': emitter.FP_DEAD})
+            ops.append(op)
+            emc._retrack_scratch(scratch, [op])
+            ledger.append({'kind': 'named', 'side': 'fp',
+                           'region': sanitize(str(ls[0] or '')),
+                           'tkey': nm, 'n': 1})
         elif ls and not js and pside == 'SHADOW':
             # a Shadow named figure eliminated in the apply: minions
             # go out of play via the same kill grammar (converged)
@@ -1682,12 +1974,11 @@ def render_forced_rows(view, nick, side, rows, pre, label=''):
     return em, ledger
 
 
-# ---- settlement-capture markers (WAVE-H blocker 2) ------------------
-# donor grammar: ai_move_server.py :10094-10236 (G4 control markers,
-# VP reconciler).  Engine truth: post.enemy_controlled sets + game_
-# logic.calculate_victory_points(post).  Ledger-reconciled per commit,
-# idempotent; a marker the HUMAN already claimed (visible in the dump)
-# is ADOPTED, never duplicated.
+# ---- settlement-capture markers --------------------------------------
+# G4 control markers + the VP reconciler.  Engine truth:
+# post.enemy_controlled sets + game_logic.calculate_victory_points(post).
+# Ledger-reconciled per commit, idempotent; a marker the HUMAN already
+# claimed (visible in the dump) is ADOPTED, never duplicated.
 _VP_TRACK_ZONES = {0: 'Game.27', 1: 'Game.28', 2: 'Game.29',
                    3: 'Game.30', 4: 'Game.31', 5: 'Game.32',
                    6: 'Game.33', 7: 'Game.388', 8: 'Game.389',
@@ -1777,9 +2068,27 @@ def render_capture_markers(view, nick, post, ctrl, vp):
         old = max(0, min(10, int(vp.get(key, 0))))
         if cur == old:
             continue
+        source = _VP_TRACK_ZONES[old]
+        if view.piece_region.get(pid):
+            # A human or native capture handler may already have updated
+            # the physical marker before this engine commit reaches us.
+            # The ledger describes the prior score, not its current source.
+            try:
+                source = emitter._piece_zone_code(view, pid)
+            except LookupError:
+                source = None
+            if source not in _VP_TRACK_ZONES.values():
+                notes.append('vp-marker: %s marker %s has no known track '
+                             'source; no move emitted' % (key, pid))
+                continue
+            if source == _VP_TRACK_ZONES[cur]:
+                vp[key] = cur
+                notes.append('vp-adopt: %s marker %s already at %d; '
+                             'no move emitted' % (key, pid, cur))
+                continue
         em.lines.append(render('move', {
             'nick': nick, 'pieces': [pid],
-            'frm': _VP_TRACK_ZONES[old],
+            'frm': source,
             'to': _VP_TRACK_ZONES[cur]}, local=False))
         vp[key] = cur
     return em, notes

@@ -1,15 +1,15 @@
 """Card-effect row renderer: the SANCTIONED, BOUNDED exception to
 design rule 6 (REBUILD_PLAN.md), decided by the coordinator 2026-08-19.
 
-WHY THIS DIFF-SCOPED RENDERER IS ALLOWED WHILE _emit_board_diff WAS NOT
-(provenance for the future reader):
+DECISION ENDPOINT CONTRACT:
 
   The retired `_emit_board_diff` (ai_move_server.py :8940-9759) diffed
   WHOLE parser-state snapshots after the fact, then PAIRED pluses to
   minuses with distance/adjacency heuristics whenever the counts did
   not line up -- and those guessed pairings bred the phantom-piece
   defect family (pieces invented, resurrected, or teleported to make a
-  diff balance).  Rule 6 therefore bans emission-by-diff.
+  diff balance). This renderer instead uses both committed engine endpoints
+  and requires actual physical pieces to reproduce their difference.
 
   Optioned event cards are the one action class where the engine's
   ACTION carries no board effect at all (the chosen option's effect is
@@ -23,14 +23,11 @@ WHY THIS DIFF-SCOPED RENDERER IS ALLOWED WHILE _emit_board_diff WAS NOT
     * rows: client_board.board_delta(pre, post) -- both sides of the
       diff are the ENGINE's own states (I1), the same projection the
       witnesses use.
-    * pairing: a row renders ONLY when it matches one LITERAL rule
-      below (single unambiguous counterpart).  There are NO pairing
-      heuristics, no distance scoring, no cross-type matching.  Every
-      ambiguity class that fed the old differ's guesses -- multiple
-      sources for one destination, split counts, a removal that could
-      be either a casualty or a return -- is a LOUD HOLD naming the
-      rows.  Holds are acceptable; phantom pairings are the disease
-      this replaces.
+    * pairing: count-conserving transfers of the same nation and figure
+      type reproduce one endpoint regardless of grouping or source pairing.
+      Nazgul are fungible too. Named characters retain their identity.
+      Casualties and recruitment retain their actual reserve/dead-pile
+      effects; missing physical pieces cannot be invented to fill a gap.
 
 ROW-MATCHING RULES (per (nation, kind) unit type; leaders refined from
 the engine armies into nazgul / per-nation plain-leader rows; named
@@ -42,9 +39,10 @@ figures ride the __named__ identity rows):
             pile -- SA casualties recycle, rulebook p.30; a physical
             shortage raises and becomes a HOLD, pieces are never
             invented).
-  MOVE      exactly ONE (-n) region and exactly ONE (+n) region with
-            EQUAL counts and an unmoved casualty ledger: one group drag,
-            arrival zone via the garrison question.
+  MOVE      matching total removals/arrivals for one figure type, with
+            an unchanged casualty ledger: deterministic physical transfers
+            from any number of sources to any number of destinations.
+            Arrival zones retain field/stronghold ownership.
   CASUALTY  (-n) rows fully covered by the engine's OWN fp_casualties
             ledger increment: kill drags (hand_exit_b) out of the
             region; any (+n) rows of the type then recruit from the
@@ -61,8 +59,9 @@ figures ride the __named__ identity rows):
             (or joining from off-board / the fellowship): one identity
             drag of its pid from where the client holds it.  A named
             FP figure sourced from the FP dead pile is a resurrection
-            and HOLDS.  A name that only LEAVES holds (casualty or
-            return -- cannot tell).
+            and HOLDS. A name that only LEAVES goes to its side's dead
+            pile only when the committed post-state proves it is out
+            of play; live or deferred placements remain distinct.
   POLITICAL per-nation +k increments walk the nation's track marker k
             steps via emitter.plan_advance_political (the political
             planner emission.py already dispatches); a backward step
@@ -122,6 +121,8 @@ class _Scratch(object):
                                  or ())
         self.fellowship_location = getattr(view, 'fellowship_location',
                                            None)
+        self.shadow_stronghold_regions = dict(
+            getattr(view, 'shadow_stronghold_regions', {}) or {})
 
 
 def _retrack_scratch(scratch, ops):
@@ -168,7 +169,11 @@ def _leader_comp(state, region_san):
             tn = type(ld).__name__
             if tn == 'Nazgul':
                 naz += 1
-            elif tn in ('Companion', 'Minion'):
+            elif tn in ('Companion', 'Minion', 'ShadowMinion'):
+                # FLA-3 (par5 g3#6): the engine's minion class is
+                # ShadowMinion - the old 'Minion' check matched
+                # nothing, so minions leaked into the plain-leader
+                # buckets (nation '') and their identity rows vanished
                 continue
             else:
                 nv = _nv(getattr(ld, 'nation', ''))
@@ -178,17 +183,47 @@ def _leader_comp(state, region_san):
 
 def _named_pid_side(name):
     """(client pid, canonical side name) for a named figure, or
-    (None, None) when the tables do not know it."""
+    (None, None) when the tables do not know it.  FLA-6: reads the
+    parser tables DIRECTLY - _companion_pid resolves minions too now
+    (the seat's echo performer needs it), so its success no longer
+    implies FREE_PEOPLES."""
     import log_replay as lr
-    try:
-        return emitter._companion_pid(name), 'FREE_PEOPLES'
-    except LookupError:
-        pass
     want = str(name).strip().lower()
+    for p, n in lr.COMPANIONS.items():
+        if str(n).strip().lower() == want:
+            return str(p), 'FREE_PEOPLES'
+    for p, faces in getattr(lr, 'PIECE_NAME_ALIASES', {}).items():
+        for f in faces:
+            if str(f).strip().lower() == want:
+                return str(p), 'FREE_PEOPLES'
     for pid, nm in lr.MINION_PIECES.items():
         if str(nm).strip().lower() == want:
             return str(pid), 'SHADOW'
     return None, None
+
+
+def _named_identity(name):
+    """A promotion changes a piece's face, not its physical identity."""
+    import log_replay
+    pid, _side = _named_pid_side(name)
+    return str(log_replay.COMPANIONS.get(str(pid), name))
+
+
+def _named_elimination_destination(post, pid, side):
+    """Use the completed rule state, retaining live/deferred named figures."""
+    if post is None or pid is None:
+        return None
+    if side == 'FREE_PEOPLES':
+        from .emission import _companion_out_of_play
+        return emitter.FP_DEAD if _companion_out_of_play(post, pid) else None
+    if side == 'SHADOW':
+        import log_replay
+        names = set(log_replay.names_for_pid(pid) or ())
+        living = {str(getattr(figure, 'name', ''))
+                  for army in post.armies.values() for figure in army.leaders}
+        if names and not names.intersection(living):
+            return emitter.SH_DEAD
+    return None
 
 
 def _table_cids_changed(t0, t1):
@@ -204,10 +239,50 @@ def _table_cids_changed(t0, t1):
     return changed
 
 
+def _day_without_dawn_dice(view, nick, pre, post, cid):
+    """Render exactly the card's removed unused Will results and compact bindings.
+
+    Removal uses the pre-action PID mapping. Survivor indices are published
+    only after the complete card effect has rendered successfully.
+    """
+    from game_state import Side, ActionDieFace
+    if cid != 'SHADOW_Strategy_The_Day_Without_Dawn':
+        return None
+    fp, sh = Side.FREE_PEOPLES, Side.SHADOW
+    signature = lambda die: (tuple(die.faces), die.current, bool(die.used))
+    before = list(pre.dice.get(fp, ()))
+    removed = [i for i, d in enumerate(before)
+               if d.current == ActionDieFace.WILL_OF_WEST and not d.used]
+    if not removed:
+        return None
+    for side, expected in ((fp, [d for i, d in enumerate(before) if i not in removed]),
+                           (sh, pre.dice.get(sh, ()))):
+        if [signature(d) for d in expected] != [signature(d) for d in post.dice.get(side, ())]:
+            raise LookupError('Day Without Dawn changed dice beyond its unused Will results')
+    pids = [emitter.die_piece_for(view, fp.name, i) for i in removed]
+    if len(set(pids)) != len(pids):
+        raise LookupError('Day Without Dawn has duplicate die identities')
+    ops = []
+    for pid in pids:
+        source = emitter._piece_zone_code(view, pid, default=emitter.FP_DICE_POOL)
+        if source != emitter.FP_DICE_POOL:
+            raise LookupError('Unused Will die is not in the Free Peoples dice pool: ' + pid)
+        ops.append(('hand_exit_b', {'nick': nick, 'pieces': [pid], 'frm': source}))
+    bindings = dict(view.die_id_map)
+    # Resolve by PID instead of assuming a registration index equals a live
+    # index; legacy views may already carry discarded registration slots.
+    for pid, (side, _) in list(bindings.items()):
+        if side == fp:
+            bindings.pop(pid)
+    for index, old_index in enumerate(i for i in range(len(before)) if i not in removed):
+        bindings[emitter.die_piece_for(view, fp.name, old_index)] = (fp, index)
+    return ops, bindings
+
+
 # ---------------------------------------------------------------------
 # the renderer
 # ---------------------------------------------------------------------
-def render_card_effect(view, nick, side, kind, action, pre, post):
+def _render_card_effect_rows(view, nick, side, kind, action, pre, post):
     """Render the board effect of ONE applied card_option/card_followup
     decision from the engine's pre/post states.  See the module
     docstring for the row-matching rules and the rule-6 rationale.
@@ -215,6 +290,7 @@ def render_card_effect(view, nick, side, kind, action, pre, post):
     Returns an emission.Emission; HOLD (loud, naming the rows) on any
     ambiguity or physical shortage -- never a guessed pairing."""
     from .emission import Emission, _ops_to_emission, _pool_growth_lines
+    from .board_transfers import balanced_transfers, physical_move_ops
     from board import sanitize
 
     at = getattr(action, 'action_type', 'card_option')
@@ -241,6 +317,7 @@ def render_card_effect(view, nick, side, kind, action, pre, post):
     scratch = _Scratch(view, pre)
     kill_ops, move_ops, recruit_ops = [], [], []
     tail_ops, extra_lines = [], []
+    dice_bindings = None
 
     # ---- expected play bookkeeping (consumed, never rendered) --------
     from game_state import Side as _S
@@ -255,13 +332,33 @@ def render_card_effect(view, nick, side, kind, action, pre, post):
         for cid in gained:
             if str(cid) in pid_map:
                 continue       # the client itself drew it (!CALL)
+            if str(cid).startswith('HU_'):
+                # SQF-9 (seqack_fp1): a HUMAN-side placeholder gain IS
+                # the client's own blinded draw - the engine can mint
+                # HU_ identities only from client randomness (the draw
+                # funnel starves the apply otherwise), so the physical
+                # card already exists client-side; nothing to render.
+                continue
             holds.append('hand row: %s gained %r with no client-drawn '
                          'pid -- cannot have been a funnel draw'
                          % (skey, cid))
     table = delta.pop('__table__', None)
     if table is not None:
         cids = _table_cids_changed(table[0], table[1])
-        stray = sorted(c for c in cids if str(c) != expected_cid)
+        # Companion movement, including a legal stationary move, can activate
+        # Rohan and expire Wormtongue. The server's watched table-seat cleanup
+        # owns that physical discard; it is not another card choice.
+        from game_state import Nation, PersistentCardType
+        expired = set()
+        if (not pre.political.active.get(Nation.ROHAN, False)
+                and post.political.active.get(Nation.ROHAN, False)):
+            expired = {
+                card.card_id for card in pre.persistent_cards.sh_cards
+                if card.card_type is PersistentCardType.WORMTONGUE
+                and card.card_id in table[0][1]
+                and card.card_id not in set(table[1][0]) | set(table[1][1])
+            }
+        stray = sorted(c for c in cids if str(c) != expected_cid and c not in expired)
         if stray:
             holds.append('table row: cards other than the pending one '
                          'changed: %r' % (stray,))
@@ -277,21 +374,29 @@ def render_card_effect(view, nick, side, kind, action, pre, post):
         shrank = any(len(post.dice.get(s, []))
                      < len(pre.dice.get(s, []))
                      for s in (_S.FREE_PEOPLES, _S.SHADOW))
-        if grew and not shrank:
+        dawn = None
+        if shrank:
+            try:
+                dawn = _day_without_dawn_dice(view, nick, pre, post, expected_cid)
+            except LookupError as e:
+                holds.append('dice row: %s' % e)
+        if dawn is not None:
+            removed_ops, dice_bindings = dawn
+            tail_ops.extend(removed_ops)
+        elif grew and not shrank:
             try:
                 extra_lines += _pool_growth_lines(view, nick, pre, post)
             except LookupError as e:
                 holds.append('dice row: pool growth unrenderable: %s'
                              % e)
         else:
-            # WAVE-K K6 (wkf1 LIVE: Mirror of Galadriel wedged the
-            # first AI-as-FP game): a pure FACE CHANGE of unused dice
-            # (same roster length, same used flags, only .current
-            # differs) renders as the corpus die-change line per die
-            # ('$nick changes <pid>  to <letter>' - emitter op
-            # 'die_change', the elven-ring planner's grammar); the
-            # Shadow's Mouth-of-Sauron class rides the same lane.  Any
-            # other dice delta (usage flips, shrink) still HOLDS.
+            # K6: a pure FACE CHANGE of unused dice (same roster length,
+            # same used flags, only .current differs) renders as the
+            # corpus die-change line per die ('$nick changes <pid>  to
+            # <letter>' - emitter op 'die_change', the elven-ring
+            # planner's grammar); the Shadow's Mouth-of-Sauron class
+            # rides the same lane.  Any other dice delta (usage flips,
+            # shrink) HOLDS.
             changed = []
             pure = not grew and not shrank
             if pure:
@@ -333,7 +438,7 @@ def render_card_effect(view, nick, side, kind, action, pre, post):
 
     # ---- fellowship ---------------------------------------------------
     fell = dict(delta.pop('__fellowship__', ()) or ())
-    fell_left = set(fell.pop('left', ()) or ())
+    fell_left = {_named_identity(name) for name in (fell.pop('left', ()) or ())}
     fell.pop('guide', None)          # implicit: parser auto-reassigns
     if 'corruption' in fell:
         fell.pop('corruption')
@@ -357,7 +462,8 @@ def render_card_effect(view, nick, side, kind, action, pre, post):
     named_delta = {}                     # region -> named count delta
     leaves, joins = {}, {}
     for region, before, after in named:
-        b, a2 = set(before), set(after)
+        b = {_named_identity(name) for name in before}
+        a2 = {_named_identity(name) for name in after}
         named_delta[region] = named_delta.get(region, 0) \
             + len(after) - len(before)
         for nm in b - a2:
@@ -401,15 +507,49 @@ def render_card_effect(view, nick, side, kind, action, pre, post):
             move_ops.append(op)
             _retrack_scratch(scratch, [op])
         elif ls and not js:
-            holds.append('named row: %r left %r with no destination '
-                         '(casualty or return -- cannot tell)'
-                         % (nm, ls))
+            pid, pside = _named_pid_side(nm)
+            destination = _named_elimination_destination(post, pid, pside)
+            if destination is None:
+                holds.append('named row: %r left %r without a proved elimination '
+                             'or rendered live destination' % (nm, ls))
+                continue
+            try:
+                # Do not turn a missing physical identity into an initial-
+                # setup source. The figure may occupy a native siege seat.
+                frm = (emitter._piece_zone_code(scratch, pid)
+                       if pid in scratch.piece_region else None)
+            except LookupError:
+                frm = None
+            if frm is None or frm in (emitter.FP_DEAD, emitter.SH_DEAD,
+                                       emitter.FP_POOL, emitter.SH_POOL):
+                holds.append('named row: no live client source for eliminated %r' % (nm,))
+                continue
+            op = ('move', {'nick': nick, 'pieces': [pid], 'frm': frm,
+                           'to': destination})
+            kill_ops.append(op)
+            _retrack_scratch(scratch, [op])
         else:
             holds.append('named row: %r ambiguous (leaves=%r joins=%r)'
                          % (nm, ls, js))
     for nm in sorted(fell_left):
-        holds.append('fellowship row: %r left the fellowship with no '
-                     'named board arrival' % (nm,))
+        # K1 (Lure of the Ring class): a companion leaving the
+        # fellowship with NO board arrival is ELIMINATED (or removed
+        # from play - There and Back Again's Mordor path): the
+        # physical render is Fellowship box -> FP Casualties (the FP
+        # dead pile is permanent, which is exactly what both fates
+        # mean on the board).  Never a HOLD here: a rules-correct
+        # decision the emitter refuses to show wedges the AI step.
+        pid, pside = _named_pid_side(nm)
+        if pid is None:
+            holds.append('fellowship row: %r left the fellowship '
+                         'with no named board arrival (unknown '
+                         'figure)' % (nm,))
+            continue
+        op = ('move', {'nick': nick, 'pieces': [pid],
+                       'frm': emitter.FELLOWSHIP_BOX,
+                       'to': emitter.FP_DEAD})
+        move_ops.append(op)
+        _retrack_scratch(scratch, [op])
 
     # ---- army rows: units + refined leader rows -----------------------
     cas_inc = _cas_increments(pre, post)
@@ -496,14 +636,10 @@ def render_card_effect(view, nick, side, kind, action, pre, post):
         try:
             pids = _pick(sanitize(str(frm)), side_tag, nation,
                          unit_kind, n)
-            op = ('move', {
-                'nick': nick, 'pieces': pids,
-                'frm': emitter.zone_code_for(sanitize(str(frm))),
-                'to': emitter._garrison_dest(scratch,
-                                             sanitize(str(to)),
-                                             side_name9)})
-            move_ops.append(op)
-            _retrack_scratch(scratch, [op])
+            transfers = physical_move_ops(scratch, nick, pids,
+                emitter._garrison_dest(scratch, sanitize(str(to)), side_name9))
+            move_ops.extend(transfers)
+            _retrack_scratch(scratch, transfers)
         except LookupError as e:
             holds.append('%s row: cannot supply the %d-piece move '
                          '%s -> %s: %s' % (tname, n, frm, to, e))
@@ -539,34 +675,10 @@ def render_card_effect(view, nick, side, kind, action, pre, post):
                 for r, n in M:
                     _emit_kills(r, n, side_tag, nation, unit_kind,
                                 tkey)
-        elif len(M) == 1 and len(P) == 1 and M[0][1] == P[0][1] \
-                and cas == 0:
-            _emit_move(M[0][0], P[0][0], M[0][1], side_tag, side_name9,
-                       nation, unit_kind, tkey)
-        elif cas == 0 and sum(n for _, n in M) == sum(n
-                                                      for _, n in P):
-            # WAVE-J (wjg8 LIVE wedge: Rage of the Dunlendings moved
-            # Isengard regulars North+South Dunland -> Moria and this
-            # branch held 'AMBIGUOUS' forever): a COUNT-CONSERVING
-            # pairing of same-(nation,kind) unit rows with NO casualty
-            # increment has NOTHING to guess - the units are fungible,
-            # so every assignment of sources to destinations yields
-            # the IDENTICAL client board (pick_units already owns pid
-            # fungibility).  Deterministic greedy pour, sorted row
-            # order.
-            pi = [[r, n] for r, n in P]
-            for r, n in M:
-                left = n
-                while left > 0 and pi:
-                    pr, pn = pi[0]
-                    take = min(left, pn)
-                    _emit_move(r, pr, take, side_tag, side_name9,
-                               nation, unit_kind, tkey)
-                    left -= take
-                    if pn - take == 0:
-                        pi.pop(0)
-                    else:
-                        pi[0][1] = pn - take
+        elif cas == 0 and balanced_transfers(M, P) is not None:
+            for source, target, count in balanced_transfers(M, P):
+                _emit_move(source, target, count, side_tag, side_name9,
+                           nation, unit_kind, tkey)
         else:
             holds.append('%s row: AMBIGUOUS pairing (minus=%r plus=%r '
                          'fp_cas%+d) -- refusing to guess'
@@ -582,9 +694,10 @@ def render_card_effect(view, nick, side, kind, action, pre, post):
         elif not P:
             for r, n in M:
                 _emit_kills(r, n, 'shadow', None, 'nazgul', 'nazgul')
-        elif len(M) == 1 and len(P) == 1 and M[0][1] == P[0][1]:
-            _emit_move(M[0][0], P[0][0], M[0][1], 'shadow', 'SHADOW',
-                       None, 'nazgul', 'nazgul')
+        elif balanced_transfers(M, P) is not None:
+            for source, target, count in balanced_transfers(M, P):
+                _emit_move(source, target, count, 'shadow', 'SHADOW',
+                           None, 'nazgul', 'nazgul')
         else:
             holds.append('nazgul row: AMBIGUOUS pairing (minus=%r '
                          'plus=%r) -- refusing to guess' % (M, P))
@@ -621,5 +734,138 @@ def render_card_effect(view, nick, side, kind, action, pre, post):
 
     ops = kill_ops + move_ops + recruit_ops + tail_ops
     em = _ops_to_emission(view, nick, at, ops)   # retracks the REAL view
+    if dice_bindings is not None and not em.hold:
+        view.die_id_map = dice_bindings
+        shifts = dict(getattr(view, '_die_idx_shift', {}) or {})
+        shifts.pop('FREE_PEOPLES', None)
+        view._die_idx_shift = shifts
     em.lines += extra_lines
     return em
+
+_STAGED_ARMY_CARDS = frozenset((
+    'SHADOW_Strategy_The_Shadow_Lengthens',
+    'SHADOW_Strategy_The_Shadow_is_Moving',
+))
+
+
+def staged_army_card(state):
+    pending = getattr(state, 'pending_card_option', None) or {}
+    cid = pending.get('card_id')
+    return cid if cid in _STAGED_ARMY_CARDS else None
+
+
+def _staged_cargo_plan(view, nick, pre, witness):
+    """Reserve every original physical group before rendering any arrival."""
+    import ai
+    import game_state as gs
+    from board import sanitize
+    projected = ai.clone_state(pre)
+    scratch = _Scratch(view, pre)
+    reserved, plans = set(), []
+
+    def army_at(state, region):
+        key = next((k for k in state.armies if sanitize(str(k)) == region), None)
+        return key, state.armies.get(key)
+
+    for source, target, units, leaders in witness[1]:
+        source, target = sanitize(source), sanitize(target)
+        key, army = army_at(projected, source)
+        if army is None or source == target:
+            raise LookupError('staged movement has no distinct original source: %s' % source)
+        chosen_units, chosen_leaders, pids = [], [], []
+        for nation, kind, count in units:
+            if type(count) is not int or count <= 0:
+                raise LookupError('invalid staged unit count')
+            matches = [u for u in army.units if u.nation.name == nation and u.kind.name == kind]
+            if len(matches) < count:
+                raise LookupError('staged unit cargo exceeds original source at %s' % source)
+            chosen_units.extend(matches[:count])
+            kw = {'n_regular': 0, 'n_elite': 0}
+            if kind not in ('REGULAR', 'ELITE'):
+                raise LookupError('unsupported staged unit kind %s' % kind)
+            kw['n_' + kind.lower()] = count
+            pids.extend(emitter.pick_units(scratch, source, 'shadow',
+                        nation=gs.Nation[nation].value, side_hint='shadow', **kw))
+        for cls, nation, name, count in leaders:
+            if type(count) is not int or count <= 0:
+                raise LookupError('invalid staged leader count')
+            matches = [l for l in army.leaders if
+                       (type(l).__name__, getattr(getattr(l, 'nation', None), 'name', ''),
+                        str(getattr(l, 'name', ''))) == (cls, nation, name)]
+            if len(matches) < count:
+                raise LookupError('staged leader cargo exceeds original source at %s' % source)
+            chosen_leaders.extend(matches[:count])
+            if name:
+                pid, side = _named_pid_side(name)
+                if count != 1 or pid is None or side != 'SHADOW':
+                    raise LookupError('unknown staged named figure %s' % name)
+                pid = str(pid)
+                if sanitize(str(scratch.piece_region.get(pid, ''))) != source:
+                    raise LookupError('staged named figure is not at original source: %s' % name)
+                pids.append(pid)
+            else:
+                pids.extend(emitter.pick_units(scratch, source, 'shadow',
+                            n_nazgul=count, side_hint='shadow'))
+        pids = [str(pid) for pid in pids]
+        if not pids or len(set(pids)) != len(pids) or reserved.intersection(pids):
+            raise LookupError('staged movement reuses or lacks an original physical piece')
+        reserved.update(pids)
+        plans.append((key, source, target, chosen_units, chosen_leaders, pids))
+
+    # This projection subtracts only already-rendered cargo from the residual
+    # effect renderer. It never adopts the physical client board into gameplay.
+    for key, source, target, units, leaders, pids in plans:
+        army = projected.armies[key]
+        for unit in units:
+            army.units.remove(unit)
+        for leader in leaders:
+            army.leaders.remove(leader)
+    for key, source, target, units, leaders, pids in plans:
+        dest_key, army = army_at(projected, target)
+        if army is None:
+            army = gs.Army(region=projected.board.region(target))
+            projected.armies[target] = army
+        army.units.extend(units)
+        army.leaders.extend(leaders)
+    ops = [('move', {'nick': nick, 'pieces': pids,
+                    'frm': emitter.garrison_arrival_zone(pre, source, 'shadow'),
+                    'to': emitter._garrison_dest(scratch, target, 'shadow')})
+           for key, source, target, units, leaders, pids in plans]
+    return projected, ops
+
+
+
+
+def render_card_effect(view, nick, side, kind, action, pre, post):
+    from .emission import Emission, _ops_to_emission, _retrack_ops
+    pre = pre if pre is not None else view.state
+    cid = staged_army_card(pre)
+    if cid is None:
+        return _render_card_effect_rows(view, nick, side, kind, action, pre, post)
+    if post is None:
+        return Emission(hold='staged movement needs its committed post state')
+    witness = getattr(post, '_card_army_move_witness', None)
+    if witness is None or witness is getattr(pre, '_card_army_move_witness', None):
+        delta = client_board.board_delta(pre, post)
+        if staged_army_card(post) == cid and set(delta).issubset({'__hands__', '__table__'}):
+            return _render_card_effect_rows(view, nick, side, kind, action, pre, post)
+        return Emission(hold='staged movement completed without original-cargo provenance')
+    if not isinstance(witness, tuple) or len(witness) != 2 or witness[0] != cid:
+        return Emission(hold='staged movement provenance belongs to a different card')
+    try:
+        projected, ops = _staged_cargo_plan(view, nick, pre, witness)
+        scratch = _Scratch(view, projected)
+        _retrack_ops(scratch, ops)
+        tail = _render_card_effect_rows(scratch, nick, side, kind, action, projected, post)
+        if tail.hold:
+            return tail
+        # Validate the entire render on scratch before changing the live view.
+        result = _ops_to_emission(view, nick, action.action_type, ops)
+        _retrack_ops(view, tail.ops)
+        result.ops.extend(tail.ops)
+        result.lines.extend(tail.lines)
+        result.calls.extend(tail.calls)
+        result.chat.extend(tail.chat)
+        return result
+    except (LookupError, ValueError, KeyError, TypeError) as exc:
+        return Emission(hold='staged movement: %s' % exc)

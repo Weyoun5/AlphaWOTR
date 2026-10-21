@@ -8,19 +8,24 @@ quarantine-renamed batch dirs (batch_000_quarantined_stageA — the
 enforcement mechanism itself was retired 2026-08-11, the renamed dirs
 persist on disk) hold pre-rename paths.
 
-Policy: a stored trace_path that exists is used as-is.  Otherwise the
+Legacy policy: a stored trace_path that exists is used as-is. Otherwise the
 BASENAME is searched across every known trace root (batch dirs,
 quarantine renames, baseline_games, smoke traces, the live trace dir)
 and the NEWEST match by mtime wins.  Callers must show
 `missing_message()` in the GUI when nothing is found — never a silent
 failure, never a stack trace.
 
-Kept dependency-free (os/glob only) so the replay GUI and the
+Committed dashboard rows additionally supply an expected SHA256. Both the
+stored file and any relocated candidate must match those exact trace bytes;
+a same-name trace from another attempt is never substituted.
+
+Kept standard-library-only so the replay GUI and the
 dashboard can both import it, and lab tests can exercise it against a
 fake tree via explicit `roots=`.
 """
 import glob
 import os
+import hashlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -84,7 +89,7 @@ def _pick(cands, stored_parent):
     return max(cands)[1]
 
 
-def resolve_trace(path, roots=None, index=None):
+def resolve_trace(path, roots=None, index=None, expected_sha256=None):
     """Resolve a possibly-stale trace path.
 
     Returns (resolved_path_or_None, searched_roots).  resolved_path
@@ -92,18 +97,30 @@ def resolve_trace(path, roots=None, index=None):
     same-basename file under the roots (same-parent-prefix first,
     then newest); else None.  When `index` is supplied it MUST have
     been built over the same `roots` — the roots value is what
-    missing_message() reports as searched."""
+    missing_message() reports as searched. If expected_sha256 is supplied,
+    only matching file contents qualify, including at the stored path."""
     if roots is None:
         roots = default_roots()
     path = str(path or '')
-    if path and os.path.exists(path):
+    def matches(candidate):
+        if expected_sha256 is None:
+            return True
+        try:
+            value = hashlib.sha256()
+            with open(candidate, 'rb') as source:
+                for block in iter(lambda: source.read(1024 * 1024), b''):
+                    value.update(block)
+            return value.hexdigest() == expected_sha256
+        except OSError:
+            return False
+    if path and os.path.isfile(path) and matches(path):
         return path, roots
     base = os.path.basename(path)
     if not base:
         return None, roots
     stored_parent = os.path.basename(os.path.dirname(path))
     if index is not None:
-        return _pick(index.get(base, []), stored_parent), roots
+        return _pick([c for c in index.get(base, []) if matches(c[1])], stored_parent), roots
     cands = []
     for root in roots:
         if not os.path.isdir(root):
@@ -112,15 +129,22 @@ def resolve_trace(path, roots=None, index=None):
                                         glob.escape(base)),
                            recursive=True):
             try:
-                cands.append((os.path.getmtime(p), p))
+                if matches(p):
+                    cands.append((os.path.getmtime(p), p))
             except OSError:
                 continue
     return _pick(cands, stored_parent), roots
 
 
-def missing_message(path, roots):
+def missing_message(path, roots, expected_sha256=None):
     """The in-GUI error text when a trace is truly gone (names the
     searched roots per USER spec — never a silent failure)."""
+    if expected_sha256 is not None:
+        return ('No trace matching this committed game was found.\n\n'
+                'Stored path:\n  %s\n\nExpected SHA256:\n  %s\n\n'
+                'Searched roots:\n%s\n\n'
+                'Same-name files with different contents were excluded.'
+                % (path, expected_sha256, '\n'.join('  %s' % r for r in roots)))
     return ('Trace file not found.\n\n'
             'Stored path (stale):\n  %s\n\n'
             'Searched (by basename, newest wins):\n%s\n\n'

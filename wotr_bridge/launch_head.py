@@ -61,8 +61,18 @@ HEARTBEAT_WAIT_S = 240
 HEAD_ENV = (
     ('CUDA_VISIBLE_DEVICES', '-1'),
     ('KMP_DUPLICATE_LIB_OK', 'TRUE'),
+    ('KMP_BLOCKTIME', '0'),
+    ('OMP_WAIT_POLICY', 'PASSIVE'),
     ('PYTHONHASHSEED', '0'),
-    ('WOTR_ACT_GEN', 'v41'),
+    ('WOTR_ACT_GEN', 'v52'),
+    ('WOTR_REWARD_CONTRACT', 'predecision_profile_v1'),
+    # Legacy wotr_native.pyd mirrors in ai.py; unrelated to the C++ search DLL.
+    # Keep the live Python driver and select native search independently below.
+    ('WOTR_NATIVE', '0'),
+    ('WOTR_LIVE_SEARCH_BACKEND', 'native'),
+    ('WOTR_LIVE_INFERENCE_THREADS', '1'),
+    ('WOTR_LIVE_INFERENCE_CACHE', '1'),
+    ('WOTR_LIVE_POLICY_THREADS', '8'),
 )
 
 # coordination files a new session must not inherit (a survivor would
@@ -183,16 +193,18 @@ PAD = (':: the game window closed - fall through to the cleanup below '
        'running instance of the previous file resumes; launch_head.py '
        'BAT LAYOUT)')
 
+_PROBE_IMPORTS = 'import torch, numpy, shapely, PIL, matplotlib, psutil, tkinter'
+
 _PROBE = r''':: ---- which Python: the BUNDLED runtime (python\python.exe, shipped in
 ::      the release zip), then ALPHAWOTR_PYTHON, then python.exe on PATH,
-::      then the developer runtime; the first that imports torch+numpy wins
+::      then the developer runtime; require all play dependencies, not only torch
 set "PY="
 if exist "!HERE!python\python.exe" (
-    "!HERE!python\python.exe" -c "import torch, numpy" >nul 2>&1
+    "!HERE!python\python.exe" -c "{PROBE_IMPORTS}" >nul 2>&1
     if not errorlevel 1 set "PY=!HERE!python\python.exe"
 )
 if not defined PY if defined ALPHAWOTR_PYTHON (
-    "!ALPHAWOTR_PYTHON!" -c "import torch, numpy" >nul 2>&1
+    "!ALPHAWOTR_PYTHON!" -c "{PROBE_IMPORTS}" >nul 2>&1
     if not errorlevel 1 set "PY=!ALPHAWOTR_PYTHON!"
 )
 if not defined PY (
@@ -201,23 +213,23 @@ if not defined PY (
         if not defined PY_PROBE set "PY_PROBE=%%p"
     )
     if defined PY_PROBE (
-        "!PY_PROBE!" -c "import torch, numpy" >nul 2>&1
+        "!PY_PROBE!" -c "{PROBE_IMPORTS}" >nul 2>&1
         if not errorlevel 1 set "PY=!PY_PROBE!"
     )
 )
 if not defined PY (
     if exist "{PY}" (
-        "{PY}" -c "import torch, numpy" >nul 2>&1
+        "{PY}" -c "{PROBE_IMPORTS}" >nul 2>&1
         if not errorlevel 1 set "PY={PY}"
     )
 )
 if not defined PY (
-    echo   [X] No working Python found.
+    echo   [X] No Python with all play dependencies found.
     if exist "!HERE!python\python.exe" (
         echo       The bundled runtime python\python.exe exists but cannot import
-        echo       torch+numpy.  Its error follows; send it with a bug report:
+        echo       all play dependencies. Its error follows:
         echo       ----------------------------------------------------------
-        "!HERE!python\python.exe" -c "import torch, numpy" 2>&1 | findstr /V /C:"^$"
+        "!HERE!python\python.exe" -c "{PROBE_IMPORTS}" 2>&1 | findstr /V /C:"^$"
         echo       ----------------------------------------------------------
         echo       Usual causes: the zip was not fully unpacked ^(use Explorer or
         echo       7-Zip, to a SHORT path like C:\AlphaWOTR^), or a DLL load error
@@ -227,12 +239,15 @@ if not defined PY (
         echo       zip^).  Install Python 3.10+ and run
         echo       pip install -r requirements.txt   ^(or set ALPHAWOTR_PYTHON^)
     )
+    echo       Required: torch, numpy, shapely, Pillow, matplotlib, psutil, tkinter.
+    echo       PIL is provided by the Pillow package in requirements.txt.
     echo.
     pause
     exit /b 1
 )
 set "PYW=!PY:python.exe=pythonw.exe!"
 if not exist "!PYW!" set "PYW=!PY!"
+echo   Python: "!PY!"
 '''
 
 _BAT = r'''@echo off
@@ -245,7 +260,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 ::                               is Shadow, FP = the AI is Free Peoples)
 ::   Play_Engine_Only.bat        the engine's own board, no Java (UNTESTED)
 :: Client wotr_bridge\play_client; AI server FIRST (heartbeat), then
-:: java adopts it; nets corpus_live = the v41 pair (WOTR_ACT_GEN=v41).
+:: java adopts it; nets corpus_live = the v52 full-corpus BC pair (WOTR_ACT_GEN=v52).
 :: =====================================================================
 title AlphaWOTR - Play vs AI
 
@@ -513,7 +528,8 @@ ENGINE_BAT_PATH = os.path.join(ROOT, 'Play_Engine_Only.bat')
 
 def _render(template):
     txt = template
-    for key, val in (('{PROBE}', _PROBE), ('{PY}', PY), ('{PYW}', PYW),
+    for key, val in (('{PROBE}', _PROBE), ('{PROBE_IMPORTS}', _PROBE_IMPORTS),
+                     ('{PY}', PY), ('{PYW}', PYW),
                      ('{JAVA_MIN}', str(JAVA_MIN)),
                      ('{ENV_LINES}', bat_env_lines()),
                      ('{NET_TAG}', NET_TAG), ('{JAR_NAME}', JAR_NAME),

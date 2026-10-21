@@ -49,8 +49,7 @@ class ActionDieFace(Enum):
 # ---------------------------------------------------------------------------
 # PNG helpers
 # ---------------------------------------------------------------------------
-# Die-face art is side-specific (FP_PNG / SH_PNG); consumed only by the
-# standalone board_visual.py renderer.
+# Die-face art (FP_PNG / SH_PNG): renderer helper; no in-tree reader as of 2026-08-29.
 
 FP_PNG: Dict[ActionDieFace, str] = {
     ActionDieFace.CHARACTER: "ADFPcharacter.png",
@@ -140,10 +139,6 @@ class ShadowMinion:
     # Combat abilities
     combat_card_draw: bool = False  # Witch King first round draw
     isengard_elite_leadership: bool = False  # Saruman grants elite leadership
-    # (moves_with_nazgul / muster_to_army stubs DELETED 2026-08-24:
-    # Mouth movement = the 'mouth_move' action, USER 1.177b; the
-    # muster-as-army ability = sh_mouth_muster_used_this_turn +
-    # ai.get_legal_actions 'mouth_muster', amendment 1.2)
 
 
 @dataclass
@@ -191,9 +186,6 @@ class Fellowship:
 class PoliticalTrack:
     boxes: Dict[Nation, int]   # 0-3 (3 = At War)
     active: Dict[Nation, bool] # True = coloured (active) side
-
-    def pos(self, nation: Nation) -> Tuple[int, bool]:
-        return self.boxes[nation], self.active[nation]
 
     def is_active(self, nation: Nation) -> bool:
         """Nation has been activated (flipped to coloured/active side).
@@ -684,20 +676,12 @@ class GameState:
     # Ring usage tracking (reset at start of each turn)
     fp_ring_used_this_turn: bool = False
     sh_ring_used_this_turn: bool = False
-    # A7 (USER ruling 2026-08-19): an Elven Ring is a LEGALITY
-    # EXPANSION, not a face change.  Paying one raises this flag; while
-    # it is up, ONE action of that side may be funded by any unused die
-    # the ring permits (FP: any non-Will-of-the-West die; Shadow: any
-    # die), and the die KEEPS ITS ROLLED FACE - anything downstream that
-    # reads the face still sees the original.  Cleared by the action
-    # that spends it (game_logic.ring_waiver_spend) and at every turn
-    # boundary, so its lifetime is bounded by the once-per-turn ring.
-    # WHY A WAIVER AND NOT A FACE CHANGE: the client's ring command
-    # emits a marker walk and nothing else (no die pid, no face) -
-    # measured over 300 human logs, 540 ring uses produced 1 nearby
-    # die-face re-render against 2.6 expected by chance, in a client
-    # that re-renders faces 254 times elsewhere.  A face change the
-    # client never emits cannot be reconstructed by any parser.
+    # A7 (USER 2026-08-19): an Elven Ring is a LEGALITY EXPANSION, not a face
+    # change - while up, ONE action of that side may be funded by any die the
+    # ring permits (FP: any non-Will die; Shadow: any) and the die KEEPS its
+    # rolled face.  Cleared by game_logic.ring_waiver_spend and at every turn
+    # boundary.  (The client's ring command renders no die face, so a face
+    # change is unreconstructible from any log.)
     fp_ring_waiver: bool = False
     sh_ring_waiver: bool = False
     # Mouth of Sauron ability (user ruling 2026-07-03): once per turn,
@@ -732,11 +716,8 @@ class GameState:
     # Persistent cards on the table
     persistent_cards: PersistentCardState = field(default_factory=PersistentCardState)
 
-    # VESTIGIAL — always []: the writer loop was deleted (full-pass
-    # review 2026-07-27); special tiles enter via
-    # event_effects.stage_special_hunt_tile.  Kept only because the
-    # encoder occupies a frozen (constant-0) dim in the 3742 layout —
-    # remove field + dim together at the next encoding bump.
+    # VESTIGIAL (always []): kept only because the encoder occupies a frozen
+    # dim for it - remove field + dim together at the next encoding bump.
     pending_hunt_tiles: List[str] = field(default_factory=list)
 
     # Pending multi-step die actions (army double-move, muster double-recruit)
@@ -746,7 +727,8 @@ class GameState:
     # Own units already at the first move's destination BEFORE it arrived —
     # those figures did NOT move and MAY move out with the second half
     # (rulebook p.25 forbids moving the same FIGURE twice, not the region):
-    # {'regular': int, 'elite': int, 'leaders': int} or None
+    # Aggregate counts plus immutable 'figures' nation/kind/character inventory
+    # and the Army-die pair's 'waived' payment flag, or None.
     pending_army_move_preexist: Optional[dict] = None
     pending_muster_die: Optional[int] = None       # die_idx for first muster recruit
     pending_muster_first_type: Optional[str] = None  # 'regular' or 'leader' (first recruit)
@@ -762,10 +744,17 @@ class GameState:
 
     # Pending multi-phase combat (siege/retreat decisions)
     pending_combat: Optional[dict] = None
+    # A Wormtongue-blocked Rohan reaction is reconsidered at action end:
+    # 1 = activation only; 2 = activation and a still-owed advance.
+    _wormtongue_attack_pending: Optional[int] = None
     # Pending hunt sacrifice / Gollum reveal decision
     pending_hunt: Optional[dict] = None
     # Pending guide change (tie-breaking)
     pending_guide_change: Optional[dict] = None
+    # An Event-funded FP card may earn Gandalf's optional same-deck draw
+    # only after the entire action and its first hand-limit discard settle.
+    # Carries source_card_id/deck/die_face; the later choice is a card option.
+    _gandalf_draw_pending: Optional[dict] = None
     # Strongholds currently under siege (set of sanitized region keys)
     besieged_strongholds: set = field(default_factory=set)
 
@@ -849,10 +838,8 @@ def setup_initial_game(b: "board.Board") -> GameState:
     gandalf_grey = Companion(
         name="Gandalf the Grey", level=3, leadership=1,
         captain_of_the_west=True,
-        guide_ability="palantir_draw",  # ANNOTATION ONLY: the real
-        # Gandalf-guide same-deck draw is implemented BY NAME (ai.py
-        # play_event executor ~10571 + gui._check_gandalf_card_draw,
-        # USER RULE 2026-07-08); nothing consumes this string
+        guide_ability="palantir_draw",  # annotation only: the Gandalf-guide
+        # draw is implemented BY NAME (ai.py play_event, gui; USER 2026-07-08)
         activates_nations=[],  # Empty = activates ANY nation
         activation_regions=[],  # Empty = anywhere
     )
@@ -985,5 +972,4 @@ def setup_initial_game(b: "board.Board") -> GameState:
         fp_bonus_dice=0,
         sh_bonus_dice=0,
     )
-
 

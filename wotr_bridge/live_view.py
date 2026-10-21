@@ -1,11 +1,11 @@
-"""Live ENGINE board mirror for AI-vs-AI games.
+"""Live ENGINE board mirror.
 
-The move server (ai_move_server.py --ai --gui) writes the persistent
+The live server (live/live_server.py, _write_mirror_snapshot) writes the
 engine GameState to <client_dir>/ai_live_state.pkl (atomic) plus a
-status line to ai_live_status.json after every tick.  This viewer opens
-the project's own WotrGUI on that state and repaints whenever the
-snapshot changes -- so you can watch the CLONED ENGINE game side by side
-with the Java client, with the verification status in the title bar.
+status line to ai_live_status.json every commit / second.  This viewer
+opens the project's own WotrGUI on that state and repaints whenever the
+snapshot changes -- the ENGINE game side by side with the Java client,
+with the census status in the title bar.
 
 Because the snapshot is the REAL engine state (full hidden info), the
 viewer also renders an "ENGINE CARDS" side panel proving exactly that:
@@ -34,6 +34,64 @@ _DECKS = (
     ('SH Character', 'sh_char_deck', 'sh_character'),
     ('SH Strategy', 'sh_strat_deck', 'sh_strategy'),
 )
+
+
+def _taxonomy():
+    """The ONE mismatch taxonomy (wotr_bridge/live/taxonomy.py),
+    loaded by path so the panel process needs no package import and
+    the release layout (live_view.py beside live/) resolves the same
+    way.  None when unavailable - the caller then shows the rows
+    UNCLASSIFIED and says so, never silently as divergences."""
+    try:
+        import importlib.util
+        p = os.path.join(HERE, 'live', 'taxonomy.py')
+        spec = importlib.util.spec_from_file_location('wotr_taxonomy', p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+def compose_card_panel(report, status):
+    """The card panel text: the divergence banner ABOVE the card
+    report (USER 2026-08-16: untracked desyncs must be visible), with
+    the published mismatch rows partitioned by the same taxonomy the
+    server counts with (USER 2026-08-25 manual test: an informational
+    `die_rebound_to_staged` note was printed under '!!! DIVERGENCES
+    !!!' - a row is a divergence on every surface or on none).  Pure
+    function of (report, status) so the banner is pinnable."""
+    mism = (status or {}).get('mismatches') or []
+    tax = _taxonomy()
+    if mism and tax is None:
+        return ('!!! %d MISMATCH ROW(S) (taxonomy unavailable - '
+                'unclassified) !!!\n%s\n\n%s'
+                % (len(mism), '\n'.join('  ' + str(m) for m in mism),
+                   report))
+    div, err, info = tax.partition(mism) if mism else ([], [], [])
+    head = []
+    n_census = int((status or {}).get('census_rows') or 0)
+    if div:
+        head.append('!!! DIVERGENCES (%d) - client board vs ENGINE '
+                    'view !!!\n%s' % (len(div),
+                                      '\n'.join('  ' + m for m in div)))
+    elif n_census > 0 and status and status.get('mode') == 'sided':
+        # the census disagrees NOW (settling toward escalation) - never
+        # 'CLEAN' beside 'divergences 3 -> 3' (USER 2026-08-25)
+        head.append('engine-vs-client census: %d row(s) DIVERGING '
+                    '(first: %s)' % (n_census,
+                                     (status or {}).get('census_first')))
+    elif status and status.get('mode') == 'sided':
+        head.append('engine-vs-client census: CLEAN')
+    if err:
+        head.append('ERRORS (%d) - file them, play on unless wedged:\n%s'
+                    % (len(err), '\n'.join('  ' + m for m in err)))
+    if info:
+        head.append('notes (%d, protocol info):\n%s'
+                    % (len(info), '\n'.join('  ' + m for m in info[-3:])))
+    if head:
+        return '\n\n'.join(head) + '\n\n' + report
+    return report
 
 
 def build_card_report(state, hide_side=None):
@@ -324,17 +382,9 @@ class LiveView:
     def update_card_panel(self, state, status):
         import tkinter as tk
         hide = mask_sides(status, getattr(self, '_last_status', None))
-        report = build_card_report(state, hide_side=hide)
-        # DIVERGENCES first (USER 2026-08-16: untracked desyncs must
-        # be visible): the engine-vs-client census, named per piece
-        mism = (status or {}).get('mismatches') or []
-        if mism:
-            report = ('!!! DIVERGENCES (%d) - client board vs ENGINE '
-                      'view !!!\n%s\n\n%s'
-                      % (len(mism), '\n'.join('  ' + m for m in mism),
-                         report))
-        elif status and status.get('mode') == 'sided':
-            report = ('engine-vs-client census: CLEAN\n\n' + report)
+        report = compose_card_panel(build_card_report(state,
+                                                      hide_side=hide),
+                                    status)
         t = self.card_text
         t.configure(state=tk.NORMAL)
         t.delete('1.0', tk.END)

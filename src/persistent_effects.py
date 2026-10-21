@@ -78,8 +78,6 @@ def can_shadow_attack(state: "GameState", region: str) -> Tuple[bool, Optional[s
     return can_shadow_move_to(state, region)
 
 
-
-
 # ---------------------------------------------------------------------------
 # Hunt Modifications
 # ---------------------------------------------------------------------------
@@ -142,9 +140,7 @@ def get_denethors_folly_discard_options(state: "GameState") -> Dict:
     """
     can_use_any_die = False
 
-    # QA 2026-07-10: sanitize-aware lookup (the old literal keys never
-    # matched the real 'minas tirith' army key, making this path
-    # unreachable); almanac A3 - Gandalf (Grey or White) or Aragorn
+    # sanitize-aware lookup; almanac A3: Gandalf (Grey or White) or Aragorn
     # (NOT Strider) must be with the besieged army in Minas Tirith
     mt_army = None
     for _k, _a in state.armies.items():
@@ -154,9 +150,7 @@ def get_denethors_folly_discard_options(state: "GameState") -> Dict:
     if mt_army:
         for leader in mt_army.leaders:
             nm = getattr(leader, 'name', '')
-            # W7 BUG fix (2026-07-20): accept the crowned-Aragorn name
-            # variant "Aragorn - Heir to Isildur" (8+ other sites do),
-            # not just bare "Aragorn".
+            # accept the crowned name variant "Aragorn - Heir to Isildur"
             if (nm in ('Gandalf the Grey', 'Gandalf the White')
                     or nm.startswith('Aragorn')):
                 can_use_any_die = True
@@ -198,24 +192,19 @@ def can_activate_nation(state: "GameState", nation: "Nation", method: str,
     """
     if state.persistent_cards.has_card_type(PersistentCardType.WORMTONGUE):
         if nation == Nation.ROHAN:
-            # QA 2026-07-10 (Wormtongue card text): the attack /
-            # declaration exceptions apply ONLY at Edoras or Helm's
-            # Deep - an attack on a plain Rohan region does not
-            # activate Rohan while Wormtongue is in play
+            # Wormtongue card text: the attack / declaration exceptions apply
+            # ONLY at Edoras or Helm's Deep
             allowed = method == "companion_ability"
             if method == "companion_move":
-                # WT card text: Rohan may activate via 'the entrance in
-                # Edoras or Helm's Deep of a Companion able to activate
-                # Rohan' (QA 2026-07-11 CASE4b: this trigger was
-                # unreachable - the method was never whitelisted)
+                # card text: Rohan may activate via a Companion entering
+                # Edoras or Helm's Deep (CASE4b)
                 allowed = sanitize(region or '') in ("edoras",
                                                      "helm s deep")
             elif method == "fellowship_declared":
-                # the declare path only activates the DECLARED
-                # settlement's nation, and Edoras/Helm's Deep are the
-                # only Rohan settlements - permissive here (QA
-                # 2026-07-11 CASE5b/5c: requiring a region blocked
-                # legal Edoras declarations; callers pass none)
+                # the declare path only activates the DECLARED settlement's
+                # nation, and Edoras/Helm's Deep are the only Rohan
+                # settlements - permissive here (CASE5b/5c; callers pass
+                # no region)
                 allowed = True
             elif method == "attack":
                 allowed = sanitize(region or '') in ("edoras",

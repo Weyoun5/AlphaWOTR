@@ -70,16 +70,12 @@ from card_decoder import (          # noqa: F401  (re-export)
 # Location Code Mappings (Game.XXXX -> region/area names)
 # ---------------------------------------------------------------------------
 
-# (W8 D1: the unused SPECIAL_AREAS dict was deleted 2026-07-20 —
-# zero code callers, only a docstring mention in
-# location_codes_authoritative.py; it conflicted with LOCATION_CODES
-# on Game.1999/2000/2033/2034 which is the authoritative map.)
+# LOCATION_CODES is the sole authority for Game.1999/2000/2033/2034 (W8 D1).
 
 LOCATION_CODES = {
     # Mordor track. Codes verified by tracing marker-247 walks across the
     # corpus (2023-2026 module versions): 524 -> 525 -> 528 -> 529 -> 532
-    # -> 533.  (530/531 never appear in any sampled log; the old guesses
-    # 'Game.530/531' = Mordor 4/5 were wrong.)
+    # -> 533 (530/531 never appear in any sampled log).
     'Game.524': 'Mordor 0', 'Game.525': 'Mordor 1',
     'Game.528': 'Mordor 2', 'Game.529': 'Mordor 3',
     'Game.532': 'Mordor 4', 'Game.533': 'Mordor 5',
@@ -217,7 +213,6 @@ TOKEN_CARD_DRAW = '427'   # Hunt for the Ring (Card Draw) - freeaction2.png
 # definitions; the *_PIECES names are aliases kept for their call sites.
 FP_CONTROL_MARKERS = frozenset(str(i) for i in range(405, 411))
 SA_CONTROL_MARKERS = frozenset(str(i) for i in range(411, 421))
-SH_CONTROL_MARKERS = SA_CONTROL_MARKERS
 CONTROL_MARKERS = FP_CONTROL_MARKERS | SA_CONTROL_MARKERS
 CONTROL_MARKER_PIECES = CONTROL_MARKERS
 
@@ -305,13 +300,9 @@ MINION_PIECES = {
     '255': 'Mouth of Sauron',
 }
 
-# Named-character alias sets (t133 fix F5): the dual-sided figures
-# change NAME mid-game (240 Grey->White, 241 Strider->Aragorn) while
-# the drag pid stays constant.  Every name-match against army.leaders
-# must accept BOTH faces — matching only the base name made the walk
-# handler steal an anonymous leader instead of moving the named object
-# (triage F5: GtW's Grey Havens -> Ered Luin walk moved the setup
-# Elven leader; ~85-90 games).
+# Named-character alias sets (t133 F5): dual-sided figures change NAME
+# mid-game (240 Grey->White, 241 Strider->Aragorn) while the drag pid stays
+# constant, so every name-match against army.leaders must accept BOTH faces.
 PIECE_NAME_ALIASES = {
     '240': ('Gandalf the Grey', 'Gandalf the White'),
     '241': ('Strider', 'Aragorn'),
@@ -545,6 +536,7 @@ _ONSLAUGHT_EVENT_CARDS = {
     'orcsmultiplyingagain', 'shadowsonthemistymountains',
     'thefightingurukhai',
 }
+_DREAD_EVENT_CARDS = {'candlesofcorpses', 'thebreakingofthefellowship', 'grondhammeroftheunderworld'}
 
 # Event cards whose COMBAT side is 'Relentless Assault' ('Before the
 # Combat roll, you may inflict and apply up to two hits against your
@@ -775,14 +767,9 @@ class LogReplayer:
 
         # Siege bookkeeping: which side's units retreated into each
         # stronghold box (garrison), and whether the besieger's army has
-        # been seen in the region yet.  Without this,
-        # _update_region_control lifted sieges from region composition
-        # alone: during the window between retreat_into_siege and the
-        # besieger's advance the region holds ONLY the garrison side and
-        # the old heuristic read that as "siege over" (2025-04-06
-        # demanray T16 Erebor L1470: a garrison casualty-return drag ran
-        # the control update and the Erebor siege vanished while the
-        # T17 assault still had three press rounds to fight).
+        # been seen in the region yet.  Composition alone cannot decide a
+        # siege: between retreat_into_siege and the besieger's advance the
+        # region holds ONLY the garrison side (demanray T16 Erebor L1470).
         self._siege_garrison: Dict[str, Side] = {}
         self._siege_arrived: set = set()
 
@@ -848,13 +835,13 @@ class LogReplayer:
         # Last piece-drag (multi-hop moves collapse into one decision)
         self._last_drag: Optional[dict] = None
 
-        # ---- t125 fix 1: replay-side FP dead-pool bookkeeping -------
+        # ---- replay-side FP dead-pool bookkeeping -------------------
         # pid -> (Nation, 'regular'|'elite'|'leader') counted into
         # state.fp_casualties; refunded when the client board revives
         # the piece (map region / stronghold box / reinforcement box).
         self._fp_dead_pids: Dict[str, tuple] = {}
 
-        # ---- t125 fix 2: hunt-tile replay model ---------------------
+        # ---- hunt-tile replay model ---------------------------------
         # state.hunt_pool/discard/removed mirror the client's tile
         # zones; piece_region tracks every tile pid.  Client setup
         # (base2): 16 standard tiles in the Hunt Pool, the 8 special
@@ -869,7 +856,7 @@ class LogReplayer:
         self.piece_region['230'] = 'Spare'
         self.piece_region['231'] = 'Spare'
 
-        # ---- t125 fix 5: client-unparseable line bookkeeping --------
+        # ---- client-unparseable line bookkeeping --------------------
         self.checksumless_dropped: List[int] = []
 
         # Dice removed from play (dragged from a dice pool back to a
@@ -879,7 +866,7 @@ class LogReplayer:
         # die id; censuses exclude these (t125).
         self._dice_out_of_play: set = set()
 
-        # ---- t125 fix 7 (ruling 1.157): end-of-game noise -----------
+        # ---- end-of-game noise (ruling 1.157) -----------------------
         # _game_over latches on a DEFINITE, irreversible signal (ring
         # destroyed / ring claimed), or lazily on an armed pending
         # signal (military VP / concession chat) once inside the
@@ -902,7 +889,7 @@ class LogReplayer:
 
         # (piece locations are tracked lazily as the log mentions them)
 
-    # ---- t125 fix 1: FP dead-pool piece bookkeeping -----------------
+    # ---- FP dead-pool piece bookkeeping -----------------------------
     # Zones that mean an army piece is DEAD / permanently off-board.
     # Card-play areas are included: card-killed / sacrificed pieces are
     # displayed there mid-sequence and in the dead pile afterwards
@@ -1003,7 +990,7 @@ class LogReplayer:
                 self._fp_dead_pids[pid] = (nation, kind)
         self.piece_region[pid] = zone
 
-    # ---- t125 fix 2: hunt-tile replay model -------------------------
+    # ---- hunt-tile replay model -------------------------------------
     _TILE_ZONE_LISTS = {'Hunt Pool': 'hunt_pool',
                         'Used Hunt Tiles': 'hunt_discard',
                         'Removed Hunt Tiles': 'hunt_removed'}
@@ -1130,16 +1117,11 @@ class LogReplayer:
         ctx = self._hunt_ctx
         if (ctx is not None and not ctx.get('resolved')
                 and action_type == 'companion_separate'):
-            # SACRIFICE-BY-SEPARATION dialect (rendered ruling fix 29,
-            # ported 2026-07-25): a companion walking OUT of the
-            # fellowship while hunt damage is UNRESOLVED is the
-            # random-victim sacrifice absorbing it - the client renders
-            # it as a bare fellowship-box move with no kill gesture
-            # (GAME19 T7 L598-599: Merry -> Fangorn absorbs the '1'
-            # tile; the old synthesizer fabricated hunt_take_corruption
-            # +1 AND kept an ordinary separation).  No corruption walk
-            # exists in these logs, so corruption was demonstrably NOT
-            # taken; the separation stays as the placement record.
+            # SACRIFICE-BY-SEPARATION dialect: a companion walking OUT of
+            # the fellowship while hunt damage is UNRESOLVED is the
+            # random-victim sacrifice absorbing it (bare fellowship-box
+            # move, no kill gesture: GAME19 T7 L598-599).  No corruption
+            # is taken; the separation stays as the placement record.
             ctx['resolved'] = True
             self._hunt_ctx = None
             self.action_log.append((
@@ -1184,13 +1166,13 @@ class LogReplayer:
             # gate above can never catch them (GAME21 T4: Merry+Pippin
             # became phantom expected decisions).
             params['card_effect'] = True
-        # fix 91: stamp the emission line (underscore key, same class
+        # stamp the emission line (underscore key, same class
         # as _pieces/_by_nation) so gesture-adjacency checks (advance
         # drag-through fold) can verify records belong to ONE drag
         if isinstance(params, dict) and '_rec_line' not in params:
             params['_rec_line'] = self.line_num
         self.action_log.append((action_type, params, side))
-        # t125 fix 7: a hunt-damage resolution inside the final-hunt
+        # a hunt-damage resolution inside the final-hunt
         # window (Cracks of Doom) decides the game — sacrifice paths
         # resolve without a corruption walk, so latch here too.
         if self._final_hunt_pending and self._game_over is None \
@@ -1247,14 +1229,10 @@ class LogReplayer:
         # FELLOWSHIP-PHASE window only: the stay-heal drag precedes the
         # turn's action-dice roll (dice_rolled resets at the turn
         # marker).  Mid-turn heals (Athelas class, during a battle at
-        # the fellowship's settlement) must NOT classify - gate-1
-        # regression 2026-07-24: Ruellor/Elessar each lost a kept
-        # decision to a phantom mid-turn re-declare.
-        # ... and NOT the heal leg of a just-recorded DECLARATION
-        # gesture (the client renders pawn-move first, heal after:
-        # Ruellor T? Eastemnet->Minas Tirith produced a duplicate
-        # in-place declare and cost the teacher a kept decision,
-        # gate-1 2026-07-24) - the engine's declare path already heals.
+        # the fellowship's settlement) must NOT classify, and neither
+        # must the heal leg of a just-recorded DECLARATION gesture (the
+        # client renders pawn-move first, heal after) - the engine's
+        # declare path already heals.
         _last_rec9 = self.action_log[-1] if getattr(
             self, 'action_log', None) else None
         _last_ty9 = (_last_rec9[0] if isinstance(_last_rec9, tuple)
@@ -1299,8 +1277,8 @@ class LogReplayer:
             self.log(f"Lure resolved as corruption "
                      f"({self._lure_pending['companion']} returns)")
             self._lure_pending = None
-        # t125 fix 7 (ruling 1.157): corruption 12 = the Ring claimed —
-        # a DEFINITE, irreversible Shadow victory
+        # ruling 1.157: corruption 12 = the Ring claimed - a DEFINITE,
+        # irreversible Shadow victory
         if pos >= 12 and self._game_over is None:
             self._final_hunt_pending = False
             self._game_over = {'line': self.line_num,
@@ -1422,19 +1400,11 @@ class LogReplayer:
         if self._card_window_side is not None:
             _b = self._battle_synth_region
             _bf = None
-            # 139 (2026-07-25 PeterM T16 West Harondor, Opus-agent
-            # verified by fix-simulation): the positional
-            # action_log[_synth_attack_idx] read went STALE when later
-            # records shifted around the synth attack, so the
-            # ATTACKER's own-region casualties (kills at WH while the
-            # battle window sat on 'pelargir') failed the (_b, _bf)
-            # membership test and were mis-caused 'card_window' - the
-            # deliberate v5 blocker then left a phantom 12-piece SH
-            # stack at WH and the T18 Osgiliath move overstacked.
-            # Resolve the attacker-from ROBUSTLY: the nearest
-            # army_attack at/before the stored index whose 'to'
-            # matches the live battle region.  The card_window safety
-            # gate itself is unchanged.
+            # 139 (PeterM T16 West Harondor): action_log indices go STALE
+            # when later records shift, so resolve the attacker-from
+            # ROBUSTLY: the nearest army_attack at/before the stored
+            # index whose 'to' matches the live battle region.  The
+            # card_window safety gate itself is unchanged.
             if self._synth_attack_idx is not None:
                 try:
                     _lo139 = min(self._synth_attack_idx,
@@ -1505,19 +1475,12 @@ class LogReplayer:
             # Attack already emitted this window — patch '?' target
             if (rs and self._battle_synth_region == '?'
                     and self._synth_attack_idx is not None):
-                # 1.218 (content-anchored, mirrors fix 139): the stored
-                # _synth_attack_idx read went STALE when a later
-                # action_log mutation (combat-card retag pop()+re-append
-                # ~L3757, or a cross-line 'del self.action_log[...]'
-                # record retraction) shifted the record the index named,
-                # so the raw positional read wrote params['to'] onto the
-                # WRONG record — a combat_card, not the synth attack
-                # (reproduced in a 200-game direct-parse sweep: 1 hit,
-                # idx->combat_card).  Resolve the still-open '?'-target
-                # synth attack by scanning BACK from the (clamped) index
-                # for the army_attack whose target is not yet known,
-                # exactly as 139 hardened _mark_cause's attacker-from
-                # lookup.
+                # 1.218 (content-anchored, mirrors 139): a stored
+                # action_log index goes stale after a combat-card retag
+                # pop()+re-append or a record retraction, so resolve the
+                # still-open '?'-target synth attack by scanning BACK
+                # from the (clamped) index for the army_attack whose
+                # target is not yet known.
                 _sa = self._resolve_open_synth_attack()
                 if _sa is None:
                     return
@@ -1667,7 +1630,7 @@ class LogReplayer:
             hits = [rk for rk in regions if rk.startswith(t)]
             if len(hits) == 1:
                 return hits[0]
-            # fix 90 (jmelder T6): multiple prefix hits — take the
+            # multiple prefix hits (jmelder T6) - take the
             # HIGHEST-COVERAGE completion (shortest name) when the
             # abbreviation covers most of it ('westem' -> westemnet,
             # 6/9, not 'western brown lands' 6/19; the failed hint let
@@ -1768,13 +1731,10 @@ class LogReplayer:
 
         san = sanitize(region_key)
         info = board.regions.get(san, {})
-        # RB-08 (2026-07-22): TOWNS capture on walk-in too (amendment
-        # 1.55a: "ALL settlements capture - towns included; capture on
-        # walk-in").  The engine's enforce_settlement_control already
-        # includes is_town; the raw truth skipped towns, so a Shadow
-        # walk-in onto an undefended enemy TOWN (Skaarj iron hills T4,
-        # 2023-11-09 westemnet T6) left the raw truth a control-box
-        # behind the engine until the human's late marker gesture.
+        # RB-08 (amendment 1.55a): ALL settlements capture on walk-in,
+        # towns included - the engine's enforce_settlement_control
+        # includes is_town, so the raw truth must too (Skaarj iron hills
+        # T4, westemnet T6).
         if not info.get('is_city') and not info.get('is_stronghold') \
                 and not info.get('is_town'):
             return
@@ -1812,15 +1772,11 @@ class LogReplayer:
 
         besieged = getattr(self.state, 'besieged_strongholds', None)
 
-        # Active siege: composition heuristics must key off WHO is the
-        # garrison (inside the stronghold box) vs the besieger.  The old
-        # side-symmetric logic lifted sieges during the window between
-        # retreat_into_siege and the besieger's advance (the region then
-        # holds ONLY the garrison side) and flipped control while the
-        # besieger co-located with a live garrison (2025-04-06 demanray
-        # T16 Erebor: a garrison casualty-return drag at L1470 read
-        # "only Shadow present at an FP settlement" as garrison-
-        # eliminated and the T17 assault's three press rounds stranded).
+        # Active siege: composition heuristics key off WHO is the
+        # garrison (inside the stronghold box) vs the besieger.  A region
+        # holding only the garrison side is NOT a lifted siege, and a
+        # besieger co-located with a live garrison does not flip control
+        # (demanray T16 Erebor L1470).
         if besieged is not None and san in besieged:
             gside = getattr(self, '_siege_garrison', {}).get(san)
             if gside is not None:
@@ -1901,47 +1857,9 @@ class LogReplayer:
     # client interpreter does NOT snapshot these (ay_0.k() runs only
     # before moves/kills/flips/allocates dispatches), so an undo after
     # one restores the snapshot of the PRECEDING snapshotted command —
-    # reverting that command AND the face change (t125 fix 4).
+    # reverting that command AND the face change.
     _DIE_CHANGE_LINE_RE = re.compile(
         r'^\$\w+\s+changes\s+\d+\s+to\s+[A-Z]\b')
-
-    @staticmethod
-    def drop_client_unparseable(log_lines: List[str]) -> List[int]:
-        """CLIENT-REPLAY ALIGNMENT ONLY (t125 fix 5): blank the $ command
-        lines the client's own replay strip mangles and drops.
-
-        The client replay applies `game.z.c(line)` to every line, which
-        unconditionally cuts the LAST space-separated token (normally
-        the 6-hex network checksum or the literal 'null').  A corpus
-        line that carries NO trailing checksum (Wirbelwind/GJB line 38,
-        a Controls.281 bid-token move; whole client-build spans in
-        demanray) therefore loses its real last token and the
-        interpreter throws — the client counts an error and drops the
-        line.  This mirror is NOT applied in normal corpus parsing:
-        those lines were real, applied moves in the LIVE game (Columbo
-        T8 uses the very token its line 41 grants), so the teacher/BC
-        pipeline must keep them.  replay_verify's prefix replayer calls
-        this explicitly to reproduce the client board exactly.
-
-        sendTokens commitment lines are kept: they carry no board
-        effect on either side, and blanking them would break the
-        CardDecoder (deck brute-force input).
-
-        Mutates *log_lines* IN PLACE; returns the 1-based indices of
-        the blanked lines."""
-        dropped = []
-        for i, line in enumerate(log_lines):
-            ls = line.strip()
-            if not ls.startswith('$') or ' sendTokens ' in ls:
-                continue
-            toks = ls.split()
-            if len(toks) >= 2 and (
-                    toks[-1] == 'null'
-                    or re.fullmatch(r'[A-F0-9]{6}', toks[-1])):
-                continue
-            log_lines[i] = ''
-            dropped.append(i + 1)
-        return dropped
 
     @staticmethod
     def dedupe_adjacent_lines(log_lines: List[str]) -> List[int]:
@@ -2088,8 +2006,8 @@ class LogReplayer:
         self._preprocess_inverse_drags(log_lines)
         self._preprocess_vp_waypoints(log_lines)
         self._preprocess_table_card_kills(log_lines)
-        # t125 fix 7 (USER RULING 1.157): precompute the pure-noise log
-        # TAIL — the earliest line index from which every remaining $
+        # USER RULING 1.157: precompute the pure-noise log
+        # TAIL - the earliest line index from which every remaining $
         # command is a noise-kind line (hand reveal, hunt draw, card
         # draw, track walk, tile drag, card discard) or chat.  The
         # military-victory / concession game-over signals only latch
@@ -2113,7 +2031,7 @@ class LogReplayer:
         except (ValueError, TypeError):
             return False
 
-    # ---- t125 fix 7 (USER RULING 1.157): end-of-game noise ----------
+    # ---- end-of-game noise (USER RULING 1.157) ----------------------
     _EOG_RE_REVEAL = re.compile(r'\breveal \d+ [A-F0-9]{8,} \d+')
     _EOG_RE_TILE_DRAW = re.compile(r'<~Controls\.624~>')
     _EOG_RE_CARD_DRAW = re.compile(
@@ -2168,11 +2086,10 @@ class LogReplayer:
         Controls.281, then 103+361 allocated for real; T5 lines 468/470:
         die 103 in, dragged to Used two lines later)."""
         self._eye_drag_noise = set()  # (line_num, die_id_str)
-        # 131 (2026-07-25 board-is-set T9 L662-666): BUTTON (Controls.372)
+        # 131 (board-is-set T9 L662-666): BUTTON (Controls.372)
         # allocations retracted via a die return from the Hunt Box
-        # (Controls.281 Game.1997 -> SA Dice, '1 eye max' correction).
-        # The drag-based pending never saw them, so the turn eye count
-        # ran 2 vs the true 1 and the engine's roll went a die short.
+        # (Controls.281 Game.1997 -> SA Dice, '1 eye max' correction)
+        # decrement the pending eye count.
         self._eye_btn_noise = set()   # (alloc_line_num, die_id_str)
         die_ids = self._all_die_ids   # built once in preprocess()
         pool_codes = {'Game.2042', 'Game.2043'}
@@ -2525,13 +2442,10 @@ class LogReplayer:
                     c = adj_a & adj_b
                 cand = c if cand is None else (cand & c)
             if cand is None:
-                # USER RULING 1.156 (t125): no unit-exit constraint
-                # (nazgul-only / off-map exits) — box units are IN
-                # GORGOROTH.  The old stay-at-A guess contradicted the
-                # client board and was prefix-unstable (Rizino1 cp250:
-                # only the nazgul exit in the prefix -> army wrongly
-                # kept at Barad-Dur).  Fall back to A only when the
-                # entry region cannot reach Gorgoroth.
+                # USER RULING 1.156: no unit-exit constraint
+                # (nazgul-only / off-map exits) - box units are IN
+                # GORGOROTH (Rizino1 cp250).  Fall back to A only when
+                # the entry region cannot reach Gorgoroth.
                 x_san = 'gorgoroth' if (a_san == 'gorgoroth'
                                         or 'gorgoroth' in adj_a) \
                     else a_san
@@ -2610,7 +2524,7 @@ class LogReplayer:
         line = re.sub(r'\s+[A-F0-9]{6}$', '', line)
         line = re.sub(r'\s+null$', '', line)
 
-        # ---- t125 fix 7 (USER RULING 1.157): end-of-game noise ------
+        # ---- end-of-game noise (USER RULING 1.157) ------------------
         # Lazy latch: an armed military-victory/concession signal only
         # fires inside the precomputed pure-noise tail.
         if self._game_over is None and self._eog_pending is not None \
@@ -2691,28 +2605,14 @@ class LogReplayer:
 
         # Skip auto-setup lines (initial game state setup by engine)
         # BUT allow <auto> lines that are CARD PLAYS.
-        #
-        # 2026-08-18: this was a hand-written list of three op numbers
-        # (Controls.3 / 866 / 861) and Controls.888 - the same grammar,
-        # a SHADOW card leaving the hand for the Current SA Card slot -
-        # was not on it.  An unstripped <auto> line RETURNS EARLY, so
-        # the whole line was invisible: no reveal, and no hand exit.
-        # MEASURED: 3,879 corpus games / 5,556 lines carry one, and
-        # replaying six specimens with and without the strip changed
-        # the Shadow hand in FIVE of them - always one card too HIGH
-        # as shipped, because the play was never booked
-        # (streak/probe_888_auto_strip.py).
-        #
-        # THE CLASS, NOT THE INSTANCE.  A card play is identifiable by
-        # what it DOES: it says 'reveal' and it moves a piece from a
-        # HAND zone to a CURRENT CARD zone.  Censused over 155,532
-        # <auto> lines (streak/census_auto_reveal_family.py): that
-        # predicate admits exactly the four ops of this family - 866,
-        # 3, 861 and 888 - and NOTHING else, so a future sibling is
-        # covered without another edit here.  Every other <auto> line
-        # (Scribe.141 43,731, Controls.323, Controls.281 ...) is
-        # auto-SETUP and must keep being skipped, which the zone test
-        # guarantees: setup lines carry no hand->Current-Card pair.
+        # THE CLASS, NOT THE INSTANCE: a card play is identifiable by
+        # what it DOES - it says 'reveal' and moves a piece from a HAND
+        # zone to a CURRENT CARD zone (censused over 155,532 <auto>
+        # lines: exactly ops 866, 3, 861 and 888;
+        # streak/census_auto_reveal_family.py).  Every other <auto> line
+        # (Scribe.141, Controls.323, Controls.281 ...) is auto-SETUP and
+        # must keep being skipped; setup lines carry no
+        # hand->Current-Card pair.
         if line.startswith('<auto>'):
             _hand9 = ('<~Controls.45~>' in line
                       or '<~Controls.46~>' in line)
@@ -2771,7 +2671,7 @@ class LogReplayer:
             toks = msg.split()
             if toks and re.fullmatch(r'[0-9a-f]{6}', toks[-1]):
                 toks = toks[:-1]  # strip the VASSAL line hash
-            # t125 fix 7 (ruling 1.157): concession chat ARMS the
+            # ruling 1.157: concession chat ARMS the
             # game-over signal (latches only in the pure-noise tail)
             if toks and ('gg' in toks or 'concede' in msg
                          or 'resign' in toks):
@@ -2809,11 +2709,9 @@ class LogReplayer:
                     region = (getattr(self, '_battle_hint_region', None)
                               or self._battle_synth_region
                               or self._combat_region or '?')
-                    # (129 v1 nc-synth REVERTED 2026-07-25: synthesizing
-                    # at the nc chat re-ordered attack records vs
-                    # adjacent moves in 27 windows of PeterM alone and
-                    # regressed it 0->9.  v2 synthesizes at the swap-
-                    # removal site instead - see _handle_..304.)
+                    # (129 v2: the attack is synthesized at the
+                    # swap-removal site, not at the nc chat - see
+                    # _handle_..304.)
                     self.action_log.append(('combat_card_none',
                                             {'region': region}, side))
                     self.log(f"{side.name} declines combat card (nc)")
@@ -2822,12 +2720,12 @@ class LogReplayer:
             # window = 'forfeit N' (Dread and Despair: forfeit N points
             # of Nazgul leadership; game0 T9 'ff3' twice — FP rolled 2
             # dice instead of 5). A learned combat_effect_choice decision.
-            _ff = re.fullmatch(r'ff\s*(\d)', ' '.join(toks)) \
-                if toks else None
-            if _ff and getattr(self, 'line_num', 0) - \
-                    self._battle_window_line <= 10:
+            from combat_forfeit_text import dread_forfeit_count
+            _ff_count = dread_forfeit_count(' '.join(toks)) if toks else None
+            if _ff_count is not None:
                 side = self._player_to_side.get(player)
-                if side is not None:
+                if (side is not None and self._cc_pre_roll.get(side, False)
+                        and _normalize_name(self._last_combat_card_name.get(side, '')) in _DREAD_EVENT_CARDS):
                     region = (getattr(self, '_battle_hint_region', None)
                               or self._battle_synth_region
                               or self._combat_region or '?')
@@ -2847,21 +2745,21 @@ class LogReplayer:
                                 break
                     self.action_log.append((
                         'combat_effect_choice',
-                        {'count': int(_ff.group(1)),
+                        {'count': _ff_count,
                          'card_name':
                              self._last_combat_card_name.get(side, ''),
                          'region': region}, side))
                     self.log(f"{side.name} combat-effect forfeit "
-                             f"{_ff.group(1)} (ff)")
+                             f"{_ff_count} (Dread and Despair)")
                 return
-            # fix 76b (GAME19 T8): players announce presses in chat
+            # GAME19 T8: players announce presses in chat
             # ("press", "press draw") right before paying the elite —
             # stamp the line so the 307-sourced press path (replacement
             # regular from REINFORCEMENTS, which Block-1's 308-only
             # detection misses) can emit a nation-stamped record.
             if 'press' in msg.lower().split():
                 self._last_press_chat_line = self.line_num
-            # fix 82 (game-16 canary): an UNAMBIGUOUS tile-token chat
+            # an UNAMBIGUOUS tile-token chat
             # right after a hunt-tile draw names the tile — override the
             # version-unstable static piece map ('3r' etc.; plain digits
             # are NOT used, they collide with hit-count announcements).
@@ -2903,12 +2801,8 @@ class LogReplayer:
             return
 
         # Die consumption (SH): HighlightLabel.81 variant (krechet's and
-        # Upward's clients, 2025-04-15 line 49 / 2025-01-10 line 52).
-        # Unhandled, the SH die never attaches to its action record —
-        # the T1 'political Isengard' advance became die-less, was
-        # dropped by the auto-advance heuristic, Isengard never reached
-        # At War in replay, and the (correct) Saruman entry rule then
-        # rejected the logged muster.
+        # Upward's clients, 2025-04-15 line 49 / 2025-01-10 line 52);
+        # without it the SH die never attaches to its action record.
         hl_sh_die_match = re.search(
             r'<~HighlightLabel\.81~>(\d+)<~HighlightLabel\.82~><~[\w.]+~><~HighlightLabel\.83~><~Game\.2035~>', line)
         if hl_sh_die_match:
@@ -2952,7 +2846,7 @@ class LogReplayer:
         hunt_tile_match = re.search(
             r'<~Controls\.624~>(\d+)<~Controls\.625~><~([\w.]+)~><~Controls\.626~><~([\w.]+)~>', line)
         if hunt_tile_match:
-            # t125 fix 7: inside the final-hunt window the FIRST draw
+            # inside the final-hunt window the FIRST draw
             # is the decisive Cracks-of-Doom hunt (real play); a SECOND
             # draw means the decisive tile resolved without a
             # corruption walk (0 damage) — the ring is destroyed and
@@ -2974,10 +2868,9 @@ class LogReplayer:
             dest = hunt_tile_match.group(3)
             # Look up tile name from empirically verified mapping
             tile_name = HUNT_TILE_PIECES.get(tile_id, f"tile {tile_id}")
-            # Reveal-ness comes from the TILE itself when known (the old
-            # destination heuristic — Game.2036 vs 2037 card areas — is
-            # just where the player happened to drop the tile; game
-            # 2023-12-07_001647 put the '2r' reveal tile on 2037)
+            # Reveal-ness comes from the TILE itself when known; the drop
+            # zone (Game.2036 vs 2037) is not evidence (2023-12-07_001647
+            # put the '2r' reveal tile on 2037)
             low = str(tile_name).strip().lower()
             sp = next((t for k, t in gs.SPECIAL_HUNT_TILES.items()
                        if k.lower() == low), None)
@@ -2988,10 +2881,6 @@ class LogReplayer:
             elif low.startswith('eye'):
                 # the Eye tile IS a reveal (its artwork is the reveal
                 # icon; engine tile.reveal=True; Gollum cannot block it).
-                # The old False classification was masked in the corpus
-                # because humans walk the pawn while _in_hunt_resolution
-                # is still set — the engine-master bridge defers the
-                # placement past the damage decision, which exposed it.
                 is_reveal = True
             elif re.fullmatch(r'-?\d+', low):
                 is_reveal = False
@@ -3004,7 +2893,7 @@ class LogReplayer:
                 'is_reveal': is_reveal,
             }
             self._record_action('hunt_tile_draw', _tp82, Side.SHADOW)
-            # fix 82 (game-16 canary): tile piece IDs are NOT stable
+            # tile piece IDs are NOT stable
             # across VASSAL module versions (2025 module: piece 219 =
             # '3r', but the census-era static map says 'Eye').  Players
             # announce the tile in chat right after the draw — keep a
@@ -3012,7 +2901,7 @@ class LogReplayer:
             # 'eye') within a few lines can correct the record.
             self._last_tile_draw_params = _tp82
             self._last_tile_draw_line = self.line_num
-            # t125 fix 2: the draw takes the tile out of state.hunt_pool
+            # the draw takes the tile out of state.hunt_pool
             # (in-flight on the display area until discarded/removed)
             self._tile_to_zone(tile_id, decode_location(dest))
             self._in_hunt_resolution = True
@@ -3042,12 +2931,9 @@ class LogReplayer:
             except (ValueError, TypeError):
                 dmg = 0
             # The Breaking of the Fellowship: the tile drawn inside the
-            # card window counts SEPARATIONS, not hunt damage - opening
-            # a damage ctx here FABRICATED a hunt_take_corruption
-            # decision the game never contained (GAME21 rendered
-            # L261-264: draw '2' -> Merry+Pippin separate -> discard,
-            # NO corruption walk; the synthesized +2 was then force-fed
-            # to the engine by the teacher)
+            # card window counts SEPARATIONS, not hunt damage - no damage
+            # ctx (GAME21 rendered L261-264: draw '2' -> Merry+Pippin
+            # separate -> discard, NO corruption walk).
             # The gate applies only while the BoF card window is still
             # OPEN (_card_window_side is cleared on die consumption);
             # _card_window_card alone is never cleared and would
@@ -3258,7 +3144,7 @@ class LogReplayer:
                 self._handle_card_zone_discard(_pid, _frm)
 
         # Card draw: <~Controls.509~>card <~Controls.510~>deck <~Controls.511~>hand
-        # GRAMMAR VARIANTS (session 33, live AI-vs-AI build): the menu
+        # GRAMMAR VARIANTS (live AI-vs-AI build): the menu
         # draw handlers emit PER-DECK token sets — A.a() fdrawc uses
         # Controls.491/492/493, A.c() sdrawc uses Controls.0/549/550,
         # A.d() sdraws uses Controls.557/558/559 (A.b() fdraws uses the
@@ -3430,12 +3316,10 @@ class LogReplayer:
                 # the previous battle must not name this one's target;
                 # the region resolves via chat hint or first casualties.
                 self._maybe_synth_attack(None)
-                # FIX D1: an unresolved combat-card region tags '?' -- NEVER
-                # the PREVIOUS battle's region.  A stale _combat_region
-                # fallback stamped cards onto the wrong battle (game 11: a
-                # 'Pelagir' typo left _combat_region at 'old forest road',
-                # so the cards + their casualties landed there).  '?' lets
-                # the closed loop's episode reconciler bind by evidence.
+                # D1: an unresolved combat-card region tags '?' -- NEVER the
+                # PREVIOUS battle's region (a stale _combat_region fallback
+                # binds cards to the wrong battle: game 11 'Pelagir' typo).
+                # '?' lets the episode reconciler bind by evidence.
                 params['region'] = (self._battle_synth_region
                                     if self._battle_synth_region
                                     and self._battle_synth_region != '?'
@@ -3545,12 +3429,9 @@ class LogReplayer:
                             # all): Lure of the Ring's random victim.
                             # The draw names the victim (logged RNG -
                             # legitimate forcing) but does NOT prove the
-                            # eliminate choice: emitting companion_death
-                            # here FABRICATED an elimination when the
-                            # human chose corruption (GAME21 rendered
+                            # eliminate choice (GAME21 rendered
                             # L1021-1024: Legolas drawn, +2 corruption,
-                            # RETURNED to the Guide box - engine killed
-                            # him for the rest of the game).  Emit a
+                            # RETURNED to the Guide box).  Emit a
                             # non-decision lure_draw carrying the victim;
                             # companion_death is emitted only on the
                             # eliminate EVIDENCE (kill/dead-zone of the
@@ -3584,13 +3465,12 @@ class LogReplayer:
             return
 
         # Card-area sweep: <~Controls.662~>pids <~Controls.663~><~zone~>
-        # (client verb 'kills', messages.properties 477).  t138 wave-3
-        # (triage N3): 85% of logs use it to clear card areas after the
-        # pieces were already dealt with by 296/644/637 — but when the
-        # sweep is the ONLY removal record it must route pids by
-        # identity (Jed/Mirdain L266: tile 218 + Gandalf + Gimli swept
-        # from FP Card Play; the tile stayed 'fp card play' for 15
-        # checkpoints).  Idempotent per pid: only pieces whose TRACKED
+        # (client verb 'kills', messages.properties 477).  Usually it
+        # clears card areas after the pieces were already dealt with by
+        # 296/644/637 - but when the sweep is the ONLY removal record it
+        # must route pids by identity (Jed/Mirdain L266: tile 218 +
+        # Gandalf + Gimli swept from FP Card Play).  Idempotent per pid:
+        # only pieces whose TRACKED
         # zone is still an in-flight card/current area are routed
         # through the same identity router as Controls.644; cards,
         # dice, and already-resolved pieces are untouched.
@@ -3624,12 +3504,10 @@ class LogReplayer:
         if casualty_match:
             pieces = casualty_match.group(1).strip().split()
             loc = decode_location(casualty_match.group(2))
-            # t133 fix F2: hunt-tile pids in kill/cleanup grammars are
-            # DISCARDED to Used Hunt Tiles (the client's tile resting
-            # place; 193 games left tiles in flight at card-play areas
-            # or marked them dead alongside hunt casualties).  A
+            # hunt-tile pids in kill/cleanup grammars are DISCARDED to
+            # Used Hunt Tiles (the client's tile resting place).  A
             # special tile killed out of Removed Hunt Tiles is its
-            # ACTIVATION — it parks in Used ("in play, set aside",
+            # ACTIVATION - it parks in Used ("in play, set aside",
             # USER RULING A1 2026-07-17; rulebook p.42) until the
             # Mordor-entry re-pool.
             _tile_kill = [p for p in pieces
@@ -3644,8 +3522,7 @@ class LogReplayer:
             if base is not None:
                 # Garrison casualties reported in the stronghold BOX
                 # ("kills ... in Minas Tirith Stronghold") belong to the
-                # base region's army — previously dropped entirely,
-                # leaving immortal garrisons / wrong control / wrong VP.
+                # base region's army.
                 # Removals in a card window with no active battle are card
                 # effects (e.g. Cirdan's Ships pulling 2 Gondor Regulars
                 # out of besieged Dol Amroth) — no attack to synthesize.
@@ -3675,7 +3552,7 @@ class LogReplayer:
                 if _rest9 and 'Hunt' not in str(loc) \
                         and 'Dice' not in str(loc) \
                         and 'Hand' not in str(loc):
-                    # t133 fix F6 (+ off-board parking kills): kills
+                    # t133 F6 (+ off-board parking kills): kills
                     # reported at battle/parking boxes (Game.2029 =
                     # Board1: SlowCobra/Raster L311 Gondor leader 085;
                     # VP-box parking: SlowCobra/Wey L445 kills the
@@ -3698,17 +3575,14 @@ class LogReplayer:
         # Piece swap/placement: <~Controls.313~>pieces <~Controls.30X~><~Controls.314~><~location~>
         # AUTHORITATIVE decode (WOTR-Gandalf messages.properties):
         # Controls.313=" moves ", 307/309="from reinforcements",
-        # 308="from casualties", 314=" to ".  The old comment
-        # (307=Elite/308=Regular) was wrong — the digit is the SOURCE
-        # POOL, not the unit type.
-        # t125: tolerate a literal mixed-source annotation between the
-        # source-pool token and Controls.314 — Columbo L433:
-        # 'Controls.313 295 069 Controls.309 (1)/casualties(1)
-        # Controls.314 Game.1993' places 295 from reinforcements AND
-        # 069 from casualties in ONE line; the strict grammar dropped
-        # the whole placement (069 stayed dead, phantom HD garrison
-        # gap).  The piece-level dead-pool bookkeeping refunds the
-        # from-casualties pids regardless of the leading source token.
+        # 308="from casualties", 314=" to " - the digit is the SOURCE
+        # POOL, not the unit type.  Tolerate a literal mixed-source
+        # annotation between the source-pool token and Controls.314
+        # (Columbo L433: 'Controls.313 295 069 Controls.309
+        # (1)/casualties(1) Controls.314 Game.1993' places 295 from
+        # reinforcements AND 069 from casualties in ONE line); the
+        # piece-level dead-pool bookkeeping refunds the from-casualties
+        # pids regardless of the leading source token.
         swap_place_match = re.search(
             r'<~Controls\.313~>([\d\s]+)<~Controls\.(307|308|309)~>'
             r'[^<]*<~Controls\.314~><~([\w.]+)~>',
@@ -3810,11 +3684,9 @@ class LogReplayer:
         if not dice_ids or not values:
             return
 
-        # Determine side from the first KNOWN die id — the first LISTED
-        # id may be a bonus die not registered yet (2023-08-13
-        # HombreLobo T2 L128: the Witch-king's die 362 leads the roll,
-        # the old first-id-only test defaulted to FREE_PEOPLES and the
-        # whole Shadow roll parsed empty, leaving T2 faces unforced).
+        # Determine side from the first KNOWN die id - the first LISTED
+        # id may be an unregistered bonus die (HombreLobo T2 L128: the
+        # Witch-king's die 362 leads the roll).
         side = None
         for _ds in dice_ids:
             _di = int(_ds)
@@ -3896,15 +3768,11 @@ class LogReplayer:
                             else ActionDieFace(_nf2)
                         _last = self.action_log[-1] \
                             if self.action_log else None
-                        # t138 (family 2, USER ruling 1.168): consecutive
-                        # rerolls of ONE die are ONE ring decision
-                        # ("reroll a single die until it is different")
-                        # — fold into ANY adjacent same-side
-                        # dwarven_ring record whose net face chain
-                        # continues (the old test required
-                        # placeholder_reroll, so a piece-428 use
-                        # followed by a second reroll emitted TWO
-                        # records).
+                        # t138 (USER ruling 1.168): consecutive rerolls
+                        # of ONE die are ONE ring decision ("reroll a
+                        # single die until it is different") - fold into
+                        # ANY adjacent same-side dwarven_ring record
+                        # whose net face chain continues.
                         if _last is not None \
                                 and _last[0] == 'dwarven_ring' \
                                 and _last[2] == _sd2 \
@@ -4013,13 +3881,11 @@ class LogReplayer:
             if not pieces:
                 return
 
-        # EDGE-2 (2026-08-17): a CARD piece dragged TO a deck zone =
-        # the card RETURNS to the deck (the refusal corrective for an
-        # un-owed draw is exactly this, in all-Game grammar; 'put it
-        # back on the deck' effects share the shape).  Remove it from
-        # the hand model the same way the face-down hand exit does —
-        # without this the corrective was grammar-performable but
-        # EFFECT-nil and the un-owed card haunted the parser hand.
+        # EDGE-2: a CARD piece dragged TO a deck zone = the card RETURNS
+        # to the deck (the refusal corrective for an un-owed draw is
+        # exactly this, in all-Game grammar; 'put it back on the deck'
+        # effects share the shape).  Remove it from the hand model the
+        # same way the face-down hand exit does.
         if len(pieces) == 1 and to_loc in (
                 'FP Char Deck', 'FP Strat Deck',
                 'SA Char Deck', 'SA Strat Deck'):
@@ -4055,7 +3921,7 @@ class LogReplayer:
                         break
                 return
 
-        # Hunt-tile drags (t125 fix 2): tiles shuttled between the tile
+        # Hunt-tile drags: tiles shuttled between the tile
         # zones (Mordor-entry re-pooling by hand, specials introduced
         # from Removed, discards) or parked on display areas.  Zone- or
         # tracking-gated so numeric pid collisions can't misroute.
@@ -4145,16 +4011,14 @@ class LogReplayer:
                     self.log(f"Army-box exit rewrite: {from_loc} -> {x_name}")
                     from_loc = x_name
             elif 'Mordor ' in from_loc or 'Mordor ' in to_loc:
-                # USER RULING 1.156 (t125 fix 6): army units dragged
-                # onto Mordor-track boxes are a common human shortcut
-                # for being IN GORGOROTH — the army state joins/creates
-                # the Gorgoroth army.  The adjacency-inference pre-pass
-                # above still resolves the classic parking pairs
-                # (canary-certified); this branch handles the residue
-                # the pre-pass could not resolve (sharpz L104: the
-                # whole Barad-Dur garrison dragged onto 'Mordor 5' and
-                # never dragged out — previously skipped, leaving a
-                # phantom Barad-Dur army the client board disproves).
+                # USER RULING 1.156: army units dragged onto
+                # Mordor-track boxes are a common human shortcut for
+                # being IN GORGOROTH - the army state joins/creates the
+                # Gorgoroth army.  The adjacency-inference pre-pass
+                # above resolves the classic parking pairs; this branch
+                # handles the residue (sharpz L104: the whole Barad-Dur
+                # garrison dragged onto 'Mordor 5' and never dragged
+                # out).
                 unit_pieces = [p for p in pieces
                                if p not in self._TRACK_MARKER_PIECES]
                 if unit_pieces:
@@ -4215,13 +4079,9 @@ class LogReplayer:
         if _ring_ps and len(_ring_ps) == len(pieces):
             # t138 (engine-check family 2): grants arrive as GROUP drags
             # of ring pieces 428-431 ('adds 2 Dwarven Ring(s)' then
-            # '429 428 [storage] -> [FP Dice]') — the old branch only
-            # accepted a single piece 428, so multi-ring grants never
-            # incremented the counter and every later use was illegal
-            # at the certifier (27/42 misses, rings=0).  SIDE comes from
-            # the POOL zone ('FP Dice'/'SA Dice'), never from 'SA'
-            # appearing anywhere in the pair (a use dragged onto
-            # SA Card Play misattributed an FP ring to 'sh').
+            # '429 428 [storage] -> [FP Dice]').  SIDE comes from the
+            # POOL zone ('FP Dice'/'SA Dice'), never from 'SA' appearing
+            # anywhere in the pair.
             if 'Dice' in to_loc and 'Dice' not in from_loc:
                 ring_side = Side.SHADOW if 'SA' in to_loc \
                     else Side.FREE_PEOPLES
@@ -4248,21 +4108,17 @@ class LogReplayer:
                 self.log("Dwarven Ring used (reroll follows)")
             return
 
-        # Control markers / VP markers: explicit ground-truth bookkeeping.
-        # Must intercept BEFORE the muster path (previously a Shadow
-        # control marker from SA Reinforcements to Pelargir mustered a
-        # phantom unit, and the VP marker's undecoded 'Game.392' target
-        # produced a phantom 'muster at Game.392').
-        # t138 Q11 (per-drag context inference): clients also use the
-        # 405-420 marker pids as OVERFLOW UNIT STOCK when the normal
-        # pieces run out (9 proven games, side- and class-agnostic).
-        # Unambiguous discriminator: a marker dragged from a REINF box
-        # onto a region that still holds units HOSTILE to the marker's
-        # side cannot be a control capture (you never control a region
-        # with enemy units in it, rulebook) — route it to the muster
-        # path instead (Wems/Gileforn L133 '416 SA Reinf -> Dale' cost
-        # one Sauron regular for 22 checkpoints).  Anything else keeps
-        # capture semantics; ambiguous shapes are curation-flagged.
+        # Control markers / VP markers: explicit ground-truth bookkeeping,
+        # intercepted BEFORE the muster path.
+        # t138 Q11: clients also use the 405-420 marker pids as OVERFLOW
+        # UNIT STOCK when the normal pieces run out (9 proven games, side-
+        # and class-agnostic).  Discriminator: a marker dragged from a
+        # REINF box onto a region that still holds units HOSTILE to the
+        # marker's side cannot be a control capture (you never control a
+        # region with enemy units in it, rulebook) - route it to the
+        # muster path (Wems/Gileforn L133 '416 SA Reinf -> Dale').
+        # Anything else keeps capture semantics; ambiguous shapes are
+        # curation-flagged.
         if any(p in CONTROL_MARKERS or p in VP_MARKERS for p in pieces):
             _q11 = []
             if 'Reinf' in from_loc and is_map_region(to_loc):
@@ -4332,14 +4188,12 @@ class LogReplayer:
                         except ValueError:
                             pass
                     elif 'Reinf' in to_loc:
-                        # t133 fix F4b: a die retired to a REINF box
-                        # from ANY zone is removed from play — the
-                        # rulebook's die-loss on character elimination
-                        # is applied by tidying the die out of the DEAD
-                        # pile at turn start (p.18; Kaeldar L452 'SA
-                        # Dead -> SA Reinf' after Saruman fell).  The
-                        # old guard required 'Dice' in from_loc, so the
-                        # dead-pile variant kept a phantom die forever.
+                        # t133 F4b: a die retired to a REINF box from
+                        # ANY zone is removed from play - the rulebook's
+                        # die-loss on character elimination is applied
+                        # by tidying the die out of the DEAD pile at
+                        # turn start (p.18; Kaeldar L452 'SA Dead -> SA
+                        # Reinf' after Saruman fell).
                         _di = int(p)
                         self._dice_out_of_play.add(_di)
                         mp = self.die_id_map.get(_di)
@@ -4449,13 +4303,11 @@ class LogReplayer:
 
         # Die movements: track consumption when die goes from pool to used
         if 'Dice' in from_loc or 'Dice' in to_loc:
-            # t138 (triage 4.6 / pass-5 3.4): NAMED pieces riding a
-            # dice-zone leg are NOT dice — Saruman entered play via
-            # 'SA Reinf -> SA Dice' (Controls.281 bounce) then
-            # 'SA Dice -> Orthanc'; the old dispatch consumed both legs
-            # and Saruman never mustered (25 checkpoints).  A named pid
-            # leaving a dice zone for the MAP musters/returns; entering
-            # a dice zone just zone-parks.
+            # t138: NAMED pieces riding a dice-zone leg are NOT dice
+            # (Saruman enters play via 'SA Reinf -> SA Dice'
+            # (Controls.281 bounce) then 'SA Dice -> Orthanc').  A named
+            # pid leaving a dice zone for the MAP musters/returns;
+            # entering a dice zone just zone-parks.
             _named9 = [p for p in pieces if not self._is_die_piece(p)
                        and (p in MINION_PIECES or p in COMPANIONS)]
             if _named9:
@@ -4496,13 +4348,9 @@ class LogReplayer:
                         self.log(f"Die {p} removed from play "
                                  f"(-> {to_loc})")
             elif 'Hunt' in from_loc and 'Dice' in to_loc:
-                # t125: turn-start hunt-box retrieval (Controls.757
-                # 'die from Hunt Box to SA Dice' and friends).  The
-                # client's die is physically back in the pool; the
-                # parser kept it in state.hunt_box until the turn
-                # marker, so every checkpoint landing in that window
-                # showed phantom hunt-box dice (Adobim: one window per
-                # turn boundary, 9 of 33 checkpoints).
+                # turn-start hunt-box retrieval (Controls.757 'die from
+                # Hunt Box to SA Dice' and friends): the client's die is
+                # physically back in the pool.
                 for p in pieces:
                     try:
                         mp = self.die_id_map.get(int(p))
@@ -4524,15 +4372,12 @@ class LogReplayer:
                 for p in pieces:
                     if self._is_die_piece(p):
                         self._dice_out_of_play.discard(int(p))
-                # Die RETURNED to the pool from ANY off-pool zone —
+                # Die RETURNED to the pool from ANY off-pool zone -
                 # dwarven-ring reroll flow (Used/Current -> pool,
                 # 2026-01-05 kapcerz T1 L48-51) AND the turn-start
-                # retrieval grammars from the DEAD piles (t125:
-                # Controls.731 'FP Dead -> FP Dice', Controls.762
-                # 'SA Dead -> SA Dice'; unhandled, retrieved dice
-                # stayed 'used' until the turn marker and every
-                # checkpoint in that window showed a short pool —
-                # Adobim/Rizino1 dumps).  Un-consume it.
+                # retrieval grammars from the DEAD piles (Controls.731
+                # 'FP Dead -> FP Dice', Controls.762 'SA Dead -> SA
+                # Dice').  Un-consume it.
                 for p in pieces:
                     try:
                         die_id = int(p)
@@ -4611,12 +4456,10 @@ class LogReplayer:
             return
 
         # --- Stronghold boxes (siege mechanics) -------------------------
-        # "X Stronghold" is an off-map VASSAL box. Moves into it are the
-        # defender's RETREAT INTO SIEGE (previously misparsed as
-        # casualties, deleting the garrison!); moves from it back to X are
-        # the siege lifting (previously phantom musters); moves from it to
-        # Dead/Used are the garrison's battle casualties (previously
-        # invisible). Replay keeps besieged units in the region.
+        # "X Stronghold" is an off-map VASSAL box.  Moves into it are the
+        # defender's RETREAT INTO SIEGE; moves from it back to X are the
+        # siege lifting; moves from it to Dead/Used are the garrison's
+        # battle casualties.  Replay keeps besieged units in the region.
         def _stronghold_of(loc: str) -> Optional[str]:
             if loc and loc.endswith(' Stronghold'):
                 return loc[:-len(' Stronghold')]
@@ -4626,7 +4469,7 @@ class LogReplayer:
         sh_from = _stronghold_of(from_loc)
         if sh_from is not None and is_map_region(to_loc)                 and any(p in ('247', '248') for p in pieces):
             if sanitize(sh_from) == sanitize(to_loc):
-                # t133 fix F3: the ring-bearers figure dragged between
+                # t133 F3: the ring-bearers figure dragged between
                 # a region and its OWN stronghold box (siege display
                 # shuffles, courtesy drag-backs) is NEVER a declare or
                 # reveal — no region change happened, so the progress
@@ -4643,11 +4486,8 @@ class LogReplayer:
                 # The FELLOWSHIP leaving a besieged stronghold's BOX for
                 # a DIFFERENT map region is a reveal/declare placement,
                 # never units (2023-08-13 HombreLobo T7 L811: 247 from
-                # Minas Tirith Stronghold -> Minas Morgul — the gateway
-                # reveal that ENTERS MORDOR — used to parse as a
-                # phantom 1R muster at Minas Morgul, so the teacher
-                # never entered the track and every T8+ mordor_move
-                # went stranded).
+                # Minas Tirith Stronghold -> Minas Morgul, the gateway
+                # reveal that ENTERS MORDOR).
                 self._handle_army_move(
                     [p for p in pieces if p in ('247', '248')],
                     sh_from, to_loc)
@@ -4681,18 +4521,16 @@ class LogReplayer:
         if sh_to is not None and is_map_region(from_loc) \
                 and sanitize(sh_to) != sanitize(from_loc) \
                 and sanitize(sh_to) in board.regions:
-            # t133 fix F15 (+F9 geography): a drag from a DIFFERENT
+            # t133 F15 (+F9 geography): a drag from a DIFFERENT
             # region into a stronghold BOX joins the garrison inside
-            # that stronghold — nazgul flights into a friendly besieged
+            # that stronghold - nazgul flights into a friendly besieged
             # stronghold are plain printed rules (Moving Nazgul: "can
             # never move this way into a region that contains a
             # Stronghold controlled by the Free Peoples player, unless
             # that Stronghold is besieged by a Shadow Army");
             # companion/GtW walks mirror the client drag (zone wins,
-            # Q6/A6).  The old handlers only accepted a box paired with
-            # ITS OWN region, so these pieces were deleted as
-            # leaving-the-board casualties (74 games).  t138: side_lock
-            # so a contested source region never donates enemy units.
+            # Q6/A6).  t138: side_lock so a contested source region
+            # never donates enemy units.
             self._handle_army_move(pieces, from_loc, sh_to,
                                    side_lock=self._piece_side(pieces))
             for p in pieces:
@@ -4702,14 +4540,13 @@ class LogReplayer:
             return
         if sh_to is not None and not is_map_region(from_loc) \
                 and sanitize(sh_to) in board.regions:
-            # t133 fix F12: a NAMED character pid leaving a dead/
+            # t133 F12: a NAMED character pid leaving a dead/
             # casualty/card-play zone for the stronghold box is a
             # character appearance/revival, never a unit refund.
             # (Stronghold-box SOURCES are excluded: box->box garrison
             # transfers are a human MISTAKE per USER RULING 2026-07-17
-            # Q7 — "those are mistakes, do not implement those" — and
-            # keep the old muster-at-destination behavior, flagged for
-            # curation.)
+            # Q7 - "those are mistakes, do not implement those" -
+            # muster-at-destination, flagged for curation.)
             if _stronghold_of(from_loc) is None:
                 _comp_ps = [p for p in pieces
                             if p in COMPANIONS or p in MINION_PIECES]
@@ -4756,15 +4593,13 @@ class LogReplayer:
                 self.log(f"Siege lifted at {region} (units already in region)")
                 return
             if is_map_region(to_loc) and sanitize(region) in board.regions:
-                # t133 fix F15 (exit leg): pieces leaving a stronghold
+                # t133 F15 (exit leg): pieces leaving a stronghold
                 # BOX for a DIFFERENT map region move out of the box's
                 # base-region army (nazgul flying out of the besieged
                 # garrison, Mount Gundabad L570 '039 040 Game.19 ->
-                # Moria').  Previously fell through to the off-board-
-                # return branch and RE-mustered pieces the parser had
-                # already lost.  t138 (pass-4 5.1 regression): at a
-                # CONTESTED region the drag must select by the pids'
-                # OWN side, never the besieger's army — side_lock.
+                # Moria').  t138: at a CONTESTED region the drag must
+                # select by the pids' OWN side, never the besieger's
+                # army - side_lock.
                 self._handle_army_move(pieces, region, to_loc,
                                        side_lock=self._piece_side(pieces))
                 self.log(f"Cross-region move out of stronghold box: "
@@ -4784,13 +4619,11 @@ class LogReplayer:
 
         # Mordor track marker moved via Scribe.141.  MUST precede the
         # map->non-map branch below: the ENTRY drag (map region ->
-        # 'Mordor 0', e.g. Morannon -> Game.524) was previously swallowed
-        # as "units leaving the board", so the replay state's
-        # mordor_entered stayed False past the entry moment and the
-        # Mouth-of-Sauron legality check failed at the muster line
-        # (game 1 line 644 entry vs line 665 muster; game 2 line 801
-        # entry vs line 817 muster).  Between-box drags (both locs
-        # 'Mordor N') were unaffected.
+        # 'Mordor 0', e.g. Morannon -> Game.524) sets mordor_entered at
+        # the entry moment, before the Mouth-of-Sauron legality check at
+        # the muster line (game 1 L644 entry vs L665 muster; game 2 L801
+        # vs L817).  Between-box drags (both locs 'Mordor N') are
+        # unaffected.
         if '247' in pieces and ('Mordor ' in from_loc or 'Mordor ' in to_loc):
             self._handle_fellowship_track(from_loc, to_loc)
             return
@@ -4892,9 +4725,9 @@ class LogReplayer:
                 # transit-parking, never casualties
                 self._park_army_pids(pieces, from_loc, to_loc)
                 return
-            # (Separated companions killed from a map region are now
-            # handled BY IDENTITY inside _remove_pieces_from_armies —
-            # t133 fix F10, alias-matched so GtW/Aragorn faces resolve.)
+            # (Separated companions killed from a map region resolve
+            # BY IDENTITY inside _remove_pieces_from_armies,
+            # alias-matched so GtW/Aragorn faces resolve.)
             from_san = sanitize(from_loc)
             # Combat-card effect cost: army units moved onto the active
             # combat card ("moves group ([4]Sauron Regular) from Minas
@@ -4926,11 +4759,9 @@ class LogReplayer:
                     or (_cc_name in _RELENTLESS_EVENT_CARDS
                         and self._cc_pre_roll.get(fx_side, False)))
                 if n_units > 0 and _is_choice:
-                    # 134 (2026-07-25 board-is-set T8 L558): the
-                    # sacrificed PIECES are the human's decision - a
-                    # bare count let the engine pick its own units
-                    # (policy) and 2 paid SAUR elites survived at MT
-                    # for the rest of the game.  Carry the kind mix.
+                    # 134 (board-is-set T8 L558): the sacrificed PIECES
+                    # are the human's decision - carry the kind mix,
+                    # never a bare count.
                     _ne134 = sum(
                         1 for pp in pieces
                         if get_unit_type_from_piece_id(
@@ -5008,7 +4839,7 @@ class LogReplayer:
                     if comp_name == 'Gandalf the Grey' and self._gandalf_dead:
                         # Dead Gandalf returning to the map IS the Gandalf
                         # the White transformation (W-die decision, incl.
-                        # WHERE to place him) — previously never extracted
+                        # WHERE to place him)
                         comp = gs.Companion(name='Gandalf the White',
                                             level=3, leadership=1)
                         to_army.leaders.append(comp)
@@ -5056,13 +4887,8 @@ class LogReplayer:
                                 break
 
             # Remaining non-companion pieces treated as muster
-            # 137 (2026-07-25 demanray L620/L623, client-dump proven):
-            # the FELLOWSHIP PAWN (247) and its marker family are NEVER
-            # army units - when the humans parked the pawn on a card
-            # zone mid-battle and dragged it back, this muster tail
-            # minted one phantom region-nation REGULAR per return trip
-            # (Rivendell held 2 phantom Elven regulars vs the client
-            # from cp625 for the rest of the game).  Dice pieces are
+            # 137 (demanray L620/L623): the FELLOWSHIP PAWN (247) and its
+            # marker family are NEVER army units; dice pieces are
             # excluded for the same reason.
             non_comp = [p for p in pieces
                         if p not in COMPANIONS
@@ -5084,15 +4910,15 @@ class LogReplayer:
                 self._handle_muster(non_comp, to_loc, is_shadow)
             return
 
-        # (Mordor track marker branch hoisted above the map->non-map
-        # branch, 2026-07-04 — see comment there.)
+        # (Mordor track marker branch lives above the map->non-map
+        # branch - see the comment there.)
 
         # Army movement between map regions
         if is_map_region(from_loc) and is_map_region(to_loc):
             self._handle_army_move(pieces, from_loc, to_loc)
             return
 
-        # Unclaimed off-board bookkeeping drags (t125 fix 1): keep
+        # Unclaimed off-board bookkeeping drags: keep
         # piece-level zones in client sync for tracked unit pids —
         # e.g. dead regulars tidied from FP Dead to FP Reinf
         # (GenericPie pids 078/082: the client board shows them in
@@ -5273,20 +5099,15 @@ class LogReplayer:
                 if getattr(self, '_in_hunt_resolution', False) \
                         or getattr(self, '_hunt_reveal_pending', False):
                     self._hunt_reveal_pending = False
-                    # AUTO-94 game-1 specimen (2026-08-17): the AUTO
-                    # emitter's reveal choreography can put the marker
-                    # FLIP BEFORE the walk drags (flip -> die kill ->
-                    # 248 reset -> 247 hops).  The old unconditional
-                    # skip-arm assumed the flip was still AHEAD; when
-                    # it had already passed, the armed skip went STALE
-                    # and ate the NEXT genuine flip (the post-entry
-                    # fellowship_hide) - phase inversion, self-healing
-                    # on the overworld (walk handlers re-sync hidden)
-                    # but TERMINAL in Mordor where nothing re-syncs:
-                    # engine ended revealed, roundtrip hidden, at the
-                    # ring_corruption tick.  If a flip already landed
-                    # in this gesture window, RETRACT its record (the
-                    # declare branch's mirror rule) instead of arming.
+                    # AUTO-94 specimen: the AUTO emitter's reveal
+                    # choreography can put the marker FLIP BEFORE the
+                    # walk drags (flip -> die kill -> 248 reset -> 247
+                    # hops).  If a flip already landed in this gesture
+                    # window, RETRACT its record (the declare branch's
+                    # mirror rule) instead of arming a skip - a stale
+                    # armed skip would eat the NEXT genuine flip
+                    # (terminal in Mordor, where nothing re-syncs
+                    # hidden).
                     _pf9 = getattr(self, '_last_fsp_flip', None)
                     _preflip9 = (_pf9 is not None
                                  and self.line_num - _pf9['line'] <= 8)
@@ -5427,15 +5248,13 @@ class LogReplayer:
                 break
 
         if not src_key or src_key not in self.state.armies:
-            # t138 stale-source root (triage pass-4 4.6, R5): the
-            # line's DECLARED source goes stale on re-drags/fans (the
-            # client moves pids from wherever they actually are) — the
-            # tracked piece_region is the source of truth.  Redirect to
-            # the pieces' common tracked map region when the declared
-            # one holds no army (Gileforn/Sambalam L349-352: the same
-            # group dragged out of the Guide Box twice, then fanned
-            # from the SECOND landing; Gandalf stranded one region
-            # short for the rest of the game).
+            # t138: the line's DECLARED source goes stale on
+            # re-drags/fans (the client moves pids from wherever they
+            # actually are) - the tracked piece_region is the source of
+            # truth.  Redirect to the pieces' common tracked map region
+            # when the declared one holds no army (Gileforn/Sambalam
+            # L349-352: the same group dragged out of the Guide Box
+            # twice, then fanned from the SECOND landing).
             _tzs = set()
             for p in pieces:
                 _tb = self._tracked_map_base(p)
@@ -5490,7 +5309,7 @@ class LogReplayer:
             # Companion pieces (240-246) and minion pieces (253-255) are named leaders
             named_char = COMPANIONS.get(piece_id) or MINION_PIECES.get(piece_id)
             if named_char:
-                # t133 fix F5: match by ALIAS SET — the figure's current
+                # t133 F5: match by ALIAS SET - the figure's current
                 # name may be the flipped face (Gandalf the White,
                 # Aragorn) while the pid decodes to the base name.
                 _names = set(names_for_pid(piece_id)) or {named_char}
@@ -5509,10 +5328,8 @@ class LogReplayer:
                     # coronation region was wrong).  Move the NAMED
                     # figure from wherever it actually is; if it is
                     # nowhere, CREATE the named object at the
-                    # destination — never move an anonymous leader in
-                    # a named figure's place (t133 fix F5: the old
-                    # pop(0) fallback stole setup army leaders on
-                    # GtW/companion walks; ~85-90 games).
+                    # destination - never move an anonymous leader in
+                    # a named figure's place (t133 F5).
                     _found_c = False
                     for _ck in list(self.state.armies):
                         _ca = self.state.armies[_ck]
@@ -5752,11 +5569,10 @@ class LogReplayer:
             if nation and nation not in SHADOW_NATIONS:
                 move_side = Side.FREE_PEOPLES
                 break
-        # Companion-only piece movement is NOT an army decision. Placement
-        # drags (e.g. a hunt-casualty companion walked Lorien->...->Bree)
-        # previously produced chains of phantom 1L army_move rows that
-        # polluted the BC data. Classify as companion_move and collapse
-        # multi-hop drags into one decision (first origin -> final stop).
+        # Companion-only piece movement is NOT an army decision (placement
+        # drags, e.g. a hunt-casualty companion walked Lorien->...->Bree).
+        # Classify as companion_move and collapse multi-hop drags into
+        # one decision (first origin -> final stop).
         comp_names = [self._pid_display_name(p) for p in pieces
                       if p in COMPANIONS]
         comp_only = (len(comp_names) == len(pieces) and len(pieces) > 0
@@ -5861,7 +5677,7 @@ class LogReplayer:
         elif _same_region and move_side == self._battle_attacker_side:
             # Attacker moving INTO the battle region = post-battle advance
             # (a decision — how many units move in — but not a die action)
-            # fix 91 (jmelder T6): DRAG-THROUGH fold — the human drags
+            # DRAG-THROUGH fold (jmelder T6) - the human drags
             # the advancing stack through a waypoint region in one
             # gesture (Westemnet -> Druadan -> Folde, raw L514/515).
             # The immediately-preceding record then is a same-side
@@ -5894,7 +5710,7 @@ class LogReplayer:
                         _lastA[1].get('_rec_line', self.line_num)) <= 2
                     # SAME physical pieces both legs = one drag; real
                     # repositioning legs move different units (game 5
-                    # T10 post-battle shuffle was wrongly folded by v1)
+                    # T10 post-battle shuffle)
                     and _adv_pieces and _adv_pieces == _leg_pieces):
                 from_loc = _lastA[1].get('from', from_loc)
                 if _phantom_cs is not None:
@@ -5969,14 +5785,7 @@ class LogReplayer:
                 # 2023-08-13 HombreLobo T1: attack at line 102, siege
                 # retreat at 102, move-in drag at 109): the drag is
                 # battle noise.  Checked BEFORE the besieged guard.
-                # 130 (2026-07-25 board-is-set T8 L603): the plain
-                # 10-record lookback swallowed a GENUINE A-die siege
-                # reinforcement (Osgiliath -> besieged Minas Tirith) as
-                # "battle noise" of the PREVIOUS assault, which had
-                # fully resolved (rolls thrown, its die killed, another
-                # die action complete) - the 5 Sauron regulars never
-                # moved in-engine and every later Osgiliath/Harondor
-                # decision cascaded.  A recent attack still OWNS a
+                # 130 (board-is-set T8 L603): a recent attack OWNS a
                 # move-in only while it is the live action: no rolls
                 # since the attack (pre-battle siege-retreat class,
                 # HombreLobo T1) OR no new die staged since it
@@ -6054,10 +5863,9 @@ class LogReplayer:
                     # inside the mover's own card window is the CARD's
                     # attack (Corsairs of Umbar landing at Dol Amroth,
                     # wotr2026_7_17_11_26 L393), not a standalone die
-                    # decision — same rule the roll-side synth applies
-                    # in _maybe_synth_attack.  Gated: ungated it
-                    # re-tagged corpus drag-attacks and shifted the
-                    # campaign canary (StellaRossa 132->130 et al).
+                    # decision - same rule the roll-side synth applies
+                    # in _maybe_synth_attack.  Gated on the bridge log
+                    # (corpus behaviour unchanged).
                     if self._pending_die[move_side] is None \
                             and self._card_window_side == move_side \
                             and getattr(self, '_ai_bridge_log', False):
@@ -6337,10 +6145,8 @@ class LogReplayer:
             if p in FELLOWSHIP_MARKERS:
                 continue
             if p in COMPANIONS:
-                # t133 fix F10: companions leaving the board resolve BY
-                # IDENTITY below (the old filter dropped them entirely,
-                # so a companion staged out of a stronghold box was
-                # never eliminated; rulebook p.29)
+                # t133 F10: companions leaving the board resolve BY
+                # IDENTITY below (rulebook p.29)
                 _comp_kill_ps.append(p)
                 continue
             if p == TOKEN_POLITICAL or p == TOKEN_CARD_DRAW:
@@ -6405,10 +6211,9 @@ class LogReplayer:
         _to_death = not any(w in (to_loc or '')
                             for w in ('Reinf', 'reinforcements'))
         for piece_id in army_pieces:
-            # t125 fix 1: piece_region + FP dead-pool bookkeeping in one
-            # place (the old inline fp_casualties increment is subsumed;
-            # _to_death keeps its semantics — any non-Reinf exit counts,
-            # incl. 'Used'/card-play parking).
+            # piece_region + FP dead-pool bookkeeping in one place;
+            # _to_death keeps its semantics - any non-Reinf exit counts,
+            # incl. 'Used'/card-play parking.
             self._set_piece_zone(piece_id, to_loc, dead=_to_death)
 
             # Handle minion pieces being killed
@@ -6663,7 +6468,7 @@ class LogReplayer:
         dup_minions_skipped = 0
         self._muster_by_nation_tmp = {}   # 119: per-line nation tally
         for piece_id in pieces:
-            # Track the piece (t125 fix 1: refunds the FP dead pool if
+            # Track the piece (refunds the FP dead pool if
             # a dead-counted pid is manually returned to the board —
             # downgrade returns done by hand instead of Controls.308)
             self._set_piece_zone(piece_id, to_key)
@@ -6874,16 +6679,13 @@ class LogReplayer:
         from_match = re.search(r'Political (\d)', from_loc)
         to_match = re.search(r'Political (\d)', to_loc)
 
-        # t138 wave-3 (triage N1): political positioning is ABSOLUTE —
-        # the counter's box is the whole state.  A drag ENDING outside
-        # the track (marker parked on a card being played / bounced
-        # through the dice box) only zone-parks the pid; a drag ENDING
-        # in a political box sets that nation's counter to that box
-        # regardless of the declared source (savedbyhim01/sharpz L65-66:
-        # Isengard advance staged through FP Card Play — both legs were
-        # dropped by the old both-boxes-required gate; Kaeldar/gus833
-        # L414-416: an advance taken back via a Controls.281 bounce
-        # stayed applied).
+        # t138 (triage N1): political positioning is ABSOLUTE - the
+        # counter's box is the whole state.  A drag ENDING outside the
+        # track (marker parked on a card being played / bounced through
+        # the dice box) only zone-parks the pid; a drag ENDING in a
+        # political box sets that nation's counter to that box regardless
+        # of the declared source (savedbyhim01/sharpz L65-66;
+        # Kaeldar/gus833 L414-416).
         if not to_match:
             for p in pieces:
                 if p in POLITICAL_MARKERS:
@@ -6910,17 +6712,13 @@ class LogReplayer:
             if not any(p in POLITICAL_MARKERS for p in pieces):
                 return
 
-        # t133 fix F8: a GROUP drag of several political markers applies
-        # the box transition to EVERY nation in the piece list (the old
-        # loop broke after the first marker — 2025-06-26 kapcerz L210
-        # moved THE_NORTH + ELVES together and Elves stayed a box
-        # behind for 6 checkpoints; 39 games).  The action record stays
-        # ONE row (first marker), matching the old schedule shape; the
-        # extra nations get the BOX update only — their active flag is
-        # untouched, so the human's separate activation FLIP (the
-        # Controls.323 toggle) still lands passive->ACTIVE (setting
-        # active here inverted the later real flip: AngryBird canary,
-        # The North ended passive after the human activated it).
+        # t133 F8: a GROUP drag of several political markers applies the
+        # box transition to EVERY nation in the piece list (kapcerz L210:
+        # THE_NORTH + ELVES together).  The action record stays ONE row
+        # (first marker); the extra nations get the BOX update only -
+        # their active flag is untouched, so the human's separate
+        # activation FLIP (the Controls.323 toggle) still lands
+        # passive->ACTIVE.
         _pol_recorded = False
         for piece_id in pieces:
             nation = POLITICAL_MARKERS.get(piece_id)
@@ -6939,51 +6737,40 @@ class LogReplayer:
                     self.log(f"Political: {nation.value} {direction} to "
                              f"{to_internal} (group drag, box only)")
                     continue
-                # WAVE-6 (2026-07-25) INVERTED-RULE FIX: a manual counter
-                # DRAG on the political track (muster die / event advancing
-                # a nation's disposition) NEVER activates the nation
-                # (session-21 rule; the engine's advance_political has
-                # asserted this for years - game_logic L1603-1615).  The
-                # old heuristic set active=True on EVERY advance, so the
-                # parser TRUTH MIRROR ran ahead of the rule-correct engine
-                # and manufactured ~45 false 'engine-behind' political
-                # parity events across 17/20 held-out audit games (each
-                # box-matched, active-only: e.g. pol@GONDOR eng=(2,False)
-                # truth=(2,True)), mis-colouring the pure-mode triage.
-                # Real activations are captured at their own sources: the
-                # explicit marker FLIP (pieces 256-263, _POL_FLIP below ->
-                # activate aux), an attack on the nation's region
-                # (_auto_tag_defender_political + the engine's
-                # activate_nation_for_attack), fellowship declare/reveal,
-                # companions, event cards.  The box-advance RECORD itself
-                # is unchanged (decision schedule byte-identical); only the
-                # spurious active-flag write is removed.  A now-unmasked
-                # real flip legitimately emits its activate aux (was_active
-                # False) - a ground-truth idempotent aux, not a BC
-                # decision, so extraction stays decision-preserving.
+                # INVARIANT (session-21 rule; game_logic.advance_political):
+                # a manual counter DRAG on the political track (muster die
+                # / event advancing a nation's disposition) NEVER activates
+                # the nation.  Real activations are captured at their own
+                # sources: the explicit marker FLIP (pieces 256-263,
+                # _POL_FLIP below -> activate aux), an attack on the
+                # nation's region (_auto_tag_defender_political + the
+                # engine's activate_nation_for_attack), fellowship
+                # declare/reveal, companions, event cards.  The box-advance
+                # RECORD itself is unchanged (decision schedule
+                # byte-identical); a real flip emits its activate aux (a
+                # ground-truth idempotent aux, not a BC decision), so
+                # extraction stays decision-preserving.
                 direction = ("advanced" if to_internal > _src_box9
                              else "retreated")
                 self.log(f"Political: {nation.value} {direction} to {to_internal}")
                 pol_side = Side.SHADOW if nation in SHADOW_NATIONS else Side.FREE_PEOPLES
                 # During an active battle the defender's track advance is
                 # AUTOMATIC (rulebook p.35: attacked nation activates/
-                # advances) — mark it so extraction doesn't treat it as a
-                # decision.  RB-07 (2026-07-22): the engine advances each
-                # attacked nation exactly ONCE per battle
+                # advances) - mark it so extraction doesn't treat it as a
+                # decision.  RB-07: the engine advances each attacked
+                # nation exactly ONCE per battle
                 # (advance_defenders_political); the SECOND advance in the
-                # same battle window is the capture-advance.  wave-E fix 5
-                # (2026-07-23) makes the ENGINE do the capture-advance too
-                # (_check_settlement_capture -> activate_nation_for_attack
-                # captured=True, rulebook L349-350), but the capture-advance
-                # is kept as a non-auto political_sync GROUND-TRUTH aux (NOT a
-                # decision) rather than marked `auto`: the political_sync
-                # applier is a CONDITIONAL absolute-set (`if want > cur`) so it
-                # is IDEMPOTENT with the engine's now-automatic advance (no
-                # double-advance), AND leaving it aux keeps the extraction
-                # SCHEDULE byte-identical (marking it auto shifted 22/40
-                # harness games).  So: FIRST advance -> auto (engine attack-
-                # advance); subsequent same-window advance -> political_sync,
-                # which the engine now also produces and the sync confirms.
+                # same battle window is the capture-advance, which the
+                # engine also produces (_check_settlement_capture ->
+                # activate_nation_for_attack captured=True, rulebook
+                # L349-350).  It is kept as a non-auto political_sync
+                # GROUND-TRUTH aux (NOT a decision) rather than marked
+                # `auto`: the political_sync applier is a CONDITIONAL
+                # absolute-set (`if want > cur`), so it is IDEMPOTENT with
+                # the engine's advance (no double-advance), AND leaving it
+                # aux keeps the extraction SCHEDULE byte-identical.  So:
+                # FIRST advance -> auto (engine attack-advance); subsequent
+                # same-window advance -> political_sync.
                 _pol_params = {'nation': nation.value,
                                'from': _src_box9, 'to': to_internal}
                 if self._battle_synth_region is not None \
@@ -7045,7 +6832,7 @@ class LogReplayer:
                     self.state.vp.free_peoples = n
                 self.piece_region[piece_id] = to_loc
                 self.log(f"VP marker: {side.name} -> {n}")
-                # t125 fix 7 (ruling 1.157): a military-victory VP
+                # ruling 1.157: a military-victory VP
                 # threshold ARMS the game-over signal; it latches only
                 # inside the pure-noise log tail (VP can drop again —
                 # FP retakes — so this is never definite mid-play)
@@ -7084,9 +6871,8 @@ class LogReplayer:
         # Check for companion death (moving to Card Play, Dead, Casualties
         # areas).  Location codes decode to: 'FP Card Play', 'FP Dead',
         # 'SA Card Play', etc.  Classification is delegated to the single
-        # resolver _zone_is_companion_death — the private substring test
-        # this used to run swallowed every separation into DEAD MARSHES
-        # ('Dead' is a substring of it) as a companion death.
+        # resolver _zone_is_companion_death (a substring test on 'Dead'
+        # would match DEAD MARSHES).
         for piece_id in pieces:
             comp_name = COMPANIONS.get(piece_id)
             if comp_name:
@@ -7106,8 +6892,7 @@ class LogReplayer:
                             self.state.fellowship.companions.pop(i)
                             # If this was the guide, the guide passes to
                             # the highest-level remaining companion
-                            # (mirror the engine — previously left None,
-                            # a stale/absent guide)
+                            # (mirror the engine's change_guide)
                             if was_guide:
                                 self._reassign_guide()
                             self.log(f"Companion DIED: {comp_name}")
@@ -7221,8 +7006,7 @@ class LogReplayer:
                                  f"-> Fellowship Box")
                 elif to_loc in ('Board2', 'Board3', 'Board4', 'Board5',
                                 'Board6'):
-                    # t138 wave-3 (triage pass-4 3.6 / pass-5 3.1,
-                    # StregoRe family): companions separate by dragging
+                    # t138 (StregoRe family): companions separate by dragging
                     # into a BOARD box, then fan onward to the map
                     # (kapcerz/Jan L500-501: '243 245 246 Game.1998 ->
                     # Game.2034 -> Game.1969').  Stage the separation:
@@ -7250,8 +7034,8 @@ class LogReplayer:
                             break
                 elif is_map_region(to_loc) \
                         or stronghold_base_region(to_loc) is not None:
-                    # Separating to a region — or to a stronghold BOX
-                    # zone (t133 fix F1b, rulebook p.38: with the
+                    # Separating to a region - or to a stronghold BOX
+                    # zone (t133 F1b, rulebook p.38: with the
                     # Ring-bearers in a region whose FP stronghold is
                     # under siege, companions "separate into the
                     # Stronghold and may not leave"; USER RULING A6
@@ -7283,13 +7067,12 @@ class LogReplayer:
                             _, _sep_army = self._find_or_create_army(
                                 to_key)
                             _sep_army.leaders.append(separated)
-                            # t133 fix F1a: mirror the drag into the
+                            # t133 F1a: mirror the drag into the
                             # piece-level view (rulebook p.38: the
-                            # figure moves to the map) — without
+                            # figure moves to the map) - without
                             # this the piece stays zoned
                             # 'Fellowship Box' and the verifier
-                            # counts a phantom dead companion
-                            # (largest sweep family, 462 games).
+                            # counts a phantom dead companion.
                             self.piece_region[piece_id] = (
                                 to_loc if _sep_base is not None
                                 else to_key)
@@ -7303,15 +7086,13 @@ class LogReplayer:
                             # Guide reassignment is IMPLICIT in the
                             # client (no line emitted): if the GUIDE
                             # just left, the guide passes to the
-                            # highest-level remaining companion —
+                            # highest-level remaining companion -
                             # mirror the engine's change_guide so the
-                            # parser doesn't keep a stale guide
-                            # (caught by cloned-state verification
-                            # 2026-07-16).
+                            # parser doesn't keep a stale guide.
                             _g = self.state.fellowship.guide
                             if _g is not None and _g.name == comp_name:
                                 self._reassign_guide()
-                            # t133 fix F1b: a Guide-Box STAGING drag
+                            # t133 F1b: a Guide-Box STAGING drag
                             # right before a group separation is not
                             # a guide pick — retract the just-made
                             # choose_guide for the companion now
@@ -7388,14 +7169,11 @@ class LogReplayer:
                     and not self.state.fellowship.hidden \
                     and getattr(self, '_ai_bridge_log', False):
                 # AI-BRIDGE grammar (t123): a REVEALED fellowship cannot
-                # move (official rule, engine-enforced) — a +1 advance
+                # move (official rule, engine-enforced) - a +1 advance
                 # while revealed is marker RE-PLACEMENT bookkeeping,
                 # never a decision (wotr2026_7_17_11_26 T7 L464-467 /
-                # T8 L540-544: an old bridge build walked the counter
-                # back up right after the reveal flip; parsed as 9
-                # phantom fellowship_moves).  Progress is already
-                # synced above.  Corpus path unchanged (campaign canary:
-                # ungated, branstonpickle flipped CLEAN->MISMATCH).
+                # T8 L540-544).  Progress is already synced above.
+                # Gated on the bridge log; the corpus path is unchanged.
                 self.log("  (790 advance while revealed: marker "
                          "re-placement, not a move)")
             elif to_pos == from_pos + 1:
@@ -7422,13 +7200,13 @@ class LogReplayer:
             self.state.fellowship.mordor_entered = True
             self.state.fellowship.mordor_step = to_step
             if not _was_entered:
-                # t125 fix 3: entry consumes the progress counter; the
+                # entry consumes the progress counter; the
                 # CLIENT's silent 248 reset actually lands at the first
                 # fellowship flip after entry (see _handle_flip), so
                 # the marker itself is synced there — here only the
                 # entry housekeeping (hunt-tile re-pool) runs.
                 self._on_mordor_entry()
-            # t125 fix 7 (ruling 1.157): reaching the Cracks of Doom
+            # ruling 1.157: reaching the Cracks of Doom
             # opens the FINAL-HUNT window — the arrival's own hunt
             # draw and damage resolution are still REAL play (they
             # decide ring destroyed vs claimed); the latch fires when
@@ -7475,8 +7253,8 @@ class LogReplayer:
                     gate = gate or 'morannon'
                     # progress_before: the counter still holds its
                     # pre-entry value here (the client's silent 248
-                    # reset lands at the first flip AFTER entry, t125
-                    # fix 3) - but a track-reset line may already have
+                    # reset lands at the first flip AFTER entry) - but
+                    # a track-reset line may already have
                     # stashed it; peek WITHOUT clearing (the stash
                     # lifecycle belongs to the pawn-move branch).
                     _stash_m9 = getattr(self, '_pre_reset_progress', None)
@@ -7784,29 +7562,19 @@ class LogReplayer:
 
         # Remove a card from hand.
         #
-        # ROOT-CAUSE FIX (2026-08-15, auto35 census break): the reveal's
-        # SOURCE zone decides whether anything leaves the hand.  Hand
-        # zones are Controls.* (FP Controls.45 / SH Controls.46); a
-        # Game.* source means the card was ALREADY on the board/table --
-        # e.g. the 1.149b on-table Balrog of Moria discarded to play its
-        # combat side (ai.py combat_card_play from_table), whose reveal
-        # reads '<~Controls.867~><~Game.2034~>'.  Parsing that as a hand
-        # play matched no pid and no name, fell through to the blind
-        # `hand.pop(0)` below and deleted an UNRELATED card from the
-        # tracked hand; every later genuine play of that phantom-deleted
-        # card then missed again and popped the NEXT one, walking a
-        # permanent one-card deficit through the whole hand (auto35:
-        # Flocks of Crebain -> Wormtongue -> The Lidless Eye -> Cruel
-        # Weather, 533 census ticks of 'hand SH: engine-only=[...]').
-        # The ENGINE was right throughout; this tracked hand was wrong.
+        # The reveal's SOURCE zone decides whether anything leaves the
+        # hand.  Hand zones are Controls.* (FP Controls.45 / SH
+        # Controls.46); a Game.* source means the card was ALREADY on the
+        # board/table -- e.g. the 1.149b on-table Balrog of Moria
+        # discarded to play its combat side (ai.py combat_card_play
+        # from_table), whose reveal reads '<~Controls.867~><~Game.2034~>'
+        # -- and must not pop anything from the tracked hand: a blind
+        # pop walks a permanent one-card deficit through the whole hand.
         _from_hand9 = not (src_zone or '').startswith('Game.')
-        # CROSS-SIDE GUARD (2026-08-15, auto36 break): `side` here comes
-        # from marker sniffing (Controls.45/884/885 in the line).  A
-        # reveal sourced from a BOARD zone carries no hand marker, so an
-        # FP commitment (`reveal 156 ... <~Controls.862~><~Game.2037~>`,
-        # Current FP Card) sniffed as SHADOW and blind-popped pid 183 —
-        # The Day Without Dawn — out of the SHADOW hand.  Piece-id RANGE
-        # is authoritative (106-157 FP, 158-209 SH) and is already what
+        # CROSS-SIDE GUARD: `side` here comes from marker sniffing
+        # (Controls.45/884/885 in the line); a reveal sourced from a
+        # BOARD zone carries no hand marker.  Piece-id RANGE is
+        # authoritative (106-157 FP, 158-209 SH) and is already what
         # this method trusts for deck typing: never let a reveal touch
         # the hand of the side its own pid contradicts.
         if _from_hand9 and piece_id:
@@ -7862,12 +7630,11 @@ class LogReplayer:
                         found = True
                         break
                 if not found:
-                    # LOUD (2026-08-15): this fallback pops an ARBITRARY
-                    # card and is the cascade engine described above.
-                    # It is kept only as a hand-SIZE correction for a
-                    # genuine hand play whose identity we failed to
-                    # decode; if it ever fires again the log names the
-                    # victim so the class is visible instead of silent.
+                    # LOUD: this fallback pops an ARBITRARY card.  It is
+                    # kept only as a hand-SIZE correction for a genuine
+                    # hand play whose identity we failed to decode, and
+                    # it logs the victim so the class is visible instead
+                    # of silent.
                     _victim9 = hand[0]
                     hand.pop(0)
                     self.log("  [hand-drift] reveal pid=%s (%s) matched "
@@ -7951,7 +7718,7 @@ class LogReplayer:
                          f"ritual, by design)")
                 continue
             # Hunt tiles killed/cleaned up = discarded to the used pile
-            # (t125 fix 2; the client renders them in Used Hunt Tiles:
+            # (the client renders them in Used Hunt Tiles:
             # Wirbelwind L475 kills tile 228 -> dump shows 'used hunt
             # tiles')
             if piece_id in HUNT_TILE_PIECES or piece_id in ('230', '231'):
@@ -7984,7 +7751,7 @@ class LogReplayer:
                                 {'companion': comp_name}, Side.FREE_PEOPLES)
                         break
                 if not _in_fell:
-                    # t133 fix F10: a SEPARATED/placed companion listed
+                    # a SEPARATED/placed companion listed
                     # in the cleanup kill (army destroyed) dies with
                     # his army (rulebook p.29: "all Leaders (including
                     # Characters) ... are also immediately removed from
@@ -8000,9 +7767,8 @@ class LogReplayer:
                         _pref = sanitize(str(prev))
                     self._kill_named_piece(piece_id, 'Dead',
                                            prefer_san=_pref)
-                    # t138: a separated Gandalf killed here still arms
-                    # the GtW arrival gate (the in-fellowship branch
-                    # above already did; the F10 branch never set it)
+                    # a separated Gandalf killed here still arms the GtW
+                    # arrival gate (like the in-fellowship branch above)
                     if comp_name == 'Gandalf the Grey':
                         self._gandalf_dead = True
                 continue
@@ -8099,12 +7865,10 @@ class LogReplayer:
             pieces = [p for p in pieces if p not in _rekill9]
             if not pieces:
                 return
-        # Casualties leave the board: without this, piece_region kept
-        # dead pieces AT the region and the bridge emitter re-selected
-        # them for later moves (a killed regular marched off Osgiliath
-        # while the engine had it dead).  'Dead' is not a map region, so
-        # region listings exclude it; zone inversion falls to defaults.
-        # t125 fix 1: routed through _set_piece_zone so FP kills feed
+        # Casualties leave the board: piece_region must not keep dead
+        # pieces AT the region ('Dead' is not a map region, so region
+        # listings exclude it; zone inversion falls to defaults).
+        # Routed through _set_piece_zone so FP kills feed
         # state.fp_casualties (ai.py muster availability).
         for p in pieces:
             self._set_piece_zone(p, 'Dead', dead=True)
@@ -8113,9 +7877,7 @@ class LogReplayer:
         # Controls.296 kill of Gandalf 240 in the Guide Box Game.1999 =
         # the T1 hunt guide sacrifice, chat 'l lose gandalf').  Mirrors
         # the kill-event companion handling; SEPARATED companions are
-        # eliminated BY IDENTITY from their tracked army (t133 fix
-        # F10 — they used to fall through to the count-based army path
-        # and survive whenever the region lookup failed).
+        # eliminated BY IDENTITY from their tracked army.
         _rest = []
         for p in pieces:
             comp_name = COMPANIONS.get(p)
@@ -8162,10 +7924,8 @@ class LogReplayer:
         pieces = _rest
         if not pieces:
             if _comp_leader_kills9:
-                # lone separated-companion kill: keep the OLD record
-                # shape (synth + combat_casualties leader count) so the
-                # schedule is unchanged where the old name-match at the
-                # kill region used to succeed
+                # lone separated-companion kill: record shape = synth +
+                # combat_casualties leader count (schedule-stable)
                 if synth_attack:
                     self._maybe_synth_attack(loc)
                 removed = {'regular': 0, 'elite': 0,
@@ -8336,9 +8096,8 @@ class LogReplayer:
                             found = True
                             break
                 # Fallback: promoted unit (Regular->Elite via swap) or
-                # identity-mismatched piece — same-side unit, then leader
-                # (never the other side's units; the old blind pop(0)
-                # could kill besiegers out of mixed siege armies)
+                # identity-mismatched piece - same-side unit, then leader
+                # (never the other side's units in a mixed siege army)
                 if not found:
                     _fallback_same_side(is_piece_shadow)
 
@@ -8347,8 +8106,7 @@ class LogReplayer:
             del self.state.armies[src_key]
 
         # t133: separated companions killed BY IDENTITY above still
-        # count as leader casualties in the record (parity with the old
-        # in-loop companion pop)
+        # count as leader casualties in the record
         removed['leader'] += _comp_leader_kills9
 
         # Log
@@ -8374,10 +8132,9 @@ class LogReplayer:
             self._record_action('combat_casualties', {
                 'region': loc, 'removed': removed, 'side': casualty_side.name
             }, casualty_side)
-            # v3: this kill-path (Controls.296/281/644) never emitted
-            # casualty marks — whole sides' hits were invisible to the
-            # per-round forcing (2023-11-09 AngryBird T8 L714: the FP
-            # besieger loss at Minas Morgul had no mark)
+            # this kill-path (Controls.296/281/644) emits casualty marks
+            # so the per-round forcing sees every side's hits (AngryBird
+            # T8 L714: the FP besieger loss at Minas Morgul)
             if self._battle_synth_region is not None:
                 # Per-SIDE marks: a mixed 296 line pooled into one mark
                 # over-forced one side's round window and hid the
@@ -8437,7 +8194,7 @@ class LogReplayer:
             nation, unit_type = get_unit_type_from_piece_id(piece_id, self.piece_types)
             is_piece_shadow = nation in SHADOW_NATIONS if nation else False
 
-            # t125 fix 1: the Controls.304 'kills' removal physically
+            # the Controls.304 'kills' removal physically
             # sends the piece to its dead pile (client dumps show the
             # downgraded elites in FP Dead — GenericPie 344/564/750/
             # 1172/1196); the parser left piece_region stale at the
@@ -8519,17 +8276,14 @@ class LogReplayer:
                 self._last_swap_remove_elite = (unit_type == UnitKind.ELITE)
                 is_shadow = nation in SHADOW_NATIONS if nation else False
                 self._last_swap_remove_side = Side.SHADOW if is_shadow else Side.FREE_PEOPLES
-                # fix 76 (GAME19 T8): the press PAYMENT nation is log
+                # GAME19 T8: the press PAYMENT nation is log
                 # evidence — carry it so the teacher downgrades the exact
                 # elite the human paid with (engine default = first elite
                 # in list order, wrong nation half the time)
                 self._last_swap_remove_nation = nation
-            # 129 v2 (2026-07-25 Vayze T8 Dale L797): a CHAT-ONLY battle
-            # (both sides 'nc', no explicit kills before the swap) never
-            # synthesized its attack, so _battle_synth_region stayed
-            # None and the downgrade-pair casualty mark below was gated
-            # off -> v5 forced a ZERO defender spec and the dead elite
-            # survived, blocking the victor advance.  Mirror the
+            # 129 v2 (Vayze T8 Dale L797): a CHAT-ONLY battle (both sides
+            # 'nc', no explicit kills before the swap) has no synthesized
+            # attack, so mirror the
             # Controls.296 kill path: an ELITE swap-removal with combat
             # rolls already thrown in this die window and no card
             # window open is battle evidence - synthesize here (the
@@ -8562,8 +8316,7 @@ class LogReplayer:
             return
         loc_san = sanitize(loc)
 
-        # explicit region-validity gate (the old bare-except around an
-        # unused board.region() call swallowed unrelated errors too)
+        # explicit region-validity gate
         if loc_san not in board.regions:
             return
 
@@ -8586,20 +8339,17 @@ class LogReplayer:
         faction = board.fid_to_name.get(parent_id, "").lower() if parent_id else ""
 
         for piece_id in pieces:
-            # t125 fix 1: _set_piece_zone refunds the replay-side FP
-            # dead pool when a counted piece returns to the board
-            # (Controls.308 'from casualties' downgrade returns — the
-            # old inline refund is subsumed piece-exactly).
+            # _set_piece_zone refunds the replay-side FP dead pool when
+            # a counted piece returns to the board (Controls.308 'from
+            # casualties' downgrade returns).
             self._set_piece_zone(piece_id, to_key)
             nation, unit_type = get_unit_type_from_piece_id(piece_id, self.piece_types)
 
             # Override unit type from swap_type if piece type is unknown.
-            # W8 B1 fix (2026-07-20): swap_type 307/308 are SOURCE pools
-            # ('from reinforcements' / 'from casualties'), NOT unit
-            # kinds — the old 307->ELITE mapping was wrong. Source
-            # doesn't determine kind; default to REGULAR (dormant: every
-            # placed pid resolved to a known type across 2000 logs, so
-            # this fallback never fires — fixed to prevent future drift).
+            # swap_type 307/308 are SOURCE pools ('from reinforcements' /
+            # 'from casualties'), NOT unit kinds (W8 B1); source doesn't
+            # determine kind, so default to REGULAR (dormant: every
+            # placed pid resolves to a known type).
             if unit_type is None:
                 unit_type = UnitKind.REGULAR
 
@@ -8646,7 +8396,7 @@ class LogReplayer:
                 _placed_counts['regular'] += 1
                 _placed_pieces9.append(('regular', nation))
 
-        # ROOT-CAUSE FIX (un-recorded musters): outside a battle window
+        # Un-recorded musters: outside a battle window
         # and outside a card-effect window, a 304(remove)+313(place)
         # pair — or a standalone 313 placement — at a map region is a
         # MUSTER (elite upgrade / recruitment) encoded via the swap
@@ -8710,9 +8460,9 @@ class LogReplayer:
                 self._combat_region and self._combat_casualties_this_round and
                 self._last_swap_remove_elite and
                 (swap_type == '308'
-                 # fix 76b: a 307-sourced press (replacement regular from
+                 # a 307-sourced press (replacement regular from
                  # REINFORCEMENTS) is normally ambiguous with a casualty
-                 # downgrade (wave-E exclusion) — but an announced
+                 # downgrade - but an announced
                  # "press" in chat within the last few lines settles it.
                  # Record-only: the sentinel/no-mark treatment of 307
                  # weight ambiguity is unchanged.
@@ -8734,34 +8484,21 @@ class LogReplayer:
                      or (swap_type == '307'
                          and not board.regions.get(
                              sanitize(loc), {}).get('is_stronghold')))):
-            # wave-E fix 2 (2026-07-23): extend the FIELD (non-stronghold)
-            # elite-downgrade casualty mark to swap_type 307 (replacement
-            # Regular 'from reinforcements') in addition to 308 ('from
-            # casualties').  A Shadow FIELD elite downgraded mid-battle whose
-            # returning Regular came from reinforcements (307) was previously
-            # unparsed here (Block-1 press needs 308+is_stronghold; Block-1's
-            # muster path needs battle_synth_region is None), so it fell
-            # through unrecorded -> engine kept the un-downgraded elite.  The
-            # source pool is a VASSAL bookkeeping detail; a field elite->
-            # regular downgrade is the same casualty either way.  The
-            # STRONGHOLD 307 case is deliberately EXCLUDED: at a stronghold a
-            # 307 elite reduction is AMBIGUOUS between a defender casualty and
-            # an attacker siege-PRESS (Block-1 catches only 308 presses), and
-            # forcing the weight-ambiguity sentinel there wrongly over-removes
-            # 307-sourced presses (regressed Columbo/Skaarj Lorien sieges).
-            # v3 AMBIGUITY SENTINEL: a field elite->regular swap inside a
-            # battle window that was NOT detected as a siege press — it
-            # may be a casualty downgrade (1 hit) or a missed press (0
-            # hits); the weighting is unknowable, so the round window
-            # containing it must not be hit-forced.
-            # PATCH A (RC4 v5): split by region type.  A NON-stronghold
-            # field elite->regular swap here is an unambiguous casualty
-            # DOWNGRADE (a field defender cannot press), so emit the exact
-            # removal COMPOSITION {R:0,E:0,D:1} with the live cause -> v5
-            # can reproduce the unit mix.  A stronghold swap that failed
-            # press-detection KEEPS the weight-ambiguity sentinel
-            # (downgrade=1 hit vs missed press=0 hits is unknowable), so
-            # spec=None and its round window is not hit-forced.
+            # The FIELD (non-stronghold) elite-downgrade casualty mark covers
+            # swap_type 307 (replacement Regular 'from reinforcements') as
+            # well as 308 ('from casualties'): the source pool is a VASSAL
+            # bookkeeping detail; a field elite->regular downgrade is the
+            # same casualty either way.  The STRONGHOLD 307 case is
+            # deliberately EXCLUDED: at a stronghold a 307 elite reduction is
+            # AMBIGUOUS between a defender casualty and an attacker
+            # siege-PRESS (Block-1 catches only 308 presses).
+            # AMBIGUITY SENTINEL: a stronghold swap that failed
+            # press-detection may be a casualty downgrade (1 hit) or a missed
+            # press (0 hits) - unknowable, so spec=None and its round window
+            # is not hit-forced.  A NON-stronghold field elite->regular swap
+            # is an unambiguous casualty DOWNGRADE (a field defender cannot
+            # press): emit the exact removal COMPOSITION {R:0,E:0,D:1} with
+            # the live cause so the unit mix reproduces.
             if board.regions.get(
                     sanitize(loc), {}).get('is_stronghold'):
                 self._emit_casualty_mark(
@@ -8782,20 +8519,17 @@ class LogReplayer:
     def _handle_flip(self, piece_id: str):
         """Handle token flip (fellowship hidden/revealed, coronation)."""
         if piece_id == '241':
-            # Strider/Aragorn figure flip = CROWNING (Aragorn — Heir to
+            # Strider/Aragorn figure flip = CROWNING (Aragorn - Heir to
             # Isildur, Will of the West die).  2026-01-05 kapcerz line 88:
-            # Controls.323 on 241 right after the W-die spend — readable
+            # Controls.323 on 241 right after the W-die spend - readable
             # log "flips Aragorn in Minas Tirith".  Rename the leader so
             # requirement checks ("Aragorn is in play") see him, keep the
             # piece mapping in sync for later drags of piece 241.
-            # t138 (engine-check family 1): REPLACE the object instead
-            # of renaming in place — clone_state shares Companion refs
-            # (ai.py 'share refs'), so the in-place rename retro-mutated
-            # every already-cloned pre-state and the certifier's
-            # can_crown_aragorn saw 'Strider not found' at the very
-            # decision being matched (38/38 crown misses).  The GtW
-            # transform and the engine's own game_logic.crown_aragorn
-            # both create a NEW object; mirror that.
+            # REPLACE the object, never rename in place: clone_state
+            # shares Companion refs (ai.py 'share refs'), so an in-place
+            # rename retro-mutates every already-cloned pre-state; the GtW
+            # transform and the engine's own game_logic.crown_aragorn both
+            # create a NEW object - mirror that (t138).
             region = None
             for rk, army in self.state.armies.items():
                 for _ci, ld in enumerate(army.leaders):
@@ -8835,7 +8569,7 @@ class LogReplayer:
                                 {'region': region}, Side.FREE_PEOPLES)
             return
         if piece_id in ['247', '248']:
-            # t125 fix 3 (client-verified timing): the client silently
+            # client-verified timing: the client silently
             # returns the progress marker 248 to Track 0 at the first
             # fellowship FLIP after Mordor entry, not at the entry drag
             # itself (Wirbelwind dumps: 248 stays on Track 1 through
@@ -8853,17 +8587,10 @@ class LogReplayer:
             # double-counted it and inverted every hide/reveal afterwards
             # (hides were logged as reveals).
             if self._skip_next_fsp_flip > 0:
-                # AUTO-95 game-5 (2026-08-17, the routed stale-skip
-                # SIBLING): the declare branch armed skip=2 for the
-                # corpus flip-and-unflip dance, but the AUTO emitter
-                # sends ONE dance flip (or none) - the leftover skip
-                # ate the NEXT REAL flips one by one (an engine
-                # reveal at +48 lines, then - via a re-arm the eaten
-                # flip made invisible - the post-entry hide), and
-                # the phase inversion rode the Mordor track to the
-                # ring end, exactly like AUTO-94.  CONSUMPTION IS
-                # WINDOW-TRUTH (coordinator rule): a skip may only
-                # eat a flip landing NEAR its arming; a stale skip
+                # AUTO-95 sibling: the AUTO emitter sends ONE dance
+                # flip (or none), so an armed skip may never be
+                # consumed.  CONSUMPTION IS WINDOW-TRUTH: a skip may
+                # only eat a flip landing NEAR its arming; a stale skip
                 # EXPIRES and the flip processes normally.
                 _arm9 = getattr(self, '_fsp_skip_line', None)
                 if _arm9 is not None                         and self.line_num - _arm9 <= 10:
@@ -8926,24 +8653,13 @@ class LogReplayer:
             return
         # POLITICAL ACTIVATION: nations are activated by FLIPPING their
         # political marker to the colored side (auth piece table
-        # 256-263; 'p*' images = flippable active side).  Previously
-        # dropped — the replay's political.active never flipped unless
-        # a box DRAG happened, so 'Gondor must be Active' requirements
-        # and at-war advances failed corpus-wide (2025-01-10
-        # SilmarillWill L188/215/218: north/dwarves/rohan/gondor/
-        # southron flips).
+        # 256-263; 'p*' images = flippable active side; SilmarillWill
+        # L188/215/218: north/dwarves/rohan/gondor/southron flips).
         #
-        # t142 (engine-check political family, 11 games): a political
-        # flip is an ACTIVATION, never a de-activation — WOTR nations
-        # never revert to passive (rulebook p.33: passive -> active is
-        # the only transition).  The old TOGGLE double-counted against
-        # the box-advance heuristic (_handle_political sets active=True
-        # on any advance): Gondor advanced 1->2 (heuristic set active),
-        # the human's real activation flip then TOGGLED it back to
-        # passive, and the later 2->3 At-War advance was illegal
-        # (Jorrick L163/169/276; +9 twins).  SET active=True
-        # (idempotent) instead: the flip can only ever activate, so it
-        # can never re-introduce an 'advance not offered' miss.  Genuine
+        # t142: a political flip is an ACTIVATION, never a de-activation
+        # - WOTR nations never revert to passive (rulebook p.33: passive
+        # -> active is the only transition), so SET active=True
+        # (idempotent) rather than toggle (Jorrick L163/169/276).  Genuine
         # flip-undo pairs are already removed by the undo pre-pass
         # (1.169); a stray manual re-flip leaving a nation active is
         # harmless (an activated nation not yet at war changes nothing).

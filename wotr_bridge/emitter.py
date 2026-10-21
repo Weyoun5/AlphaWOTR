@@ -411,10 +411,7 @@ OPS = {
 # (guide box -> dead, hunt removed -> used, region -> reinforcements,
 # current-card -> dead): one root cause wearing four symptoms.
 #
-# Routed HERE, at render(), rather than at the ~dozen call sites that
-# build these ops - a call-site sweep is exactly the shape of edit I
-# got wrong twice today (fixed one of three hunt sites; fixed one of
-# sixteen garrison sites), and a chokepoint cannot be half-applied.
+# Routed HERE, at render(): a chokepoint cannot be half-applied.
 _SUPPLY_BOXES = frozenset('Game.%d' % n for n in range(2038, 2047))
 # the six play-on-table card slots (Board1..Board6)
 _TABLE_SLOTS = frozenset('Game.%d' % n for n in range(2029, 2035))
@@ -494,11 +491,8 @@ def render(op, fields, local=True):
     # second value. Ours was 985 correct and 26 not (18 to Game.2036,
     # 4 to Game.2037, 2 to Game.2034, 2 to Game.2029), produced by
     # four different sites that each passed "where the piece is" as
-    # though the token meant a destination.
-    #
-    # Enforced here rather than at those four sites: this is the third
-    # time today a fix has had to cover N producers of one act, and the
-    # first two only worked because they were done at a chokepoint.
+    # though the token meant a destination.  Enforced here, at the
+    # chokepoint, never at the producing sites.
     #
     # `_trail` marks a line that came from classify_line (round-trip),
     # where the bytes must be reproduced exactly as they were read -
@@ -545,22 +539,19 @@ def render(op, fields, local=True):
 # for uncovered action types so the server can fall back loudly.
 
 # Mordor track boxes, step 0..5 (Mount Doom).  The codes are NOT
-# contiguous, which is exactly why this must exist in ONE place: a
-# second transcription of 524/525/528/529/532/533 is a table nobody
-# would notice going stale.  Used by the fellowship_move planner and
-# by live_server's Mordor tile/slot choreography (historically the
-# retired monolith's per-action reconciler).
+# contiguous, which is why this table exists in ONE place (the
+# fellowship_move planner and live_server's Mordor choreography share
+# it).
 MORDOR_TRACK_ZONES = ('Game.524', 'Game.525', 'Game.528', 'Game.529',
                       'Game.532', 'Game.533')
 
 # Set True by live.randomness.ClientRandomness.install() when the
-# client-randomness funnels go in (historically the retired monolith's
-# AiBrain._install_live_patches).  Two planners below can SOURCE randomness themselves
-# (a die face, a drawn card identity); that is legitimate offline,
-# where there is no client to ask, and forbidden in live play, where
-# inventing a value the client never produced is the injected
-# randomness the USER ruled out on 2026-08-16.  The planners cannot
-# see the brain, so the brain tells the module.
+# client-randomness funnels go in.  Two planners below can SOURCE
+# randomness themselves (a die face, a drawn card identity): legitimate
+# offline, where there is no client to ask, and forbidden in live play
+# (USER 2026-08-16: a value the client never produced is injected
+# randomness).  The planners cannot see the brain, so the brain tells
+# the module.
 LIVE_MODE = False
 
 # fixed client zones (constant across the corpus)
@@ -679,22 +670,17 @@ def _pieces_in(replayer, region_key):
     initial-setup fallback for pieces that never moved."""
     keys = (region_key, region_key + ' stronghold')
     if region_key in ('sa dead', 'fp dead'):
-        # ZONE-NAME ALIAS (game 4 'Shadows on the Misty Mountains',
-        # USER 2026-08-14): the parser's kill/dkill routing tracks
-        # dead pieces under the bare zone name 'Dead', which the pool
-        # fallback's 'sa dead'/'fp dead' keys never matched — recycled
-        # Shadow elites became unpickable and card musters silently
-        # dropped.  Side discrimination happens in pick_units.
+        # ZONE-NAME ALIAS (USER 2026-08-14): the parser's kill/dkill
+        # routing tracks dead pieces under the bare zone name 'Dead',
+        # which the pool keys 'sa dead'/'fp dead' must also match.
+        # Side discrimination happens in pick_units.
         keys = keys + ('dead', 'sa casualties' if region_key[0] == 's'
                        else 'fp casualties')
     if region_key == 'sa reinf':
-        # SH casualties RECYCLE to reinforcements (rules) but the
-        # client kill physically routes them to the Dead pile — the
-        # POOL pick must see them there (attempt-25 Many Kings: the
-        # near harad placement dropped whole while the recycled
-        # southron sat in 'Dead'; census: pool PHANTOM + region
-        # short).  FP reinf must NEVER get this alias — FP dead are
-        # permanent.  Side discrimination happens in pick_units.
+        # Shadow units recycle. Native kills return them to reinforcements,
+        # but historical logs and manual placement can leave physical pieces
+        # in casualties. Include those pieces while retaining their actual
+        # source. FP reinforcements never acquire this alias.
         keys = keys + ('sa dead', 'dead', 'sa casualties')
     out = []
     for pid, z in replayer.piece_region.items():
@@ -784,15 +770,10 @@ def die_piece_for(replayer, side_name, die_idx):
     (_die_idx_shift: side_name -> [removed registration indexes,
     cleared at the next action roll]); un-shift through them here so
     every mapping call site inherits the correction."""
-    # THE Nth LIVE REGISTRATION SLOT, not compounding arithmetic.
-    # The old form bumped die_idx by one per dead reg <= it, which is
-    # only equivalent when every removal sits BELOW the query: with
-    # dead regs [0, 4] an engine index of 3 became 4 (>=0) and then 5
-    # (>=4) — one past a map that ends at 4, and the emission died with
-    # 'no die piece for FREE_PEOPLES die 5' mid-battle (attempt 48).
-    # Walking the live slots is correct by construction and cannot run
-    # off the end; when it does run out, the roster genuinely
-    # disagrees, and the error now says so with the whole picture.
+    # THE Nth LIVE REGISTRATION SLOT, not compounding arithmetic:
+    # walking the live slots is correct by construction and cannot run
+    # off the end; when it runs out the roster genuinely disagrees and
+    # the error says so with the whole picture.
     _dead = set((getattr(replayer, '_die_idx_shift', {}) or {}).get(
         side_name) or ())
     _by_reg = {}
@@ -943,24 +924,15 @@ def plan_muster(replayer, nick, side_name, params, kind):
         kw['n_nazgul'] = 1
     else:
         kw['n_' + kind] = 1
-    # SHADOW casualties return to the pool (rulebook p.30) — on the
-    # client they sit in the SA Dead pile (Game.2041, the corpus kill
-    # destination), so a muster may legitimately pull from there once
-    # the fresh Reinf pieces of that type are exhausted.
+    # Shadow casualties are reusable. Native kills return army units to
+    # reinforcements; historical/manual physical casualties can still be
+    # selected, provided the emitted source matches the piece's location.
     #
     # FP DEAD ARE PERMANENT (rules; USER precedent, comms 50 Part 35
-    # Class A: "FP reinf explicitly NEVER gets this alias").  The old
-    # code appended ('fp dead', FP_DEAD) here as a physical-supply
-    # borrow — and it RESURRECTED A DEAD FP LEADER onto the board
-    # (RULES-agent finding: attempt11_clean_game01 rendered L610,
-    # 'moves Gondor Leader from FP Casualties to Dol Amroth'; one
-    # occurrence in 70 archived games).  A rules-illegal render is
-    # never the lesser evil: the FP branch now has ONE pool, and a
-    # genuine physical shortfall raises LookupError, which
-    # _emit_engine_action already routes to the board-diff renderer
-    # (whose own pool pick is FP-correct by the same Part-35 ruling)
-    # with a loud [emit-fallback] line.  No halt, no resurrection.
-    pools = [('sa reinf', SH_POOL)] if shadow else \
+    # Class A: "FP reinf explicitly NEVER gets this alias"): the FP
+    # branch has ONE pool, and a genuine physical shortfall raises
+    # LookupError - never a resurrection.
+    pools =[('sa reinf', SH_POOL)] if shadow else \
         [('fp reinf', FP_POOL)]
     if shadow:
         pools.append(('sa dead', SH_DEAD))
@@ -983,17 +955,12 @@ def plan_muster(replayer, nick, side_name, params, kind):
             pieces = pick_units(replayer, pool_key, side,
                                 nation=params.get('nation'),
                                 side_hint=side, **kw)
-            # SOURCE FROM THE PIECE, NOT THE POOL (structural item).
-            # `_pieces_in('sa reinf')` deliberately aliases in the
-            # Dead pile because SH casualties recycle to
-            # reinforcements - but the emission then claimed
-            # `frm = SH_POOL` while the client physically holds the
-            # piece at SH_DEAD, so one pid was resolvable from two
-            # pools with two different source zones.  That is the
-            # pid-316 resurrection class.  The piece's OWN tracked
-            # zone is the discriminating predicate, so use it and
-            # only fall back to the nominal pool zone when the piece
-            # is untracked.
+            # SOURCE FROM THE PIECE, NOT THE POOL: `_pieces_in('sa
+            # reinf')` aliases in the Dead pile (SH casualties
+            # recycle), so the piece's OWN tracked zone is the
+            # discriminating source; the nominal pool zone is the
+            # fallback for an untracked piece (the pid-316
+            # resurrection class).
             if pieces:
                 _pz9 = _piece_zone_code(replayer, pieces[0], default=None)
                 if _pz9 and _pz9 != pool_zc:
@@ -1057,22 +1024,15 @@ def plan_draw_card(replayer, nick, side_name, params, rng=None):
     decks, so a uniform pick over the remainder IS the fair shuffle.
 
     LIVE PLAY MAY NOT REACH HERE - guarded at entry, below."""
-    # SAME RULE AS plan_roll, and guarded at ENTRY.  My first placement
-    # of this check was further down, after the deck and ledger
-    # lookups - which raise LookupError first, so the live guard was
-    # unreachable and the test "proving" the halt was actually seeing
-    # an unrelated error.  A guard you have to survive three other
-    # checks to reach is not a guard.
+    # SAME RULE AS plan_roll, guarded at ENTRY (before the deck and
+    # ledger lookups, which raise LookupError first - a guard behind
+    # them is not a guard).
     if LIVE_MODE:
-        # THE FUNNEL, not a halt (P1, USER live session 2 2026-08-16:
-        # the AI's own mid-turn event-card draw reached here via the
-        # sided AI-slot and the old guard HALTED the game on the
-        # human's 'pass').  The guard's invariant is PRESERVED: the
-        # CLIENT still chooses the card - this returns the !CALL
-        # directive; the client draws with its own RNG and the next
-        # tick's log replay ingests the card it named.  Same grammar
-        # as the turn-start draws.  plan_use_token's draw half heals
-        # through here too.
+        # THE FUNNEL, not a halt (P1, USER 2026-08-16): the CLIENT
+        # chooses the card - this returns the !CALL directive; the
+        # client draws with its own RNG and the next tick's log replay
+        # ingests the card it named.  Same grammar as the turn-start
+        # draws.  plan_use_token's draw half heals through here too.
         _tag9 = 'sa' if side_name == 'SHADOW' else 'fp'
         _dk9 = ('strat' if str(params.get('deck', 'character')
                                ).lower().startswith('strat')
@@ -1091,13 +1051,9 @@ def plan_draw_card(replayer, nick, side_name, params, rng=None):
     else:
         pids = [158 + i for i, t in enumerate(lr._SA_PID_TYPES)
                 if t == want]
-    # THE LEDGER MUST EXIST (PERMANENT item 7).
-    # `getattr(replayer, 'ai_drawn_pids', ())` defaulted to an EMPTY
-    # TUPLE, which filters nothing - so if the replayer was never
-    # stamped, every draw returned `left[0]`: the SAME pid, forever,
-    # with the client asked to draw a card it already holds.  A
-    # missing ledger is not "no cards drawn yet", it is "we cannot
-    # know", and those must not look alike.
+    # THE LEDGER MUST EXIST (PERMANENT item 7): a missing ai_drawn_pids
+    # is "we cannot know", never "no cards drawn yet" (an empty default
+    # would return the same pid forever).
     if not hasattr(replayer, 'ai_drawn_pids'):
         raise LookupError(
             'cannot plan a %s %s draw: the replayer has no '
@@ -1120,22 +1076,23 @@ def plan_army_move(replayer, nick, side_name, params):
     frm_key = _norm_zone(params.get('from'))
     to_key = _norm_zone(params.get('to'))
     side = 'shadow' if side_name == 'SHADOW' else 'fp'
-    n_l = int(params.get('n_leader', 0) or 0)
+    # FLD-5b (par5b_g5#13): the engine's LA-8 per-count variant rides
+    # key 'n_leaders' (plural, ai.py:5485); reading only the legacy
+    # singular left the explicit count invisible, so take_leaders
+    # swept ALL leader pieces while the executor moved exactly
+    # int(n_leaders) (ai.py move_leaders) - render == engine.
+    n_l = int(params.get('n_leaders',
+                         params.get('n_leader', 0)) or 0)
     n_naz = int(params.get('n_nazgul', 0) or 0)
     if params.get('take_leaders') and not n_l \
             and params.get('n_nazgul') is None:
-        # take ALL plain-leader pieces of this side at the source.  For
-        # Shadow that includes NAZGUL (their leaders, typed 'nazgul' —
-        # the engine moves them under take_leaders, so a move that omits
-        # them leaves a phantom leader behind on the client board) —
-        # UNLESS the action carries an EXPLICIT 'n_nazgul' split: the
-        # engine then passes move_leaders=None to move_army, and its
-        # take() treats None as ZERO (the documented 1.150 quirk), so
-        # NO plain leader moves either — auto-counting here dragged
-        # figures the engine left behind (t115: T1 Barad-Dur move with
-        # n_nazgul=0 stranded a phantom engine-side nazgul army; t116
-        # seed-7 T6: the Mouth dragged out of Dol Guldur while the
-        # engine kept him home).  Corpus logs never carry n_nazgul
+        # take ALL plain-leader pieces of this side at the source; for
+        # Shadow that includes NAZGUL (typed 'nazgul' - the engine
+        # moves them under take_leaders) - UNLESS the action carries an
+        # EXPLICIT 'n_nazgul' split: the engine then passes
+        # move_leaders=None to move_army, and its take() treats None
+        # as ZERO (the documented 1.150 quirk), so NO plain leader
+        # moves either.  Corpus logs never carry n_nazgul
         # (engine-enumeration variant only), so the L1/L2 roundtrip
         # gates are byte-identical either way.
         for pid in _pieces_in(replayer, frm_key):
@@ -1145,14 +1102,16 @@ def plan_army_move(replayer, nick, side_name, params):
             elif ut == 'nazgul' and side == 'shadow':
                 n_naz += 1
     chars = [str(c) for c in params.get('characters', ())]
-    if params.get('take_leaders') and params.get('n_nazgul') is None:
+    if params.get('take_leaders') and params.get('n_nazgul') is None \
+            and params.get('n_leaders') is None:
+        # FLD-5b: an explicit n_leaders pins the leader FIGURE count
+        # precisely (ai.py 1.211 comment) - the character sweep only
+        # rides the plain take-all form
         # the engine's take_leaders also carries CHARACTER leaders: a
-        # minion (Witch-king / Mouth — Saruman never leaves Orthanc)
-        # or a separated companion leading the army.  Omitting them
-        # left a phantom leader behind on the client (WK stranded at
-        # Osgiliath while the engine marched him on).  With an EXPLICIT
+        # minion (Witch-king / Mouth - Saruman never leaves Orthanc)
+        # or a separated companion leading the army.  With an EXPLICIT
         # n_nazgul the engine moves ONLY those nazgul (move_leaders
-        # None = zero — see above), so minions/companions stay home.
+        # None = zero - see above), so minions/companions stay home.
         for pid in _pieces_in(replayer, frm_key):
             nat, ut = _unit_type(pid, replayer, side_hint=side)
             if ut == 'minion' and side == 'shadow' and pid != '254' \
@@ -1163,10 +1122,9 @@ def plan_army_move(replayer, nick, side_name, params):
                 chars.append(pid)
     mbn = params.get('moved_by_nation')
     if mbn:
-        # the ENGINE's exact per-(nation, kind) moved composition —
-        # splitting a MIXED army with a nation-blind pick shipped an
-        # Isengard regular where the engine moved a Sauron one (t131
-        # game 10: Parth Celebrant swap, engine-vs-client 4 issues)
+        # the ENGINE's exact per-(nation, kind) moved composition (a
+        # nation-blind pick would ship the wrong nation's regular from
+        # a MIXED army)
         pieces = []
         used = set(chars)
         for key9, n9 in mbn.items():
@@ -1192,13 +1150,10 @@ def plan_army_move(replayer, nick, side_name, params):
             n_nazgul=n_naz,
             nation=params.get('nation'), exclude=chars,
             side_hint=side)
-    # SIEGE (attempt-77 audit): units CAN move in to join a besieged
-    # garrison - game_logic's own comment says "the 5-unit siege cap
-    # only applies to units joining the garrison side inside a
-    # besieged stronghold" - so the field zone is not automatically
-    # right here.  The bridge's board-diff path already asks via
-    # _siege_dest_zone; this planner did not.  victor_advance
-    # delegates here, so it is covered by the same change.
+    # SIEGE: units CAN move in to join a besieged garrison (game_logic:
+    # the 5-unit siege cap applies only to units joining the garrison
+    # side inside a besieged stronghold), so the arrival zone is the
+    # garrison question.  victor_advance delegates here.
     return ('move', {'nick': nick, 'pieces': pieces + chars,
                      'frm': zone_code_for(frm_key),
                      'to': _garrison_dest(replayer, to_key,
@@ -1231,17 +1186,22 @@ def _companion_pid(name):
         if str(n).strip().lower() == want:
             return p
     # DUAL-FACE figures change NAME mid-game while the pid stays
-    # constant (240 Grey->White, 241 Strider->Aragorn).  The parser's
-    # COMPANIONS table renames 241 at crowning but NEVER renames 240,
-    # so 'Gandalf the White' fell through this lookup forever and the
-    # by-name reconciler silently skipped his moves (attempt-9 game-1:
-    # client Gandalf stranded at dol guldur while the engine walked
-    # him to parth celebrant, with nation leader 068 shipped in his
-    # place).  Resolve every alias face to its pid.
+    # constant (240 Grey->White, 241 Strider->Aragorn); the parser's
+    # COMPANIONS table renames 241 at crowning but never 240, so every
+    # alias face must resolve to its pid.
     for p, faces in getattr(lr, 'PIECE_NAME_ALIASES', {}).items():
         for f in faces:
             if str(f).strip().lower() == want:
                 return p
+    # FLA-6 (par5 g3#5): MINIONS resolve too - the named echo
+    # performer (human_gestures.play_human_echo_kills) resolves every
+    # named row through this ONE table, and 'Witch King' raised here
+    # so the owed drag was never auto-performed.  Side attribution
+    # stays with emission_card._named_pid_side (which checks the
+    # tables itself, never this function's success).
+    for p, n in getattr(lr, 'MINION_PIECES', {}).items():
+        if str(n).strip().lower() == want:
+            return str(p)
     raise LookupError('unknown companion %r' % (name,))
 
 
@@ -1291,8 +1251,26 @@ def _holding_zone_code(replayer, pid, default=None):
     return default
 
 
+def _native_kill_zone(replayer, pid, default='Dead'):
+    """Java's destination for a newly killed piece, not a historical pile.
+
+    Shadow army units and ordinary Nazgul return to reinforcements. Named
+    minions, FP pieces and other tokens retain the casualty/dead handling.
+    All live projection paths must agree before the next board dump arrives.
+    Never use this to reinterpret an explicitly observed casualty location.
+    """
+    nation, kind = _unit_type(str(pid), replayer)
+    if kind == 'nazgul' or (kind in ('regular', 'elite')
+                           and _side_of_nation(nation) == 'shadow'):
+        return 'sa reinf'
+    return default
+
+
 def _piece_zone_code(replayer, pid, default=None):
     """Client zone code where the replayer believes a piece sits."""
+    slot = (getattr(replayer, 'shadow_stronghold_regions', None) or {}).get(str(pid))
+    if slot and _norm_zone(replayer.piece_region.get(str(pid))) == slot[0] + ' stronghold':
+        return slot[1]
     zone = replayer.piece_region.get(str(pid)) \
         or _initial().get(str(pid))
     if not zone:
@@ -1301,14 +1279,10 @@ def _piece_zone_code(replayer, pid, default=None):
         raise LookupError('no known zone for piece %r' % (pid,))
     zk = _norm_zone(zone)
     if zk == 'dead':
-        # BARE-'Dead' TRACKING (synth probe18 wedge, 2026-08-16): the
-        # parser's kill/dkill routing stores casualties under the
-        # bare zone name 'Dead', which the client zone table (built
-        # from the decode tables) has no key for - so a muster that
-        # legally recycles a Shadow casualty (rulebook p.30) died on
-        # 'no client zone code for region dead'.  The pid decides
-        # WHICH dead pile: FP pieces -> FP Casualties, Shadow ->
-        # SA Casualties.
+        # BARE-'Dead' TRACKING: the parser's kill/dkill routing stores
+        # casualties under the bare zone name 'Dead', which the client
+        # zone table has no key for; the pid decides WHICH dead pile
+        # (FP pieces -> FP Casualties, Shadow -> SA Casualties).
         nat, _ut9 = _unit_type(pid, replayer)
         if _ut9 in ('nazgul', 'minion'):
             return SH_DEAD
@@ -1351,23 +1325,6 @@ def plan_army_attack(replayer, nick, side_name, params):
 # inside the stronghold sub-box?"  Answer: the sub-box iff R is under
 # siege AND this piece's side holds the garrison.
 #
-# That single sentence was written out longhand in EIGHT places across
-# two modules, and the copies had drifted:
-#
-#   * six were faithful transcriptions - the bug-per-copy risk without
-#     even the excuse of a difference;
-#   * one asked it by COMBAT ROLE ("defender and besieged") instead of
-#     by garrison side, which inverts during a SORTIE - when the
-#     garrison attacks, the defender is the besieger out in the field,
-#     and that copy routed the besieger's casualties into the
-#     stronghold box (see plan(), casualty selection);
-#   * one arrival site (transform_gandalf) never asked at all, which
-#     put Gandalf the White among the besiegers of Lorien and ran 83
-#     settled census rows before it was caught;
-#   * and the two modules spoke different vocabularies for the same
-#     answer - 'FREE_PEOPLES'/'SHADOW' here, 'fp'/'shadow' there - so
-#     even a correct copy could compare unequal-but-identical answers.
-#
 # WHICH STATE ANSWERS.  These take `state` explicitly rather than
 # reaching for one, because the honest answer differs by caller: the
 # server holds the ENGINE's state and must use it (engine is master,
@@ -1375,11 +1332,10 @@ def plan_army_attack(replayer, nick, side_name, params):
 # replayer's client-side mirror.  Passing it in lets both ask the SAME
 # function without pretending the emitter has access it does not have.
 #
-# NO BLANKET except: - every copy above ended in `except Exception:
-# pass`, which turns "combat.garrison_side_for is broken" into "the
-# piece quietly lands in the field zone" - a divergence that then has
-# to be rediscovered from a census row.  Only the genuinely expected
-# failure is caught: a region with no ' stronghold' sub-box defined.
+# NO BLANKET except: a bare `except Exception: pass` turns
+# "combat.garrison_side_for is broken" into "the piece quietly lands in
+# the field zone".  Only the genuinely expected failure is caught: a
+# region with no ' stronghold' sub-box defined.
 _SIDE_ALIASES = {'fp': 'FREE_PEOPLES', 'free_peoples': 'FREE_PEOPLES',
                  'freepeoples': 'FREE_PEOPLES', 'free': 'FREE_PEOPLES',
                  'shadow': 'SHADOW', 'sh': 'SHADOW'}
@@ -1454,13 +1410,10 @@ def plan_companion_move(replayer, nick, side_name, params):
         pids = [p for p in present if p in lr.COMPANIONS]
     if not pids:
         raise LookupError('no companions to move in %r' % (frm,))
-    # SIEGE (attempt-77 audit): a companion arriving at a BESIEGED
-    # friendly stronghold joins the garrison INSIDE - the field zone
-    # belongs to the besieger.  The BRIDGE's own companion path
-    # already asks this (ai_move_server _companion_move_lines ->
-    # _siege_dest_zone); this planner did not, so the two
-    # implementations of one question disagreed.  Same pattern as
-    # plan_nazgul_move directly below.
+    # SIEGE: a companion arriving at a BESIEGED friendly stronghold
+    # joins the garrison INSIDE - the field zone belongs to the
+    # besieger (the ONE question, garrison_arrival_zone; same as
+    # plan_nazgul_move below).
     return ('move', {'nick': nick, 'pieces': pids,
                      'frm': zone_code_for(frm),
                      'to': _garrison_dest(replayer,
@@ -1496,15 +1449,17 @@ def plan_nazgul_move(replayer, nick, side_name, params):
     if not pids:
         raise LookupError('no nazgul in %r' % (frm,))
     _to9 = _norm_zone(params['to'])
-    # SIEGE (attempt-25): nazgul arriving at a BESIEGED friendly
-    # stronghold join the garrison INSIDE the sub-box - the field zone
-    # belongs to the besieger.  Nazgul are always Shadow, so the side
-    # is a constant here; the QUESTION is not, and it is asked in the
-    # one place now.
+    # SIEGE: nazgul arriving at a BESIEGED friendly stronghold join the
+    # garrison INSIDE the sub-box - the field zone belongs to the
+    # besieger (the ONE question; the side is a constant, the question
+    # is not).
     _toz9 = garrison_arrival_zone(replayer.state, _to9, 'SHADOW')
-    return ('move', {'nick': nick, 'pieces': pids,
-                     'frm': zone_code_for(frm),
-                     'to': _toz9})
+    groups = {}
+    for pid in pids:
+        source = _piece_zone_code(replayer, pid, default=zone_code_for(frm))
+        groups.setdefault(source, []).append(pid)
+    return [('move', {'nick': nick, 'pieces': pieces, 'frm': source, 'to': _toz9})
+            for source, pieces in groups.items()]
 
 
 def plan_companion_separate(replayer, nick, side_name, params):
@@ -1512,15 +1467,10 @@ def plan_companion_separate(replayer, nick, side_name, params):
     the guide is the one leaving) is IMPLICIT in the client -- humans
     emit no extra line -- so the parser auto-reassigns it (log_replay
     change_guide, mirroring the engine); we emit only the move."""
-    # THE GROUP FORM IS THE COMMON ONE (offline rig instrument,
-    # 2026-08-17: 761 of 1119 emit-fallbacks over 900 chaos games were
-    # this KeyError).  ai.py builds a SINGLE separation as
-    # params['companion'] and a group separation - the rulebook's
-    # normal case, since companions of equal level leave together - as
-    # params['companions'] (a LIST).  This planner only ever read the
-    # singular key, so every group separation raised KeyError and fell
-    # back to the raw board diff: the corpus gesture (one drag, all
-    # figures) was never emitted for the majority of separations.
+    # THE GROUP FORM IS THE COMMON ONE: ai.py builds a SINGLE separation
+    # as params['companion'] and a group separation (the rulebook's
+    # normal case - companions of equal level leave together) as
+    # params['companions'] (a LIST); both shapes are read.
     names = params.get('companions')
     if names is None:
         names = [params['companion']]
@@ -1540,9 +1490,9 @@ def plan_companion_separate(replayer, nick, side_name, params):
                 break
         else:
             groups.append((frm, [pid]))
-    # SIEGE (attempt-77 audit): same question as plan_companion_move -
-    # a companion separated into a BESIEGED friendly stronghold joins
-    # the garrison, not the besiegers.
+    # SIEGE: a companion separated into a BESIEGED friendly stronghold
+    # joins the garrison, not the besiegers (same question as
+    # plan_companion_move).
     return [('move', {'nick': nick, 'pieces': list(gp), 'frm': gf,
                       'to': to}) for gf, gp in groups]
 
@@ -1612,23 +1562,12 @@ def pick_fp_ring_walk(replayer, paid=None, used=None):
             where[_p] = _piece_zone_code(replayer, _p, default=None)
         except LookupError:
             where[_p] = None
-    # THE REPEAT GUARD IS A LEDGER-vs-COUNT CHECK, NOT A BOARD CHECK.
-    # (BRIDGE-11, fixing a regression I caused and the round-trip rig
-    # caught within one battery.)  My first cut refused whenever ANY
-    # already-paid ring still showed in an active slot - i.e. whenever
-    # the board lagged the ledger.  In the rig the board lags BY
-    # DESIGN, so every ring use after the first raised, the action
-    # emitted nothing, and the engine advanced while the board did not:
-    #     [emit-fallback] elven_ring: LookupError(...) -> 0 diff lines
-    #     seed 824000 T2 elven_ring | SILENT-STEP dice FREE_PEOPLES
-    # The OLD guard never claimed that.  It refused only when the ring
-    # it was ABOUT TO WALK was already paid - which, because the pid
-    # came from the count, happens exactly when the LEDGER HAS RUN
-    # AHEAD OF THE COUNT: the caller is re-emitting one logical use.
-    # That is the real condition, so it is stated directly.  WORDING IS
-    # PART OF THE CONTRACT: test_permanent_class.py's "a repeat walk of
-    # the SAME ring is refused" asserts the phrase 'already been
-    # walked', and the pin is HONOURED, never edited to fit a rewrite.
+    # THE REPEAT GUARD IS A LEDGER-vs-COUNT CHECK, NOT A BOARD CHECK
+    # (BRIDGE-11): it refuses only when the LEDGER HAS RUN AHEAD OF THE
+    # COUNT - the caller is re-emitting one logical use.  A board that
+    # merely lags the ledger (the round-trip rig lags BY DESIGN) must
+    # never refuse.  WORDING IS PART OF THE CONTRACT:
+    # test_permanent_class.py asserts the phrase 'already been walked'.
     if paid is not None and used is not None and len(paid) >= used + 1:
         raise LookupError(
             'an FP elven ring has already been walked to its Used Ring '
@@ -1638,10 +1577,9 @@ def pick_fp_ring_walk(replayer, paid=None, used=None):
     avail = [(p, z) for p, z in sorted(where.items())
              if z in RING_ACTIVE_SLOTS and not (paid and p in paid)]
     if not avail:
-        # NAME THE REAL CAUSE.  "no ring is in a slot" and "every ring
+        # NAME THE REAL CAUSE: "no ring is in a slot" and "every ring
         # is already in my ledger" are different facts with different
-        # fixes, and a halt message that states the wrong one costs the
-        # next reader the whole diagnosis.
+        # fixes.
         if paid and all(p in paid for p in ('249', '250', '251')):
             raise LookupError(
                 'all three FP elven rings have already been walked '
@@ -1657,9 +1595,8 @@ def pick_fp_ring_walk(replayer, paid=None, used=None):
     pid, frm = avail[0]
     # DESTINATION: the first Used Ring slot that is free ON THE BOARD,
     # skipping the walks this caller has emitted that the board has not
-    # shown yet.  With a board that tracks, lag is 0 and this is simply
-    # "the first free slot"; with a board that lags it reproduces the
-    # old `2011+used` arithmetic exactly.  Both worlds, one expression.
+    # shown yet (lag 0 = "the first free slot"; a lagging board
+    # reproduces the `2011+used` arithmetic exactly).
     occupied = set(z for z in where.values() if z in RING_USED_SLOTS)
     lag = sum(1 for p in (paid or ())
               if where.get(p) in RING_ACTIVE_SLOTS)
@@ -1730,8 +1667,7 @@ def pick_sh_ring_dispose(replayer, disposed=None):
 
 
 def plan_elven_ring(replayer, nick, side_name, params):
-    """Ring active->used walk (FP only; a Shadow collected-ring use is
-    proven by the die_change alone) + the die-face change line."""
+    """Transfer/dispose one actual ring and change the selected physical die."""
     ops = []
     state = replayer.state
     if side_name == 'FREE_PEOPLES':
@@ -1739,20 +1675,14 @@ def plan_elven_ring(replayer, nick, side_name, params):
         _used9 = 3 - int(getattr(state, 'fp_elven_rings', 3))
         pid, _frm, _to = pick_fp_ring_walk(replayer, _paid, _used9)
         # COUNTS MUST AGREE (USER 2026-08-19, invariant 2: no phantom
-        # ring, none spent twice, none stranded).  The gesture follows
-        # the BOARD because only the board can be walked - but a count
-        # that points at a ring the board does NOT have in a slot is a
-        # tracking break, and a tracking break never said out loud is
-        # how auto69 game 5 ran to the end.  Said, not raised: refusing
-        # would block a legal ring use over bookkeeping the gesture
-        # itself is not wrong about.
-        # Narrow on purpose: only when the count's ring is ABSENT from
-        # the slots, never merely when the choice differs.  A board
-        # that simply lags an emitted walk is normal (the round-trip
-        # rig lags by design) and must not print a false alarm - and
-        # under the USER's ruling a different CHOICE is not a defect at
-        # all: "which ring is irrelevant as long as it is cleanly
-        # tracked".
+        # ring, none spent twice, none stranded): a count that points
+        # at a ring the board does NOT have in a slot is a tracking
+        # break, SAID not raised (refusing would block a legal ring
+        # use).  Narrow on purpose: only when the count's ring is
+        # ABSENT from the slots - a lagging board is normal (the
+        # round-trip rig lags by design) and a different CHOICE is not
+        # a defect ("which ring is irrelevant as long as it is cleanly
+        # tracked").
         if 0 <= _used9 <= 2:
             _want9 = ('249', '250', '251')[_used9]
             _z9 = None
@@ -1771,59 +1701,20 @@ def plan_elven_ring(replayer, nick, side_name, params):
             _paid.add(pid)
         ops.append(('marker_366', {'nick': nick, 'piece': pid,
                                    'frm': _frm, 'to': _to}))
-    # A7 (USER ruling 2026-08-19): THE RING NO LONGER CHANGES A DIE'S
-    # FACE, so this planner must no longer render one.  The engine
-    # raises a legality waiver and leaves the die as rolled; forging a
-    # die-face line here would tell the client - and our own parser -
-    # about a change that did not happen.  CAUGHT BY THE ROUND-TRIP
-    # RIG, not by reading: `test_roundtrip_rig_gate.py` went red the
-    # moment the engine stopped changing the face -
-    #     seed 824000 T2 elven_ring {'new_face': 'Character'}
-    #     dice FREE_PEOPLES: engine=(('EVENT','EVENT'),2)
-    #                     roundtrip=(('CHARACTER','EVENT'),2)
-    # which is the emitted face-change line being replayed by the
-    # parser against an engine that never made it.
-    # AND IT WAS NEVER THE CLIENT'S GRAMMAR EITHER: the client's ring
-    # command emits a marker walk and an optional flip - no die pid, no
-    # face - and over 300 human logs, 540 ring uses produced ONE nearby
-    # die-face re-render against 2.6 expected by chance.
-    #
-    # THE ONE SURVIVOR is the Shadow ring-to-EYE use, where the engine
-    # still changes the face because the die's move into the Hunt Box
-    # is a ZONE MOVE the client does render.
-    #
-    # FP legality use  -> the marker walk above IS the whole gesture.
-    # SH legality use  -> no ops here.  HISTORICAL: the retired
-    #   monolith's `[ring-dispose]` reconciler emitted the Dark Ring
-    #   -> SA Casualties walk off the `sh_elven_rings` delta; the
-    #   live stack currently has NO caller of pick_sh_ring_dispose.
-    #   If a live SH ring-dispose render is owed it must get ONE
-    #   producer - never a second gesture here (the auto69
-    #   double-departure).
+    else:
+        pid, frm, stale = pick_sh_ring_dispose(replayer)
+        if stale or frm not in RING_USED_SLOTS:
+            raise LookupError('no Shadow-held Elven Ring is on the client board')
+        ops.append(('kill', {'nick': nick, 'pieces': [pid], 'to': SH_DEAD}))
     face = str(getattr(params.get('new_face'), 'value',
-                       params.get('new_face'))).upper() \
-        .replace(' ', '_').replace('/', '_')
-    # CRITIQUE NEW-2: the hybrid face's engine VALUE is 'Muster/Army'
-    # — the slash survived the space normalization and the H letter
-    # (992 corpus 'to H' occurrences) was unreachable; the full name
-    # forms alias to the map keys too
-    face = {'EYE_OF_SAURON': 'EYE',
-            'WILL_OF_THE_WEST': 'WILL_OF_WEST'}.get(face, face)
-    # RIG CLASS-A (155x at 300-game scale, 2026-08-17): an Eye result
-    # BANKS - the engine puts the changed die in the Hunt Box, so the
-    # face-change line alone leaves the parser's die in the pool
-    # (dice SHADOW: engine=(...), N+1 used vs roundtrip=(...'EYE'...),
-    # N).  Emit the physical drag too, the same pool->huntbox grammar
-    # as the eye allocation.  SHADOW only - no FP face is the Eye.
+                       params.get('new_face'))).upper().replace(' ', '_').replace('/', '_')
+    face = {'EYE_OF_SAURON': 'EYE', 'WILL_OF_THE_WEST': 'WILL_OF_WEST'}.get(face, face)
+    letter = _FACE_LETTER.get(face)
+    if letter is None:
+        raise LookupError('no die-change letter for face %r' % face)
+    dp = die_piece_for(replayer, side_name, params['target_die_idx'])
+    ops.append(('die_change', {'nick': nick, 'die': dp, 'face': letter}))
     if side_name == 'SHADOW' and face == 'EYE':
-        letter = _FACE_LETTER.get(face)
-        if letter is None:
-            raise LookupError('no die-change letter for face %r'
-                              % (face,))
-        dp = die_piece_for(replayer, side_name,
-                           params['target_die_idx'])
-        ops.append(('die_change', {'nick': nick, 'die': dp,
-                                   'face': letter}))
         ops.append(plan_eye_bank(replayer, nick, dp))
     return ops
 
@@ -1847,6 +1738,120 @@ def plan_use_token(replayer, nick, side_name, params, rng=None):
     return ops
 
 
+def casualty_context(state):
+    """The active owner, region and remaining budget for either casualty source."""
+    card = getattr(state, 'pending_card_option', None) or {}
+    if card.get('card_casualty'):
+        return {'kind': 'card', 'stage': 'card', 'region': card['cas_region'],
+                'side': card['cas_side'], 'hits': int(card['cas_hits']),
+                'card_id': card['card_id']}
+    pc = getattr(state, 'pending_combat', None) or {}
+    stage = pc.get('alloc_stage')
+    if pc.get('phase') == 'casualty_allocation' and stage in ('attacker', 'defender'):
+        return {'kind': 'combat', 'stage': stage, 'region': pc[stage + '_region'],
+                'side': pc[stage + '_side'],
+                'hits': int(pc.get('atk_hits' if stage == 'attacker' else 'def_hits', 0) or 0),
+                'card_id': None}
+    return None
+
+
+def casualty_action_params(action):
+    """Normalize only explicit ordinary/card casualty actions, never generic cards."""
+    if action.action_type == 'casualty_allocate':
+        return dict(action.params)
+    choices = (action.params or {}).get('choices') or {}
+    if action.action_type == 'card_option' and 'casualty_operation' in choices:
+        return {'operation': choices['casualty_operation'], 'nation': choices.get('nation')}
+    return None
+
+
+def plan_casualty_operation(params, replayer, nick, side_name):
+    """One source-stamped casualty operation, shared by combat and event cards."""
+    state = replayer.state
+    context = casualty_context(state)
+    if context is None:
+        raise LookupError('casualty operation requires an active allocation')
+    operation, nation = params.get('operation'), params.get('nation')
+    if operation not in ('remove_regular', 'reduce_elite', 'remove_elite') or nation is None:
+        raise LookupError('casualty operation requires an explicit operation and nation')
+    owner = context['side']
+    if getattr(owner, 'name', None) != side_name:
+        raise LookupError('casualty operation belongs to another player')
+    side = 'shadow' if side_name == 'SHADOW' else 'fp'
+    region = _norm_zone(context['region'])
+    zc = garrison_arrival_zone(state, region, side)
+    # Validate against the same participating roster as the engine before
+    # choosing a physical figure; peaceful rearguard cannot pay a hit.
+    import ai
+    hits = context['hits']
+    valid = ai._casualty_operations(state, context['region'], owner, hits)
+    if not any(a.params.get('nation') == nation and
+               a.params.get('operation') == operation for a in valid):
+        raise LookupError('casualty operation is not legal in this position')
+    units = pick_units(replayer, region, side,
+                       n_regular=int(operation == 'remove_regular'),
+                       n_elite=int(operation != 'remove_regular'),
+                       nation=nation, side_hint=side)
+    if operation != 'reduce_elite':
+        return [('hand_exit_b', {'nick': nick, 'pieces': units, 'frm': zc})]
+    # The first stamp belongs to this operation. Later stamps can belong
+    # to forced follow-through and must not choose this replacement.
+    stamps = params.get('_dg_srcs') or []
+    if not stamps:
+        raise LookupError('Elite reduction has no engine source stamp')
+    stamped_nation, source = stamps[0]
+    norm = lambda n: str(getattr(n, 'value', n)).lower().replace(' ', '_')
+    if norm(stamped_nation) != norm(nation) or source not in ('cas', 'pool', None):
+        raise LookupError('Elite reduction source stamp does not match the action')
+    ops = [('swap_place', {'nick': nick, 'pieces': units, 'to': zc})]
+    if source is not None:
+        zone = (('sa dead' if side == 'shadow' else 'fp dead')
+                if source == 'cas' else
+                ('sa reinf' if side == 'shadow' else 'fp reinf'))
+        replacement = pick_units(replayer, zone, side, n_regular=1,
+                                 nation=nation, side_hint=side)
+        ops.append(('swap_remove', {'nick': nick, 'pieces': replacement,
+                    'sub': '308', 'subtext': '', 'to': zc}))
+    return ops
+
+
+
+def plan_siege_press(params, replayer, nick, side_name):
+    """Render the engine's one paid Elite, using its nation and supply stamp."""
+    state = replayer.state
+    pc = getattr(state, 'pending_combat', None) or {}
+    if getattr(pc.get('attacker_side'), 'name', None) != side_name:
+        raise LookupError('siege press belongs to another player')
+    region = _norm_zone(pc.get('attacker_region') or pc.get('region', ''))
+    if not region:
+        raise LookupError('siege press has no attacker region')
+    stamps = params.get('_dg_srcs') or []
+    if not stamps or not isinstance(stamps[0], (tuple, list)) or len(stamps[0]) != 2:
+        raise LookupError('siege press requires its engine downgrade source stamp')
+    nation, source = stamps[0]
+    side = 'shadow' if side_name == 'SHADOW' else 'fp'
+    if nation is None or _side_of_nation(nation) != side or source not in ('cas', 'pool', None):
+        raise LookupError('siege press has an invalid nation or replacement source')
+    requested = params.get('nation')
+    norm = lambda n: str(getattr(n, 'value', n)).lower().replace(' ', '_')
+    if requested is not None and norm(requested) != norm(nation):
+        raise LookupError('siege press nation disagrees with engine payment stamp')
+    elite = pick_units(replayer, region, side, n_elite=1,
+                       nation=nation, side_hint=side)
+    # Both halves use the same concrete piece's physical location, including
+    # a previously witnessed generic stronghold slot.
+    zone = _piece_zone_code(replayer, elite[0])
+    ops = [('swap_place', {'nick': nick, 'pieces': elite, 'to': zone})]
+    if source is not None:
+        supply = (('sa dead' if side == 'shadow' else 'fp dead')
+                  if source == 'cas' else
+                  ('sa reinf' if side == 'shadow' else 'fp reinf'))
+        regular = pick_units(replayer, supply, side, n_regular=1,
+                             nation=nation, side_hint=side)
+        ops.append(('swap_remove', {'nick': nick, 'pieces': regular,
+                    'sub': '308', 'subtext': '', 'to': zone}))
+    return ops
+
 def plan(action_type, params, replayer, nick, side_name,
          die_idx=None, rng=None):
     """One engine action -> ordered [(op, fields), ...] micro-ops.
@@ -1858,7 +1863,11 @@ def plan(action_type, params, replayer, nick, side_name,
     if action_type == 'pass':
         return [('chat', {'nick': nick, 'msg': 'pass'})]
     if action_type == 'army_move':
-        ops.append(plan_army_move(replayer, nick, side_name, params))
+        # A legal paid move may activate a nation without changing region
+        # (Almanac p.41). Its political delta is emitted by the commit sweep.
+        if (params.get('from') is None or params.get('to') is None
+                or _norm_zone(params['from']) != _norm_zone(params['to'])):
+            ops.append(plan_army_move(replayer, nick, side_name, params))
         return ops
     if action_type == 'draw_card':
         ops.append(plan_draw_card(replayer, nick, side_name, params,
@@ -1891,15 +1900,17 @@ def plan(action_type, params, replayer, nick, side_name,
         ops.append(plan_army_move(replayer, nick, side_name, params))
         return ops
     if action_type == 'companion_move':
-        ops.append(plan_companion_move(replayer, nick, side_name,
-                                       params))
+        if (params.get('from') is None or params.get('to') is None
+                or _norm_zone(params['from']) != _norm_zone(params['to'])):
+            ops.append(plan_companion_move(replayer, nick, side_name,
+                                           params))
         return ops
     if action_type == 'companion_separate':
         ops.extend(plan_companion_separate(replayer, nick, side_name,
                                            params))
         return ops
     if action_type == 'nazgul_move':
-        ops.append(plan_nazgul_move(replayer, nick, side_name, params))
+        ops.extend(plan_nazgul_move(replayer, nick, side_name, params))
         return ops
     if action_type == 'fellowship_move':
         fs = replayer.state.fellowship
@@ -1959,17 +1970,11 @@ def plan(action_type, params, replayer, nick, side_name,
         dest = params.get('region', params.get('to'))
         if dest is None:
             raise LookupError('no destination region in %r' % (params,))
-        # G13 (USER 2026-08-14 gap wave): the pawn's TRUE region first —
-        # the parser's fellowship tracker, not piece_region (the 247
-        # walks ride the fellowship handler, which never updates
-        # piece_region, so the old chain fell through to _initial() =
-        # 'from Rivendell' forever)
-        # PAWN CONTINUITY (CRITIQUE #4): the LIVE engine's 'from' is
-        # its last DECLARED position (Rivendell for whole stretches),
-        # so preferring it teleported the pawn back to Rivendell on
-        # every reveal (a14 renders 92/181: frm=Game.1911 forever).
-        # The parser's fellowship_location follows the pawn's rendered
-        # walks and equals 'from' at parser-record time — it leads.
+        # G13 / PAWN CONTINUITY (USER 2026-08-14): the pawn's TRUE
+        # region comes from the parser's fellowship tracker FIRST (the
+        # 247 walks ride the fellowship handler, never piece_region;
+        # the engine's 'from' is its last DECLARED position and would
+        # teleport the pawn back on every reveal)
         cur = getattr(replayer, 'fellowship_location', None) \
             or params.get('from') \
             or replayer.piece_region.get('247') or _initial().get('247')
@@ -2021,32 +2026,25 @@ def plan(action_type, params, replayer, nick, side_name,
             p = int(replayer.state.fellowship.progress)
             if p > 0:
                 # corpus grammar: a progress RESET is a Scribe DRAG back
-                # down the track (2023-08-13 HombreLobo L544: '248
-                # Game.2016 -> Game.2014' right after the declare walk).
-                # No human log contains a backward Controls.790
-                # "advance"; that form also leaves log_replay's
-                # _pre_reset_progress stash dangling, inflating the next
-                # declare's progress_consumed.
+                # down the track; no human log contains a backward
+                # Controls.790 "advance" (that form also leaves
+                # log_replay's _pre_reset_progress stash dangling)
                 ops.append(('move', {'nick': nick, 'pieces': ['248'],
                                      'frm': 'Game.%d' % (2014 + p),
                                      'to': 'Game.2014'}))
             # marker dance: humans flip-and-unflip the fellowship marker
-            # when declaring (O.1 bookkeeping pair; ketchuptime
-            # 2023-11-03 L102-103) and log_replay's declare branch arms
-            # _skip_next_fsp_flip=2 for EXACTLY this pair.  Without it
-            # the parser silently eats the next two GENUINE flips, so a
-            # later hunt/card reveal showed hidden for many ticks.
+            # when declaring (O.1 bookkeeping pair) and log_replay's
+            # declare branch arms _skip_next_fsp_flip=2 for EXACTLY
+            # this pair - without it the parser eats the next two
+            # GENUINE flips
             ops.append(('flip', {'nick': nick, 'pieces': ['247']}))
             ops.append(('flip', {'nick': nick, 'pieces': ['247']}))
         else:
             # hunt-forced reveal placement: corpus choreography is reset
-            # -> walk -> flip (2024-02-05 Polijuna_The board is set
-            # L1326-1328: '248 Game.2015->Game.2014', '247
-            # Game.1935->Game.1943', Controls.323 flip).  The reset must
-            # ride the planner so the MANUAL decide() path (which never
-            # runs _track_delta_lines) stays in sync too.  from_progress
-            # is injected by the AUTO driver (engine truth); fall back
-            # to the parser's counter for decide().
+            # -> walk -> flip.  The reset rides the planner so the
+            # MANUAL decide() path stays in sync; from_progress is
+            # injected by the AUTO driver (engine truth), the parser's
+            # counter is the fallback for decide().
             p = int(params.get('from_progress',
                                replayer.state.fellowship.progress))
             if p > 0:
@@ -2065,22 +2063,27 @@ def plan(action_type, params, replayer, nick, side_name,
         # death region when the kill line didn't re-track him)
         frm = _holding_zone_code(replayer, '240', default=FP_DEAD)
         if frm not in (FP_DEAD, 'Game.2037'):
-            # the transformation is BY DEFINITION a return from the
-            # dead pile (GenericPie L213 drags 240 FROM Game.2039); a
-            # stale tracked zone like the Guide Box routes the drag
-            # into the parser's fellowship-companion handler, where
-            # dead Gandalf matches nothing and the White never appears
-            # (t116 ga11 T123: fangorn entry missing parser-side)
-            frm = FP_DEAD
-        # ASK THE GARRISON QUESTION (attempt 77).
-        # This was a bare field-zone lookup: Gandalf the White returns
-        # to an FP Elven stronghold, Lorien can be BESIEGED when he
-        # does, and he must join the garrison INSIDE rather than
-        # appear among the besiegers.  The site did not ask the
-        # garrison-side question at all - it is not a second copy that
-        # disagreed, it is a third site that never consulted the rule.
-        # The server injects '_besieged_garrison' the same way it does
-        # for musters, because only the ENGINE knows the siege state.
+            # BL-75: Gandalf the GREY may be ALIVE and SEPARATED on the
+            # map when the transformation fires ('no longer in the
+            # Fellowship' does not require dead) - a tracked MAP REGION
+            # is then the TRUE source; only a NON-region stale zone
+            # (Guide Box, tracks) falls back to the dead pile.
+            _is_reg75 = False
+            try:
+                import board as _bd75
+                from board import sanitize as _sz75
+                _z75 = str(replayer.piece_region.get('240', '')
+                           or '')
+                _is_reg75 = _sz75(_z75) in _bd75.regions
+            except Exception:
+                _is_reg75 = False
+            if not _is_reg75:
+                frm = FP_DEAD
+        # ASK THE GARRISON QUESTION: Gandalf the White returns to an FP
+        # Elven stronghold, which can be BESIEGED when he does - he
+        # joins the garrison INSIDE, never the besiegers.  The server
+        # injects '_besieged_garrison' as it does for musters, because
+        # only the ENGINE knows the siege state.
         _gdest9 = _norm_zone(params['region'])
         if params.get('_besieged_garrison'):
             try:
@@ -2103,6 +2106,16 @@ def plan(action_type, params, replayer, nick, side_name,
     if action_type == 'choose_guide':
         pid = _companion_pid(params['companion'])
         frm = _piece_zone_code(replayer, pid, default=FELLOWSHIP_BOX)
+        if frm == GUIDE_BOX:
+            return ops  # Keeping the current Guide is a real choice, no drag.
+        # The Java Guide zone accepts multiple figures. A nomination must
+        # return the previous living Guide before seating the chosen one.
+        living = [c.name for c in replayer.state.fellowship.companions]
+        for name in living:
+            old_pid = _companion_pid(name)
+            if old_pid != pid and _piece_zone_code(replayer, old_pid, default=FELLOWSHIP_BOX) == GUIDE_BOX:
+                ops.append(('move', {'nick': nick, 'pieces': [old_pid],
+                                     'frm': GUIDE_BOX, 'to': FELLOWSHIP_BOX}))
         ops.append(('move', {'nick': nick, 'pieces': [pid],
                              'frm': frm, 'to': GUIDE_BOX}))
         return ops
@@ -2110,17 +2123,12 @@ def plan(action_type, params, replayer, nick, side_name,
         ops.append(('chat', {'nick': nick, 'msg': 'nc'}))
         return ops
     if action_type == 'combat_effect_choice':
-        # only the Dread & Despair leadership forfeit has a dedicated
-        # chat grammar ('ffN'); other magnitude choices are drags that
-        # are not wired yet
-        cid = str(params.get('card_id', '')).lower()
-        if 'dread' in cid:
-            ops.append(('chat', {'nick': nick,
-                                 'msg': 'ff%d' % int(
-                                     params.get('count', 1) or 1)}))
+        # Payment gestures are emitted from the committed board delta.
+        if all(key in params for key in ('nation', 'kind', 'operation')):
             return ops
-        raise NotImplementedError(
-            'combat_effect_choice drags for %r not wired' % (cid,))
+        from live.chat import combat_effect_choice_note
+        ops.append(('chat', {'nick': nick, 'msg': combat_effect_choice_note(params)}))
+        return ops
     if action_type == 'combat_retreat':
         # engine shape: params carry ONLY to_region; the retreating
         # side's region is its combat-role region in pending_combat
@@ -2214,204 +2222,15 @@ def plan(action_type, params, replayer, nick, side_name,
                                  'to': (SH_POOL if side == 'shadow'
                                         else FP_POOL)}))
         return ops
-    if action_type in ('casualty_allocate', 'siege_press'):
-        state = replayer.state
-        pc = getattr(state, 'pending_combat', None) or {}
-        side = 'shadow' if side_name == 'SHADOW' else 'fp'
-        defender = False
-        if action_type == 'siege_press':
-            # press = downgrade ONE attacker elite to keep assaulting
-            region = _norm_zone(pc.get('attacker_region')
-                                or pc.get('region', ''))
-            k, hits = 1, 0
-        else:
-            stage = pc.get('alloc_stage')
-            if stage == 'attacker':
-                region = _norm_zone(pc.get('attacker_region', ''))
-                hits = int(pc.get('atk_hits', 0) or 0)
-            else:
-                defender = True
-                region = _norm_zone(pc.get('defender_region', ''))
-                hits = int(pc.get('def_hits', 0) or 0)
-            k = int(params.get('count', 0) or 0)
-        if not region:
-            raise LookupError('no pending_combat region for %s'
-                              % action_type)
-        # A besieged GARRISON's units live in the stronghold sub-box.
-        #
-        # CORRECTED while unifying: this asked `defender and besieged`,
-        # i.e. it inferred the garrison from the COMBAT ROLE.  That
-        # holds for an assault, where the garrison defends - but it
-        # inverts during a SORTIE, where the garrison attacks and the
-        # DEFENDER is the besieging army standing in the field.  On a
-        # sortie the old test sent the besieger's casualties into the
-        # stronghold sub-box, selecting pieces from the wrong zone.
-        # garrison_arrival_zone asks by garrison SIDE, which is right
-        # for both (combat.garrison_side_for reads the settlement's
-        # controller, not who happens to be attacking).
-        zc = garrison_arrival_zone(state, region, side)
-        chosen = []
-        if k:
-            elites = pick_units(replayer, region, side, n_elite=k,
-                                side_hint=side)
-            # AUTO-96 game-4 (2026-08-17, the physical-supply
-            # phantom): the ENGINE's downgrade-source decision is
-            # THE answer (combat._consume_downgrade_source stamps
-            # (nation, 'cas'|'pool'|None) per downgrade; the server
-            # threads them in as _dg_srcs).  The old blind zone
-            # order ('dead first, any nation') disagreed with an
-            # engine 'pool' sourcing and left the client pool one
-            # HIGH forever (pool fp rohan/regular engine=4 client=5
-            # PHANTOM).  Obey when told; the legacy order remains
-            # only as the un-threaded fallback (teacher/live paths
-            # follow the human's physical drags instead).
-            regs = None
-            _dgs9 = params.get('_dg_srcs') or []
-            if _dgs9:
-                regs = []
-                _dz9 = ('sa dead' if side == 'shadow' else 'fp dead')
-                _rz9 = ('sa reinf' if side == 'shadow'
-                        else 'fp reinf')
-                for _nat9, _src9 in _dgs9[:k]:
-                    if _src9 is None:
-                        print('[emitter] downgrade with NO source '
-                              '(%s): elite dies outright - no '
-                              'replacement placed' % _nat9)
-                        continue
-                    _zone9 = _dz9 if _src9 == 'cas' else _rz9
-                    try:
-                        regs += pick_units(replayer, _zone9, side,
-                                           n_regular=1,
-                                           side_hint=side,
-                                           nation=_nat9,
-                                           exclude=regs)
-                    except LookupError as e:
-                        # the engine and the client board disagree on
-                        # the replacement supply: surface it (a
-                        # nation-blind pick here places a phantom)
-                        raise LookupError(
-                            'engine-stamped downgrade source %r has '
-                            'no %s regular on the client board: %s'
-                            % (_zone9, _nat9, e))
-            if regs is None:
-                for _pk9 in (('sa dead', 'sa reinf')
-                             if side == 'shadow'
-                             else ('fp dead', 'fp reinf')):
-                    try:
-                        regs = pick_units(replayer, _pk9, side,
-                                          n_regular=k,
-                                          side_hint=side)
-                        break
-                    except LookupError:
-                        continue
-            if regs is None:
-                raise LookupError(
-                    'no replacement regulars for %s downgrade' % side)
-            # op-name convention (matches ai_move_server's downgrade
-            # path and log_replay's dispatch): swap_place renders
-            # Controls.304 = REMOVE the on-board elites; swap_remove
-            # renders Controls.313 = PLACE the reserve regulars.
-            # (FIX 2026-07-27: this branch had the two inverted.)
-            ops.append(('swap_place', {'nick': nick, 'pieces': elites,
-                                       'to': zc}))
-            if regs:
-                # all-None sources leave regs empty (elites died
-                # outright, nothing placed) - never emit a bare
-                # swap_remove
-                ops.append(('swap_remove', {'nick': nick,
-                                            'pieces': regs,
-                                            'sub': '308',
-                                            'subtext': '',
-                                            'to': zc}))
-            chosen.extend(elites)
-        h = max(0, hits - k)
-        if h:
-            # THE engine allocation order (ai._apply_allocation): the
-            # remaining hits kill REGULARS first; then each elite
-            # absorbs 2 hits as an outright kill; a single leftover hit
-            # on an elite is a DOWNGRADE (the swap, sourced from the
-            # engine's next _dg_src_log stamp; a None source = the
-            # elite dies outright, nothing placed - USER R7).  Kinds
-            # must match the engine's removal exactly: a missing piece
-            # HOLDS (LookupError), never substitutes another kind.
-            def _avail(kind):
-                out_ = []
-                for pid in _pieces_in(replayer, region):
-                    if pid in chosen or pid in kills or pid in swap_out:
-                        continue
-                    nat, ut = _unit_type(pid, replayer, side_hint=side)
-                    if ut == kind and _side_of_nation(nat) == side:
-                        out_.append(pid)
-                return out_
-            kills, swap_out, swap_in = [], [], []
-            for pid in _avail('regular'):
-                if h <= 0:
-                    break
-                kills.append(pid)
-                h -= 1
-            while h > 0:
-                el = _avail('elite')
-                if not el:
-                    raise LookupError('need %d more casualt%s (%s) in '
-                                      '%r, found no %s'
-                                      % (h, 'y' if h == 1 else 'ies',
-                                         side, region,
-                                         'elite' if _avail('regular')
-                                         == [] else 'regular'))
-                if h >= 2:
-                    kills.append(el[0])
-                    h -= 2
-                    continue
-                # leftover single hit: the downgrade swap
-                _dgs9 = list(params.get('_dg_srcs') or [])[k:]
-                swap_out.append(el[0])
-                if _dgs9:
-                    _nat9, _src9 = _dgs9[0]
-                    if _src9 is None:
-                        print('[emitter] downgrade with NO source '
-                              '(%s): elite dies outright - no '
-                              'replacement placed' % _nat9)
-                    else:
-                        _zone9 = (('sa dead' if side == 'shadow'
-                                   else 'fp dead') if _src9 == 'cas'
-                                  else ('sa reinf' if side == 'shadow'
-                                        else 'fp reinf'))
-                        try:
-                            swap_in += pick_units(replayer, _zone9, side,
-                                                  n_regular=1,
-                                                  side_hint=side,
-                                                  nation=_nat9,
-                                                  exclude=swap_in)
-                        except LookupError as e:
-                            raise LookupError(
-                                'engine-stamped downgrade source %r '
-                                'has no %s regular on the client '
-                                'board: %s' % (_zone9, _nat9, e))
-                else:
-                    raise LookupError('leftover-hit elite downgrade at '
-                                      '%r has no engine source stamp '
-                                      '(_dg_srcs) - holding' % region)
-                h -= 1
-            if kills:
-                ops.append(('hand_exit_b', {'nick': nick,
-                                            'pieces': kills, 'frm': zc}))
-            if swap_out:
-                ops.append(('swap_place', {'nick': nick,
-                                           'pieces': swap_out, 'to': zc}))
-                if swap_in:
-                    ops.append(('swap_remove', {'nick': nick,
-                                                'pieces': swap_in,
-                                                'sub': '308',
-                                                'subtext': '',
-                                                'to': zc}))
-        return ops
+    if action_type == 'casualty_allocate':
+        return plan_casualty_operation(params, replayer, nick, side_name)
+    if action_type == 'siege_press':
+        return plan_siege_press(params, replayer, nick, side_name)
     if action_type == 'hunt_take_corruption':
         # FROM = where the client's marker physically sits (parser);
-        # TO = the ENGINE's landing spot when the server injects
-        # corruption_target (the parser never reconstructs
-        # pending_hunt, so the old damage fallback always walked ONE
-        # step — a '3' tile rendered as +1).  The engine target also
-        # self-heals any earlier marker drift.
+        # TO = the ENGINE's landing spot (corruption_target injected by
+        # the server; the pending_hunt damage is the fallback).  The
+        # engine target also self-heals any earlier marker drift.
         c = int(replayer.state.fellowship.corruption)
         new = params.get('corruption_target')
         if new is None:
@@ -2532,22 +2351,17 @@ def plan(action_type, params, replayer, nick, side_name,
                                        'face': letter}))
         return ops
     if action_type == 'hunt_gollum_reveal':
-        # FLIP ONLY (t123).  The engine KEEPS the progress counter on a
-        # Gollum reveal (ai.py 'hunt_gollum_reveal': hidden=False, no
-        # progress touch — only fellowship_reveal_place/declare reset).
-        # The old reset drag here ('248 -> Game.2014') misstated the
-        # engine state, and _track_delta_lines then "corrected" it back
-        # up with consecutive Controls.790 lines — which corpus grammar
-        # defines as fellowship MOVE button presses (wotr2026_7_17_11_26
-        # T7 L464-467 / T8 L540-544: 9 phantom fellowship_move records
-        # refused by the certifier).  A reveal that keeps progress
-        # renders as the marker flip alone.
+        # FLIP ONLY: the engine KEEPS the progress counter on a Gollum
+        # reveal (only fellowship_reveal_place/declare reset it) - a
+        # reset drag here would misstate the engine state and be
+        # "corrected" back by consecutive Controls.790 lines, which
+        # corpus grammar reads as fellowship MOVE presses.  A reveal
+        # that keeps progress renders as the marker flip alone.
         ops.append(('flip', {'nick': nick, 'pieces': ['247']}))
         return ops
     if action_type == 'eye_allocate':
         # one line per eye die moved to the hunt box.  count=0 is the
-        # engine's LEGAL zero-eye choice -> zero ops (the old `or 1`
-        # coerced it to a phantom eye line).
+        # engine's LEGAL zero-eye choice -> zero ops.
         _n_eyes = params.get('count')
         _n_eyes = 1 if _n_eyes is None else int(_n_eyes)
         for i in range(_n_eyes):
@@ -2558,23 +2372,10 @@ def plan(action_type, params, replayer, nick, side_name,
             pid = die_piece_for(replayer, 'SHADOW', idx)
             ops.append(('eye_alloc', {'nick': nick, 'die': pid}))
         return ops
-    # REMOVED 2026-08-16: the L2 'die_to_hunt' planner.
-    #
-    # It rendered Controls.795 with frm=SH_DICE_POOL (Game.2043) - the
-    # V1 grammar violation, x89 across the certified run, which humans
-    # never emit (they drag Scribe.141 2043->1997). The two LIVE
-    # producers were converted earlier today; this one survived because
-    # nothing calls it: no engine action of type 'die_to_hunt' exists
-    # (verified across src/ai.py, game_logic.py, game_state.py - zero
-    # hits), so it was parser-record-only and could never fire.
-    #
-    # Deleted rather than converted: an unreachable producer of a known
-    # bad form is a loaded gun for whoever next adds that action type,
-    # and "it is dormant" is the same argument that left the dwarven
-    # ring inventing its own randomness for months.
-    #
-    # Controls.795 is still correct and still emitted for the FP
-    # FELLOWSHIP die out of Game.2035 - the four live sites all source
-    # from DICE_USED, which is the human form. The violation was only
-    # ever the SHADOW-pool source.
+    # no L2 'die_to_hunt' planner exists ON PURPOSE: no engine action
+    # of that type exists, and the SHADOW-pool-sourced Controls.795 form
+    # it once rendered is a V1 grammar violation humans never emit
+    # (they drag Scribe.141 2043->1997).  Controls.795 is correct only
+    # for the FP FELLOWSHIP die out of Game.2035 (DICE_USED), which the
+    # four live sites source.
     raise NotImplementedError('no L2 planner for %r yet' % action_type)

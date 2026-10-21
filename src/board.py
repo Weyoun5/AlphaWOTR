@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Sun Jun 29 00:12:25 2025
-
-@author: Weyoun
-"""
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
 War of the Ring – annotated map builder
 Last update : 2025-06-29
 Author      : Weyoun (+ ChatGPT tweaks)
@@ -104,13 +97,9 @@ def sanitize(name: str) -> str:
     return n
 
 
-# WOTR_NATIVE=1 (PERF 2026-08-09): compiled hotspot port - PURE
-# performance swap, byte-identical outputs (parity-certified; see
-# perf/native in the lab tree).  Rebinding here, before any consumer
-# executes `from board import sanitize`, routes every sanitize call
-# (board, ai, game_logic, ...) through the compiled version.  Default
-# OFF: without the env flag this block is inert and the module is
-# byte-identical to production behavior.
+# WOTR_NATIVE=1: compiled sanitize (parity-certified, byte-identical output).
+# Rebinding here, before any `from board import sanitize`, routes every
+# consumer through it.  Default OFF: without the flag this block is inert.
 if os.environ.get('WOTR_NATIVE') == '1':
     try:
         from wotr_native import sanitize as _native_sanitize
@@ -224,7 +213,6 @@ shift_region("Osgiliath",           dx= 30)
 
 # ╭───────────────────────────────────────────────────────────╮
 # │  6.  BUILD / EDIT ADJACENCY GRAPH                        │
-# │      (unchanged from your previous version)              │
 # ╰───────────────────────────────────────────────────────────╯
 adj = {k:set() for k in regions}
 keys = list(regions)
@@ -282,9 +270,17 @@ add_pairs=[
     ('lossarnach','osgiliath'),
     ('pelargir','osgiliath'),
     # User-verified against the physical board (2026-07-06): Dol Guldur
-    # borders Eastern Mirkwood (the polygon-derived graph missed the
-    # edge; 2025-11-14 branstonpickle T1 opens with this exact move)
+    # borders Eastern Mirkwood
     ('dol guldur','eastern mirkwood'),
+    # W4-031 (USER-confirmed 2026-09-02, amendment 1.9 addendum): five printed-board
+    # borders the polygon builder drops (pairs sit 4.7-11.3 px apart, the
+    # builder keeps < 1.0 px; the same class as Carrock / Western Mirkwood
+    # above).  Narrows of the Forest - Northern Rhovanion is NOT a border.
+    ('old forest road','rhosgobel'),        # 4.67 px
+    ('dol guldur','eastern brown lands'),   # 11.28 px
+    ('ettenmoors','weather hills'),         # 8.90 px
+    ('druwaith iaur','gap of rohan'),       # 5.43 px
+    ('south downs','weather hills'),        # 6.48 px
 ]
 for a,b in add_pairs:
     if sanitize(a) not in adj and "druadan forest" in a:
@@ -365,8 +361,6 @@ for region,allowed in only.items():
 
 
 
-# … everything up to section 7 is identical to the version you just tested …
-
 # ╭───────────────────────────────────────────────────────────╮
 # │  7.  DRAW BOARD + ADJACENCIES + ICONS                    │
 # ╰───────────────────────────────────────────────────────────╯
@@ -440,7 +434,7 @@ class Region:
     orig_name: str
     centroid: Tuple[float, float]
 
-    # board_visual expects .screen_xy
+    # gui.py expects .screen_xy
     @property
     def screen_xy(self) -> Tuple[float, float]:
         return self.centroid
@@ -456,10 +450,6 @@ class Board:
             k: Region(k, info["orig"], info["centroid"])
             for k, info in regions.items()
         }
-
-        # crude defaults for boxes/tracks – tweak to taste
-        self.fellowship_box_xy = (W - 180, 80)   # top-right corner
-        # add more named boxes later as needed (VP track, political, …)
         self._adj = adj
 
     # --------------------------------------------------------
@@ -469,11 +459,9 @@ class Board:
         try:
             return self._regions[key]
         except KeyError:
-            # VASSAL location names carry a leading article the board
-            # keys drop ('The Grey Havens' vs 'grey havens') and vice
-            # versa ('Shire' vs 'the shire') — try both forms before
-            # giving up (2024-07-27 Columbo: forced move to 'the grey
-            # havens' crashed get_or_create_army)
+            # VASSAL location names may carry a leading article the board keys
+            # drop ('The Grey Havens' vs 'grey havens') and vice versa - try
+            # both forms
             alt = key[4:] if key.startswith('the ') else 'the ' + key
             if alt in self._regions:
                 return self._regions[alt]
@@ -481,18 +469,10 @@ class Board:
             
     def adjacent(self, name: str) -> list[str]:
         key = sanitize(name)
-        # SORTED: _adj holds SETS - unsorted iteration made every
-        # unlogged first-legal pick (teacher retreat destinations,
-        # heuristic fallbacks) PYTHONHASHSEED-dependent; canary Adobim
-        # flipped CLEAN/MISMATCH between identical runs (2026-07-11,
-        # amendment 1.124)
-        #
-        # OPT (stateless memo): the adjacency graph `adj` is built once at
-        # import and never mutated at runtime (add_edge/remove_edge only
-        # run during import), so the sorted neighbour list for a given key
-        # is constant. Cache the sorted TUPLE keyed on the sanitized name
-        # and return a fresh list copy each call — byte-identical order,
-        # and callers keep a mutable list they can modify safely.
+        # SORTED (1.124): _adj holds SETS and unsorted iteration made every
+        # first-legal pick PYTHONHASHSEED-dependent.  Memoized: adj is
+        # immutable after import, so the sorted TUPLE per key is constant;
+        # return a fresh list copy each call.
         cached = _ADJ_SORTED_CACHE.get(key)
         if cached is None:
             if key not in self._adj:

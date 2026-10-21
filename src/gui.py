@@ -31,7 +31,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UNITS_DIR = os.path.join(BASE_DIR, "units")
 DICE_DIR = os.path.join(BASE_DIR, "dice")
 POLIT_DIR = os.path.join(BASE_DIR, "political_track")
-FEL_DIR = os.path.join(BASE_DIR, "fellowship")
 
 # ---------------------------------------------------------------------------
 # Colors - Dark theme with good contrast
@@ -3334,11 +3333,10 @@ class WotrGUI:
                 self.log(f"Cannot play: {msg}")
                 return
 
-            # stale sweep 2026-07-27 (USER order): the legacy
-            # get_card_choices dialog is deleted — play with empty
-            # choices and let the LEARNED option-spec pending
-            # (pending_card_option) surface the decision, exactly as
-            # in self-play.
+            # play with empty choices and let the LEARNED option-spec
+            # pending (pending_card_option) surface the decision,
+            # exactly as in self-play (USER 2026-07-27: no legacy
+            # get_card_choices dialog).
             choices = {}
 
             # GUI and engine hands must agree (kept in step by
@@ -3388,7 +3386,7 @@ class WotrGUI:
                     if not _gl_phd._offer_hunt_reduction(self.state):
                         _gl_phd._settle_hunt_damage(self.state)
 
-                # full-pass review 2026-07-27: a card played with empty
+                # a card played with empty
                 # choices may open a learned pending (pending_card_option
                 # e.g. __overstack__/bof_separation, pending_combat) —
                 # surface it NOW, not on the next unrelated action.
@@ -3536,8 +3534,7 @@ class WotrGUI:
             hunt_params = get_hunt_params(self.state)
 
             # Move fellowship with skip_hunt=True so we handle hunt interactively.
-            # skip_auto_sacrifice=False is EXPLICIT (auto-resolver purge
-            # 2026-08-16, defaults inverted): the legacy manual GUI has no
+            # skip_auto_sacrifice=False is EXPLICIT: the legacy manual GUI has no
             # pending-decision loop, and its MORDOR branch relies on
             # move_fellowship's internal tile resolution (incl. the
             # auto-sacrifice policy) - outside Mordor skip_hunt=True keeps
@@ -4882,7 +4879,14 @@ class WotrGUI:
         import game_logic
 
         if self.selfplay_turn > 0:
-            _safe_next_turn(self.state)
+            if _safe_next_turn(self.state):
+                result = game_logic.check_all_victory_conditions(self.state)
+                self.log(f"\n*** GAME OVER: {result['victory']} wins by "
+                         f"{result.get('victory_type', '')}! ***")
+                self.selfplay_running = False
+                self._sync_hands()
+                self.refresh()
+                return
 
         self.selfplay_turn += 1
         if self.selfplay_turn > 25:
@@ -4954,17 +4958,7 @@ class WotrGUI:
 
         # If both sides out of dice, next turn
         if fp_left == 0 and sh_left == 0:
-            # End-of-turn Victory Check phase (rulebook p.17, ruling
-            # 1.212a): military victory (Shadow-first tiebreaker) is
-            # resolved here, after the turn's actions complete.
-            _end_vc = game_logic.check_all_victory_conditions(self.state)
-            if game_logic.should_game_end(_end_vc, end_of_turn=True):
-                self.log(f"\n*** GAME OVER: {_end_vc['victory']} wins by "
-                         f"{_end_vc.get('victory_type', '')}! ***")
-                self.selfplay_running = False
-                self._sync_hands()
-                self.refresh()
-                return
+            # _selfplay_next_turn settles inactivity before military victory.
             if self.selfplay_paused:
                 # In step mode, go to next turn immediately on this step
                 self._selfplay_next_turn()
@@ -5413,8 +5407,10 @@ class WotrGUI:
         tk.Button(bar, text=">|", width=3,
                   command=lambda: self._replay_goto(len(self.replay_steps) - 1)).pack(side=tk.LEFT, padx=2)
         meta = self.replay_meta
-        outcome = f"{meta.get('winner', '?').upper()} wins ({meta.get('victory_type', '?')}) " \
-                  f"in {meta.get('turns', '?')} turns"
+        winner = meta.get('winner')
+        outcome = (f"{str(winner).upper()} wins ({meta.get('victory_type', '?')}) "
+                   f"in {meta.get('turns', '?')} turns" if winner in ('fp', 'sh') else
+                   f"Game {meta.get('status', 'unfinished')} ({meta.get('reason') or 'no decided winner'})")
         self.replay_label = tk.Label(bar, text=outcome, anchor='w',
                                      bg=COLORS["panel_bg"], fg=COLORS["text"],
                                      font=("Arial", 10))
@@ -5452,7 +5448,9 @@ class WotrGUI:
 
         desc = describe_step(step)
         meta = self.replay_meta
-        outcome = f"{meta.get('winner', '?').upper()} wins ({meta.get('victory_type', '?')})"
+        winner = meta.get('winner')
+        outcome = (f"{str(winner).upper()} wins ({meta.get('victory_type', '?')})" if winner in ('fp', 'sh') else
+                   f"Game {meta.get('status', 'unfinished')} ({meta.get('reason') or 'no decided winner'})")
         self.replay_label.config(
             text=f"[{idx + 1}/{len(self.replay_steps)}] {desc}    |    {outcome}")
         if step['kind'] != 'initial':
@@ -5927,13 +5925,11 @@ if __name__ == '__main__':
     _tp = _a.trace_opt or _a.trace
     if _tp:
         if not os.path.exists(_tp):
-            # USER bug 2026-07-28: a stale card-index entry launched
-            # the replay GUI at a deleted trace — fail with a message,
-            # not a traceback.  2026-08-11 (USER: "doesn't let me open
-            # traces on batch 000"): quarantine RENAMES batch dirs, so
-            # first resolve the basename across every trace root;
-            # only a truly-deleted trace errors — via a dialog, since
-            # the launcher usually has no visible console.
+            # a stale card-index entry (deleted or quarantine-RENAMED
+            # batch dir): first resolve the basename across every trace
+            # root; only a truly-deleted trace errors - via a dialog,
+            # since the launcher usually has no visible console (USER
+            # 2026-07-28 / 2026-08-11).
             import trace_resolve as _tr
             _rp, _roots = _tr.resolve_trace(_tp)
             if _rp:
@@ -5962,5 +5958,5 @@ if __name__ == '__main__':
         launch_gui(_gs.setup_initial_game(_b), _b)
 
 
-    # (stale sweep 2026-07-27: the legacy pay-off dialog is deleted —
-    #  the engine's certified table-card-kill path is authoritative)
+    # (the engine's table-card-kill path is authoritative; no GUI
+    #  pay-off dialog)

@@ -24,18 +24,14 @@ SHADOW_NATIONS = {Nation.ISENGARD, Nation.SAURON, Nation.SOUTHRON_EASTERLINGS}
 
 
 def roll_d6_batch(n: int, ctx: str = '', side=None) -> List[int]:
-    """RANDOMNESS FUNNEL (session 33): every combat d6 batch goes through
-    here.  Default body = the exact inline code it replaced (same
-    `random.randint` calls, same order — seeded runs and the corpus
-    canary are unaffected).  The LIVE bridge monkey-patches this so real
-    game advances consume the Java client's own rolls (roll1..5
-    handlers); MCTS clones keep this default.
+    """RANDOMNESS FUNNEL: every combat d6 batch goes through here.  Default
+    body = plain `random.randint` calls (seeded runs unchanged).  The LIVE
+    bridge monkey-patches this so real game advances consume the Java
+    client's own rolls (roll1..5 handlers); MCTS clones keep this default.
 
     `side` (G1, USER live 2026-08-18: "Each side rolls its own combat
     dice.  The AI rolls its own; the human rolls their own; the
-    attacker rolls first.") is WHOSE dice these are.  The engine already
-    asked per side, attacker first — only the DIRECTIVE was side-blind,
-    so the AI ended up rolling the human's dice for him.  Optional and
+    attacker rolls first.") is WHOSE dice these are.  Optional and
     ignored by the default body, so every offline caller is unchanged."""
     return [random.randint(1, 6) for _ in range(n)]
 
@@ -169,6 +165,57 @@ def count_elite_units(army: Army) -> int:
     return sum(1 for u in army.units if u.kind == UnitKind.ELITE)
 
 
+def _recompute_round_leadership(combat: CombatState) -> None:
+    """ONE derivation of both sides' Leadership and the forfeitable
+    Nazgul pool from the CURRENT rosters - setup_combat and the internal
+    multi-round reset share it (audit CB-5).
+
+    Leadership = Leaders + Nazgul (Witch-king 2) + Companion ratings
+    (calc_leadership, 1.233 own-side only) + Saruman's Isengard-Elite
+    bonus, under the BATTLE-scoped Gandalf-the-White shine: all Nazgul
+    Leadership negated for the battle (_shine_companion), the shining
+    Companion's own Leadership forfeited on an explicit decision only
+    (_shined_companion).  Per-ROUND forfeits (Mighty Attack / Anduril,
+    Daring Defiance, Dread and Despair, They are Terrible, Cruel as Death,
+    Words of Power) are NOT carried - the card texts bind them to 'that
+    Combat round' - and figures eliminated mid-battle are already gone
+    from army.leaders."""
+    from game_state import Nazgul as _Nz
+    shine = getattr(combat, '_shine_companion', None) is not None
+    shined = getattr(combat, '_shined_companion', None)
+    saruman = bool(getattr(combat, '_saruman_in_play', False))
+
+    def _own(army, side):
+        return [l for l in army.leaders if _combat_leader_side(l) == side]
+
+    def _nazgul_pool(ldrs):
+        # plain Nazgul 1 each + the Witch-king's Minion leadership
+        # (USER 2026-07-18: he forfeits like a Nazgul)
+        return (sum(1 for l in ldrs if isinstance(l, _Nz))
+                + sum(getattr(l, 'leadership', 2) for l in ldrs
+                      if type(l).__name__ == 'Minion'
+                      and 'witch' in getattr(l, 'name', '').lower()))
+
+    def _side_leadership(army, side):
+        lead = calc_leadership(
+            army, cancel_nazgul=(shine and side == Side.SHADOW))
+        if saruman and side == Side.SHADOW:
+            lead += sum(1 for u in army.units
+                        if u.nation == Nation.ISENGARD
+                        and u.kind == UnitKind.ELITE)
+        if shined is not None and any(l is shined for l in army.leaders):
+            lead = max(0, lead - getattr(shined, 'leadership', 1))
+        return lead
+
+    combat.attacker_leadership = _side_leadership(
+        combat.attacker_army, combat.attacker_side)
+    combat.defender_leadership = _side_leadership(
+        combat.defender_army, combat.defender_side)
+    combat.nazgul_in_battle = (
+        _nazgul_pool(_own(combat.attacker_army, combat.attacker_side))
+        + _nazgul_pool(_own(combat.defender_army, combat.defender_side)))
+
+
 # ---------------------------------------------------------------------------
 # Combat Setup
 # ---------------------------------------------------------------------------
@@ -217,11 +264,9 @@ def setup_combat(state: "GameState", attacker_region: str, defender_region: str,
         garrison = garrison_side_for(state, def_key)
         besieger = Side.SHADOW if garrison == Side.FREE_PEOPLES \
             else Side.FREE_PEOPLES
-        # Direction (2026-07-10 sortie fix): the default attacker is
-        # the besieger (siege assault); a SORTIE - the garrison
-        # attacking its besiegers, rulebook p.32, a field battle -
-        # inverts it.  attacker_side arrives from the acting side via
-        # battle choices; None keeps the historical assault default.
+        # Attacker default = the besieger (siege assault); a SORTIE (rulebook
+        # p.32, the garrison attacking out, a field battle) inverts it via
+        # attacker_side from the acting side's battle choices.
         _atk_s = attacker_side if attacker_side is not None else besieger
         parent = atk_army
         v_gar = Army(region=parent.region)
@@ -232,36 +277,21 @@ def setup_combat(state: "GameState", attacker_region: str, defender_region: str,
         for l in parent.leaders:
             (v_gar if _combat_leader_side(l) == garrison
              else v_bes).leaders.append(l)
-        # Rulebook p.31 caps a besieged garrison at FIVE Army units;
-        # USER 1.181 overrules the printed removed-from-the-game
-        # destination — the excess returns to REINFORCEMENTS (an
-        # untracked removal IS the pool return), never casualties.
-        # (game0 T9: Cirdan's Ships raised the DA garrison to 7; the
-        # human removed 2 Gondor Regulars.)  Regulars removed first.
-        # The cap binds the GARRISON portion whichever combat role it
-        # takes (assault defender or sortie attacker).
+        # Rulebook p.31 caps a besieged garrison at FIVE units; USER 1.181: the
+        # excess returns to REINFORCEMENTS (an untracked removal IS the pool
+        # return), never casualties; regulars removed first; binds the
+        # GARRISON portion whichever combat role it takes.
         if (len(v_gar.units) > 5
-                and def_key in getattr(state, 'besieged_strongholds', set())):
-            # The 5-unit cap is a BESIEGED-STRONGHOLD rule (rulebook p.31).
-            # It must NOT fire for a co-located FIELD battle where the
-            # region is not (yet) besieged - e.g. Corsairs of Umbar lands
-            # a Shadow army onto an FP army in an open Gondor coastal
-            # region (almanac A10).  Every pre-existing co-located battle
-            # is a besieged stronghold, so this gate is behavior-neutral
-            # for them.
+                and def_key in getattr(state, 'besieged_strongholds', set())
+                and not (getattr(state, 'pending_combat', None) or {}).get('corsairs_relief_garrison')):
+            # Besieged-stronghold rule only: a co-located FIELD battle in an
+            # unbesieged region (Corsairs landing, almanac A10) is exempt.
             excess = len(v_gar.units) - 5
             removable = ([u for u in v_gar.units
                           if u.kind == UnitKind.REGULAR]
                          + [u for u in v_gar.units
                             if u.kind == UnitKind.ELITE])
-            # WHICH box the excess goes to is the USER 1.181 house
-            # ruling (2026-07-20, CL-147, game_logic siege re-clamp):
-            # REINFORCEMENTS, never casualties — an untracked removal
-            # IS a pool return (reinforcements = max - deployed -
-            # fp_casualties).
-            _cap_removed9 = list(removable[:excess])
-            _cap_removed_side9 = garrison
-            for u in _cap_removed9:
+            for u in removable[:excess]:
                 v_gar.units.remove(u)
         v_atk = v_gar if _atk_s == garrison else v_bes
         v_def = v_bes if _atk_s == garrison else v_gar
@@ -272,11 +302,9 @@ def setup_combat(state: "GameState", attacker_region: str, defender_region: str,
         atk_army, def_army = v_atk, v_def
         _coloc_parent = parent
 
-    # Away-attack from / into a co-located siege region (from != to):
-    # the shared entry mixes both sides' units. Only the right portion
-    # fights — the bystanders (e.g. the garrison inside the stronghold)
-    # stay home; resolve_combat writes survivors back. (v9 showcase:
-    # besiegers at Erebor attacking Iron Hills crashed side_of_army.)
+    # Away-attack from / into a co-located siege region (from != to): only the
+    # right portion of the shared entry fights; bystanders stay home and
+    # resolve_combat writes survivors back.
     _away_atk_parent = _away_def_parent = None
     _away_atk_rest = _away_def_rest = None
     if _coloc_parent is None:
@@ -313,6 +341,21 @@ def setup_combat(state: "GameState", attacker_region: str, defender_region: str,
             if _v.units:
                 _away_def_parent, _away_def_rest = def_army, (_ru, _rl)
                 def_army = _v
+
+    from army_participants import partition_battle_army
+    _formation_side = attacker_side or side_of_army(atk_army)
+    _pu, _pl, _ru, _rl = partition_battle_army(
+        state, atk_army, atk_key, _formation_side)
+    _coloc_rear = (list(_ru), list(_rl))
+    if _ru or _rl:
+        if _coloc_parent is None:
+            if _away_atk_parent is None:
+                _away_atk_parent = atk_army
+                _away_atk_rest = (list(_ru), list(_rl))
+            else:
+                _away_atk_rest = (_away_atk_rest[0] + list(_ru),
+                                  _away_atk_rest[1] + list(_rl))
+        atk_army = Army(region=atk_army.region, units=list(_pu), leaders=list(_pl))
 
     atk_side = side_of_army(atk_army)
     def_side = side_of_army(def_army)
@@ -352,15 +395,9 @@ def setup_combat(state: "GameState", attacker_region: str, defender_region: str,
     def_minions = [getattr(l, 'name', '') for l in _def_own_ldrs
                    if type(l).__name__ == 'Minion']
 
-    # Nazgul Leadership available for FORFEIT (Dread & Despair, They are
-    # Terrible, Cruel as Death) and the Foul Stench re-roll-cancel check.
-    # USER 2026-07-18: "witch king counts as a nazgul so he can forfeit
-    # his leadership for cruel as death, they are terrible, dread and
-    # despair, etc."  The Witch-king is modelled as a Shadow Minion (2
-    # leadership), not a Nazgul instance; add his leadership to the
-    # forfeitable pool alongside the plain Nazgul (each worth 1) so the
-    # pending-effect enumeration (ai._maybe_combat_effect_choice_phase /
-    # apply_dread_and_despair / apply_they_are_terrible) can offer it.
+    # USER 2026-07-18: the Witch-king (a Minion, leadership 2) forfeits like a
+    # Nazgul - his leadership joins the forfeitable pool (Dread & Despair,
+    # They are Terrible, Cruel as Death, Foul Stench).
     def _wk_leadership(ldrs_):
         # 1.233: own-side leaders only (stranded WK forfeits nothing)
         return sum(getattr(l, 'leadership', 2)
@@ -370,18 +407,10 @@ def setup_combat(state: "GameState", attacker_region: str, defender_region: str,
     atk_nazgul_ldr = atk_nazgul + _wk_leadership(_atk_own_ldrs)
     def_nazgul_ldr = def_nazgul + _wk_leadership(_def_own_ldrs)
 
-    # Fellowship CO-LOCATION fact only (USER 1.209, 2026-07-21): a
-    # Fellowship co-located with the battling army contributes NOTHING to
-    # combat -- no companion combat dice (no Captain-of-the-West die), no
-    # Leadership re-rolls, no Gandalf-the-White shine candidacy, and its
-    # members do NOT satisfy any combat-card play gate (requires_companion,
-    # requires_hobbit) nor appear in companions_in_battle.  We keep ONLY the
-    # boolean "is the Fellowship in the defender's region", which still
-    # matters for (a) FP combat-card play eligibility bookkeeping and (b)
-    # "Denethor's Folly": FP cannot play combat cards in Minas Tirith.
-    # (The Fellowship-in-region gate for It is a Gift / One for the
-    # Dark Lord is enforced independently via
-    # card.requires_fellowship_region.)
+    # USER 1.209 (2026-07-21): a co-located Fellowship contributes NOTHING to
+    # combat - no dice, no Leadership, no shine candidacy, no card gate; only
+    # the co-location BOOLEAN survives, for FP card eligibility and
+    # Denethor's Folly (no FP combat cards in Minas Tirith).
     from persistent_effects import can_fp_play_combat_card
     fp_card_ok, _folly = can_fp_play_combat_card(state, def_key)
     if not fp_card_ok:
@@ -390,15 +419,10 @@ def setup_combat(state: "GameState", attacker_region: str, defender_region: str,
         else:
             defender_card = None
 
-    # Gandalf 'shining' (USER 2026-07-16 item 11): Gandalf the White may
-    # forfeit HIS Leadership to cancel ALL Nazgul leadership (incl. the
-    # Witch-king) in his battle.  This is a DECISION - it no longer happens
-    # automatically.  The pending-combat machine records the FP choice in
-    # pending_combat['gtw_shine']; a direct resolve / test with no machine
-    # (no 'gtw_shine' key) keeps the legacy "shines" default.
-    # NB (USER 1.209 + 2026-07-21e): Gandalf the White can NEVER be in the
-    # Fellowship (he arrives already separated), so scanning only the two
-    # map armies loses no real shine candidate.
+    # Gandalf the White's shine is a DECISION (USER 2026-07-16 item 11):
+    # pending_combat['gtw_shine'] records it; no machine / no key keeps the
+    # legacy "shines" default.  GtW is never in the Fellowship (1.209), so
+    # scanning the two armies loses no candidate.
     _gtw_comp = next(
         (c for c in atk_companions + def_companions
          if getattr(c, 'can_cancel_nazgul_leadership', False)
@@ -409,25 +433,13 @@ def setup_combat(state: "GameState", attacker_region: str, defender_region: str,
                      if isinstance(_pcst, dict) and 'gtw_shine' in _pcst
                      else None)
     gtw_shines = gtw_in_battle and (_shine_choice is not False)
-    atk_cancel = gtw_shines and atk_side == Side.SHADOW
-    def_cancel = gtw_shines and def_side == Side.SHADOW
 
-    # Saruman's ability: while Saruman is in play, Isengard Elite units
-    # also count as Leaders (leadership 1 each). Verified vs game0:
-    # T5 Fords of Isen (Isengard 2R+5E rerolled 3) and T7 Helm's Deep
-    # (leaderless Isengard 5R+4E rerolled 2).
-    def _isengard_elite_leadership(army_):
-        return sum(1 for u in army_.units
-                   if u.nation == Nation.ISENGARD
-                   and u.kind == UnitKind.ELITE)
+    # Saruman in play: Isengard Elites also count as Leaders (derived from the
+    # live roster by _recompute_round_leadership)
     _saruman_in_play = any(
         type(l).__name__ == 'Minion'
         and 'saruman' in getattr(l, 'name', '').lower()
         for a in state.armies.values() for l in a.leaders)
-    saruman_atk_bonus = _isengard_elite_leadership(atk_army) \
-        if (_saruman_in_play and atk_side == Side.SHADOW) else 0
-    saruman_def_bonus = _isengard_elite_leadership(def_army) \
-        if (_saruman_in_play and def_side == Side.SHADOW) else 0
 
     combat = CombatState(
         attacker_region=atk_key,
@@ -443,32 +455,21 @@ def setup_combat(state: "GameState", attacker_region: str, defender_region: str,
         defender_card=defender_card,
         attacker_combat_strength=calc_combat_strength(atk_army),
         defender_combat_strength=calc_combat_strength(def_army),
-        attacker_leadership=calc_leadership(atk_army, cancel_nazgul=atk_cancel)
-        + saruman_atk_bonus,
-        defender_leadership=calc_leadership(def_army,
-                                            cancel_nazgul=def_cancel)
-        + saruman_def_bonus,
+        # Leadership + the Nazgul pool are derived below by
+        # _recompute_round_leadership once the battle-scoped shine facts
+        # are on the state (ONE derivation, shared with the multi-round
+        # reset - audit CB-5)
         companions_in_battle=def_companions + atk_companions,
-        nazgul_in_battle=atk_nazgul_ldr + def_nazgul_ldr,
         minions_in_battle=atk_minions + def_minions,
     )
-    # When Gandalf shines he FORFEITS his own Leadership (the cost of the
-    # cancel).  Remove his contribution from the FP side and mark him as
-    # already spent so Mighty Attack / Daring Defiance cannot forfeit it a
-    # second time (USER 2026-07-16 item 11).  Only on an EXPLICIT shine
-    # decision - the legacy default (no pending machine / teacher replay)
-    # keeps cancelling Nazgul leadership without the forfeit cost, so the
-    # certified battle math is unchanged.
-    combat._shined_companion = None
-    if _shine_choice is True and _gtw_comp is not None:
-        _g_ldr = getattr(_gtw_comp, 'leadership', 1)
-        if _gtw_comp in atk_companions:
-            combat.attacker_leadership = max(
-                0, combat.attacker_leadership - _g_ldr)
-        else:
-            combat.defender_leadership = max(
-                0, combat.defender_leadership - _g_ldr)
-        combat._shined_companion = _gtw_comp
+    # An EXPLICIT shine forfeits Gandalf's own Leadership once (Mighty Attack /
+    # Daring Defiance cannot forfeit it again); the legacy default cancels
+    # without the cost, so the certified battle math is unchanged.
+    combat._shined_companion = (_gtw_comp
+                                if (_shine_choice is True
+                                    and _gtw_comp is not None)
+                                else None)
+    combat._saruman_in_play = _saruman_in_play
 
     # Words-of-Power round markers (USER 1.208i/j). Default inert; set by
     # apply_words_of_power (Phase 1b) / apply_reroll_cancellation (Phase 5).
@@ -482,24 +483,18 @@ def setup_combat(state: "GameState", attacker_region: str, defender_region: str,
     combat._shine_cancelled_leadership = (
         (atk_nazgul_ldr if atk_side == Side.SHADOW else def_nazgul_ldr)
         if gtw_shines else 0)
+    _recompute_round_leadership(combat)
 
     combat.coloc_parent = _coloc_parent
-    # 5-unit siege-cap removals (informational: excess is a pool
-    # return per USER 1.181 — never booked as casualties, B2)
-    combat.cap_removed = locals().get('_cap_removed9') or []
-    combat.cap_removed_side = locals().get('_cap_removed_side9')
+    combat.coloc_rear = _coloc_rear
     combat.away_atk_parent = _away_atk_parent
     combat.away_atk_rest = _away_atk_rest
     combat.away_def_parent = _away_def_parent
     combat.away_def_rest = _away_def_rest
 
-    # RULING 1.228c (USER 2026-08-03): keep a handle to the live
-    # GameState so combat-card Minion kills (Fateful Strike / Blade of
-    # Westernesse) can do full character-sheet bookkeeping mid-round
-    # (in_play flip + Saruman elimination discards) — see
-    # _card_kill_minion_bookkeeping.  Follows the established
-    # post-construction attr pattern above; direct CombatState
-    # constructions fall back to _ACTIVE_STATE (game_logic.battle).
+    # 1.228c: keep the live GameState so card Minion kills do character-sheet
+    # bookkeeping mid-round (_card_kill_minion_bookkeeping); bare
+    # CombatStates fall back to _ACTIVE_STATE.
     combat._live_state = state
 
     return combat
@@ -564,20 +559,19 @@ def leader_reroll(rolls: List[int], threshold: int, leadership: int,
     if leadership <= 0:
         return [], 0
 
-    # Find misses (dice that didn't hit) — judged with the COMBAT
-    # roll's modifier, NOT the re-roll modifier: a re-roll-only bonus
-    # (They are Terrible) must not retroactively turn an original miss
-    # into a hit and shrink the re-roll pool (USER 2026-07-09: Lorien
-    # siege, [2,5,3] at 6+ = 3 misses -> 3 re-roll dice, engine gave 2).
-    # Under Confusion, natural 1s already penalized the roller and should
-    # NOT be re-rolled per the card text ("cannot be rolled again").
+    # Misses are judged with the COMBAT roll's modifier (USER 2026-07-09): a
+    # re-roll-only bonus must not shrink the pool.  Under Confusion natural
+    # 1s are excluded (card text: "cannot be rolled again").
     _mm = modifier if miss_modifier is None else miss_modifier
     misses = []
     for i, r in enumerate(rolls):
         if confused and r == 1:
             continue  # Confused 1s are excluded from re-roll pool
         modified = r + _mm
-        if r != 6 and modified < threshold:
+        # Natural 1 always misses, including Ent's Rage + Deadly Strife
+        # (+4). It stays eligible for a Leader re-roll unless Confusion
+        # explicitly excluded it above (rulebook p.30).
+        if r == 1 or (r != 6 and modified < threshold):
             misses.append(i)
 
     # Misses converted by Mighty Attack / Anduril are hits now
@@ -631,12 +625,8 @@ def apply_casualties(army: Army, hits: int,
     # across rounds (temp-army additions are invisible to
     # _count_deployed); standalone/card calls get a fresh per-call dict.
     _dgc = _BATTLE_DG if _BATTLE_DG is not None else {}
-    # Standalone (non-battle) scope: freeze the reinforcement baseline
-    # NOW, before the loop kills anything (task 164). In a battle
-    # _DG_AVAIL0 already holds the battle-start baseline and wins; here it
-    # is None, so a card/unit-op call that removes regulars then downgrades
-    # an elite still checks against the pre-call pool, not a kill-deflated
-    # live count. None when no state is published (direct unit use).
+    # Standalone scope: freeze the reinforcement baseline before any kill (task
+    # 164); in a battle _DG_AVAIL0 already holds it and wins.
     _av0 = None if _DG_AVAIL0 is not None else _capture_reg_baseline(_ACTIVE_STATE)
     casualties = []
     remaining_hits = hits
@@ -758,7 +748,7 @@ def apply_cancel_effects(combat: CombatState) -> None:
     # a battle-scoped White Rider 'shine' commitment persists via
     # _shined_companion and re-seeds it every round.
     _sh0 = getattr(combat, '_shined_companion', None)
-    combat._leadership_forfeited = {id(_sh0)} if _sh0 is not None else set()
+    combat._leadership_forfeited = {_sh0.name} if _sh0 is not None else set()
 
     def _resolve_side(is_attacker):
         if is_attacker:
@@ -772,11 +762,17 @@ def apply_cancel_effects(combat: CombatState) -> None:
             return
         is_forfeit = "forfeit" in effect and "leadership" in effect
         if is_forfeit:
+            # Almanac p38: without an opposing card, Daring Defiance has
+            # no effect and does not forfeit any Companion Leadership.
+            opposing_card = (combat.defender_card if is_attacker
+                             else combat.attacker_card)
+            if opposing_card is None:
+                return
             # Daring Defiance: if a participating Companion already
             # forfeited its Leadership (White Rider shine), the
             # all-Companion forfeit cost cannot be paid -> NO effect.
             forfeited = getattr(combat, '_leadership_forfeited', set())
-            if any(id(c) in forfeited for c in combat.companions_in_battle):
+            if any(c.name in forfeited for c in combat.companions_in_battle):
                 return
         # Fire: cancel the OPPONENT's card.
         if is_attacker:
@@ -800,7 +796,7 @@ def apply_cancel_effects(combat: CombatState) -> None:
                 if c is _shined or c is _wopc:
                     continue
                 companion_leadership += getattr(c, 'leadership', 1)
-                forfeited.add(id(c))
+                forfeited.add(c.name)
             if is_attacker:
                 combat.attacker_leadership = max(
                     0, combat.attacker_leadership - companion_leadership)
@@ -833,10 +829,7 @@ def apply_dice_modifiers(combat: CombatState) -> None:
         e.g. Swarm of Bats' no-card clause, They are Terrible) touch
         reroll_mod ONLY and must NOT touch dice_mod.
     Advantageous Position's -1 to the Shadow Combat roll must NOT depress
-    Shadow re-rolls. The old generic "add 1 to all dice" branch matched
-    the re-roll phrasing and wrongly boosted the combat roll (USER audit
-    2026-07-09: Swarm of Bats); combat-roll bonuses used to leak into the
-    re-roll via reroll_mod = dice_mod + reroll_mod (REMOVED under 1.208h).
+    Shadow re-rolls.
     """
     import re as _re
 
@@ -859,10 +852,8 @@ def apply_dice_modifiers(combat: CombatState) -> None:
             def add_enemy_dice(n): combat.attacker_dice_mod += n
             opp_card = combat.attacker_card
 
-        # "Both Armies add N" cards (Deadly Strife +2, Desperate Battle
-        # +1) name BOTH the combat roll AND the leader re-roll, so under
-        # 1.208h they must fill BOTH buckets on both sides (previously
-        # dice_mod only, relied on the removed dice_mod->re-roll flow).
+        # "Both Armies add N" cards name BOTH rolls: fill both buckets on both
+        # sides (1.208h)
         if "both armies add 2" in effect:
             combat.attacker_dice_mod += 2
             combat.defender_dice_mod += 2
@@ -892,11 +883,8 @@ def apply_dice_modifiers(combat: CombatState) -> None:
             if getattr(combat, '_shine_companion', None) is None:
                 cost_leadership(2)
                 add_dice(1)
-        # Relentless Assault (also The King is Revealed / Rage of the
-        # Dunlendings combat sides): "add 1 to all dice ... FOR EACH HIT
-        # you inflicted" — the magnitude is per self-inflicted hit and
-        # is applied by apply_relentless_assault. The old generic branch
-        # ALSO added a phantom flat +1 here; skip it.
+        # Relentless Assault: the +1-per-hit magnitude is applied by
+        # apply_relentless_assault - no flat +1 here
         elif "inflict" in effect and "up to two hits" in effect:
             pass
         else:
@@ -936,10 +924,8 @@ def apply_dice_modifiers(combat: CombatState) -> None:
     if combat.defender_card and not combat.defender_card_cancelled:
         _apply(combat.defender_card.combat_effect.lower(), False)
 
-    # NOTE: no defender dice bonus for fortifications — per rulebook the
-    # only City/Fortification effect is the attacker's first-round 6+
-    # threshold (city_defense). The old +1 defender modifier was a house
-    # rule (verified vs game0: T5 Fords of Isen, FP rolled at plain 5+).
+    # No defender bonus for fortifications: the only City/Fortification effect
+    # is the attacker's first-round 6+ (city_defense).
 
 
 def _companions_present(combat: CombatState) -> int:
@@ -963,16 +949,10 @@ def apply_dice_count_modifiers(combat: CombatState) -> None:
         elif "maximum of three dice" in effect:
             combat.defender_dice_cap = 3
 
-        # Brave Stand (USER 2026-07-16: previously non-functional): "The
-        # Shadow player rolls one die less in his Combat roll for each
-        # Companion present (to a minimum of one)."  Played by FP; the
-        # Shadow player is the OPPONENT.  Every Companion in the battle is
-        # a Free Peoples figure, so "each Companion present" =
-        # len(companions_in_battle).  The old code counted companions in
-        # the WRONG army (the Shadow defender, always 0) and used a
-        # 5-minus-count cap that ignored the Shadow's real dice, so it
-        # never reduced anything.  Route through dice_reduction (subtracted
-        # from combat strength; combat_roll floors the count at 1).
+        # Brave Stand (USER 2026-07-16): the Shadow rolls one die less per
+        # Companion present (min 1).  Every Companion in the battle is FP, so
+        # count companions_in_battle; delivered via dice_reduction (combat_roll
+        # floors at 1).
         if "rolls one die less" in effect and "companion" in effect:
             companion_count = _companions_present(combat)
             combat.defender_dice_reduction = getattr(
@@ -1030,22 +1010,26 @@ def _apply_pre_combat_for_side(combat: CombatState, is_attacker: bool) -> None:
 
     hits = 0
     rolls = []
+    # ZERO dice = no roll and NO batch consumed (audit CB-3; the kernel's
+    # witness plans depend on it).  combat_roll's minimum-of-one belongs to
+    # the Combat roll, not to these cards.
     if "leadership" in effect:
         # Sudden Strike: dice = leadership (max 5), at the round's base number
         dice = min(5, leadership)
-        rolls, hits = combat_roll(dice, base_threshold, 0)
+        if dice > 0:
+            rolls, hits = combat_roll(dice, base_threshold, 0)
     elif "elite units" in effect:
         # Charge: dice = elite count (max 5), at the round's base number
         dice = min(5, count_elite_units(army))
-        rolls, hits = combat_roll(dice, base_threshold, 0)
+        if dice > 0:
+            rolls, hits = combat_roll(dice, base_threshold, 0)
     elif "three combat dice" in effect:
         # Durin's Bane: prints its own number (3 dice, hit on 4+)
         rolls, hits = combat_roll(3, 4, 0)
 
     if is_attacker:
         combat.attacker_pre_combat_hits += hits
-        # keep the rolls so self-play traces can show them (they were
-        # rolled and previously discarded — coordinator item 2026-07-15)
+        # keep the rolls for self-play traces
         combat.attacker_pre_combat_rolls.extend(rolls)
     else:
         combat.defender_pre_combat_hits += hits
@@ -1120,12 +1104,20 @@ def apply_reroll_cancellation(combat: CombatState) -> None:
     Anduril for the round; the block flag raised here is consumed by
     apply_mighty_attack at Phase 5b.
     """
+    # The Nazgul Leadership the card compares is the BATTLE's: a shining
+    # Gandalf the White (White Rider) negates all of it, so it is 0 and
+    # never equals/exceeds a positive FP Leadership - the same self-gate
+    # Cruel as Death / Dread and Despair / They are Terrible apply
+    # (USER interaction I; audit CB-4).
+    nazgul_leadership = (0 if getattr(combat, '_shine_companion', None)
+                         is not None else combat.nazgul_in_battle)
+
     # Check if attacker's card cancels defender re-roll
     if combat.attacker_card and not combat.attacker_card_cancelled:
         effect = combat.attacker_card.combat_effect.lower()
         if "leader re-roll is cancelled" in effect:
             # Check if nazgul leadership >= FP leadership
-            if combat.nazgul_in_battle >= combat.defender_leadership:
+            if nazgul_leadership >= combat.defender_leadership:
                 combat.defender_reroll_cancelled = True
                 combat._foul_stench_cancel_def = True
 
@@ -1133,7 +1125,7 @@ def apply_reroll_cancellation(combat: CombatState) -> None:
     if combat.defender_card and not combat.defender_card_cancelled:
         effect = combat.defender_card.combat_effect.lower()
         if "leader re-roll is cancelled" in effect:
-            if combat.nazgul_in_battle >= combat.attacker_leadership:
+            if nazgul_leadership >= combat.attacker_leadership:
                 combat.attacker_reroll_cancelled = True
                 combat._foul_stench_cancel_atk = True
 
@@ -1190,10 +1182,8 @@ def _apply_bonus_hits_for_side(combat: CombatState, is_attacker: bool) -> None:
             else:
                 combat.defender_bonus_hits += 2
 
-    # Great Host ("twice as many"): NOT here.  The 2x-army auto-hit is
-    # checked AFTER this round's casualties are removed (card text +
-    # almanac p43) — moved to _apply_post_casualty_for_side (audit
-    # 2026-07-26; prior flags 40/41 were mislabeled FIXED).
+    # Great Host is NOT here: evaluated after casualties
+    # (_apply_post_casualty_for_side, card text + almanac p43)
 
     # Mumakil: +1 if more hits than enemy
     if "more total hits" in effect and "score one additional hit" in effect:
@@ -1263,12 +1253,15 @@ def apply_confusion_effect(combat: CombatState) -> None:
             combat.defender_confusion = True
 
 
-def apply_words_of_power(combat: CombatState) -> None:
+def apply_words_of_power(combat: CombatState, choices: dict = None) -> None:
     """Words of Power: cancel one Companion for this Combat round.
 
     SH card (val=1): 'Choose a Companion. That Companion's Leadership
     and special abilities are cancelled for this Combat round.'
-    AI heuristic: pick the highest-Leadership companion. USER 1.208i, the
+    WHICH Companion is the Shadow player's decision (1.254 / audit CB-7):
+    choices['atk_effect_target' / 'def_effect_target'] names him (see
+    combat_effect_targets); without a pick the highest-Leadership
+    companion is taken (heuristic fallback).  USER 1.208i, the
     cancel spans (a) that Companion's Leadership re-roll contribution, (b)
     his Captain-of-the-West COMBAT die (applied at the roll site, pre-cap;
     4R+Boromir 5->4), and (c) his special abilities: Gandalf's shine (the
@@ -1284,19 +1277,19 @@ def apply_words_of_power(combat: CombatState) -> None:
         if card and not cancelled:
             effect = card.combat_effect.lower()
             if "companion" in effect and "leadership" in effect and "cancelled" in effect:
-                # CARD-FLEET flags 5/34 (2026-07-21): Words of Power's
-                # play condition is "Play if a Nazgul is in the
-                # battle". Defense-in-depth resolver gate (siblings
-                # apply_they_are_terrible / apply_dread_and_despair
-                # already self-gate): a direct resolve/test/bridge
-                # path must never cancel Leadership with no Nazgul
-                # present. Runs Phase 1b, before any forfeit
-                # decrements nazgul_in_battle.
+                # Resolver self-gate: "Play if a Nazgul is in the battle" - no
+                # Nazgul, no cancel (runs before any forfeit decrements
+                # nazgul_in_battle)
                 if combat.nazgul_in_battle < 1:
                     continue
                 if combat.companions_in_battle:
-                    target = max(combat.companions_in_battle,
-                                 key=lambda c: getattr(c, 'leadership', 0) or 0)
+                    target = _pick_named_companion(
+                        combat.companions_in_battle,
+                        (choices or {}).get('atk_effect_target' if is_atk
+                                            else 'def_effect_target'))
+                    if target is None:
+                        target = max(combat.companions_in_battle,
+                                     key=lambda c: getattr(c, 'leadership', 0) or 0)
                     # FP companions fight OPPOSITE the Shadow card's player.
                     fp_is_attacker = not is_atk
                     # (c) special ability: shining GtW -> cancel shine,
@@ -1350,11 +1343,9 @@ def apply_relentless_assault(combat: CombatState, choices: dict = None) -> None:
                 fc = choices.get('atk_effect_count' if is_atk
                                  else 'def_effect_count')
                 if fc is not None:
-                    # Learned decision: inflict exactly fc hits, clamped
-                    # to the card max and the army's HIT CAPACITY
-                    # (2*elites + regulars).  Almanac p44 permits wiping
-                    # the whole army (audit 2026-07-26; the old len-1
-                    # keep-one mirrored the pre-fix Onslaught bug).
+                    # Learned decision: inflict exactly fc, clamped to the
+                    # card max and the army's HIT CAPACITY (2*elites +
+                    # regulars; a full wipe is legal, almanac p44)
                     _e_ra = count_elite_units(army)
                     _cap_ra = 2 * _e_ra + (len(army.units) - _e_ra)
                     k = max(0, min(int(fc), 2, _cap_ra))
@@ -1366,10 +1357,8 @@ def apply_relentless_assault(combat: CombatState, choices: dict = None) -> None:
                         else:
                             combat.defender_casualties.extend(casualties)
                             combat.defender_dice_mod += k
-                        # review P2 (2026-07-27): a FULL self-wipe must
-                        # set the destroyed flags here — the emptied
-                        # army otherwise rolled a phantom floor-1 die
-                        # before Phase 8 caught the destruction
+                        # a full self-wipe sets the destroyed flags here (no
+                        # phantom floor-1 die)
                         if is_army_destroyed(army):
                             if is_atk:
                                 combat.attacker_destroyed = True
@@ -1426,13 +1415,15 @@ def apply_dread_and_despair(combat: CombatState, choices: dict = None) -> None:
                 fc = choices.get('atk_effect_count' if is_atk
                                  else 'def_effect_count')
                 if fc is not None:
-                    forfeit = max(0, min(int(fc), nazgul_available))
+                    forfeit = int(fc)
+                    if not 1 <= forfeit <= nazgul_available:
+                        raise ValueError('Dread and Despair must forfeit between 1 and the available Nazgul leadership')
                 else:
                     # Forfeit enough to reduce FP to 1 die, keep at least
                     # 1 for re-roll
                     desired_reduction = max(0, fp_strength - 1)
-                    forfeit = min(desired_reduction,
-                                  max(0, nazgul_available - 1))
+                    forfeit = min(max(1, desired_reduction),
+                                  max(1, nazgul_available - 1))
                 if forfeit > 0:
                     # Reduce leadership
                     if is_atk:
@@ -1475,7 +1466,7 @@ def apply_they_are_terrible(combat: CombatState) -> None:
 
 def apply_mighty_attack(combat: CombatState, rolls: List[int],
                         threshold: int, modifier: int,
-                        is_attacker: bool) -> int:
+                        is_attacker: bool, choices: dict = None) -> int:
     """Mighty Attack / Anduril: forfeit companion leadership to auto-convert misses.
 
     FP card (val=4): 'Forfeit the Leadership of one Companion to automatically
@@ -1515,14 +1506,9 @@ def apply_mighty_attack(combat: CombatState, rolls: List[int],
         if not companions:
             return 0
 
-        # USER 2026-07-16: "forfeit the Leadership of ONE Companion" removes
-        # only THAT character's Leadership contribution (Strider 1, crowned
-        # Aragorn 2, most companions 1) — NOT the companion's Level and NOT
-        # the side's total Leadership.  The old code subtracted comp.level
-        # (3 for Strider/Aragorn, 2 for Boromir/Legolas/Gimli), which ate
-        # into every other Leader's contribution and effectively forfeited
-        # the whole re-roll.
-        def _forfeit(amt):
+        # USER 2026-07-16: forfeit only THAT Companion's Leadership rating
+        # (Strider 1, crowned Aragorn 2), never his Level.
+        def _forfeit(amt, payer):
             nonlocal_amt = max(0, int(amt))
             if is_attacker:
                 combat.attacker_leadership = max(
@@ -1530,6 +1516,14 @@ def apply_mighty_attack(combat: CombatState, rolls: List[int],
             else:
                 combat.defender_leadership = max(
                     0, combat.defender_leadership - nonlocal_amt)
+            paid = getattr(combat, '_round_paid_leadership', None)
+            if paid is None:
+                paid = combat._round_paid_leadership = []
+            paid.append(payer.name)
+            forfeited = getattr(combat, '_leadership_forfeited', None)
+            if forfeited is None:
+                forfeited = combat._leadership_forfeited = set()
+            forfeited.add(payer.name)
 
         # Andúril (Strider/Aragorn): forfeit Strider's Leadership (1) to
         # convert one miss, OR crowned Aragorn's Leadership (2) for up to two
@@ -1541,22 +1535,23 @@ def apply_mighty_attack(combat: CombatState, rolls: List[int],
                            or getattr(comp, 'leadership', 1) >= 2)
                 max_convert = 2 if crowned else 1
                 auto_hits = min(max_convert, misses)
-                _forfeit(getattr(comp, 'leadership', 1))
+                _forfeit(getattr(comp, 'leadership', 1), comp)
                 return auto_hits
-            # CARD-FLEET LOW-1 (2026-07-20): Anduril is paid by
-            # STRIDER's Leadership (1 miss) or crowned ARAGORN's (up
-            # to 2). With neither hero in the battle the card has NO
-            # effect (combat_req: "Play if Strider/Aragorn is in the
-            # battle"). Refuse HERE so a bypassed legality gate cannot
-            # fall through to the generic Mighty Attack path below and
-            # convert a miss off another Companion (probe: Gimli-only
-            # battle forfeited Gimli's Leadership for a hit).
+            # Anduril is paid by Strider / crowned Aragorn only; with neither
+            # present the card has no effect - never fall through to the
+            # generic path.
             return 0
 
         # Generic Mighty Attack: forfeit one Companion's Leadership, convert
         # one miss.  Pick the companion whose Leadership loss costs least.
-        target = min(companions, key=lambda c: getattr(c, 'leadership', 1))
-        _forfeit(getattr(target, 'leadership', 1))
+        target_name = (choices or {}).get('atk_effect_target' if is_attacker
+                                         else 'def_effect_target')
+        target = (_pick_named_companion(companions, target_name)
+                  if target_name is not None else
+                  min(companions, key=lambda c: getattr(c, 'leadership', 1)))
+        if target is None:
+            raise ValueError('Mighty Attack payer is not currently eligible')
+        _forfeit(getattr(target, 'leadership', 1), target)
         return 1
 
     return 0
@@ -1586,18 +1581,16 @@ def _card_kill_minion_bookkeeping(combat: CombatState, leader) -> None:
 
 
 def apply_fateful_strike(combat: CombatState, reroll_hits: int,
-                         is_attacker: bool) -> None:
+                         is_attacker: bool, choices: dict = None) -> None:
     """Fateful Strike: eliminate Nazgul on leader re-roll hit.
 
     FP card (val=6): 'If your Leader re-roll scores at least one hit,
     additionally eliminate a Nazgul (if present). If 2+ hits, can eliminate
     a Minion instead.'
 
-    RULING 1.228 (USER 2026-08-03): resolving here at Phase 5d — before
-    the Phase-7 Black Breath / Heroic Death window — is CORRECT even
-    though FS and Black Breath are both initiative 6: FS activates when
-    its play condition (the Leader re-roll) is met; the tied-initiative
-    defender-first rule is not relevant to this pairing.
+    Resolve at initiative 6, defender first on a tie. The observed reroll
+    already established the trigger: an earlier Black Breath removing
+    the original FP Leader does not cancel it (Almanac p39).
     """
     card = combat.attacker_card if is_attacker else combat.defender_card
     cancelled = combat.attacker_card_cancelled if is_attacker else combat.defender_card_cancelled
@@ -1605,13 +1598,36 @@ def apply_fateful_strike(combat: CombatState, reroll_hits: int,
         return
 
     effect = card.combat_effect.lower()
-    if "re-roll" not in effect or "nazg" not in effect:
+    # card-identity exact (audit CB-6): Foul Stench / They are Terrible
+    # also print "re-roll" + "Nazgul" and must never reach the kill below
+    # (a Shadow side would pop its own 1.233-stranded figure from the FP
+    # entry)
+    if "re-roll" not in effect or "nazg" not in effect \
+            or "fateful strike" not in card.combat_name.lower():
         return
 
     if reroll_hits >= 1:
         enemy_army = combat.defender_army if is_attacker else combat.attacker_army
         from game_state import Nazgul
         from game_logic import Minion
+        target = (choices or {}).get('atk_effect_target' if is_attacker
+                                   else 'def_effect_target')
+        if target is not None:
+            eligible = fateful_strike_targets(combat, is_attacker, reroll_hits)
+            if target not in eligible:
+                raise ValueError('Fateful Strike target is not currently eligible')
+            victim = next(l for l in enemy_army.leaders
+                          if (target == 'nazgul' and isinstance(l, Nazgul))
+                          or (target != 'nazgul' and isinstance(l, Minion)
+                              and l.name == target))
+            enemy_army.leaders.remove(victim)
+            if isinstance(victim, Minion):
+                if victim.name in combat.minions_in_battle:
+                    combat.minions_in_battle.remove(victim.name)
+                _card_kill_minion_bookkeeping(combat, victim)
+            else:
+                combat.nazgul_in_battle = max(0, combat.nazgul_in_battle - 1)
+            return
         # With 2+ re-roll hits the card lets you eliminate a MINION instead
         # of a Nazgûl (card text).  The USER house rule (item 8) requires a
         # Shadow Minion in the battle for this card, so on 2+ hits prefer
@@ -1623,12 +1639,9 @@ def apply_fateful_strike(combat: CombatState, reroll_hits: int,
                     enemy_army.leaders.pop(i)
                     if leader.name in combat.minions_in_battle:
                         combat.minions_in_battle.remove(leader.name)
-                    # RULING 1.228c: the Witch-king is modelled as a
-                    # Minion figure (NOT a Nazgul instance), so THIS
-                    # branch is the one that can eliminate him — flip
-                    # the character sheet (feeds the ai.py 1.228b
-                    # Sorcerer gate); a Saruman kill also discards
-                    # Palantir of Orthanc / Wormtongue.
+                    # 1.228c: the Witch-king is a Minion figure, so THIS branch
+                    # eliminates him - flip the character sheet; a Saruman
+                    # kill also discards Palantir / Wormtongue.
                     _card_kill_minion_bookkeeping(combat, leader)
                     return
         # 1 hit (or no Minion present): eliminate a Nazgûl.  Plain
@@ -1642,11 +1655,15 @@ def apply_fateful_strike(combat: CombatState, reroll_hits: int,
 
 
 def apply_blade_of_westernesse(combat: CombatState, reroll_hits: int,
-                                is_attacker: bool) -> None:
+                                is_attacker: bool,
+                                choices: dict = None) -> None:
     """Blade of Westernesse: use one hit to eliminate one Minion.
 
     FP card (val=6): 'Use one hit during the Leader re-roll to eliminate
     one Minion of your choice that is participating in the battle.'
+    "of your choice" = the FP player's pick (1.254 / audit CB-7) via
+    choices['<role>_effect_target'] (a Minion name, see
+    combat_effect_targets); roster order without one.
     """
     card = combat.attacker_card if is_attacker else combat.defender_card
     cancelled = combat.attacker_card_cancelled if is_attacker else combat.defender_card_cancelled
@@ -1660,44 +1677,48 @@ def apply_blade_of_westernesse(combat: CombatState, reroll_hits: int,
     if reroll_hits >= 1:
         enemy_army = combat.defender_army if is_attacker else combat.attacker_army
         from game_logic import Minion
-        for i, leader in enumerate(enemy_army.leaders):
-            if isinstance(leader, Minion):
-                enemy_army.leaders.pop(i)
-                if leader.name in combat.minions_in_battle:
-                    combat.minions_in_battle.remove(leader.name)
-                # RULING 1.228c: full character-sheet bookkeeping —
-                # in_play flip (Witch-king / Saruman / Mouth) and, for
-                # Saruman, the Palantir of Orthanc / Wormtongue table
-                # discards, so the dead minion's abilities cannot
-                # activate later.
-                _card_kill_minion_bookkeeping(combat, leader)
-                return
+        _tgt = (choices or {}).get('atk_effect_target' if is_attacker
+                                   else 'def_effect_target')
+        minions = [(i, l) for i, l in enumerate(enemy_army.leaders)
+                   if isinstance(l, Minion)]
+        named = [(i, l) for i, l in minions if _tgt and l.name == _tgt]
+        for i, leader in (named or minions):
+            if _tgt is not None and not named:
+                raise ValueError('Blade target is not a participating Minion')
+            role = 'attacker' if is_attacker else 'defender'
+            setattr(combat, role + '_hits', max(0, getattr(combat, role + '_hits') - 1))
+            enemy_army.leaders.pop(i)
+            if leader.name in combat.minions_in_battle:
+                combat.minions_in_battle.remove(leader.name)
+            # RULING 1.228c: full character-sheet bookkeeping —
+            # in_play flip (Witch-king / Saruman / Mouth) and, for
+            # Saruman, the Palantir of Orthanc / Wormtongue table
+            # discards, so the dead minion's abilities cannot
+            # activate later.
+            _card_kill_minion_bookkeeping(combat, leader)
+            return
 
 
 def apply_black_breath(combat: CombatState, reroll_hits: int,
-                       is_attacker: bool) -> None:
+                       is_attacker: bool, choices: dict = None) -> None:
     """Black Breath: eliminate FP leader or companion on re-roll hit.
 
     SH card (val=6): 'If your Leader re-roll scores at least one hit, you may
     additionally eliminate one FP Leader. Or eliminate a Companion if hits
     >= Companion level.'
-    AI heuristic: eliminate highest-level viable companion, else a leader.
+    WHICH figure dies is the Shadow player's decision (1.254 / audit
+    CB-7): choices['<role>_effect_target'] names a Companion (level <=
+    hits) or 'leader' (a plain Leader) - see combat_effect_targets.
+    Without a pick: highest-level viable companion, else a leader.
     """
     card = combat.attacker_card if is_attacker else combat.defender_card
     cancelled = combat.attacker_card_cancelled if is_attacker else combat.defender_card_cancelled
     if not card or cancelled:
         return
-    # 2026-07-21 resolver-gate parity (same class as Words of Power):
-    # Black Breath's play condition is "Play if a Nazgul is in the
-    # battle"; a re-roll can come from non-Nazgul leadership (Saruman,
-    # Isengard elites, Mouth), so self-gate here too.
-    # RULING 1.228 (USER 2026-08-03): vs Fateful Strike (also init 6)
-    # BOTH cards resolve — FS at Phase 5d on its own trigger, BB here
-    # at Phase 7; defender-first tie-breaking does not apply.  Kept
-    # edge case: FS killing the SOLE Nazgul at 5d drops
-    # nazgul_in_battle to 0 and this gate then blocks BB (certified
-    # CL-216).
-    if getattr(combat, 'nazgul_in_battle', 0) < 1:
+    # Eligibility was established when cards were revealed. Later figure
+    # removal does not undo the already observed reroll trigger.
+    if getattr(combat, '_round_nazgul_present',
+               getattr(combat, 'nazgul_in_battle', 0)) < 1:
         return
 
     effect = card.combat_effect.lower()
@@ -1709,13 +1730,19 @@ def apply_black_breath(combat: CombatState, reroll_hits: int,
     if reroll_hits < 1:
         return
 
-    # Try to eliminate highest-level companion whose level <= hits
+    if (choices or {}).get('atk_effect_count' if is_attacker else 'def_effect_count') == 0:
+        return
+    _tgt = (choices or {}).get('atk_effect_target' if is_attacker
+                               else 'def_effect_target')
     enemy_army = combat.defender_army if is_attacker else combat.attacker_army
     viable_companions = [
         c for c in combat.companions_in_battle if c.level <= reroll_hits
     ]
+    if _tgt == 'leader':
+        viable_companions = []       # the owner chose the plain Leader
     if viable_companions:
-        target = max(viable_companions, key=lambda c: c.level)
+        target = (_pick_named_companion(viable_companions, _tgt)
+                  or max(viable_companions, key=lambda c: c.level))
         if target in combat.companions_in_battle:
             combat.companions_in_battle.remove(target)
             # Remove from army leaders
@@ -1723,14 +1750,8 @@ def apply_black_breath(combat: CombatState, reroll_hits: int,
                 if isinstance(l, Companion) and l.name == target.name:
                     enemy_army.leaders.pop(i)
                     break
-            # RULING 1.228 wave (USER 2026-08-03): the Leadership POOL
-            # drops by the Companion's LEADERSHIP rating (e.g. Gandalf:
-            # level 3, leadership 1), NOT his level.  The viability
-            # gate above stays LEVEL-based per the card text ("if the
-            # number of hits equals or exceeds that Companion's
-            # Level").  Only visible in the engine-internal multi-round
-            # loop — the per-round ai.py flow rebuilds leadership via
-            # setup_combat each round.
+            # 1.228: the Leadership POOL drops by the Companion's LEADERSHIP
+            # rating (the viability gate stays LEVEL-based per card text)
             _ldr_drop = getattr(target, 'leadership', 1)
             if is_attacker:
                 combat.defender_leadership = max(
@@ -1758,13 +1779,16 @@ def apply_black_breath(combat: CombatState, reroll_hits: int,
 
 
 def _heroic_death_sacrifice(combat: CombatState, is_atk: bool, army: Army,
-                            fc: int, total_enemy: int) -> None:
+                            fc: int, total_enemy: int,
+                            target=None) -> None:
     """Apply a chosen Heroic Death sacrifice of magnitude fc.
 
-    fc semantics (mirrors the learned choice enumeration): 1 = eliminate
-    a plain Leader (cancel 1 hit); >= 2 = eliminate a Companion whose
-    level covers fc (cancel up to fc hits). fc == 1 falls back to a
-    level-1 companion when no plain leader is present.
+    fc is the chosen number of hits to cancel. An explicit named
+    Companion may pay any positive count up to its Level, including one
+    while a plain Leader is present. A plain Leader cancels one hit.
+    target (1.254 / audit CB-7): the OWNER's named pick - a Companion
+    name or 'leader' (see combat_effect_targets); None = the level
+    heuristic below.
     """
     from game_state import Nazgul
     if fc <= 0 or total_enemy <= 0:
@@ -1776,9 +1800,10 @@ def _heroic_death_sacrifice(combat: CombatState, is_atk: bool, army: Army,
         else:
             combat.defender_hits_cancelled += n
 
-    # fc == 1 prefers an OWN-SIDE plain Leader (1.233: a stranded
-    # Shadow Minion in the FP army is never a legal FP sacrifice)
-    if fc == 1:
+    # fc == 1 (or an explicit 'leader' pick) prefers an OWN-SIDE plain
+    # Leader (1.233: a stranded Shadow Minion in the FP army is never a
+    # legal FP sacrifice)
+    if (fc == 1 and target is None) or target == 'leader':
         for i, leader in enumerate(army.leaders):
             if (type(leader).__name__ == 'Leader'
                     and _combat_leader_side(leader)
@@ -1792,29 +1817,26 @@ def _heroic_death_sacrifice(combat: CombatState, is_atk: bool, army: Army,
                     combat.defender_leadership = max(
                         0, combat.defender_leadership - 1)
                 return
-    # Companion sacrifice: smallest level covering fc, else best available
+    # Companion sacrifice: the owner's named pick, else smallest level
+    # covering fc, else best available
+    named = _pick_named_companion(combat.companions_in_battle, target)
     viable = sorted((c for c in combat.companions_in_battle
                      if c.level >= max(1, fc)), key=lambda c: c.level)
     if not viable:
         viable = sorted(combat.companions_in_battle,
                         key=lambda c: -c.level)
-    if not viable:
+    if named is None and not viable:
         return
-    target = viable[0]
-    combat.companions_in_battle.remove(target)
+    chosen = named if named is not None else viable[0]
+    combat.companions_in_battle.remove(chosen)
     for i, l in enumerate(army.leaders):
-        if isinstance(l, Companion) and l.name == target.name:
+        if isinstance(l, Companion) and l.name == chosen.name:
             army.leaders.pop(i)
             break
-    # Hit-CANCEL magnitude stays LEVEL-based per the card text ("cancel
-    # a number of hits equal to or less than the Companion's Level") —
-    # verified against card_list.csv, USER 2026-08-03.
-    _cancel(min(max(fc, 1), target.level, total_enemy))
-    # RULING 1.228 wave (USER 2026-08-03): the Leadership POOL drops by
-    # the Companion's LEADERSHIP rating, not his level (engine-internal
-    # multi-round loop only; the per-round ai.py flow rebuilds
-    # leadership each round).
-    _ldr_drop = getattr(target, 'leadership', 1)
+    # hit-CANCEL magnitude stays LEVEL-based (card text; USER 2026-08-03)
+    _cancel(min(max(fc, 1), chosen.level, total_enemy))
+    # 1.228: the Leadership POOL drops by the LEADERSHIP rating
+    _ldr_drop = getattr(chosen, 'leadership', 1)
     if is_atk:
         combat.attacker_leadership = max(
             0, combat.attacker_leadership - _ldr_drop)
@@ -1867,8 +1889,12 @@ def _heroic_death_for_side(combat: CombatState, is_atk: bool,
     fc = choices.get('atk_effect_count' if is_atk else 'def_effect_count')
     if fc is not None:
         # Learned decision: 0 declines, otherwise apply the chosen
-        # sacrifice at the printed timing (before casualties are removed)
-        _heroic_death_sacrifice(combat, is_atk, army, int(fc), total_enemy)
+        # sacrifice at the printed timing (before casualties are removed);
+        # WHICH figure is the owner's pick too (1.254 / audit CB-7)
+        _heroic_death_sacrifice(
+            combat, is_atk, army, int(fc), total_enemy,
+            target=choices.get('atk_effect_target' if is_atk
+                               else 'def_effect_target'))
         return
 
     # Only sacrifice if hits would destroy >50% of army
@@ -1890,9 +1916,7 @@ def _heroic_death_for_side(combat: CombatState, is_atk: bool,
             if isinstance(l, Companion) and l.name == best_comp.name:
                 army.leaders.pop(i)
                 break
-        # RULING 1.228 wave (USER 2026-08-03): pool drops by LEADERSHIP
-        # rating, not level (same fix as _heroic_death_sacrifice; the
-        # cancel magnitude best_value stays level-based per card text).
+        # 1.228: pool drops by LEADERSHIP rating; the cancel stays level-based
         _ldr_drop = getattr(best_comp, 'leadership', 1)
         if is_atk:
             combat.attacker_hits_cancelled += best_value
@@ -1936,7 +1960,10 @@ def _apply_bb_hd(combat: CombatState, atk_reroll_hits: int,
     actually holds the card fires."""
     def _side(is_attacker):
         rh = atk_reroll_hits if is_attacker else def_reroll_hits
-        apply_black_breath(combat, rh, is_attacker=is_attacker)
+        apply_fateful_strike(combat, rh, is_attacker, choices=choices)
+        apply_blade_of_westernesse(combat, rh, is_attacker, choices=choices)
+        apply_black_breath(combat, rh, is_attacker=is_attacker,
+                           choices=choices)
         _heroic_death_for_side(combat, is_attacker, choices)
 
     if _defender_first_initiative(combat):
@@ -1949,17 +1976,52 @@ def _apply_bb_hd(combat: CombatState, atk_reroll_hits: int,
 
 def _apply_post_casualty_for_side(combat: CombatState, is_attacker: bool,
                                   choices: dict = None) -> None:
-    """Apply post-casualty effects (Onslaught, We Come to Kill) for one side."""
+    """Apply post-casualty effects (Onslaught, We Come to Kill) for one side.
+
+    USER RULING 1.254 (2026-08-29): every casualty is the OWNER's learned
+    allocation.  Enemy hits scored here (We Come to Kill, Great Host, the
+    direct Onslaught roll) apply under the ENEMY owner's casualty policy
+    from `choices`, and with choices['defer_post_hits'] they are STASHED
+    on combat.deferred_post_hits_on_defender / _on_attacker (never
+    applied) for the caller's casualty_allocate pending (audit CB-7)."""
     choices = choices or {}
+    own_policy = choices.get('atk_casualty_policy' if is_attacker
+                             else 'def_casualty_policy', 'preserve_elites')
+    enemy_policy = choices.get('def_casualty_policy' if is_attacker
+                               else 'atk_casualty_policy', 'preserve_elites')
+
+    def _inflict_enemy(enemy_army, n):
+        """n post-casualty hits on the enemy: counted as this side's
+        bonus hits, then applied under the enemy owner's policy or
+        stashed for the learned allocation (defer_post_hits)."""
+        if n <= 0:
+            return
+        if is_attacker:
+            combat.attacker_bonus_hits += n
+        else:
+            combat.defender_bonus_hits += n
+        if choices.get('defer_post_hits'):
+            key = ('deferred_post_hits_on_defender' if is_attacker
+                   else 'deferred_post_hits_on_attacker')
+            setattr(combat, key, int(getattr(combat, key, 0) or 0) + n)
+            return
+        extra = apply_casualties(enemy_army, n, enemy_policy)
+        if is_attacker:
+            combat.defender_casualties.extend(extra)
+        else:
+            combat.attacker_casualties.extend(extra)
+        if is_army_destroyed(enemy_army):
+            if is_attacker:
+                combat.defender_destroyed = True
+            else:
+                combat.attacker_destroyed = True
+            combat.battle_over = True
+
     if combat.battle_over:
-        # fix 78 (game-14 canary): the deferred-Onslaught path must still
-        # be reachable when THIS round's casualties ended the battle — a
-        # spec-forced round folds the onslaught-caused kills into the
-        # main casualty step, so the enemy is already destroyed while
-        # the surviving owner's sacrifice (a logged decision) still
-        # needs its pending phase.  Only the deferral escapes this gate;
-        # auto-resolved effects on a finished battle stay moot (the
-        # enemy-destroyed guards below skip them).
+        # fix 78: the deferred-Onslaught path stays reachable when THIS round's
+        # casualties ended the battle (the surviving owner's sacrifice still
+        # needs its pending); auto-resolved effects on a finished battle
+        # stay moot.
         _own_dead78 = (combat.attacker_destroyed if is_attacker
                        else combat.defender_destroyed)
         if not (choices.get('defer_onslaught') and not _own_dead78):
@@ -1985,31 +2047,24 @@ def _apply_post_casualty_for_side(combat: CombatState, is_attacker: bool,
         army = combat.attacker_army if is_attacker else combat.defender_army
         enemy_army = combat.defender_army if is_attacker else combat.attacker_army
 
-        # rulebook + almanac: "up to four additional hits against your
-        # units" -- the cap is on HITS, and an Elite absorbs 2 hits, so
-        # the own-side HIT CAPACITY is 2*elites + regulars (Shadow may
-        # eliminate its ENTIRE army; the old len-1 keep-one was wrong).
+        # The cap is on HITS: own hit capacity = 2*elites + regulars (a full
+        # self-wipe is legal, almanac)
         _e = count_elite_units(army)
         _r = len(army.units) - _e
         hit_capacity = 2 * _e + _r
         max_sacrifice = min(4, hit_capacity)
         if max_sacrifice > 0 and choices.get('defer_onslaught'):
-            # How many units to sacrifice is a player choice — defer
-            # it to the learned 'combat_effect_choice' pending phase
-            # (game0 T3 MT assault: SP sacrificed 4, rolled 1 6 4 3
-            # = 2 hits). apply_onslaught_choice() resumes the effect.
-            # fix 78 (game-14 canary): the deferral must NOT be gated
-            # on the enemy surviving — with spec-forced casualties the
-            # onslaught-caused kills land in the main casualty step,
-            # so by this point the enemy can already be destroyed while
-            # the human's sacrifice record still needs its phase (the
-            # sacrificed units really die; extra hits just fizzle).
+            # The sacrifice count is a player choice - defer to the learned
+            # 'combat_effect_choice' pending (apply_onslaught_choice resumes).
+            # fix 78: NOT gated on the enemy surviving (the sacrificed units
+            # really die).
             combat.deferred_effect = ('attacker' if is_attacker
                                       else 'defender')
             return
         if not is_army_destroyed(enemy_army):
             if max_sacrifice > 0:
-                self_casualties = apply_casualties(army, max_sacrifice)
+                self_casualties = apply_casualties(army, max_sacrifice,
+                                                   own_policy)
                 if is_attacker:
                     combat.attacker_casualties.extend(self_casualties)
                 else:
@@ -2017,9 +2072,12 @@ def _apply_post_casualty_for_side(combat: CombatState, is_attacker: bool,
 
                 # "Roll one die for each HIT you inflicted" -- one die per
                 # HIT, NOT per figure removed (an Elite absorbs 2 hits).
+                # The enemy hits are NOT bonus hits (direct 4+ roll);
+                # they apply under the enemy owner's policy.
                 for roll in roll_d6_batch(max_sacrifice, 'sacrifice hits'):
                     if roll >= 4:
-                        enemy_casualties = apply_casualties(enemy_army, 1)
+                        enemy_casualties = apply_casualties(enemy_army, 1,
+                                                            enemy_policy)
                         if is_attacker:
                             combat.defender_casualties.extend(enemy_casualties)
                         else:
@@ -2048,45 +2106,16 @@ def _apply_post_casualty_for_side(combat: CombatState, is_attacker: bool,
             elite_count = min(5, count_elite_units(army))
             if elite_count > 0:
                 _, hits = combat_roll(elite_count, 5, 0)
-                if hits > 0:
-                    extra_casualties = apply_casualties(enemy_army, hits)
-                    if is_attacker:
-                        combat.defender_casualties.extend(extra_casualties)
-                        combat.attacker_bonus_hits += hits
-                    else:
-                        combat.attacker_casualties.extend(extra_casualties)
-                        combat.defender_bonus_hits += hits
+                _inflict_enemy(enemy_army, hits)
 
-                if is_army_destroyed(enemy_army):
-                    if is_attacker:
-                        combat.defender_destroyed = True
-                    else:
-                        combat.attacker_destroyed = True
-                    combat.battle_over = True
-
-    # Great Host (A New Power is Rising / Many Kings / Stormcrow):
-    # "score one automatic hit if your Army has at least twice as many
-    # units" — evaluated AFTER removing this round's casualties (card
-    # text + almanac p43; audit 2026-07-26, moved from the pre-casualty
-    # Phase-6 bonus-hits pass where flags 40/41 left it).
+    # Great Host: evaluated AFTER removing this round's casualties (card text +
+    # almanac p43)
     if "twice as many" in effect and "automatic hit" in effect:
         army = combat.attacker_army if is_attacker else combat.defender_army
         enemy_army = combat.defender_army if is_attacker else combat.attacker_army
         if not is_army_destroyed(enemy_army) and \
                 len(army.units) >= 2 * len(enemy_army.units):
-            extra = apply_casualties(enemy_army, 1)
-            if is_attacker:
-                combat.defender_casualties.extend(extra)
-                combat.attacker_bonus_hits += 1
-            else:
-                combat.attacker_casualties.extend(extra)
-                combat.defender_bonus_hits += 1
-            if is_army_destroyed(enemy_army):
-                if is_attacker:
-                    combat.defender_destroyed = True
-                else:
-                    combat.attacker_destroyed = True
-                combat.battle_over = True
+            _inflict_enemy(enemy_army, 1)
 
 
 def _apply_post_casualty_effects(combat: CombatState,
@@ -2142,11 +2171,8 @@ def apply_casualties_spec(army: Army, spec: dict,
              'kill_elite': int(spec.get('kill_elite', 0) or 0),
              'downgrade': int(spec.get('downgrade', 0) or 0)}
     _got = {'kill_regular': 0, 'kill_elite': 0, 'downgrade': 0}
-    # NATION-EXACT preference (2026-07-25): the parser's kill lines
-    # name the nations ('kills S&E Elite ...'); prefer removing those
-    # exact (nation, kind) units before the legacy last-in pick
-    # (GAME19 T8: the engine killed SAURON where the client killed
-    # ISENGARD - fungible counts, wrong nation).
+    # NATION-EXACT preference: prefer the (nation, kind) the parser's kill
+    # lines name before the last-in pick (fungible counts, wrong nation)
     _byn9 = dict(spec.get('_by_nation') or {})
 
     def _pick9(kind_enum, kind_str):
@@ -2209,21 +2235,17 @@ def resolve_combat_round(combat: CombatState, choices: dict = None) -> None:
     combat.attacker_final_hits = 0
     combat.defender_final_hits = 0
 
+    combat._round_nazgul_present = combat.nazgul_in_battle
+
     # Phase 1: Cancel effects (Swarm of Bats, Daring Defiance)
     apply_cancel_effects(combat)
 
     # Phase 1b: Words of Power - cancel companion leadership
-    apply_words_of_power(combat)
+    apply_words_of_power(combat, choices)
 
     # Phase 2: Dice modifiers (+1/+2, both armies, subtract)
     apply_dice_modifiers(combat)
     apply_dice_count_modifiers(combat)
-
-    # Phase 2b: Dread and Despair - forfeit Nazgul to reduce FP dice
-    apply_dread_and_despair(combat, choices)
-
-    # Phase 2c: Relentless Assault - self-damage for dice boost
-    apply_relentless_assault(combat, choices)
 
     # Phase 3: Pre-combat attacks (Sudden Strike, Charge, Durin's Bane) in
     # initiative order, INTERLEAVED so each side's magnitude reflects the
@@ -2232,6 +2254,12 @@ def resolve_combat_round(combat: CombatState, choices: dict = None) -> None:
     # D + J).  If the battle ended here, skip the Combat roll (and its
     # roll-dependent cards, e.g. Confusion).
     _resolve_pre_combat(combat, choices)
+    if combat.battle_over:
+        return
+
+    # Initiative 3 payments use the survivors of initiative 2 attacks.
+    apply_dread_and_despair(combat, choices)
+    apply_relentless_assault(combat, choices)
     if combat.battle_over:
         return
 
@@ -2264,32 +2292,20 @@ def resolve_combat_round(combat: CombatState, choices: dict = None) -> None:
     def_strength -= getattr(combat, 'defender_dice_reduction', 0)
 
     # Roll
-    # G1: whose dice these are - attacker first, then defender.
+    # User-selected sequential dice convention: attacker roll and re-roll,
+    # then defender roll and re-roll. Pre/post-combat card timing is unchanged.
     combat.attacker_combat_rolls, atk_hits = combat_roll(
         atk_strength, atk_threshold, combat.attacker_dice_mod, combat.attacker_dice_cap,
         side=getattr(combat, 'attacker_side', None)
     )
-    combat.defender_combat_rolls, def_hits = combat_roll(
-        def_strength, def_threshold, combat.defender_dice_mod, combat.defender_dice_cap,
-        side=getattr(combat, 'defender_side', None)
-    )
 
-    # Confusion: 1s hit the roller. CARD-FLEET HIGH-1 (2026-07-20):
-    # natural 1s NEVER counted as hits (combat_roll skips them), so
-    # the old `hits -= ones` cancelled one LEGITIMATE 5/6 hit per 1
-    # rolled — an invented penalty. The card's whole effect is the
-    # hits AGAINST the roller (+ the no-reroll exclusion handled in
-    # leader_reroll).
+    # Confusion: natural 1s score hits AGAINST the roller (they never counted
+    # as hits, so nothing is subtracted)
     if combat.attacker_confusion:
         ones = sum(1 for r in combat.attacker_combat_rolls if r == 1)
         combat.defender_hits += ones
 
-    if combat.defender_confusion:
-        ones = sum(1 for r in combat.defender_combat_rolls if r == 1)
-        combat.attacker_hits += ones
-
     combat.attacker_hits += max(0, atk_hits)
-    combat.defender_hits += max(0, def_hits)
 
     # Phase 5: Leader re-roll
     apply_reroll_cancellation(combat)
@@ -2300,13 +2316,8 @@ def resolve_combat_round(combat: CombatState, choices: dict = None) -> None:
     # Phase 5b: Mighty Attack / Anduril - auto-convert misses before re-roll
     atk_auto = apply_mighty_attack(combat, combat.attacker_combat_rolls,
                                    atk_threshold, combat.attacker_dice_mod,
-                                   is_attacker=True)
+                                   is_attacker=True, choices=choices)
     combat.attacker_hits += atk_auto
-
-    def_auto = apply_mighty_attack(combat, combat.defender_combat_rolls,
-                                   def_threshold, combat.defender_dice_mod,
-                                   is_attacker=False)
-    combat.defender_hits += def_auto
 
     # Phase 5c: Actual leader re-roll (with modified leadership and re-roll mods).
     # 1.208h supersedes 1.79: combat-roll bonuses are fully separate and do
@@ -2328,6 +2339,18 @@ def resolve_combat_round(combat: CombatState, choices: dict = None) -> None:
         )
         combat.attacker_hits += atk_reroll_hits
 
+    combat.defender_combat_rolls, def_hits = combat_roll(
+        def_strength, def_threshold, combat.defender_dice_mod, combat.defender_dice_cap,
+        side=getattr(combat, 'defender_side', None)
+    )
+    if combat.defender_confusion:
+        combat.attacker_hits += combat.defender_combat_rolls.count(1)
+    combat.defender_hits += max(0, def_hits)
+    def_auto = apply_mighty_attack(combat, combat.defender_combat_rolls,
+                                   def_threshold, combat.defender_dice_mod,
+                                   is_attacker=False, choices=choices)
+    combat.defender_hits += def_auto
+
     def_reroll_hits = 0
     if not combat.defender_reroll_cancelled and combat.defender_leadership > 0:
         reroll_mod = combat.defender_reroll_mod
@@ -2340,23 +2363,6 @@ def resolve_combat_round(combat: CombatState, choices: dict = None) -> None:
             side=getattr(combat, 'defender_side', None)
         )
         combat.defender_hits += def_reroll_hits
-
-    # Phase 5d: Post-reroll specials that eliminate the ENEMY's leaders —
-    # Fateful Strike (-> Nazgul) and Blade of Westernesse (-> Minion). They
-    # act on the opposing (Shadow) leader pool, independent of the Black
-    # Breath / Heroic Death Free-Peoples-leader window resolved at Phase 7.
-    # RULING 1.228 (USER 2026-08-03): this ordering is CORRECT for the
-    # tied-initiative-6 Fateful Strike vs Black Breath pairing — the
-    # defender-first tie rule is NOT relevant: FS activates on its play
-    # condition (the Leader re-roll), which still takes place even if
-    # Black Breath eliminates a Leader/Companion at Phase 7, and BB
-    # remains playable after FS fires (unless FS killed the sole Nazgul,
-    # tripping BB's resolver gate — CL-216).  The adversarial-review
-    # defender-first flag on this block is dismissed.
-    apply_fateful_strike(combat, atk_reroll_hits, is_attacker=True)
-    apply_fateful_strike(combat, def_reroll_hits, is_attacker=False)
-    apply_blade_of_westernesse(combat, atk_reroll_hits, is_attacker=True)
-    apply_blade_of_westernesse(combat, def_reroll_hits, is_attacker=False)
 
     # Phase 6: Post-reroll bonus hits (No Quarter, Nameless Wood, Great Host, Mumakil)
     apply_bonus_hits(combat)
@@ -2400,16 +2406,16 @@ def resolve_combat_round(combat: CombatState, choices: dict = None) -> None:
         combat.battle_over = True
         return
 
-    # Phase 8: Apply casualties (owner-chosen allocation policy).
+    # Phase 8: The attacker removes casualties first (Rulebook p30).
     _ch = choices or {}
-    combat.defender_casualties.extend(
-        apply_casualties(combat.defender_army, final_atk_hits,
-                         _ch.get('def_casualty_policy',
-                                 'preserve_elites'))
-    )
     combat.attacker_casualties.extend(
         apply_casualties(combat.attacker_army, final_def_hits,
                          _ch.get('atk_casualty_policy',
+                                 'preserve_elites'))
+    )
+    combat.defender_casualties.extend(
+        apply_casualties(combat.defender_army, final_atk_hits,
+                         _ch.get('def_casualty_policy',
                                  'preserve_elites'))
     )
 
@@ -2504,31 +2510,19 @@ def resolve_combat(state: "GameState", attacker_region: str, defender_region: st
     """
     from cards import get_card
 
-    # BATTLE-SCOPED downgrade counter (2026-07-20, Feanor teacher-path
-    # mint): a multi-round battle operates on TEMP split-armies not
-    # written back to state.armies between rounds, so _downgrade_allowed
-    # reads STALE pre-battle deployed counts all battle long and the
-    # per-apply_casualties-call _dgc resets each round -> more downgrades
-    # than the pre-battle reinforcement pool supplies. A single counter
-    # shared across every apply_casualties call in THIS battle fixes it
-    # (avail0 - battle_downgrades = true remaining reinforcements; kills
-    # don't change reinforcement availability). Save/restore for nesting.
+    # Battle-scoped downgrade counter: the temp split-armies are not written
+    # back between rounds, so ONE counter shared by every apply_casualties
+    # call in THIS battle keeps downgrades within the pre-battle pool.
+    # Save/restore for nesting.
     global _BATTLE_DG, _DG_AVAIL0
     _prev_bdg = _BATTLE_DG
     _prev_av0 = _DG_AVAIL0
     _BATTLE_DG = {}
-    # Freeze the reinforcement baseline for the WHOLE battle BEFORE any
-    # round removes a unit (task 164, Feanor/Hynch teacher replay). A
-    # regular KILLED mid-battle vacates a deployment slot but becomes a
-    # PERMANENT casualty — NOT free reinforcement capacity. Without this
-    # snapshot _downgrade_allowed read a LIVE deployed count deflated by
-    # those same-scope kills (Dale: 3 Elf regulars removed first by the
-    # preserve_elites policy), computed avail=3 where the true pool was 0,
-    # and green-lit a downgrade that MINTED a 6th Elf regular. Downgrades
-    # are the ONLY legitimate consumer of this baseline (tracked via
-    # _BATTLE_DG / already_consumed). Save/restore for nesting (a card
-    # handler whose battle triggers another battle).
+    # Freeze the reinforcement baseline before round 1. The ledger records
+    # net pool consumption: replacements taken minus Shadow Regulars returned.
+    # FP losses go to their separate casualty box at publication.
     _DG_AVAIL0 = _capture_reg_baseline(state)
+    _previous_active = set_active_state(state)
     try:
         return _resolve_combat_body(
             state, attacker_region, defender_region,
@@ -2537,6 +2531,117 @@ def resolve_combat(state: "GameState", attacker_region: str, defender_region: st
     finally:
         _BATTLE_DG = _prev_bdg
         _DG_AVAIL0 = _prev_av0
+        set_active_state(_previous_active)
+
+
+def resume_combat(state, payload, decision):
+    """Continue a paused battle. The payload belongs to the same copied state graph.
+
+    Validation precedes all mutation. A completed payload cannot be replayed.
+    Store it on GameState before deepcopy/save so army and figure aliases survive.
+    """
+    from cards import get_card
+    if not isinstance(payload, dict) or payload.get('schema') != 'combat_battle_resume_v1':
+        raise ValueError('Unknown combat continuation schema')
+    cursor = payload.get('cursor')
+    if payload.get('done') or cursor is None or cursor.pending is None:
+        raise ValueError('Battle has no pending round decision')
+    if getattr(cursor.combat, '_live_state', None) is not state:
+        raise ValueError('Combat continuation must be copied with its owning GameState')
+    if decision not in cursor.pending['options']:
+        raise ValueError('Choice is not legal at the observed round stage')
+    global _BATTLE_DG, _DG_AVAIL0
+    previous = (_BATTLE_DG, _DG_AVAIL0)
+    active = set_active_state(state)
+    _BATTLE_DG = dict(payload['downgrades'])
+    _DG_AVAIL0 = dict(payload['reinforcement_baseline'])
+    try:
+        return _resolve_combat_body(state, *payload['args'], payload['choices'],
+                                    get_card, resume=payload, decision=decision)
+    finally:
+        _BATTLE_DG, _DG_AVAIL0 = previous
+        set_active_state(active)
+
+
+def _emit_round_annotations(state, combat, is_siege, defender_region, payload):
+    # iter 38 (user directive): combat rolls + leader re-rolls become
+    # visible annotation rows in SELF-PLAY traces (no-op otherwise)
+    try:
+        from game_trace import emit_annotation as _emit_annotation
+        def emit_annotation(state, kind, data):
+            key = (combat.siege_round, data['ctx'], tuple(data['faces']))
+            emitted = payload.setdefault('annotated_rolls', [])
+            if key not in emitted:
+                _emit_annotation(state, kind, data)
+                emitted.append(key)
+        _ctx = (f"{'siege ' if is_siege else ''}battle at "
+                f"{defender_region} r{combat.siege_round}")
+        _atk_tag = 'SH' if combat.attacker_side.name == 'SHADOW' \
+            else 'FP'
+        _def_tag = 'FP' if _atk_tag == 'SH' else 'SH'
+        if combat.attacker_combat_rolls:
+            emit_annotation(state, 'dice_roll', {
+                'faces': list(combat.attacker_combat_rolls),
+                'ctx': f'{_ctx} attacker', 'side': _atk_tag})
+        if combat.attacker_rerolls:
+            emit_annotation(state, 'dice_roll', {
+                'faces': list(combat.attacker_rerolls),
+                'ctx': f'{_ctx} attacker re-roll', 'side': _atk_tag})
+        if combat.defender_combat_rolls:
+            emit_annotation(state, 'dice_roll', {
+                'faces': list(combat.defender_combat_rolls),
+                'ctx': f'{_ctx} defender', 'side': _def_tag})
+        if combat.defender_rerolls:
+            emit_annotation(state, 'dice_roll', {
+                'faces': list(combat.defender_rerolls),
+                'ctx': f'{_ctx} defender re-roll', 'side': _def_tag})
+        # Pre-combat attack rolls (Sudden Strike / Charge / Durin's
+        # Bane) — previously rolled and discarded, invisible in traces
+        # (coordinator item 2026-07-15).
+        if combat.attacker_pre_combat_rolls:
+            _acn = getattr(combat.attacker_card, 'combat_name',
+                           'pre-combat') or 'pre-combat'
+            emit_annotation(state, 'dice_roll', {
+                'faces': list(combat.attacker_pre_combat_rolls),
+                'ctx': f'{_acn} pre-combat attack', 'side': _atk_tag})
+        if combat.defender_pre_combat_rolls:
+            _dcn = getattr(combat.defender_card, 'combat_name',
+                           'pre-combat') or 'pre-combat'
+            emit_annotation(state, 'dice_roll', {
+                'faces': list(combat.defender_pre_combat_rolls),
+                'ctx': f'{_dcn} pre-combat attack', 'side': _def_tag})
+    except Exception:
+        pass
+
+
+def _publish_round_casualties(state, combat, payload):
+    for i, role in enumerate(('attacker', 'defender')):
+        casualties = getattr(combat, role + '_casualties')
+        _track_fp_casualties(state, casualties[payload['published'][i]:],
+                             getattr(combat, role + '_side'))
+        payload['published'][i] = len(casualties)
+    dead = getattr(combat, '_round_card_fp_dead', [])
+    start = payload.get('published_card_figures', 0)
+    book_eliminated_characters(state, dead[start:])
+    payload['published_card_figures'] = len(dead)
+
+
+def _publish_paused_combat(state, combat, payload):
+    """Expose surviving participants without finalizing the still-running round."""
+    parent = getattr(combat, 'coloc_parent', None)
+    if parent is not None:
+        rear_units, rear_leaders = combat.coloc_rear
+        parent.units = list(combat.defender_army.units) + list(combat.attacker_army.units) + rear_units
+        parent.leaders = list(combat.defender_army.leaders) + list(combat.attacker_army.leaders) + rear_leaders
+    else:
+        for role, prefix in (('attacker', 'away_atk'), ('defender', 'away_def')):
+            parent = getattr(combat, prefix + '_parent', None)
+            if parent is not None:
+                rear_units, rear_leaders = getattr(combat, prefix + '_rest')
+                army = getattr(combat, role + '_army')
+                parent.units = list(army.units) + rear_units
+                parent.leaders = list(army.leaders) + rear_leaders
+    _publish_round_casualties(state, combat, payload)
 
 
 _BATTLE_DG = None
@@ -2545,91 +2650,83 @@ _DG_AVAIL0 = None
 
 def _resolve_combat_body(state, attacker_region, defender_region,
                          attacker_card_id, defender_card_id, is_siege,
-                         max_rounds, auto_press, choices, get_card):
-    # Load combat cards
-    atk_card = None
-    def_card = None
+                         max_rounds, auto_press, choices, get_card, resume=None, decision=None):
+    if resume is None:
+        # Load combat cards
+        atk_card = None
+        def_card = None
 
-    if attacker_card_id:
-        card = get_card(attacker_card_id)
-        if card:
-            atk_card = card.to_combat_card()
+        if attacker_card_id:
+            card = get_card(attacker_card_id)
+            if card:
+                atk_card = card.to_combat_card()
 
-    if defender_card_id:
-        card = get_card(defender_card_id)
-        if card:
-            def_card = card.to_combat_card()
+        if defender_card_id:
+            card = get_card(defender_card_id)
+            if card:
+                def_card = card.to_combat_card()
 
-    # Setup combat
-    combat = setup_combat(state, attacker_region, defender_region,
-                          atk_card, def_card, is_siege,
-                          attacker_side=(choices or {}).get(
-                              'attacker_side'))
-    # Battle-scoped dice reductions (Help Unlooked For, QA 2026-07-09):
-    # "reduced by one die per FP unit inside the Stronghold, min 1, for
-    # this ENTIRE battle" - applied at the roll site every round, never
-    # reset by the per-round state reset.
-    combat.attacker_dice_reduction = int(
-        (choices or {}).get('attacker_dice_reduction', 0) or 0)
-    combat.defender_dice_reduction = int(
-        (choices or {}).get('defender_dice_reduction', 0) or 0)
+        # Setup combat
+        combat = setup_combat(state, attacker_region, defender_region,
+                              atk_card, def_card, is_siege,
+                              attacker_side=(choices or {}).get(
+                                  'attacker_side'))
+        # Battle-scoped dice reductions (Help Unlooked For, QA 2026-07-09):
+        # "reduced by one die per FP unit inside the Stronghold, min 1, for
+        # this ENTIRE battle" - applied at the roll site every round, never
+        # reset by the per-round state reset.
+        combat.attacker_dice_reduction = int(
+            (choices or {}).get('attacker_dice_reduction', 0) or 0)
+        combat.defender_dice_reduction = int(
+            (choices or {}).get('defender_dice_reduction', 0) or 0)
 
-    # After round 1, city/fortification defense no longer applies
-    if choices and choices.get('disable_city_defense'):
-        combat.city_defense = False
+        # After round 1, city/fortification defense no longer applies
+        if choices and choices.get('disable_city_defense'):
+            combat.city_defense = False
 
-    total_atk_hits = 0
-    total_def_hits = 0
-    rounds_fought = 0
+        total_atk_hits = 0
+        total_def_hits = 0
+        rounds_fought = 0
 
-    # For siege: base is 1 round, +extra from cards (max_rounds), +presses
-    effective_max = max_rounds
+        # For siege: base is 1 round, +extra from cards (max_rounds), +presses
+        effective_max = max_rounds
 
+        resume = {'schema': 'combat_battle_resume_v1', 'cursor': None,
+                  'args': (attacker_region, defender_region, attacker_card_id,
+                           defender_card_id, is_siege, max_rounds, auto_press),
+                  'choices': dict(choices or {}), 'published': [0, 0], 'done': False}
+    else:
+        combat = resume['cursor'].combat
+        combat._live_state = state
+        total_atk_hits, total_def_hits, rounds_fought, effective_max = resume['totals']
+        choices = resume['choices']
     # Resolve rounds
     while not combat.battle_over and combat.siege_round <= effective_max:
-        resolve_combat_round(combat, choices)
-        # iter 38 (user directive): combat rolls + leader re-rolls become
-        # visible annotation rows in SELF-PLAY traces (no-op otherwise)
-        try:
-            from game_trace import emit_annotation
-            _ctx = (f"{'siege ' if is_siege else ''}battle at "
-                    f"{defender_region} r{combat.siege_round}")
-            _atk_tag = 'SH' if combat.attacker_side.name == 'SHADOW' \
-                else 'FP'
-            _def_tag = 'FP' if _atk_tag == 'SH' else 'SH'
-            if combat.attacker_combat_rolls:
-                emit_annotation(state, 'dice_roll', {
-                    'faces': list(combat.attacker_combat_rolls),
-                    'ctx': f'{_ctx} attacker', 'side': _atk_tag})
-            if combat.attacker_rerolls:
-                emit_annotation(state, 'dice_roll', {
-                    'faces': list(combat.attacker_rerolls),
-                    'ctx': f'{_ctx} attacker re-roll', 'side': _atk_tag})
-            if combat.defender_combat_rolls:
-                emit_annotation(state, 'dice_roll', {
-                    'faces': list(combat.defender_combat_rolls),
-                    'ctx': f'{_ctx} defender', 'side': _def_tag})
-            if combat.defender_rerolls:
-                emit_annotation(state, 'dice_roll', {
-                    'faces': list(combat.defender_rerolls),
-                    'ctx': f'{_ctx} defender re-roll', 'side': _def_tag})
-            # Pre-combat attack rolls (Sudden Strike / Charge / Durin's
-            # Bane) — previously rolled and discarded, invisible in traces
-            # (coordinator item 2026-07-15).
-            if combat.attacker_pre_combat_rolls:
-                _acn = getattr(combat.attacker_card, 'combat_name',
-                               'pre-combat') or 'pre-combat'
-                emit_annotation(state, 'dice_roll', {
-                    'faces': list(combat.attacker_pre_combat_rolls),
-                    'ctx': f'{_acn} pre-combat attack', 'side': _atk_tag})
-            if combat.defender_pre_combat_rolls:
-                _dcn = getattr(combat.defender_card, 'combat_name',
-                               'pre-combat') or 'pre-combat'
-                emit_annotation(state, 'dice_roll', {
-                    'faces': list(combat.defender_pre_combat_rolls),
-                    'ctx': f'{_dcn} pre-combat attack', 'side': _def_tag})
-        except Exception:
-            pass
+        if (choices or {}).get('defer_round_choices'):
+            from combat_round_resume import RoundCursor, advance
+            if resume['cursor'] is None:
+                resume['cursor'] = RoundCursor(combat, dict(choices or {}))
+            pending = advance(resume['cursor'], decision)
+            decision = None
+            if pending is not None:
+                resume['totals'] = (total_atk_hits, total_def_hits, rounds_fought, effective_max)
+                resume['downgrades'] = dict(_BATTLE_DG)
+                resume['reinforcement_baseline'] = dict(_DG_AVAIL0)
+                _publish_paused_combat(state, combat, resume)
+                _emit_round_annotations(state, combat, is_siege, defender_region, resume)
+                result = CombatResult(attacker_region, defender_region, rounds_fought,
+                                      total_atk_hits, total_def_hits,
+                                      combat.attacker_casualties, combat.defender_casualties,
+                                      combat.attacker_destroyed, combat.defender_destroyed,
+                                      combat.attacker_retreated, combat.defender_retreated)
+                result.round_paused = True
+                result.round_resume = resume
+                result.round_pending = pending
+                return result
+            resume['cursor'] = None
+        else:
+            resolve_combat_round(combat, choices)
+        _emit_round_annotations(state, combat, is_siege, defender_region, resume)
         # the totals are the hits that REACH casualties (after Shield-
         # Wall / Heroic Death / Black Breath prevention): what the
         # allocation asks for and what the hit announcement states.
@@ -2704,7 +2801,12 @@ def _resolve_combat_body(state, attacker_region, defender_region,
             # Recalculate combat strength and leadership for next round
             combat.attacker_combat_strength = calc_combat_strength(combat.attacker_army)
             combat.defender_combat_strength = calc_combat_strength(combat.defender_army)
+            # Leadership + Nazgul pool from the live rosters: per-round
+            # forfeits (Mighty Attack, Words of Power, ...) end with the
+            # round; the battle-scoped shine persists (audit CB-5)
+            _recompute_round_leadership(combat)
 
+    resume['done'] = True
     # Build result
     result = CombatResult(
         attacker_region=attacker_region,
@@ -2723,6 +2825,7 @@ def _resolve_combat_body(state, attacker_region, defender_region,
     )
     # post-roll allocation flags ride the result wrapper (ai.py routes
     # them into the pending 'casualty_allocation' phase)
+    result.round_paused = False
     result.casualties_deferred = getattr(combat, 'casualties_deferred',
                                          False)
     result.deferred_hits_on_defender = getattr(
@@ -2734,28 +2837,14 @@ def _resolve_combat_body(state, attacker_region, defender_region,
     result.attacker_card_cancelled = combat.attacker_card_cancelled
     result.defender_card_cancelled = combat.defender_card_cancelled
 
-    # Track FP permanent casualties (rulebook p.30: FP casualties never
-    # return) — but do it AFTER the survivors are written back to
-    # state.armies, at each exit below. In a SPLIT battle (co-located
-    # siege / away-attack) the fighting army is a TEMP copy not yet merged
-    # back, so booking casualties here left state.armies showing the STALE
-    # pre-battle deployed count: deployed + casualties momentarily crossed
-    # max at the tracking site even though the merge-back immediately
-    # reconciles it (Giampy/Hynch lorien siege — a real Elf regular dies,
-    # dep 3->2 cas 2->3, but _track ran while dep still read 3 => transient
-    # 6/5). The conservation tripwire wraps _track, so that ordering
-    # artifact read as a mint. Deferring to post-write-back keeps deployed
-    # live at booking time (field battles are unaffected: their combat army
-    # IS the live state.armies entry). Call EXACTLY once per exit path.
+    # Book FP casualties (rulebook p.30) AFTER the survivors are written back:
+    # split battles fight a temp copy, and booking earlier read a stale
+    # deployed count (transient max+1 at the conservation tripwire).
+    # Exactly once per exit path.
     def _publish_fp_casualties():
-        _track_fp_casualties(state, combat.attacker_casualties,
-                             combat.attacker_side)
-        _track_fp_casualties(state, combat.defender_casualties,
-                             combat.defender_side)
-        # 5-unit siege-cap removals are NOT casualties: USER 1.181
-        # house ruling (2026-07-20, pinned CL-147) — the excess
-        # returns to reinforcements, and an untracked removal IS the
-        # return (reinforcements = max - deployed - fp_casualties).
+        _publish_round_casualties(state, combat, resume)
+        # 5-unit siege-cap removals are NOT casualties (USER 1.181, CL-147):
+        # the excess returns to reinforcements
 
     # Update game state - remove destroyed armies
     # Find the original army key matching each region (state.armies uses original names)
@@ -2788,16 +2877,17 @@ def _resolve_combat_body(state, attacker_region, defender_region,
                 state, combat.attacker_army.leaders)
         else:
             atk_leaders = list(combat.attacker_army.leaders)
+        _rear_u, _rear_l = combat.coloc_rear
         _parent.units = list(combat.defender_army.units) + \
-            list(combat.attacker_army.units)
-        _parent.leaders = def_leaders + atk_leaders
+            list(combat.attacker_army.units) + _rear_u
+        _parent.leaders = def_leaders + atk_leaders + _rear_l
         if not _parent.units and not _parent.leaders:
             dkey = _find_army_key(defender_region)
             if dkey:
                 state.armies.pop(dkey, None)
-        if combat.defender_destroyed and not combat.attacker_destroyed:
-            # 1.152 (USER): mutual elimination -> original controller
-            # keeps the region; capture needs a surviving attacker
+        if combat.defender_destroyed and (not combat.attacker_destroyed or _rear_u):
+            # Almanac36: on dual elimination in a siege/sortie the
+            # surviving rearguard takes/retains the Stronghold.
             _check_settlement_capture(state, sanitize(defender_region),
                                       combat.attacker_side)
         _publish_fp_casualties()   # after the shared-entry merge-back
@@ -2853,9 +2943,14 @@ def _resolve_combat_body(state, attacker_region, defender_region,
         dkey = _find_army_key(defender_region)
         if dkey:
             reconcile_destroyed_army(state, dkey, combat.defender_side)
-        # Check for settlement capture (for VP tracking).  1.152:
-        # mutual elimination captures nothing - the attacker must live
-        if not combat.attacker_destroyed:
+        # Settlement capture (VP + capture-advance) needs the victor IN
+        # the region (USER RULING 1.255): a field-battle wipe from an
+        # adjacent region captures nothing here - the ENTRY (victor
+        # advance / walk-in) captures.  1.152: mutual elimination
+        # captures nothing - the attacker must live.
+        if not combat.attacker_destroyed \
+                and _wipe_captures_in_place(attacker_region,
+                                            defender_region):
             _check_settlement_capture(state, sanitize(defender_region),
                                       combat.attacker_side)
 
@@ -2887,12 +2982,9 @@ def _handle_eliminated_minions(state: "GameState", leaders) -> None:
 
 
 
-# OVERSIGHT #2 (2026-07-20): downgrade replacements must come from a
-# real supply slot — the four inline downgrade sites minted regulars
-# pool-blind. game_logic.battle() publishes the live GameState here;
-# _downgrade_allowed answers "does a replacement regular exist for
-# this nation" (FP: casualties box OR computed pool; SH: pool).
-# With no active state (standalone/unit use) downgrades are allowed.
+# Downgrade replacements must come from a real supply slot: game_logic.
+# battle() publishes the live state here; with none (standalone / unit
+# use) downgrades are allowed.
 _ACTIVE_STATE = None
 
 
@@ -2914,11 +3006,7 @@ def _live_reg_avail(state, nation) -> int:
     downgrades FIRST (USER 2026-07-20d: "the downgrade is the ONLY
     way casualties return") — is checked separately and live in
     _downgrade_source_of / _cas_box_regulars."""
-    # ONE ANSWERER (USER ruling 2026-08-18, strict component limits):
-    # ai.figures_available carries this arithmetic now.  It used to be
-    # copied here, in _capture_reg_baseline, in ai._can_recruit, in
-    # game_logic._clamp_place and inline in two card paths - six
-    # answerers to one question.
+    # ONE ANSWERER (USER 2026-08-18): ai.figures_available owns the cap arithmetic
     import ai as _ai9
     return _ai9.figures_available(state, nation, 'regular')
 
@@ -3049,17 +3137,22 @@ def _consume_downgrade_source(state, nation, dgc,
     return src
 
 
+def _return_shadow_regular(unit, dgc):
+    """Credit a physical Regular returned during a frozen supply transaction.
+
+    A split battle roster may not yet be published on the board. Net pool
+    consumption therefore records returns explicitly, including a replacement
+    Regular killed later in the same round. FP returns use the casualty box.
+    """
+    if (dgc is not None and unit.kind == UnitKind.REGULAR
+            and side_of_nation(unit.nation) == Side.SHADOW):
+        dgc[unit.nation] = dgc.get(unit.nation, 0) - 1
+
+
 def _dg_stamp(state, nation, src):
-    """AUTO-96 game-4 (2026-08-17, the physical-supply phantom):
-    the engine's downgrade-source decision (cas -> pool -> None) is
-    THE answer; the emitter re-implemented it as a blind zone-order
-    pick ('fp dead' first, any nation) and, when they disagreed
-    (engine 'pool', emitter picked a dead-pile piece), the client
-    pool ran one HIGH forever - pool fp rohan/regular engine=4
-    client=5 PHANTOM.  Every consumption stamps this ledger; the
-    AUTO server threads the entries into the emission params so the
-    emitter OBEYS the engine instead of guessing.  One rule body,
-    one witness."""
+    """Every downgrade consumption stamps state._dg_src_log so the live
+    emitter OBEYS the engine's source decision (cas -> pool -> None)
+    instead of guessing (AUTO-96).  One rule body, one witness."""
     if state is None:
         return
     log = getattr(state, '_dg_src_log', None)
@@ -3163,11 +3256,9 @@ def _is_plain_leader(ld) -> bool:
 
 def _handle_eliminated_companions(state: "GameState", leaders) -> None:
     """Character-sheet bookkeeping for Companion figures eliminated with
-    a destroyed army.  Each is a real CASUALTY, so 'Worn with Sorrow and
-    Toil' and the companion persistent-card discards fire exactly as
-    they do for a hunt casualty (game_logic._on_companion_casualty; it
-    self-defers the learned WWSAT source pick onto state._wwsat_owed, so
-    it is safe to call mid-battle)."""
+    a destroyed army. These are eliminations, not Fellowship Hunt
+    casualties: they must not trigger Worn with Sorrow and Toil
+    (Almanac p.26). Companion-dependent table upkeep still runs."""
     if state is None:
         return
     from game_state import Companion
@@ -3176,7 +3267,7 @@ def _handle_eliminated_companions(state: "GameState", leaders) -> None:
         if not isinstance(ld, Companion):
             continue
         try:
-            _glec._on_companion_casualty(state, ld.name)
+            _glec._on_companion_casualty(state, ld.name, casualty=False)
         except Exception as _cc_err9:
             # LOUD but non-fatal: the figure is still eliminated
             print('[combat] companion casualty bookkeeping failed for '
@@ -3249,9 +3340,16 @@ def reconcile_destroyed_army(state: "GameState", region_key, dying_side=None,
         state.armies.get(key) if key is not None else None)
     if entry is None:
         return []
+    protected = []
+    leaders = entry.leaders
+    if dying_side is not None:
+        from army_participants import partition_battle_army
+        _, fighting, _, protected = partition_battle_army(
+            state, entry, key or region_key, dying_side)
+        leaders = list(fighting)
     dead, survivors = eliminate_army_characters(
-        state, entry.leaders, dying_side, card_name=card_name)
-    entry.leaders = survivors
+        state, leaders, dying_side, card_name=card_name)
+    entry.leaders = survivors + list(protected)
     if key is not None and not entry.units and not entry.leaders \
             and state.armies.get(key) is entry:
         state.armies.pop(key, None)
@@ -3287,6 +3385,17 @@ def _track_fp_casualties(state: "GameState", casualties: List[Unit], army_side: 
             state.fp_casualties[nat]['elite'] += 1
 
 
+def _wipe_captures_in_place(attacker_region, defender_region) -> bool:
+    """USER RULING 1.255 (2026-08-29): a settlement is captured only when
+    an enemy army is actually IN it.  A wipe captures at the wipe only
+    when the victor already stands in the defender's region (co-located
+    siege assault / co-located field battle); a wipe from an ADJACENT
+    region captures nothing until the victor ENTERS (victor_advance /
+    walk-in), exactly as the retreat branch already works.  ONE predicate
+    for every wipe site (combat.py and the ai.py deferred path)."""
+    return sanitize(str(attacker_region)) == sanitize(str(defender_region))
+
+
 def _check_settlement_capture(state: "GameState", region_key: str, victor_side: Side):
     """
     Check if a settlement was captured and update enemy_controlled tracking.
@@ -3308,67 +3417,52 @@ def _check_settlement_capture(state: "GameState", region_key: str, victor_side: 
     is_fp_settlement = is_fp_region(region_key)
     is_sh_settlement = is_shadow_region(region_key)
 
-    # wave-E fix 5 (2026-07-23): rulebook p.35 (_rulebook.txt L349-350) —
-    # "Every time a Nation's Settlement (Town, City, or Stronghold) is
-    # captured by the opponent" that Nation activates AND advances one
-    # political step (an ADDITIONAL step beyond the attack-advance).  The
-    # engine only advanced on ATTACK (advance_defenders_political); the
-    # capture-advance was previously supplied ONLY by the teacher's
-    # political_sync ground truth (RB-07) and NEVER happened in self-play.
-    # Now the engine performs it natively.  Minimal, teacher-neutral: it
-    # advances the OWNING nation's box one step (+activates), mirroring the
-    # political_sync applier's effect EXACTLY, WITHOUT the heavier
-    # activate_nation_for_attack path (its early persistent-card discard
-    # cascade regressed the certified teacher replay).  political_sync is a
-    # conditional absolute-set (`if want > cur`), so on the teacher path it
-    # stays idempotent with this native advance (zero gate-1 shift, verified).
-    # Fire once, only on a GENUINE opponent capture (region not already in
-    # the captor's control set); recapture of one's own settlement never
-    # advances.
+    # Rulebook p.35: a captured Settlement's nation activates AND advances one
+    # step (beyond the attack-advance).  Native, teacher-neutral: advance the
+    # owning nation one box (+activate) only on a GENUINE opponent capture
+    # (never on recapture); political_sync stays idempotent with it; the
+    # heavier activate_nation_for_attack path is deliberately not used.
+    # LOUD (audit CB-8): only the Wormtongue block (RuntimeError from
+    # activate_nation) is tolerated.
     def _capture_advance():
-        try:
-            nat = None
-            parent_id = meta.get("parent_id")
-            if parent_id:
-                from board import fid_to_name
-                _fac = (fid_to_name.get(parent_id, "") or "").lower()
-                _nm = {
-                    'gondor': Nation.GONDOR, 'rohan': Nation.ROHAN,
-                    'elves': Nation.ELVES, 'dwarves': Nation.DWARVES,
-                    'the north': Nation.THE_NORTH, 'north': Nation.THE_NORTH,
-                    'isengard': Nation.ISENGARD, 'sauron': Nation.SAURON,
-                    'southrons': Nation.SOUTHRON_EASTERLINGS,
-                    'southron': Nation.SOUTHRON_EASTERLINGS,
-                    'southrons and easterlings':
-                        Nation.SOUTHRON_EASTERLINGS,
-                }
-                nat = _nm.get(_fac)
-            if nat is None:
-                return
-            cur = state.political.boxes.get(nat, 0)
-            if cur < 3:
-                # audit A11 (2026-07-26): activation must go through
-                # game_logic.activate_nation so the Wormtongue gate and
-                # the Rohan-activation discard triggers apply to
-                # capture-advances too (was a direct active=True).
-                if not state.political.active.get(nat, False):
-                    import game_logic as _gl_cap
-                    try:
-                        _gl_cap.activate_nation(state, nat,
-                                                method="attack",
-                                                region=region_key)
-                    except RuntimeError:
-                        pass       # blocked (Wormtongue)
-                # review P2 (2026-07-27): the passive->At-War clamp the
-                # attacked-branch enforces applies to capture-advances
-                # too — a still-passive nation may not be pushed to 3.
-                if cur + 1 == 3 and not state.political.active.get(
-                        nat, False):
-                    pass
-                else:
-                    state.political.boxes[nat] = cur + 1
-        except Exception:
-            pass
+        nat = None
+        parent_id = meta.get("parent_id")
+        if parent_id:
+            from board import fid_to_name
+            _fac = (fid_to_name.get(parent_id, "") or "").lower()
+            _nm = {
+                'gondor': Nation.GONDOR, 'rohan': Nation.ROHAN,
+                'elves': Nation.ELVES, 'dwarves': Nation.DWARVES,
+                'the north': Nation.THE_NORTH, 'north': Nation.THE_NORTH,
+                'isengard': Nation.ISENGARD, 'sauron': Nation.SAURON,
+                'southrons': Nation.SOUTHRON_EASTERLINGS,
+                'southron': Nation.SOUTHRON_EASTERLINGS,
+                'southrons and easterlings':
+                    Nation.SOUTHRON_EASTERLINGS,
+            }
+            nat = _nm.get(_fac)
+        if nat is None:
+            return
+        cur = state.political.boxes.get(nat, 0)
+        if cur < 3:
+            # Capture alone is not an attack (Almanac p.29, Wormtongue).
+            # Battle callers resolve attack activation separately; walking
+            # into empty Edoras/Helm's Deep must keep Rohan passive.
+            if not state.political.active.get(nat, False):
+                import game_logic as _gl_cap
+                try:
+                    _gl_cap.activate_nation(state, nat,
+                                            method="enemy_entry",
+                                            region=region_key)
+                except RuntimeError:
+                    pass       # blocked (Wormtongue)
+            # passive->At-War clamp (review P2): a still-passive nation may not
+            # be pushed to 3
+            if cur + 1 == 3 and not state.political.active.get(
+                    nat, False):
+                pass
+            else:
+                state.political.boxes[nat] = cur + 1
 
     # Shadow capturing FP settlement
     if victor_side == Side.SHADOW and is_fp_settlement:
@@ -3413,6 +3507,62 @@ def combat_effect_kind(combat_name: str) -> Optional[str]:
     }.get(name)
 
 
+def _pick_named_companion(companions, name):
+    """The Companion called `name` among `companions`, else None."""
+    if not name or name == 'leader':
+        return None
+    return next((c for c in companions if getattr(c, 'name', '') == name),
+                None)
+
+
+def combat_effect_targets(combat: CombatState, is_attacker: bool,
+                          reroll_hits: int = None):
+    """Legal figure picks for the side's target-bearing combat card this
+    round (USER RULING 1.254 / audit CB-7: the pick is the OWNER's
+    decision, consumed via choices['atk_effect_target' /
+    'def_effect_target']).  Returns printed names; 'leader' stands for a
+    plain Leader.  [] when the side's card carries no pick or none is
+    legal.  reroll_hits gates the post-re-roll cards (Black Breath: a
+    Companion needs level <= hits); None enumerates every figure the
+    card could reach.
+      Words of Power (Shadow)      -> enemy Companions
+      Black Breath (Shadow)        -> enemy Companions (level <= hits) / 'leader'
+      Blade of Westernesse (FP)    -> enemy Minions
+      Heroic Death (FP)            -> own Companions / 'leader'
+    """
+    card = combat.attacker_card if is_attacker else combat.defender_card
+    cancelled = (combat.attacker_card_cancelled if is_attacker
+                 else combat.defender_card_cancelled)
+    if not card or cancelled:
+        return []
+    name = (getattr(card, 'combat_name', '') or '').lower()
+    enemy_army = combat.defender_army if is_attacker else combat.attacker_army
+    own_army = combat.attacker_army if is_attacker else combat.defender_army
+
+    def _has_fp_leader(army):
+        return any(type(l).__name__ == 'Leader'
+                   and _combat_leader_side(l) == Side.FREE_PEOPLES
+                   for l in army.leaders)
+
+    if 'words of power' in name:
+        return [c.name for c in combat.companions_in_battle]
+    if 'black breath' in name:
+        out = [c.name for c in combat.companions_in_battle
+               if reroll_hits is None or c.level <= reroll_hits]
+        if _has_fp_leader(enemy_army):
+            out.append('leader')
+        return out
+    if 'westernesse' in name:
+        return [getattr(l, 'name', '') for l in enemy_army.leaders
+                if type(l).__name__ == 'Minion']
+    if 'heroic death' in name:
+        out = [c.name for c in combat.companions_in_battle]
+        if _has_fp_leader(own_army):
+            out.append('leader')
+        return out
+    return []
+
+
 def _army_entry(state: "GameState", region: str):
     """(key, army) for a region, tolerant of case-variant keys."""
     san = sanitize(str(region))
@@ -3426,6 +3576,11 @@ def _side_units(army: Army, side: Side) -> List[Unit]:
     return [u for u in army.units if side_of_nation(u.nation) == side]
 
 
+def _battle_side_units(state, army, region, side):
+    from army_participants import partition_battle_army
+    return list(partition_battle_army(state, army, region, side)[0])
+
+
 def onslaught_max_sacrifice(state: "GameState", region: str,
                             side: Side) -> int:
     """Max HITS *side* may inflict on its own army via Onslaught at *region*.
@@ -3437,7 +3592,7 @@ def onslaught_max_sacrifice(state: "GameState", region: str,
     _, army = _army_entry(state, region)
     if army is None:
         return 0
-    units = _side_units(army, side)
+    units = _battle_side_units(state, army, region, side)
     elites = sum(1 for u in units if u.kind == UnitKind.ELITE)
     hit_capacity = 2 * elites + (len(units) - elites)
     return max(0, min(4, hit_capacity))
@@ -3448,7 +3603,8 @@ def _write_back_side_units(state: "GameState", key: str, army: Army,
     """Replace *side*'s units within a (possibly shared siege) army entry.
 
     Preserves the co-location convention (garrison units first)."""
-    others = [u for u in army.units if side_of_nation(u.nation) != side]
+    from army_participants import partition_battle_army
+    others = list(partition_battle_army(state, army, key, side)[2])
     try:
         garrison = garrison_side_for(state, sanitize(key))
     except Exception:
@@ -3467,19 +3623,27 @@ def resume_deferred_post_casualty(state: "GameState", atk_region: str,
                                   atk_cancelled: bool = False,
                                   def_cancelled: bool = False,
                                   is_siege: bool = False,
-                                  choices: dict = None
+                                  choices: dict = None,
+                                  out: dict = None
                                   ) -> Tuple[bool, bool, Optional[str]]:
     """Phase 9 for the deferred-casualties round path: once post-roll
     allocation has resolved, run the SAME _apply_post_casualty_effects
     the standalone path runs (We Come to Kill, Great Host, Onslaught),
     on a thin CombatState wrapping the live post-allocation armies.
     Returns (attacker_destroyed, defender_destroyed, deferred_effect).
+
+    USER RULING 1.254 (audit CB-7): with choices['defer_post_hits'] the
+    We-Come-to-Kill / Great-Host enemy hits are NOT applied here; the
+    caller reads them from `out` ('post_hits_on_defender' /
+    'post_hits_on_attacker') and opens the enemy owner's learned
+    casualty_allocate pending for them.  `out` is also filled on the
+    historical apply path (both 0) so callers can branch on it.
     """
     from cards import get_card
     atk_key, atk_parent = _army_entry(state, atk_region)
     def_key, def_parent = _army_entry(state, def_region)
-    a_units = _side_units(atk_parent, atk_side) if atk_parent else []
-    d_units = _side_units(def_parent, def_side) if def_parent else []
+    a_units = _battle_side_units(state, atk_parent, atk_region, atk_side) if atk_parent else []
+    d_units = _battle_side_units(state, def_parent, def_region, def_side) if def_parent else []
 
     def _cc(cid):
         if not cid:
@@ -3507,15 +3671,18 @@ def resume_deferred_post_casualty(state: "GameState", atk_region: str,
     cs.defender_destroyed = not td.units
     cs.battle_over = cs.attacker_destroyed or cs.defender_destroyed
 
-    # publish the live state (battle() parity): downgrade replacements
-    # must be SOURCED (casualty box first, else pool, else the elite
-    # dies unreplaced) — an unpublished state let apply_casualties
-    # mint replacement Regulars from thin air (batch-0 A4 breach)
+    # publish the live state (battle() parity): downgrade replacements are
+    # SOURCED (box, pool, or the elite dies), never minted
     _prev_as = set_active_state(state)
     try:
         _apply_post_casualty_effects(cs, dict(choices or {}))
     finally:
         set_active_state(_prev_as)
+    if out is not None:
+        out['post_hits_on_defender'] = int(
+            getattr(cs, 'deferred_post_hits_on_defender', 0) or 0)
+        out['post_hits_on_attacker'] = int(
+            getattr(cs, 'deferred_post_hits_on_attacker', 0) or 0)
 
     if atk_parent is not None:
         _write_back_side_units(state, atk_key, atk_parent, atk_side,
@@ -3534,7 +3701,8 @@ def apply_onslaught_choice(state: "GameState", own_region: str,
                            enemy_side: Side, count: int,
                            own_policy: str = 'preserve_elites',
                            enemy_policy: str = 'preserve_elites',
-                           enemy_is_defender: bool = True
+                           enemy_is_defender: bool = True,
+                           defer_enemy_hits: bool = False
                            ) -> Tuple[bool, bool, List[int], int]:
     """Resume a deferred Onslaught with the chosen sacrifice magnitude.
 
@@ -3545,25 +3713,29 @@ def apply_onslaught_choice(state: "GameState", own_region: str,
     Verified vs game0 T3 MT assault1: SP sacrificed 4 Regulars, rolled
     1 6 4 3 -> 2 hits (one die per inflicted hit, 4+ scores).
 
+    defer_enemy_hits (USER RULING 1.254 / audit CB-7): the enemy hits
+    are NOT applied - the caller opens the ENEMY owner's learned
+    casualty_allocate pending for `hits` and finishes the wipe / capture
+    bookkeeping itself; enemy_destroyed is returned False.
+
     Returns (own_destroyed, enemy_destroyed, rolls, hits).
     """
     own_key, own_army = _army_entry(state, own_region)
     enemy_key, enemy_army = _army_entry(state, enemy_region)
     if own_army is None or enemy_army is None:
         return False, False, [], 0
-    own_units = _side_units(own_army, own_side)
+    own_units = _battle_side_units(state, own_army, own_region, own_side)
     # cap on HITS: an Elite absorbs 2, so capacity = 2*elites + regulars
     # (full self-wipe permitted -- almanac); apply_casualties absorbs the k
     # hits via the standard elite-downgrade rules.
     _own_elites = sum(1 for u in own_units if u.kind == UnitKind.ELITE)
     hit_capacity = 2 * _own_elites + (len(own_units) - _own_elites)
     k = max(0, min(int(count), 4, hit_capacity))
-    if k <= 0 or not _side_units(enemy_army, enemy_side):
+    if k <= 0 or not _battle_side_units(state, enemy_army, enemy_region, enemy_side):
         return False, False, [], 0
 
-    # publish the live state (battle() parity): downgrade replacements
-    # must be SOURCED (box first / pool / refuse) — an unpublished
-    # state minted replacement Regulars (batch-0 A4 breach)
+    # publish the live state (battle() parity): downgrade replacements are
+    # SOURCED (box, pool, or the elite dies), never minted
     _prev_as = set_active_state(state)
     try:
         # Self-inflicted hits (owner's casualty policy applies)
@@ -3578,9 +3750,9 @@ def apply_onslaught_choice(state: "GameState", own_region: str,
         rolls, hits = combat_roll(k, 4, 0)
 
         enemy_destroyed = False
-        if hits > 0:
+        if hits > 0 and not defer_enemy_hits:
             etmp = Army(region=enemy_army.region,
-                        units=_side_units(enemy_army, enemy_side),
+                        units=_battle_side_units(state, enemy_army, enemy_region, enemy_side),
                         leaders=[])
             enemy_cas = apply_casualties(etmp, hits, enemy_policy)
             _write_back_side_units(state, enemy_key, enemy_army,
@@ -3588,28 +3760,97 @@ def apply_onslaught_choice(state: "GameState", own_region: str,
             _track_fp_casualties(state, enemy_cas, enemy_side)
     finally:
         set_active_state(_prev_as)
-    if hits > 0:
+    if hits > 0 and not defer_enemy_hits:
         if not etmp.units:
             enemy_destroyed = True
             # Destroyed side's CHARACTERS die with the army (USER RULING
             # 2026-08-15) — same reconciler as every other wipe path
             reconcile_destroyed_army(state, enemy_key, enemy_side,
                                      army=enemy_army)
+            # 1.152: no capture on mutual elimination; 1.255: capture
+            # only with the victor IN the region (co-located)
             if enemy_is_defender \
-                    and _side_units(own_army, own_side):
-                # 1.152: no capture on mutual elimination
+                    and _battle_side_units(state, own_army, own_region, own_side) \
+                    and _wipe_captures_in_place(own_region, enemy_region):
                 _check_settlement_capture(state, sanitize(enemy_region),
                                           own_side)
-    own_destroyed = not _side_units(own_army, own_side)
+    own_destroyed = not _battle_side_units(state, own_army, own_region, own_side)
     if own_destroyed:
         # A self-wiped side loses its characters with the army; the
         # shared (siege) entry is only popped once BOTH sides are gone.
         reconcile_destroyed_army(state, own_key, own_side, army=own_army)
         # self-wiped DEFENDER loses the settlement to the surviving
-        # attacker; a self-wiped ATTACKER captures nothing (1.152
-        # mutual-elimination guard).
+        # attacker standing IN the region (1.255); a self-wiped
+        # ATTACKER captures nothing (1.152 mutual-elimination guard).
         if not enemy_is_defender and not enemy_destroyed \
-                and _side_units(enemy_army, enemy_side):
+                and _battle_side_units(state, enemy_army, enemy_region, enemy_side) \
+                and _wipe_captures_in_place(enemy_region, own_region):
             _check_settlement_capture(state, sanitize(own_region),
                                       enemy_side)
     return own_destroyed, enemy_destroyed, rolls, hits
+
+
+def mighty_attack_payers(combat, is_attacker, rolls, threshold, modifier):
+    """Current owner choices after Combat roll and reroll cancellation."""
+    card = combat.attacker_card if is_attacker else combat.defender_card
+    cancelled = combat.attacker_card_cancelled if is_attacker else combat.defender_card_cancelled
+    if not card or cancelled or card.combat_name.lower() != 'mighty attack':
+        return []
+    if getattr(combat, '_foul_stench_cancel_atk' if is_attacker else '_foul_stench_cancel_def', False):
+        return []
+    if not any(r != 6 and r + modifier < threshold for r in rolls):
+        return []
+    shined = getattr(combat, '_shined_companion', None)
+    cancelled_companion = getattr(combat, '_wop_cancelled', None)
+    return [c.name for c in combat.companions_in_battle
+            if c is not shined and c is not cancelled_companion]
+
+
+def fateful_strike_targets(combat, is_attacker, reroll_hits):
+    """Current owner choices after actual Leader re-roll hits are known."""
+    from game_state import Nazgul
+    from game_logic import Minion
+    card = combat.attacker_card if is_attacker else combat.defender_card
+    cancelled = combat.attacker_card_cancelled if is_attacker else combat.defender_card_cancelled
+    if not card or cancelled or card.combat_name.lower() != 'fateful strike' or reroll_hits < 1:
+        return []
+    enemy = combat.defender_army if is_attacker else combat.attacker_army
+    targets = ['nazgul'] if any(isinstance(l, Nazgul) for l in enemy.leaders) else []
+    if reroll_hits >= 2:
+        targets.extend(l.name for l in enemy.leaders if isinstance(l, Minion))
+    return targets
+
+
+def relentless_assault_choices(combat: CombatState, is_attacker: bool):
+    """Legal self-hit counts at initiative 3, after earlier attacks resolve.
+
+    The battle roster excludes a rearguard. Each Elite can take two hits;
+    wiping the participating army is legal (Almanac p44).
+    """
+    army = combat.attacker_army if is_attacker else combat.defender_army
+    capacity = sum(2 if u.kind == UnitKind.ELITE else 1 for u in army.units)
+    return list(range(min(2, capacity) + 1))
+
+
+def heroic_death_choices(combat: CombatState, is_attacker: bool,
+                         incoming_roll_hits: int):
+    """Legal optional sacrifice pairs at the pre-casualty initiative-6 window.
+
+    Call after earlier effects have resolved, passing the eligible incoming
+    hits from the existing damage-scope calculation. A named level-1
+    Companion and a plain Leader are
+    different choices; a Companion may cancel less than his full Level.
+    Leadership cancellation does not remove a Companion as a sacrifice.
+    """
+    hits = max(0, int(incoming_roll_hits))
+    out = [(0, None)]
+    if not hits:
+        return out
+    army = combat.attacker_army if is_attacker else combat.defender_army
+    if any(type(l).__name__ == 'Leader'
+           and _combat_leader_side(l) == Side.FREE_PEOPLES for l in army.leaders):
+        out.append((1, 'leader'))
+    for companion in combat.companions_in_battle:
+        for count in range(1, min(hits, int(companion.level)) + 1):
+            out.append((count, companion.name))
+    return out

@@ -4,7 +4,7 @@ War of the Ring - AI core (2026-07-27 state)
 
 Single-file AI infrastructure:
   1. State cloning (clone_state)
-  2. State-to-vector encoding (encode_state, 3742 dims, tail-append rule)
+  2. State-to-vector encoding (encode_state, versioned append-only fields)
   3. Action encoding (encode_action, ACTION_ENCODING_DIM dims; col 22
      dead by design)
   4. Nets (WOTRValueNet: arch registry base/wide/xformer; value head +
@@ -21,6 +21,7 @@ extraction in rendered_extract.py.  The old CSV-export / legacy-npz
 training paths were removed 2026-07-27.
 """
 
+import copy
 import dataclasses
 import math
 import os
@@ -66,6 +67,11 @@ import combat
 # Constants
 # ---------------------------------------------------------------------------
 
+from encoding_batch import EncodingBatch, ENCODING_BATCH_KEY, MISSING_BATCH, active_batch
+import companion_search_cache as _companion_search_cache
+import search_lattice as _search_lattice
+_segment_Menu = _search_lattice.Menu
+
 def _armies_lookup(state, key):
     """state.armies lookup tolerant of key-casing drift ('Pelargir' vs
     'pelargir') — exact hit first, then a sanitized scan.  The exact-key
@@ -85,8 +91,11 @@ def _armies_lookup(state, key):
     return None
 
 
-SHADOW_NATIONS = {Nation.ISENGARD, Nation.SAURON, Nation.SOUTHRON_EASTERLINGS}
-FP_NATIONS = {Nation.ELVES, Nation.DWARVES, Nation.GONDOR, Nation.THE_NORTH, Nation.ROHAN}
+# SPTR-9: fixed-order TUPLES, never set literals - Nation members hash
+# by id, so set iteration order (and with it the political-advance
+# menu order) followed PYTHONHASHSEED.
+SHADOW_NATIONS = (Nation.ISENGARD, Nation.SAURON, Nation.SOUTHRON_EASTERLINGS)
+FP_NATIONS = (Nation.ELVES, Nation.DWARVES, Nation.GONDOR, Nation.THE_NORTH, Nation.ROHAN)
 ALL_NATIONS = list(Nation)
 
 # Shared action type vocabulary (used in training data / encode_action one-hot)
@@ -108,9 +117,6 @@ CARD_PAD_IDX = 96       # Embedding padding index (index 96)
 
 _CARD_ID_TO_IDX = None
 
-# (RETREAT_ADVANCE_HOOK + VICTOR_ADVANCE_SAMPLE_CB deleted 2026-07-27
-#  — the teacher that installed them is retired; all gated branches
-#  collapsed to the self-play behavior)
 
 def _build_card_id_index():
     from cards import get_cards
@@ -122,10 +128,6 @@ def _get_card_idx_map():
         _CARD_ID_TO_IDX = _build_card_id_index()
     return _CARD_ID_TO_IDX
 
-# (LOG_ACTION_TO_CANONICAL and _find_mandatory_draws — consumer-less
-# leftovers of the CSV-export path removed 2026-07-27 — were DELETED
-# in the 2026-08-24 vestigial sweep; victor_advance is the discrete
-# post-battle decision.)
 
 # Per rulebook p.7: maximum figures available per nation (regular, elite, leader/nazgul)
 NATION_MAX_FIGURES = {
@@ -198,6 +200,32 @@ def _region_nation(rkey: str) -> Optional[Nation]:
     return _FACTION_TO_NATION.get(faction_name)
 
 
+def _border_pred9(state: GameState, own_units, leaders, side: Side,
+                  to_san: str):
+    """W4-038 (rulebook L3093-3096 / L3108-3109 / L4189-4191): on a
+    VOLUNTARY move into another Nation's borders the acting side's
+    non-belligerent figures - Army units AND plain Leaders - may not
+    cross, even when stacked with figures of a Nation At War.  Returns
+    the predicate 'may Nation n enter to_san' when the restriction bites
+    (some own nation in the stack is not At War and the destination
+    belongs to a Nation), else None (no restriction).  1.213 (USER
+    2026-07-22): per figure - a figure of the destination's own Nation
+    may always enter it.  Retreats and advances are exempt (L3110-3114)
+    and never call this.  ONE body: the army_move menu and its executor
+    share it, so the offered composition is the executed one."""
+    nats = set(u.nation for u in own_units)
+    nats.update(l.nation for l in leaders
+                if game_logic.leader_must_follow(l)
+                and game_logic._leader_side(l) == side)
+    _pol = state.political
+    if all(_pol.is_at_war(n) for n in nats):
+        return None
+    dest_nation = _region_nation(to_san)
+    if dest_nation is None:
+        return None
+    return lambda n, _d=dest_nation, _p=_pol: _p.is_at_war(n) or n == _d
+
+
 def _count_deployed(state: GameState, nation: Nation) -> Dict[str, int]:
     """Count units of a nation currently on the board.
 
@@ -238,11 +266,9 @@ def _count_deployed_all(state: GameState) -> Dict[Nation, Dict[str, int]]:
                 else:
                     c['elite'] += 1
         for ld in army.leaders:
-            # Conservation fix (2026-07-20): only POOL figures count —
-            # plain Leaders and Nazgul. Minions (Witch-king/Mouth/
-            # Saruman) and Companions carry a nation but are NOT
-            # leader-pool figures; counting them blocked the last
-            # nazgul/leader from ever mustering while they lived.
+            # Only POOL figures count (plain Leaders and Nazgul): Minions and
+            # Companions carry a nation but are not leader-pool pieces
+            # (conservation 2026-07-20).
             _tn = type(ld).__name__
             if _tn not in ('Leader', 'Nazgul'):
                 continue
@@ -311,10 +337,8 @@ def _can_recruit(state: GameState, nation: Nation, typ: str,
     `deployed_all`: precomputed _count_deployed_all(state) to avoid a
     full army scan per candidate.
     """
-    # ONE ANSWERER (USER ruling 2026-08-18): this used to carry its own
-    # copy of the cap arithmetic.  It is now a predicate over
-    # figures_available, so "can I recruit" and "how many are left"
-    # can never disagree.
+    # ONE ANSWERER (USER ruling 2026-08-18): a predicate over
+    # figures_available - never a second copy of the cap arithmetic.
     return figures_available(state, nation, typ, deployed_all) > 0
 
 
@@ -692,10 +716,8 @@ def _compute_strategic_features(
         steps_rem = dist_to_gate + 5  # distance to gate + 5 mordor steps
 
     # --- VP to win (enemy perspective: how far is my enemy from winning) ---
-    # FIX (full-pass review 2026-07-27): the enemy's OWN victory
-    # threshold — Shadow needs 10, FP needs 4 (FP_VP_VICTORY).  The old
-    # code used the Shadow threshold for both perspectives, overstating
-    # FP's distance by 6 from the Shadow side's view.
+    # The enemy's OWN victory threshold: Shadow needs 10, FP needs 4
+    # (FP_VP_VICTORY; review 2026-07-27).
     if my_side == Side.FREE_PEOPLES:
         en_vp_to_win = max(0, game_logic.SHADOW_VP_VICTORY - vp['shadow'])
     else:
@@ -717,8 +739,6 @@ def _compute_strategic_features(
         en_vp_to_win / 10.0,              # How far enemy is from military VP win
     ]
 
-STRATEGIC_FEATURE_COUNT = 12
-
 
 # ===================================================================
 # Step 1: State Cloning
@@ -733,6 +753,16 @@ def clone_state(state: GameState) -> GameState:
     could be mutated during action application are deep-copied.
     """
     board_obj = state.board
+
+    # A paused round contains references to the same figures and supply
+    # ledgers as the live state. Copy that graph together, preserving aliases.
+    if (getattr(state, 'pending_combat', None) or {}).get('_round_resume'):
+        import copy
+        cloned = copy.deepcopy(state, {id(board_obj): board_obj})
+        for name in ('_last_round_call', '_last_round_phase_call',
+                     '_last_battle_result'):
+            cloned.__dict__.pop(name, None)
+        return cloned
 
     # Deep-copy armies (the most complex mutable structure)
     new_armies = {}
@@ -846,12 +876,8 @@ def clone_state(state: GameState) -> GameState:
         saruman=dataclasses.replace(state.saruman) if state.saruman else None,
         mouth_of_sauron=dataclasses.replace(state.mouth_of_sauron) if state.mouth_of_sauron else None,
         gandalf_the_white=dataclasses.replace(state.gandalf_the_white) if state.gandalf_the_white else None,
-        # 1.137 (USER bug report): aragorn_crowned was a SHARED
-        # reference - an MCTS clone considering crown_aragorn set
-        # crowned=True on the LIVE state: Aragorn appeared in the GUI
-        # before any crowning action, the real crown action vanished
-        # from the menu ('already crowned') so no die was ever spent,
-        # and calculate_bonus_dice granted FP a spurious +1 die.
+        # 1.137: aragorn_crowned is COPIED, never shared - an in-tree crown
+        # must not mutate the live state.
         aragorn_crowned=dataclasses.replace(state.aragorn_crowned)
         if state.aragorn_crowned else None,
         gollum=state.gollum,
@@ -885,12 +911,11 @@ def clone_state(state: GameState) -> GameState:
             params=dict(_pco['resume_action'].get('params') or {}))
     s2._crebain_hunt_bonus = getattr(state, '_crebain_hunt_bonus', 0)
     s2._reveal_place_due = getattr(state, '_reveal_place_due', False)
-    # (stale-state sweep 2026-07-27: legacy _saruman/_wk/_mouth
-    # in-play flags DELETED — canonical .in_play + map presence are
-    # the single source of truth)
+    s2._hunt_reveal_pending = getattr(state, '_hunt_reveal_pending', 0)
     s2._ents_chain_n = getattr(state, '_ents_chain_n', 0)
     _ms9 = getattr(state, '_mithril_stash', None)
     s2._mithril_stash = dict(_ms9) if _ms9 else None
+    s2._fellowship_move_die_pending = getattr(state, '_fellowship_move_die_pending', None)
     _wss9 = getattr(state, '_wizardstaff_stash', None)
     s2._wizardstaff_stash = dict(_wss9) if _wss9 else None
     _ovr9 = getattr(state, '_overstack_regions', None)
@@ -908,6 +933,9 @@ def clone_state(state: GameState) -> GameState:
     # free-action routing marker (elven_ring): _next_acting_side keeps
     # the ring user's seat until its funded action lands
     s2._ring_free_side = getattr(state, '_ring_free_side', None)
+    # LA-1/LA-2: the recorded Elven-Ring waiver face is pending-shaped
+    s2.fp_ring_waiver_face = getattr(state, 'fp_ring_waiver_face', None)
+    s2.sh_ring_waiver_face = getattr(state, 'sh_ring_waiver_face', None)
     s2.pending_army_move_preexist = (
         dict(state.pending_army_move_preexist)
         if getattr(state, 'pending_army_move_preexist', None) else None)
@@ -925,15 +953,17 @@ def clone_state(state: GameState) -> GameState:
     s2.eyes_allocated = getattr(state, 'eyes_allocated', 0)
 
 
-    # Copy pending multi-phase states (dicts of primitives — shallow copy suffices,
-    # except rearguard_units/rearguard_leaders which are lists of dataclasses)
+    # Copy pending multi-phase states (dicts of primitives - shallow copy
+    # suffices; the nested containers are copied below)
+    s2._wormtongue_attack_pending = getattr(
+        state, '_wormtongue_attack_pending', None)
     pc = getattr(state, 'pending_combat', None)
     if pc is not None:
         s2.pending_combat = dict(pc)
-        if 'rearguard_units' in pc:
-            s2.pending_combat['rearguard_units'] = list(pc['rearguard_units'])
-        if 'rearguard_leaders' in pc:
-            s2.pending_combat['rearguard_leaders'] = list(pc['rearguard_leaders'])
+        if isinstance(pc.get('_onslaught_payment'), dict):
+            s2.pending_combat['_onslaught_payment'] = dict(pc['_onslaught_payment'])
+        if isinstance(pc.get('_observed_round_completed'), dict):
+            s2.pending_combat['_observed_round_completed'] = dict(pc['_observed_round_completed'])
         ec = pc.get('effect_choice')
         if isinstance(ec, dict):
             ec2 = dict(ec)
@@ -948,9 +978,8 @@ def clone_state(state: GameState) -> GameState:
         s2.pending_combat = None
     ph = getattr(state, 'pending_hunt', None)
     s2.pending_hunt = dict(ph) if ph is not None else None
-    # W11 EDGE1 (2026-07-20): clone the scalar hunt-damage pending too
-    # (session-27 invariant: every pending field must survive a clone).
-    # Safe today via pending_hunt['damage'], but explicit is robust.
+    # Session-27 invariant (W11 EDGE1 2026-07-20): every pending field
+    # survives a clone, the scalar hunt-damage pending included.
     s2._pending_hunt_damage = getattr(state, '_pending_hunt_damage', 0)
     pg = getattr(state, 'pending_guide_change', None)
     s2.pending_guide_change = dict(pg) if pg is not None else None
@@ -961,33 +990,34 @@ def clone_state(state: GameState) -> GameState:
     s2._eye_allocation_phase = getattr(state, '_eye_allocation_phase',
                                        False)
     s2._declare_phase = getattr(state, '_declare_phase', False)
+    s2._fellowship_tail_phase = getattr(state, '_fellowship_tail_phase', False)
+    # Immutable extraction provenance only; it is not gameplay or model state.
+    if hasattr(state, '_rx_hunt_observation'):
+        s2._rx_hunt_observation = tuple(state._rx_hunt_observation)
     # v30 cross-turn search: the crossing budget MUST survive clones or
     # in-tree lookahead would cross turn boundaries without limit
     s2._search_turn_crossings = getattr(state, '_search_turn_crossings', 0)
+    if hasattr(state, '_search_endturn_victory'):
+        terminal = state._search_endturn_victory
+        s2._search_endturn_victory = None if terminal is None else dict(terminal)
     s2._hobbit_place_queue = list(getattr(state, '_hobbit_place_queue',
                                           None) or [])
-    # review P2 (2026-07-27): the once-per-region stronghold hunt-tile
-    # guard must survive clones or an in-tree second pass through the
-    # same stronghold re-draws the tile, inflating hunt damage on that
-    # search branch (getattr-None masked the loss).  Preserve None vs
-    # set: None means "no reveal event open" and must stay None.
+    # The once-per-region stronghold hunt-tile guard survives clones;
+    # None ('no reveal event open') stays None, distinct from an empty
+    # set (review P2 2026-07-27).
     _stdr9 = getattr(state, '_sh_tile_drawn_regions', None)
     s2._sh_tile_drawn_regions = set(_stdr9) if _stdr9 is not None else None
+    s2._pending_reveal_strongholds = tuple(getattr(state, '_pending_reveal_strongholds', None) or ())
+    from fellowship_route_event_context import clone_event
+    s2._fellowship_route_event = clone_event(state)
     # 1.211f: Worn with Sorrow deferred-discard queue is a pending
     # decision list - it MUST survive a clone (MCTS root determinization
     # / tree reuse) or an owed discard opened mid-search would vanish.
     s2._wwsat_owed = list(getattr(state, '_wwsat_owed', None) or [])
-    # DOWNGRADE-SOURCE LEDGER (BRIDGE-9 2026-08-18).  combat._dg_stamp
-    # appends (nation, 'cas'|'pool'|None) per downgrade and the emitter
-    # slices `post[len(pre):]` to get the ones THIS transition made.
-    # Without it on the clone, `pre` always looked empty and the slice
-    # took every stamp on the post state - over-attributing an earlier
-    # round's downgrades to a later one in a multi-round battle.  The
-    # per-clone cost was MEASURED before adding it: 0.14 us on a 40.3 us
-    # clone (0.34%), i.e. negligible against the correctness of a
-    # per-round boundary, and it keeps the field handled the same way
-    # as every other pending field here.
+    # DOWNGRADE-SOURCE LEDGER (BRIDGE-9 2026-08-18): the emitter slices
+    # post[len(pre):], so the clone carries the pre-transition stamps.
     s2._dg_src_log = list(getattr(state, '_dg_src_log', None) or [])
+    s2._casualty_operations = list(getattr(state, '_casualty_operations', None) or [])
     s2._fp_used_hunt_box_last_turn = getattr(
         state, '_fp_used_hunt_box_last_turn', False)
     # USER 1.208m: the deferred Palantir bonus-draw flag is a pending
@@ -995,6 +1025,8 @@ def clone_state(state: GameState) -> GameState:
     # / tree reuse) or a Palantir draw opened mid-battle would vanish.
     s2._palantir_draw_pending = getattr(state, '_palantir_draw_pending',
                                         False)
+    _gdp = getattr(state, '_gandalf_draw_pending', None)
+    s2._gandalf_draw_pending = dict(_gdp) if _gdp is not None else None
 
     # Copy besieged strongholds set
     bs = getattr(state, 'besieged_strongholds', set())
@@ -1016,6 +1048,37 @@ def clone_state(state: GameState) -> GameState:
 # ===================================================================
 # Step 2: State-to-Vector Encoding
 # ===================================================================
+
+RING_OBSERVATION_CONTRACT = 'physical_die_signed_ring_count_v1'
+_OBSERVATION_GENERATION = os.environ.get('WOTR_ACT_GEN', '').strip().lower()
+_CARD_CONTEXT_ON = _OBSERVATION_GENERATION in ('v45', 'v46', 'v47', 'v48', 'v49', 'v50', 'v51', 'v52')
+_COMPANION_CONTEXT_ON = _OBSERVATION_GENERATION in ('v46', 'v47', 'v48', 'v49', 'v50', 'v51', 'v52')
+_FELLOWSHIP_DIE_CONTEXT_ON = _OBSERVATION_GENERATION in ('v47', 'v48', 'v49', 'v50', 'v51', 'v52')
+_HUNT_PROTECTION_CONTEXT_ON = _OBSERVATION_GENERATION in ('v48', 'v49', 'v50', 'v51', 'v52')
+_REVEAL_ROUTE_CONTEXT_ON = _OBSERVATION_GENERATION in ('v49', 'v50', 'v51', 'v52')
+_ROUTE_EVENT_CONTEXT_ON = _OBSERVATION_GENERATION in ('v50', 'v51', 'v52')
+_BREAKING_CONTEXT_ON = _OBSERVATION_GENERATION in ('v51', 'v52')
+_COMBAT_ROUND_CONTEXT_ON = _OBSERVATION_GENERATION == 'v52'
+OBSERVATION_CONTRACT = (__import__('combat_round_observation').OBSERVATION_CONTRACT if _COMBAT_ROUND_CONTEXT_ON
+                        else 'v51_breaking_hunt_context_v1' if _BREAKING_CONTEXT_ON
+                        else 'v50_route_event_context_v1' if _ROUTE_EVENT_CONTEXT_ON
+                        else 'v49_reveal_route_context_v1' if _REVEAL_ROUTE_CONTEXT_ON
+                        else 'v48_hunt_protection_context_v1' if _HUNT_PROTECTION_CONTEXT_ON
+                        else 'v47_fellowship_move_timing_v1' if _FELLOWSHIP_DIE_CONTEXT_ON
+                        else 'v46_companion_movement_context_v1' if _COMPANION_CONTEXT_ON
+                        else 'v45_deferred_card_context_v1' if _CARD_CONTEXT_ON
+                        else 'v44_fellowship_tail_v1')
+
+
+def _ring_resource_feature(count, used_this_turn):
+    """Same width as old count features; used resources occupy negative values.
+
+    This changes observation semantics for used-ring states. Old checkpoints
+    are warm starts, and old count-only replay buffers must be regenerated.
+    """
+    count = int(count)
+    return -(count + 1) / 3.0 if used_this_turn else count / 3.0
+
 
 def encode_state(state: GameState, side: Side) -> np.ndarray:
     """Encode a GameState from the perspective of `side` into a fixed-length
@@ -1121,6 +1184,13 @@ def encode_state(state: GameState, side: Side) -> np.ndarray:
     for nat in ALL_NATIONS:
         pos = state.political.boxes.get(nat, 0)
         active = 1.0 if state.political.active.get(nat, False) else 0.0
+        # Public schema refinement without a width/checkpoint migration.
+        # Existing no-debt states remain 0/1. Rohan activation-only debt
+        # subtracts .25; activation+advance subtracts .5. All six values
+        # remain distinct, including after a separate capture activates it.
+        if nat == Nation.ROHAN:
+            active -= .25 * (getattr(
+                state, '_wormtongue_attack_pending', None) or 0)
         at_war = 1.0 if pos >= 3 else 0.0
         is_mine = 1.0 if _side_of_nation(nat) == my_side else 0.0
         feats.extend([pos / 3.0, active, at_war, is_mine])
@@ -1204,14 +1274,32 @@ def encode_state(state: GameState, side: Side) -> np.ndarray:
                           if game_logic.card_deck_of(c) == 'character')
     en_strat_in_hand = sum(1 for c in en_hand.hand
                            if game_logic.card_deck_of(c) == 'strategy')
+    my_count, en_count = len(my_hand.hand), len(en_hand.hand)
+    # A live face-down commitment stays in the engine hand until reveal.
+    # Its public hand cost is already paid, just as for an ordinary hidden
+    # commitment whose identity the engine happens to know. Do not expose or
+    # remove any identity here; only account for the public commitment/type.
+    pending = getattr(state, 'pending_combat', None) or {}
+    for role in ('atk', 'def'):
+        hidden = pending.get(role + '_hidden_cc')
+        if not hidden:
+            continue
+        owner = pending.get('attacker_side' if role == 'atk' else 'defender_side')
+        if owner == my_side:
+            my_count = max(0, my_count - 1)
+        elif owner == enemy_side:
+            en_count = max(0, en_count - 1)
+            if hidden.get('deck') == 'character':
+                en_char_in_hand = max(0, en_char_in_hand - 1)
+            elif hidden.get('deck') == 'strategy':
+                en_strat_in_hand = max(0, en_strat_in_hand - 1)
     feats.extend([
-        len(my_hand.hand) / 6.0,
-        len(en_hand.hand) / 6.0,
+        my_count / 6.0,
+        en_count / 6.0,
         en_char_in_hand / 6.0,
         en_strat_in_hand / 6.0,
-        # stale-state sweep 2026-07-27: DeckStatus was NEVER updated
-        # (four constant 1.0 features since day one) — encode the REAL
-        # deck depletion from the live deck lists
+        # Real deck depletion from the live deck lists (DeckStatus is
+        # never updated by the engine)
         len(getattr(state, 'fp_char_deck', []) or []) / 24.0,
         len(getattr(state, 'fp_strat_deck', []) or []) / 24.0,
         len(getattr(state, 'sh_char_deck', []) or []) / 24.0,
@@ -1233,11 +1321,27 @@ def encode_state(state: GameState, side: Side) -> np.ndarray:
     # 0 = unseen, 0.5 = seen (played/discarded), 1.0 = on the table now.
     # Card-counting: knowing what has been played narrows what remains.
     card_status = [0.0] * NUM_CARD_IDS
+    # MC3: the attacker's committed combat card goes face-up at COMMIT
+    # (CL-217) but its identity is hidden from the defender until the
+    # defender commits - skip that one copy so the training vector
+    # equals what the blinded search root sees (USER 2026-08-16)
+    _skip9 = _hidden_commit_card(state, side)
     for _deck_list in getattr(state, 'discard_face_up', {}).values():
         for cid in _deck_list:
+            if _skip9 is not None and cid == _skip9:
+                _skip9 = None
+                continue
             idx = card_map.get(cid, -1)
             if idx >= 0:
                 card_status[idx] = 0.5
+    # 1.261: PER-SIDE private knowledge - the encoding side's OWN
+    # face-down discards (table-kill payments, WWSAT/hand-limit
+    # discards) light at 0.5; the opponent's face-down pile stays
+    # dark (its identities are never seen).  Layout unchanged.
+    for cid in my_hand.discarded_face_down:
+        idx = card_map.get(cid, -1)
+        if idx >= 0:
+            card_status[idx] = 0.5
     pc_state = state.persistent_cards
     if pc_state is not None:
         for _pcard in (list(getattr(pc_state, 'fp_cards', []))
@@ -1263,19 +1367,19 @@ def encode_state(state: GameState, side: Side) -> np.ndarray:
     # --- Resources ---
     if my_side == Side.FREE_PEOPLES:
         feats.extend([
-            state.fp_elven_rings / 3.0,
+            _ring_resource_feature(state.fp_elven_rings, state.fp_ring_used_this_turn),
             state.fp_dwarven_rings / 1.0 if state.fp_dwarven_rings else 0.0,
             (1.0 if state.fp_political_token else 0.0),
-            state.sh_elven_rings / 3.0,
+            _ring_resource_feature(state.sh_elven_rings, state.sh_ring_used_this_turn),
             state.sh_dwarven_rings / 1.0 if state.sh_dwarven_rings else 0.0,
             state.sh_action_tokens / 3.0,
         ])
     else:
         feats.extend([
-            state.sh_elven_rings / 3.0,
+            _ring_resource_feature(state.sh_elven_rings, state.sh_ring_used_this_turn),
             state.sh_dwarven_rings / 1.0 if state.sh_dwarven_rings else 0.0,
             state.sh_action_tokens / 3.0,
-            state.fp_elven_rings / 3.0,
+            _ring_resource_feature(state.fp_elven_rings, state.fp_ring_used_this_turn),
             state.fp_dwarven_rings / 1.0 if state.fp_dwarven_rings else 0.0,
             (1.0 if state.fp_political_token else 0.0),
         ])
@@ -1299,6 +1403,16 @@ def encode_state(state: GameState, side: Side) -> np.ndarray:
     # Build alive set: fellowship companions + separated (in army leaders)
     fellowship_names = {c.name for c in state.fellowship.companions}
     alive_companions = set(fellowship_names)
+    # X-audit B4 (2026-08-31): Gollum guides OUTSIDE fellowship.companions
+    # (state.gollum / guide slot only), so his companion-details dims
+    # stayed 0 even while he led the Fellowship - only the guide one-hot
+    # lit.  Mark him alive + travelling with the Fellowship when he is
+    # the guide or in play.
+    # (state.gollum is a template object created at setup - it is NOT an
+    # in-play marker; the truthful signal is the guide slot itself)
+    if getattr(state.fellowship.guide, 'name', '') == 'Gollum':
+        alive_companions.add('Gollum')
+        fellowship_names = set(fellowship_names) | {'Gollum'}
     separated_levels = {}    # name -> level for separated companions
     separated_regions = {}   # name -> region index on the board
     for akey, army in state.armies.items():
@@ -1323,6 +1437,12 @@ def encode_state(state: GameState, side: Side) -> np.ndarray:
         ridx = separated_regions.get(cname, -1)
         if ridx >= 0 and not in_fellowship:
             loc = (ridx + 1) / float(NUM_REGIONS)
+        # Gollum never has a map location. Reuse that otherwise-zero public
+        # slot for a drawn reveal icon awaiting damage/Guide resolution:
+        # ordinary numeric icon=.5, unavoidable Eye/Shadow-special icon=1.
+        # Pending=0 preserves every existing observation byte and width.
+        if cname == 'Gollum' and getattr(state, '_hunt_reveal_pending', 0):
+            loc = state._hunt_reveal_pending / 2.0
         feats.extend([alive, in_fellowship, level, loc])
 
     # --- Minion locations (3: Witch-king, Saruman, Mouth of Sauron) ---
@@ -1351,10 +1471,8 @@ def encode_state(state: GameState, side: Side) -> np.ndarray:
 
     for nat in ALL_NATIONS:
         r, e = nation_unit_counts[nat]
-        # v26 (W10 F3): normalise by the nation's OWN max pool — the flat
-        # /15, /5 left Sauron's 28 setup regulars reading 1.87 (>1) and
-        # compressed small nations (same class as the historical /7-vs-/8
-        # count bugs). Values change, dims do not.
+        # v26 (W10 F3): normalise by the nation's OWN max pool. Values
+        # change, dims do not.
         _mx26 = NATION_MAX_FIGURES.get(nat, {})
         feats.extend([r / float(max(1, _mx26.get('regular', 15))),
                       e / float(max(1, _mx26.get('elite', 5)))])
@@ -1408,13 +1526,9 @@ def encode_state(state: GameState, side: Side) -> np.ndarray:
     # --- Reinforcement pools (8 nations × 3: remaining / max) ---
     # FP casualties are permanent; Shadow units cycle back to the pool, so
     # remaining = max - on_board (- permanent dead for FP)
-    # ONE ANSWERER (USER ruling 2026-08-18): the numerator was an
-    # inline copy of the availability arithmetic.  figures_available
-    # returns exactly max(0, cap - used) with the same `used`, so this
-    # is value-identical - pinned by leg (2) of
-    # streak/test_supply_one_answerer.py, which characterises
-    # figures_available against the old formula for every nation and
-    # type.  Feature count and order are unchanged.
+    # ONE ANSWERER (USER ruling 2026-08-18): figures_available ==
+    # max(0, cap - used), pinned by streak/test_supply_one_answerer.py
+    # leg (2).  Feature count and order are unchanged.
     _deployed_all = _count_deployed_all(state)
     for nat in ALL_NATIONS:
         maxes = NATION_MAX_FIGURES.get(nat, {})
@@ -1485,10 +1599,8 @@ def encode_state(state: GameState, side: Side) -> np.ndarray:
                 break
     feats.extend(guide_onehot)
 
-    # --- PENDING-DECISION block (iter 40, user finding: the T1 H-die
-    # second army move was passed — the net had NO feature saying it is
-    # mid-double-move with a free move left; same for the muster
-    # double-recruit and a deferred card option) ---
+    # --- PENDING-DECISION block (iter 40): mid-double-move / double-
+    # recruit / deferred-card-option flags + the pending source region ---
     _pam = state.pending_army_move_die is not None
     _pmu = getattr(state, 'pending_muster_die', None) is not None
     _pco = getattr(state, 'pending_card_option', None) is not None
@@ -1509,17 +1621,12 @@ def encode_state(state: GameState, side: Side) -> np.ndarray:
 
     # --- FULL DECISION CONTEXT (USER DIRECTIVE 2026-07-08: "for every
     # single decision that is made by the net, the entire game state
-    # needs to be exposed — the context matters for every decision no
-    # matter how small").  The pending-battle state was encoded in ZERO
-    # dims: combat cards / casualties / retreats / presses were chosen
-    # blind to which battle was being fought.  This block exposes every
-    # pending decision's situation. ---
+    # needs to be exposed - the context matters for every decision no
+    # matter how small"): every pending decision's situation is encoded. ---
     pc = getattr(state, 'pending_combat', None)
     battle_region = [0.0] * NUM_REGIONS
-    # every live pending_combat phase gets its OWN slot (capping five
-    # phases into one slot left retreat/siege/casualty/advance decisions
-    # indistinguishable to the value head; attacker_rearguard dropped —
-    # transition-only, never a live decision)
+    # every live pending_combat phase gets its OWN slot;
+    # attacker_rearguard is transition-only, never a live decision
     _PC_PHASES = ('defender_siege_choice',
                   'attacker_combat_card', 'defender_combat_card',
                   'combat_effect_choice', 'combat_round_result',
@@ -1532,11 +1639,16 @@ def encode_state(state: GameState, side: Side) -> np.ndarray:
         _bi = REGION_INDEX.get(sanitize(str(pc.get('defender_region', ''))))
         if _bi is not None:
             battle_region[_bi] = 1.0
+        # Same spatial channel: +1 defender, -1 distinct attack origin.
+        # A co-located siege/sortie retains +1 because both roles share it.
+        _ai_region = REGION_INDEX.get(sanitize(str(pc.get('attacker_region', ''))))
+        if _ai_region is not None and _ai_region != _bi:
+            battle_region[_ai_region] = -1.0
         combat_ctx[0] = 1.0
         combat_ctx[1] = 1.0 if pc.get('is_siege') else 0.0
         combat_ctx[2] = 1.0 if pc.get('attacker_side') == my_side else 0.0
-        _aa = _armies_lookup(state, str(pc.get('attacker_region', '')))
-        _da = _armies_lookup(state, str(pc.get('defender_region', '')))
+        _aa = _battle_army(state, str(pc.get('attacker_region', '')), pc.get('attacker_side'), pc)
+        _da = _battle_army(state, str(pc.get('defender_region', '')), pc.get('defender_side'), pc)
         _asd = pc.get('attacker_side')
         for _off, _army, _sd in ((3, _aa, _asd),
                                  (6, _da, pc.get('defender_side'))):
@@ -1582,6 +1694,12 @@ def encode_state(state: GameState, side: Side) -> np.ndarray:
         # v16 (Corsairs): the attacker cannot retreat/cease this battle
         combat_ctx[_mro9 + 4] = (1.0 if pc.get('attacker_no_retreat')
                                  else 0.0)
+    casualty_card = getattr(state, 'pending_card_option', None) or {}
+    if casualty_card.get('card_casualty'):
+        # Card losses also need their target in the spatial context.
+        target = REGION_INDEX.get(sanitize(str(casualty_card.get('cas_region', ''))))
+        if target is not None:
+            battle_region[target] = 1.0
     feats.extend(battle_region)
     feats.extend(combat_ctx)
 
@@ -1618,6 +1736,20 @@ def encode_state(state: GameState, side: Side) -> np.ndarray:
         # owner side (may differ from decider - cross-side decisions)
         co_ctx[5] = 1.0 if (pco.get('side') == 'fp') == (
             my_side == Side.FREE_PEOPLES) else 0.0
+    _gstage, _gcontext = _gandalf_draw_context(state)
+    if _gcontext is not None:
+        _gidx = _gandalf_source_index(_gcontext)
+        # Existing ordinary resume values remain 0/1. The negative domain
+        # represents the queued/open guide ability, its source/deck, and
+        # any underlying card option's resume bit without adding dimensions.
+        # All 96 * 2 * 2 * 2 supported combinations are distinct in float32.
+        _gcode = (_gidx + 1
+                  + 97 * (_gcontext['deck'] == 'strategy')
+                  + 194 * (_gstage == 'open')
+                  + 388 * bool(co_ctx[4]))
+        co_ctx[4] = -float(_gcode) / 776.0
+        if _gstage == 'open':
+            co_ctx[0] = (_gidx + 1) / 97.0
     feats.extend(co_ctx)
 
     # pending discard / guide change / eye-allocation phase
@@ -1681,9 +1813,9 @@ def encode_state(state: GameState, side: Side) -> np.ndarray:
     # and every earlier offset stay valid for ALL arches (base/wide/
     # xformer absorb extra dims in the global token: _global_dim is
     # computed from input_dim, global_post = x[:, _CARD_IDX_END:]). ---
-    # F1: Mordor-inactivity flag — drives the +1 end-of-turn corruption
-    # when the fellowship is on the Mordor track and did NOT move/hide
-    # this turn (game_logic.py:188). Was probe-proven invisible (W10).
+    # F1: Mordor-inactivity flag - drives the +1 end-of-turn corruption
+    # when the fellowship on the Mordor track did not move/hide
+    # (game_logic.py:188).
     feats.append(1.0 if getattr(state, 'fellowship_acted_in_mordor',
                                 False) else 0.0)
     # F2: double-move second-leg context — how many OWN figures at the
@@ -1708,6 +1840,48 @@ def encode_state(state: GameState, side: Side) -> np.ndarray:
     feats.append(1.0 if (_ps26 is not None and _ps26 != my_side)
                  else 0.0)
 
+    # v42: casualty microsteps need their remaining hit budget and owner.
+    # Append so existing spatial/card offsets remain fixed.
+    allocating = pc is not None and pc.get('phase') == 'casualty_allocation'
+    card_allocating = bool(casualty_card.get('card_casualty'))
+    feats.extend([
+        (float(casualty_card.get('cas_hits', 0) or 0) / 10.0 if card_allocating else
+         float(pc.get('atk_hits', 0) or 0) / 10.0 if allocating else 0.0),
+        float(pc.get('def_hits', 0) or 0) / 10.0 if allocating else 0.0,
+        (2.0 if card_allocating else
+         (1.0 if pc.get('alloc_stage') == 'attacker' else -1.0)
+         if allocating else 0.0),
+    ])
+    # v44: unfinished Fellowship effects continue to entry/Guide/eyes, not actions.
+    feats.append(1.0 if getattr(state, '_fellowship_tail_phase', False) else 0.0)
+    if _CARD_CONTEXT_ON:
+        from card_movement_context import commitment_tail
+        from nazgul_context import movement_tail
+        feats.extend(commitment_tail(state))
+        feats.extend(movement_tail(state, REGION_INDEX))
+    if _COMPANION_CONTEXT_ON:
+        from companion_context import movement_tail as companion_movement_tail
+        feats.extend(companion_movement_tail(state))
+    if _FELLOWSHIP_DIE_CONTEXT_ON:
+        from fellowship_action_timing import observation_tail
+        feats.extend(observation_tail(state))
+    if _HUNT_PROTECTION_CONTEXT_ON:
+        from hunt_protection_context import observation_tail as protection_tail
+        feats.extend(protection_tail(state))
+    if _REVEAL_ROUTE_CONTEXT_ON:
+        from fellowship_reveal_route import observation_tail as route_tail
+        feats.extend(route_tail(state))
+    if _ROUTE_EVENT_CONTEXT_ON:
+        from fellowship_route_event_context import observation_tail as route_event_tail
+        feats.extend(route_event_tail(state))
+    if _BREAKING_CONTEXT_ON:
+        from hunt_protection_context import breaking_tail
+        feats.extend(breaking_tail(state))
+    if _COMBAT_ROUND_CONTEXT_ON:
+        from combat_round_observation import encode_state_tail
+        feats.extend(encode_state_tail(state, side))
+        from army_cargo_state import encode_tail as cargo_state_tail
+        feats.extend(cargo_state_tail(state, REGION_INDEX))
     return np.array(feats, dtype=np.float32)
 
 
@@ -1727,7 +1901,7 @@ def get_pending_context_start() -> int:
         _gl9.initialize_decks(_st9)
         v0 = encode_state(_st9, Side.FREE_PEOPLES)
         _st9.pending_combat = {
-            'attacker_region': 'eregion', 'defender_region': 'moria',
+            'attacker_region': 'moria', 'defender_region': 'moria',
             'attacker_side': Side.SHADOW,
             'defender_side': Side.FREE_PEOPLES,
             'phase': 'attacker_combat_card', 'is_siege': False,
@@ -1763,7 +1937,6 @@ def get_feature_dim() -> int:
 # ===================================================================
 # Step 3: Log Trajectory Extraction
 # ===================================================================
-
 
 
 def _bfs_distance_to_mordor(state: 'GameState') -> int:
@@ -1931,9 +2104,6 @@ def state_value_fp(state: 'GameState') -> float:
     return float(np.clip(fp_score - shadow_score, -1, 1))
 
 
-
-
-
 def _is_shadow_stronghold(state, region_key):
     """Check if region is an unconquered shadow stronghold."""
     meta = board.regions.get(region_key, {})
@@ -1960,8 +2130,13 @@ def _get_reveal_placement_actions(state: 'GameState') -> 'List[Action]':
     progress = state.fellowship.progress
 
     if progress <= 0:
-        # No progress — must stay in place (auto-handled, no actions needed)
-        return actions
+        # BL-46: the one legal placement (staying) is an ACTION, never an
+        # empty list (n_total=0 would be an unanswerable decision).  The
+        # single-option path in open_reveal_placement auto-applies it via
+        # the shared _apply_reveal_placement.
+        return [Action(die_idx=-1,
+                       action_type='fellowship_reveal_place',
+                       params={'region': cur})]
 
     reachable = game_logic.get_reachable_regions(
         state, cur, progress, mode="reveal")
@@ -1975,14 +2150,28 @@ def _get_reveal_placement_actions(state: 'GameState') -> 'List[Action]':
         for _r9 in (_all9 - reachable):
             if _r9 in _sh_ctrl9:
                 reachable.add(_r9)
+    # BL-46: staying is a placement of zero steps and always 'within
+    # progress'; the reveal-mode memo never contains distance 0, so add
+    # the current region unless it is an unconquered FP city/stronghold
+    # (rulebook 3403-3407).  LA-9: never swallow here (a failure must
+    # not fail OPEN).
+    _cm46 = board.regions.get(sanitize(cur), {})
+    _cur_fp_settle = bool(
+        (_cm46.get('is_city') or _cm46.get('is_stronghold'))
+        and not game_logic.is_shadow_region(sanitize(cur))
+        and sanitize(cur) not in _sh_ctrl9)
+    if not _cur_fp_settle:
+        reachable.add(cur)
 
-    for dest in reachable:
-        # USER RULING 2026-07-20b (w5_g2 T9): the pawn never
-        # region-steps into Mordor's interior — reached only via the
-        # track, and entry fires at the turn-start entry check on gate
-        # POSITION, declared or revealed there (USER FINAL 2026-08-16).
-        if sanitize(dest) in game_logic._MORDOR_INTERIOR:
-            continue
+    # Keep the menu on the same passable map graph as the route executor.
+    from fellowship_reveal_route import reachable_regions
+    reachable &= reachable_regions(state)
+
+    # C2-002 (W3-038, COORD #2 2026-09-03): iterate the reachable SET in
+    # sorted order - the fellowship_reveal_place menu order (and the
+    # ledger's human index) must not depend on PYTHONHASHSEED (the
+    # W1-020 / W3-019 sorted-iteration class).
+    for dest in sorted(reachable):
         actions.append(Action(
             die_idx=-1,
             action_type='fellowship_reveal_place',
@@ -2000,102 +2189,39 @@ def _get_reveal_placement_actions(state: 'GameState') -> 'List[Action]':
     return actions
 
 
-def _apply_reveal_placement(state: 'GameState', dest: str):
-    """Execute a reveal placement to *dest* — the ONE implementation
-    shared by the fellowship_reveal_place executor (teacher + learned
-    picks) and open_reveal_placement's forced single-option case.
-    Leaving/entering Shadow-stronghold draws, pawn move, progress 0."""
-    cur = game_logic.fellowship_region(state)
-    if getattr(state, '_sh_tile_drawn_regions', None) is None:
-        state._sh_tile_drawn_regions = set()
-
-    # Shadow stronghold: "leaving" tile
-    if cur != dest and _is_shadow_stronghold(state, cur):
-        game_logic._draw_shadow_stronghold_tile(state, cur, "leaving")
-
-    # Shadow stronghold: "entering" tile at destination
-    if cur != dest and _is_shadow_stronghold(state, dest):
-        game_logic._draw_shadow_stronghold_tile(state, dest, "entering")
-
-    # Move fellowship to chosen destination
-    try:
-        state.fellowship.region = state.board.region(dest)
-    except Exception:
-        pass
-    state.fellowship.progress = 0
-    state._reveal_place_due = False
-    # No immediate Mordor entry on a gateway reveal (USER FINAL
-    # 2026-08-16: turn-start only, never mid-turn): the pawn stays;
-    # the next turn start's entry check (_check_mordor_entry, run
-    # AFTER that turn's declaration opportunity) puts it on the track
-    # — a gate position qualifies whether DECLARED or REVEALED there.
+def _apply_reveal_placement(state: 'GameState', dest: str, path=None):
+    from fellowship_reveal_route import place
+    place(state, dest, path)
 
 
 def open_reveal_placement(state: 'GameState') -> bool:
-    """Settle-point for a due hunt-reveal placement (USER RULING
-    2026-08-16, closing the charter's OPEN_reveal_placement row:
-    reveal placement is a LEARNED FP DECISION — net in self-play,
-    human in sided live play).
-
-    Returns True when the placement decision is OPEN (menu =
-    _get_reveal_placement_actions, FP to act via
-    _pending_decision_side); False when nothing was due or the
-    forced/no-choice case resolved here.
-
-    Forced cases keep the certified auto path byte-for-byte
-    (_auto_reveal_place): revealed at a Mordor gateway (pawn stays,
-    USER 2026-07-20b), progress<=0, or in Mordor.  A single-option
-    menu applies that option directly (no decision to learn).
-
-    Housekeeping: the 'revealed in' Shadow-stronghold draw precedes
-    the choice (human log order, 1.87 one draw per region per event —
-    idempotent via _sh_tile_drawn_regions, armed when the reveal set
-    the flag).  1.132 ordering holds: the reveal tile's own damage
-    settled before this runs, and a prep-draw's damage resolves as
-    its OWN decision before the menu opens (the flag stays due)."""
+    """Finish primary damage, place the figure, then resolve route effects."""
+    from fellowship_reveal_route import drain, place
+    game_logic.settle_hunt_reveal(state)
+    drain(state)
+    if getattr(state, '_fellowship_route_event', None):
+        return False
     if not getattr(state, '_reveal_place_due', False):
         return False
-    if state.pending_hunt is not None \
-            or getattr(state, '_pending_hunt_damage', 0):
-        return False          # damage first (1.132); still due
+    if game_logic.should_game_end(game_logic.check_all_victory_conditions(state), end_of_turn=False):
+        state._reveal_place_due = False
+        return False
+    if game_logic._reveal_hunt_pending(state) or getattr(state, '_hobbit_place_queue', None):
+        return False
+    if state.fellowship.mordor_entered:
+        state._reveal_place_due = False
+        return False
     cur = game_logic.fellowship_region(state)
-    if (state.fellowship.mordor_entered
-            or state.fellowship.progress <= 0
-            or sanitize(cur) in (sanitize('morannon'),
-                                 sanitize('minas morgul'))):
-        # forced: the certified auto path (it re-arms its own event
-        # set; the prep draw below never ran for these states —
-        # classification is stable across re-entry, so no double draw)
-        state._reveal_place_due = False
-        try:
-            game_logic._auto_reveal_place(state)
-        except Exception:
-            pass
-        if getattr(state, '_pending_hunt_damage', 0) > 0:
-            if not game_logic._offer_hunt_reduction(state):
-                game_logic._settle_hunt_damage(state)
+    if state.fellowship.progress <= 0 or sanitize(cur) in ('morannon', 'minas morgul'):
+        place(state, cur)
         return False
-    # prep: revealed IN a Shadow stronghold draws before the choice
-    if _is_shadow_stronghold(state, cur):
-        game_logic._draw_shadow_stronghold_tile(state, cur,
-                                                "revealed in")
-        if getattr(state, '_pending_hunt_damage', 0) > 0:
-            if not game_logic._offer_hunt_reduction(state):
-                game_logic._settle_hunt_damage(state)
-        if state.pending_hunt is not None \
-                or getattr(state, '_pending_hunt_damage', 0):
-            return False      # that damage decides first; still due
     legal = _get_reveal_placement_actions(state)
-    if len(legal) <= 1:
-        state._reveal_place_due = False
-        if legal:
-            _apply_reveal_placement(state,
-                                    legal[0].params['region'])
-            if getattr(state, '_pending_hunt_damage', 0) > 0:
-                if not game_logic._offer_hunt_reduction(state):
-                    game_logic._settle_hunt_damage(state)
+    if len(legal) == 1:
+        place(state, legal[0].params['region'])
         return False
-    return True               # decision OPEN: FP places the pawn
+    if not legal:
+        raise RuntimeError('Due Fellowship reveal has no legal placement')
+    return True
 
 
 def _build_card_name_lookup() -> Dict[str, str]:
@@ -2180,12 +2306,10 @@ def _bc_is_attemptable(act_type: str, params: dict, act_side=None) -> bool:
         # not a decision; only ring USES (die-face changes) are learnable
         return not p0.get('collect')
     if act_type == 'companion_move':
-        # Hunt-casualty hobbit placements and DIED companion walks are
+        # Hunt-casualty hobbit placements and die-bearing walks are
         # decisions; die-less walks are continuations of the same die
         # (rulebook p.36: one Character die moves ALL on-map companion
-        # groups) — the closed loop keeps those as continuation entries
-        # and force-executes them (2026-01-05 kapcerz T1: Legolas ->
-        # Lorien on the die, Strider/Boromir -> Eastemnet die-less).
+        # groups) and replay as continuation entries.
         return bool(p0.get('hunt_placement') or p0.get('die_used'))
     if act_type == 'muster':
         p = params or {}
@@ -2267,6 +2391,11 @@ def _lookup_card_id(card_lookup: 'Dict[str, str]', name: str) -> 'Optional[str]'
         # t138 (engine-check family 4): deck-table short label vs the
         # registry's full title — 16/16 Grimbeorn plays undecodable
         'grimbeorntheold': 'grimbeorntheoldsonofbeorn',
+        # card-cover census 2026-08-31: VASSAL piece title carries an
+        # INTERIOR 'the' the registry name lacks — before this row the
+        # card resolved in NO game (2,569 corpus plays all dropped as
+        # play_title_unresolved / title-less combat commits)
+        'weprovetheswifter': 'weproveswifter',
     }.get(norm, norm)
     hit = _NORM_CARD_LOOKUP.get(norm)
     if hit:
@@ -2286,8 +2415,6 @@ def _bc_param_str(v) -> str:
         return ''
     v = getattr(v, 'value', v)  # Nation enum etc. -> string value
     return sanitize(str(v))
-
-
 
 
 def _synthetic_decision_actions(state, act_side, act_type, params,
@@ -2334,11 +2461,8 @@ def _synthetic_decision_actions(state, act_side, act_type, params,
             cur = sanitize(game_logic.fellowship_region(state))
         except Exception:
             return []
-        # GENERATOR/VALIDATOR SPLIT (USER 2026-08-17 + EDGE-3): this
-        # was the 7th site with its own rule copy (no terminus
-        # filter - a hobbit could be placed to END on a Shadow
-        # army).  It now only PROPOSES; is_legal_companion_action is
-        # the sole gate.
+        # GENERATOR/VALIDATOR SPLIT (USER 2026-08-17, EDGE-3): this only
+        # PROPOSES; is_legal_companion_action is the sole gate.
         movement = state.fellowship.progress + level
         reachable = _companion_reachable(state, cur, movement) \
             if movement > 0 else set()
@@ -2383,12 +2507,10 @@ def _synthetic_decision_actions(state, act_side, act_type, params,
                 continue  # enemy units present
             other = Side.SHADOW if act_side == Side.FREE_PEOPLES \
                 else Side.FREE_PEOPLES
-            # CENSUS 2026-08-17 (EDGE-3's shape, retreat family): this
-            # synthetic branch still carried the PRE-2026-07-15 raw
-            # captured-set test; _settlement_controller is the ONE
-            # rule body (a unit may not retreat into a region holding
-            # an enemy-CONTROLLED settlement, native included, p.30)
-            # - same answerer as _get_retreat_actions.
+            # _settlement_controller is the ONE rule body: no retreat into
+            # a region holding an enemy-CONTROLLED settlement, native
+            # included (p.30) - the same answerer as _get_retreat_actions
+            # (2026-08-17).
             if _settlement_controller(state, sanitize(nb)) == other:
                 continue
             actions.append(Action(
@@ -2414,12 +2536,9 @@ def _combat_effect_choice_counts(state, card_id, region, act_side):
     _, army = _army_entry(state, str(region or ''))
     own_units = _side_units(army, act_side) if army is not None else []
     if kind == 'onslaught':
-        # t138: at a REPLAYED state the sacrifice cost may already be
-        # applied (kill line precedes the choice record), so allow up
-        # to the full sacrifice range rather than len-1.
-        # 1.211 cluster-B alignment: the count is HITS and an Elite
-        # absorbs 2, so enumerate to hit capacity (2E+R, max 4) --
-        # a logged 4-hit sacrifice on a 2-elite army must match.
+        # At a REPLAYED state the sacrifice cost may already be applied,
+        # so allow the full range.  1.211 cluster-B: the count is HITS and
+        # an Elite absorbs 2 - enumerate to hit capacity (2E+R, max 4).
         from game_state import UnitKind as _UK9
         _cap9 = sum(2 if u.kind == _UK9.ELITE else 1 for u in own_units)
         mx = max(0, min(4, _cap9))
@@ -2428,14 +2547,10 @@ def _combat_effect_choice_counts(state, card_id, region, act_side):
         mx = max(0, min(2, len(own_units) - 1))
         return list(range(0, mx + 1)) if mx > 0 else [0]
     if kind == 'dread_despair':
-        # t138 (engine-check family 3): humans forfeit Nazgul
-        # leadership INCLUDING the Witch-king's 2 (4 corpus samples),
-        # and in a FIELD battle the Nazgul ride the ATTACKER's army
-        # adjacent to the battle region (sieges co-locate, fields do
-        # not).  Enumerate the max over the battle-region army and
-        # same-side armies adjacent to it.  (The live engine pending
-        # phase now also counts the Witch-king's leadership — USER ruling
-        # 2026-07-18, amendment 1.173, combat.setup_combat.nazgul_in_battle.)
+        # Humans forfeit Nazgul leadership INCLUDING the Witch-king's 2
+        # (amendment 1.173; combat.setup_combat.nazgul_in_battle), and in
+        # a FIELD battle the Nazgul may ride a same-side army adjacent to
+        # the battle region: enumerate the max over both.
         def _dd_points(a):
             if a is None:
                 return 0
@@ -2531,13 +2646,9 @@ def _match_logged_action(actions: 'List[Action]', act_type: str, params: dict,
         ok_types = ('nazgul_move', 'companion_move', 'army_move') \
             if leaders_only else ('army_move',)
         logged_n = moved.get('regular', 0) + moved.get('elite', 0)
-        # Nazgul-aware tie-break (amendment 1.132, same defect class as
-        # the 1.131 nazgul_move count fix): humans carry the nazgul on
-        # 90% of moves out of nazgul-hosting regions (21-game census
-        # 299/333), but (r,e)-tied variants always resolved to the
-        # first-generated carry-all - the 10% leave-behinds trained as
-        # carries.  Only applies when the menu actually offers nazgul
-        # variants (Shadow moves from nazgul-hosting sources).
+        # Nazgul-aware tie-break (amendment 1.132): among (r,e)-tied
+        # variants prefer the one whose nazgul count matches the log;
+        # only when the menu offers nazgul variants.
         want_nz = int(moved.get('nazgul', 0) or 0)
         _has_nz_vars = any(a.action_type == 'army_move'
                            and a.params.get('n_nazgul') is not None
@@ -2560,11 +2671,9 @@ def _match_logged_action(actions: 'List[Action]', act_type: str, params: dict,
                     and s(a.params.get('to')) == t):
                 # Among split options, pick the closest to the human's split
                 if a.action_type == 'army_move' and a.params.get('n_regular') is not None:
-                    # 126b (2026-07-25 Vayze T8 Dale): PER-KIND
-                    # distance — the total-count diff let a 2R+1E
-                    # variant tie a logged 3R+0E move and win on
-                    # enumeration order, walking an Elves elite out of
-                    # Dale the humans left behind.
+                    # 126b: PER-KIND distance (regular and elite separately)
+                    # - the total-count diff let a different split tie and
+                    # win on enumeration order.
                     a_r9 = int(a.params.get('n_regular') or 0)
                     a_e9 = int(a.params.get('n_elite') or 0)
                     diff = ((abs(a_r9 - int(moved.get('regular', 0)
@@ -2577,10 +2686,8 @@ def _match_logged_action(actions: 'List[Action]', act_type: str, params: dict,
                 if diff < best_diff:
                     best_i, best_diff = i, diff
         if best_i < 0 and not leaders_only:
-            # The parser recorded a MOVE but the destination holds an
-            # enemy rearguard (vacate-convention leftovers, 2025-05-16
-            # Adobim T5: 1 Rohan regular left at Fords of Isen): the
-            # drag IS the attack declaration.
+            # A logged MOVE onto an enemy rearguard IS the attack
+            # declaration (vacate convention; 2025-05-16 Adobim T5).
             for i, a in enumerate(actions):
                 if a.action_type == 'army_attack' \
                         and s(a.params.get('to')) == t \
@@ -2603,13 +2710,9 @@ def _match_logged_action(actions: 'List[Action]', act_type: str, params: dict,
                 return i
     elif act_type == 'nazgul_move':
         f, t = s(p.get('from')), s(p.get('to'))
-        # Count-aware (amendment 1.131): the menu lists the full-group
-        # move first and COUNT subsets after; matching by (from,to)
-        # alone always returned the full variant, so a human moving 1
-        # of 3 nazgul trained as "move all 3" (and the 1.128 count
-        # variants could never be slot-0).  The log's moved-count picks
-        # the exact subset; k == source total falls through to the
-        # full variant (subsets only enumerate 1..n-1).
+        # Count-aware (amendment 1.131): the log's moved-count picks the
+        # exact subset; k == source total falls through to the full
+        # variant (subsets enumerate 1..n-1).
         k = int((p.get('moved') or {}).get('nazgul', 0) or 0)
         best = -1
         for i, a in enumerate(actions):
@@ -2680,14 +2783,10 @@ def _match_logged_action(actions: 'List[Action]', act_type: str, params: dict,
         for i, a in enumerate(actions):
             if (a.action_type in ('muster_recruit', 'muster_elite')
                     and s(a.params.get('region')) == region):
-                # 126a (2026-07-25 demanray T10 Erebor): kind-CLASS
-                # guard — a UNIT record must never fall back onto a
-                # leader/nazgul recruit (a '1 Dwarves regular' muster
-                # matched type=leader when the regular pool ran dry;
-                # the phantom leader + missing regular poisoned the
-                # Erebor comps for the rest of the game).  Let it
-                # fail instead — the teacher's force-place salvage
-                # applies the exact logged pieces.
+                # 126a: kind-CLASS guard - a UNIT record never falls back
+                # onto a leader/nazgul recruit (and vice versa); let it
+                # fail and the teacher's force-place salvage applies the
+                # logged pieces.
                 _atype9 = s(a.params.get('type'))
                 if (units.get('regular', 0) or units.get('elite', 0)) \
                         and _atype9 in ('leader', 'nazgul'):
@@ -2713,10 +2812,8 @@ def _match_logged_action(actions: 'List[Action]', act_type: str, params: dict,
             if a.action_type == 'fellowship_hide':
                 return i
     elif act_type == 'fellowship_declare':
-        # 2026-08-02 (declare-region enrichment): 'region' is now the
-        # board-resolved canonical key at every parser dialect —
-        # prefer it over the raw client name in 'to' (article dialect:
-        # 'The Grey Havens' vs board key 'grey havens')
+        # 'region' is the board-resolved canonical key at every parser
+        # dialect (2026-08-02); prefer it over the raw client name in 'to'.
         t = s(p.get('region')) or s(p.get('to'))
         for i, a in enumerate(actions):
             if (a.action_type == 'fellowship_declare'
@@ -2750,10 +2847,8 @@ def _match_logged_action(actions: 'List[Action]', act_type: str, params: dict,
         comp = p.get('companion', '')
         t = s(p.get('to_region'))
         # 1.147: drag-collapsed records put the FINAL destination in
-        # to_region (separate + walks in one drag) - out of separation
-        # range.  Fall back to the in-range variant NEAREST the logged
-        # destination (the human's actual waypoint), never the
-        # alphabetical first ('-> angmar' label noise).
+        # to_region; fall back to the in-range variant NEAREST the logged
+        # destination, never the alphabetical first.
         best = -1
         best_d = None
         for i, a in enumerate(actions):
@@ -2821,9 +2916,8 @@ def _match_logged_action(actions: 'List[Action]', act_type: str, params: dict,
         if isinstance(du, (list, tuple)) and len(du) > 1:
             want = getattr(ActionDieFace, str(du[1]), None)
         if want is None and p.get('old_face'):
-            # 2026-08-02 corpus sweep: 5/157 records carry old_face/
-            # new_face params but no die_used — the matcher never read
-            # them, silently falling back to the first menu variant
+            # Records may carry old_face/new_face without die_used
+            # (2026-08-02 corpus sweep).
             try:
                 want = ActionDieFace(p['old_face'])
             except ValueError:
@@ -2912,10 +3006,8 @@ def _match_logged_action(actions: 'List[Action]', act_type: str, params: dict,
         want_old, want_new = _fv(p.get('old_face')), _fv(p.get('new_face'))
         if not want_old:
             # 1.148: the logged die_used face IS the converted die's old
-            # face (Scribe-drag records carry no explicit faces).  The
-            # blind ring_idxs[0] fallback picked the FIRST variant - the
-            # Will die - teaching FP to burn W in the exact line where W
-            # crowns Aragorn (Adobim T1: human converted MUSTER).
+            # face (Scribe-drag records carry no explicit faces); never
+            # fall back to ring_idxs[0] blind.
             _du = p.get('die_used')
             if isinstance(_du, (tuple, list)) and len(_du) == 2:
                 try:
@@ -3007,10 +3099,9 @@ def _build_bc_candidates(state_pre: 'GameState', act_side: Side, act_type: str,
             # other reachable regions plus not declaring at all.
             # VASSAL logs reset the progress track BEFORE the pawn move, so
             # restore the true pre-decision progress from the logged value.
-            # 2026-08-02: mordor_entry declares carry no
-            # progress_consumed — progress_before (parser enrichment,
-            # always present now) is the correct fallback; without it a
-            # standstill gateway entry enumerated an EMPTY declare menu.
+            # mordor_entry declares carry no progress_consumed;
+            # progress_before (parser enrichment) is the fallback
+            # (2026-08-02).
             _p9 = params or {}
             consumed = int(_p9.get('progress_consumed')
                            or _p9.get('progress_before') or 0)
@@ -3084,9 +3175,7 @@ def _build_bc_candidates(state_pre: 'GameState', act_side: Side, act_type: str,
         mr, me = moved.get('regular', 0), moved.get('elite', 0)
         if mr or me:
             # USER 2026-07-11: exact figure split - nazgul counted
-            # separately (the old bool lumped them with leaders, so a
-            # human split taking a nazgul but not the leader, or vice
-            # versa, was unrepresentable)
+            # separately from leaders.
             take = moved.get('leader', 0) > 0
             chosen = Action(die_idx=chosen.die_idx, action_type='army_move',
                             params=dict(chosen.params, n_regular=mr,
@@ -3127,21 +3216,6 @@ def _build_bc_candidates(state_pre: 'GameState', act_side: Side, act_type: str,
         encs[j] = enc
         regions[j] = reg
     return encs, regions, 1 + len(alt_pool)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 # ===================================================================
@@ -3280,12 +3354,10 @@ if HAS_TORCH:
         # Gandalf 'shining' pre-combat-card decision (item 11); the yes/no
         # magnitude rides the count scalar [23] (1 = shine, 0 = decline)
         'combat_shine',
-        # FORCED hunt-casualty hobbit placement (v32 fix 2026-07-28):
-        # rides the companion_separate action type (die_idx=-1, pending
-        # hunt phase 'hobbit_place') but is a DIFFERENT decision.
-        # Without this bit ~85% of the corpus 'separation' class was
-        # forced Merry/Pippin placements, contaminating the voluntary-
-        # separation prior (turn-1 trollshaws separations, USER catch).
+        # FORCED hunt-casualty hobbit placement (v32 2026-07-28): rides
+        # companion_separate (die_idx=-1, pending hunt phase
+        # 'hobbit_place') but is a DIFFERENT decision from voluntary
+        # separation.
         'hobbit_place',
     ]
     _SUBTYPE_TO_IDX = {t: i for i, t in enumerate(_DECISION_SUBTYPES)}
@@ -3297,9 +3369,8 @@ if HAS_TORCH:
         _SUBTYPE_TO_IDX['casualty_preserve_units']
     # iter 36 FULL-INFORMATION extension (user directive: "literally
     # everything possible that the human sees").  SYMBOLS ARE THE
-    # TRUTH — never quote absolute indices here (they drift every time
-    # a subtype is appended; the 2026-07-27 and v32 shifts both proved
-    # it):
+    # TRUTH - never quote absolute indices here (they drift whenever a
+    # subtype is appended):
     # [_ACT_COMP_OFF : +4]   action-moved composition: n_regular/10,
     #          n_elite/10, n_leaders/7, n_nazgul/8 (moves, attacks,
     #          musters, retreats)
@@ -3329,24 +3400,18 @@ if HAS_TORCH:
     _ACT_CHAR_OFF = _ACT_COMP_OFF + 4
     _ACT_SRC_OFF = _ACT_CHAR_OFF + len(_ACTION_CHARACTERS)
     _ACT_TGT_OFF = _ACT_SRC_OFF + 3
-    # MORDOR-ENTRY flag (iter 39, user finding: the net could not
-    # distinguish the entry-declare at a gateway from an ordinary
-    # declare -- same class as the composition/identity gaps)
+    # MORDOR-ENTRY flag (iter 39): the entry-declare at a gateway is
+    # distinct from an ordinary declare
     _ACT_MORDOR_OFF = _ACT_TGT_OFF + 3
-    # CARD-OPTION decision flag (user finding 2026-07-07: optioned
-    # cards always took the handler's first-listed default; options are
-    # now pending decisions — see card_options.py)
+    # CARD-OPTION decision flag (USER 2026-07-07): options are pending
+    # decisions - see card_options.py
     _ACT_CARDOPT_OFF = _ACT_MORDOR_OFF + 1
-    # acting-die FACE (decision-audit 2026-07-08: skip carries a
-    # 'face' param the encoder ignored, and W-wild means the same action
-    # type can ride different faces — which die an action burns was
-    # invisible).  Face index /7, 0 for die-less actions.
-    # Then SKIP flag (skip=discard a specific die vs pass=do nothing —
-    # they encoded IDENTICALLY; 15 collapses in one audited game).
+    # acting-die FACE index /7, 0 for die-less actions (decision-audit
+    # 2026-07-08: which die an action burns is a decision input).  Then
+    # the SKIP flag (skip = discard a specific die; pass = do nothing).
     _ACT_DIEFACE_OFF = _ACT_CARDOPT_OFF + 1
     _ACT_SKIP_OFF = _ACT_DIEFACE_OFF + 1
-    # own units LEFT BEHIND at the source; then empties-source
-    # flag — the leave-a-garrison decision existed only implicitly
+    # own units LEFT BEHIND at the source; then empties-source flag
     # (USER 2026-07-09: expose the context, no weighting)
     _ACT_LEAVE_OFF = _ACT_SKIP_OFF + 1
     _ACT_EMPTIES_OFF = _ACT_LEAVE_OFF + 1
@@ -3361,10 +3426,7 @@ if HAS_TORCH:
     _ACT_OPTKIND_OFF = _ACT_OPTTERM_OFF + 1
     _ACT_OPTSIZE_OFF = _ACT_OPTKIND_OFF + 1
     # v29 (2026-07-26): target region natively ENEMY-side / MY-side
-    # bits (actor perspective; neutral regions leave both 0).  The
-    # WHERE-ranking had no ownership signal for the target — the
-    # is_stronghold bit [18] scored Moria exactly like Rivendell, and
-    # v28 self-play declared the Fellowship INTO Moria 23x in 42 games.
+    # bits (actor perspective; neutral regions leave both 0).
     _ACT_TGT_ENEMYSIDE_OFF = _ACT_OPTSIZE_OFF + 1
     _ACT_TGT_MYSIDE_OFF = _ACT_TGT_ENEMYSIDE_OFF + 1
 
@@ -3384,33 +3446,60 @@ if HAS_TORCH:
     # un-pinned tree computes dim 92 and still loads pre-v41 92-dim
     # checkpoints).  The LIVE head (Play_vs_AI.bat, generated by
     # wotr_bridge\launch_head.py) pins WOTR_ACT_GEN=v41 and runs the
-    # 93-dim corpus_live pair - v41 is the live generation.  The env
-    # var is the single generation switch (see swap_alphawotr_nets).
+    # 93-dim corpus_live pair - v41 is the live generation.
+    # WOTR_ACT_GEN is the single generation switch (v41 = 93-dim live
+    # nets; un-pinned = 92).
     ACT_GEN = os.environ.get('WOTR_ACT_GEN', '').strip().lower()
-    _ACT_TABLEKILL_ON = (ACT_GEN == 'v41')
+    _ACT_TABLEKILL_ON = ACT_GEN in ('v41', 'v45', 'v46', 'v47', 'v48', 'v49', 'v50', 'v51', 'v52')
+    _ACT_CARD_CHOICES_ON = (ACT_GEN in ('v45', 'v46', 'v47', 'v48', 'v49', 'v50', 'v51', 'v52'))
     _ACT_TABLEKILL_OFF = _ACT_TGT_MYSIDE_OFF + 1
-    ACTION_ENCODING_DIM = (_ACT_TABLEKILL_OFF + 1 if _ACT_TABLEKILL_ON
-                           else _ACT_TGT_MYSIDE_OFF + 1)  # 93 / 92
+    _ACT_CARD_CHOICE_TAIL_OFF = (_ACT_TABLEKILL_OFF + 1 if _ACT_TABLEKILL_ON
+                                 else _ACT_TGT_MYSIDE_OFF + 1)
+    from action_schema import CARD_CHOICE_TAIL_DIM, validate_active_width
+    ACTION_ENCODING_DIM = _ACT_CARD_CHOICE_TAIL_OFF + (CARD_CHOICE_TAIL_DIM if _ACT_CARD_CHOICES_ON else 0)
+    if _COMBAT_ROUND_CONTEXT_ON:
+        from combat_round_observation import ACTION_TAIL_DIM
+        ACTION_ENCODING_DIM += ACTION_TAIL_DIM
+        from card_cargo_observation import TAIL_DIM as CARGO_TAIL_DIM
+        ACTION_ENCODING_DIM += CARGO_TAIL_DIM
+    validate_active_width(ACTION_ENCODING_DIM)
+    # S-001 (2026-09-04, USER "fix the saruman encoding"): the Saruman
+    # Muster-die ability actions (W4-032, rulings 1.266 / 1.266-b / 1.270:
+    # muster_recruit saruman='settlements' = one Isengard Regular in EACH
+    # of Orthanc / North Dunland / South Dunland; muster_elite
+    # saruman='swap2' = two Orthanc Regulars -> two Elites) light the
+    # composition columns with the TRUE placement (n_r = 3 / n_e = 2), so
+    # they no longer encode byte-identically to the plain single Orthanc
+    # recruit / elite (GEN43_DESIGN.md (e) encoder line, released on the
+    # v41 path: an existing slot lit on actions no v41 net has ever seen
+    # legal - dim unchanged, every other encoding unchanged).  This
+    # capability flag is what extract_corpus.pack_npz's W4-032 alias
+    # guard and rendered_extract's alias_v41 stamp read; the pin proves
+    # the two encodings differ from their plain twins.
+    ACT_ENC_SARUMAN_DISTINCT = True
     _FACE_ORDER = {'CHARACTER': 1, 'ARMY': 2, 'MUSTER': 3,
                    'MUSTER_ARMY': 4, 'EVENT': 5, 'WILL_OF_WEST': 6,
                    'EYE': 7}
     _ACTION_CARD_IDX_DIM = 33  # raw card index (0-95) or -1
 
-    def encode_action(action, state, side):
+    def encode_action(action, state, side, _batch=None):
         """Encode an action as a fixed-length feature vector for the action scorer."""
+        _lookup = _armies_lookup if _batch is None else _batch.armies_lookup
         feat = np.zeros(ACTION_ENCODING_DIM, dtype=np.float32)
         # [0:14] action type one-hot (14 categories)
         canonical = _ATYPE_TO_CAT.get(action.action_type, 'other')
         feat[_ACTION_TYPE_TO_IDX.get(canonical, 12)] = 1.0
-        # the 1.149 table kill's OWN bit (tail-appended; see the
-        # ACTION_ENCODING_DIM block).  Without it the net scored
-        # "spend a die + 2 cards to destroy an opponent's table card"
-        # through its play-event head, with no way to tell the two
-        # apart - USER 2026-08-20.
+        # the 1.149 table kill's OWN bit (USER 2026-08-20; tail-appended,
+        # see the ACTION_ENCODING_DIM block)
         if _ACT_TABLEKILL_ON \
                 and action.action_type == 'discard_table_card':
             feat[_ACT_TABLEKILL_OFF] = 1.0
         p = action.params
+        # Reuse the source lookup within this encoding only.  Armies and
+        # their contents can change between decisions, so this must never
+        # be retained on the action or GameState.
+        source = p.get('from')
+        source_army = _lookup(state, source) if 'from' in p else None
         # [14] source region index (normalized)
         if 'from' in p:
             feat[14] = REGION_INDEX.get(sanitize(str(p['from'])), 0) / float(NUM_REGIONS)
@@ -3418,24 +3507,6 @@ if HAS_TORCH:
         target = p.get('to') or p.get('region') or p.get('to_region')
         if target:
             feat[15] = REGION_INDEX.get(sanitize(str(target)), 0) / float(NUM_REGIONS)
-        # [16] unit count at source — OWN side only (mixed siege
-        # entries hold both sides; counting the enemy garrison made
-        # the source size wrong exactly where garrisons matter)
-        if 'from' in p:
-            army = _armies_lookup(state, p['from'])
-            if army:
-                _own_src = sum(
-                    1 for u in army.units
-                    if _side_of_nation(u.nation) == side)
-                feat[16] = _own_src / 10.0
-                if action.action_type in ('army_move',
-                                          'victor_advance') \
-                        and p.get('n_regular') is not None:
-                    _mv9 = (int(p.get('n_regular') or 0)
-                            + int(p.get('n_elite') or 0))
-                    _left9 = max(0, _own_src - _mv9)
-                    feat[_ACT_LEAVE_OFF] = _left9 / 10.0
-                    feat[_ACT_EMPTIES_OFF] = 1.0 if _left9 == 0 else 0.0
         # [17] nation index (scalar, kept for continuity) + [25:33] one-hot
         if 'nation' in p:
             nat_list = ['gondor', 'rohan', 'the_north', 'dwarves', 'elves',
@@ -3477,12 +3548,10 @@ if HAS_TORCH:
         # [21] is_attack flag
         feat[21] = 1.0 if action.action_type in ('army_attack', 'siege_assault',
                                                     'siege_press') else 0.0
-        # [22] die_idx / 7 (which die is used)
-        # [22] DEAD (v30 skew fix, 2026-07-26): die INDEX is an
-        # arbitrary pool position — extraction stages its one die at
-        # idx 0 while live menus use real indices, so this column
-        # train/serve-skewed every action.  The die FACE column carries
-        # the semantics.  Kept as a column (layout stability), always 0.
+        # [22] DEAD by design (v30 skew fix 2026-07-26): the die INDEX is
+        # an arbitrary pool position that train/serve-skews; the FACE
+        # column carries the semantics.  Kept as an always-0 column
+        # (layout stability).
         # [23] special: elven ring new_face / eye count / companion index
         if action.action_type == 'elven_ring':
             # Encode target die face as index
@@ -3490,30 +3559,28 @@ if HAS_TORCH:
                      'Eye of Sauron', 'Will of the West']
             face_str = p.get('new_face', '')
             feat[23] = (faces.index(face_str) + 1) / 7.0 if face_str in faces else 0.0
-            # target_die_idx NOT encoded (col 22 dead — skew fix
-            # 2026-07-26; extraction pool order != live pool order).
-            # [24] the target die's OLD face (USER 2026-07-27): the
-            # semantic identity of WHICH die is being changed — without
-            # it, ring options changing different dice to the same new
-            # face collapsed.  Params-sourced: the shared generator
-            # stamps old_face on both the extraction and live paths.
+            # target_die_idx NOT encoded (col 22 dead).  [24] the target
+            # die's OLD face (USER 2026-07-27): WHICH die is being
+            # changed; params-sourced (the shared generator stamps
+            # old_face on both paths).
             _of9 = p.get('old_face', '')
             feat[24] = ((faces.index(_of9) + 1) / 7.0
                         if _of9 in faces else 0.0)
         elif action.action_type == 'eye_allocate':
             feat[23] = p.get('count', 0) / 3.0
         elif action.action_type == 'casualty_allocate':
-            feat[23] = p.get('count', 0) / 5.0
+            operation = p.get('operation')
+            if operation not in _CASUALTY_COST:
+                raise ValueError('Unversioned or invalid casualty operation')
+            feat[23] = 1.0 if operation == 'reduce_elite' else 0.0
+            feat[24] = 1.0 if operation == 'remove_elite' else 0.0
         elif action.action_type == 'nazgul_move':
-            # v28 (USER 2026-07-24): the flight SIZE and the WK rider
-            # were invisible - count/include_wk variants of one
-            # (from,to) route encoded byte-identically (the v11
-            # victor_advance collapse, one action type over).  The
-            # no-count action means ALL plain Nazgul at the source, so
-            # encode the EFFECTIVE count.
+            # v28 (USER 2026-07-24): flight SIZE + WK rider are decision
+            # inputs; the no-count action means ALL plain Nazgul at the
+            # source, so encode the EFFECTIVE count.
             _nz9 = p.get('count')
             if _nz9 is None:
-                _na9 = _armies_lookup(state, p.get('from'))
+                _na9 = source_army
                 _nz9 = (sum(1 for l in _na9.leaders
                             if isinstance(l, Nazgul))
                         if _na9 else 0)
@@ -3532,12 +3599,9 @@ if HAS_TORCH:
             of = p.get('old_face', '')
             feat[23] = (faces.index(of) + 1) / 7.0 if of in faces else 0.0
         elif action.action_type == 'choose_guide':
-            # review P2 (2026-07-27): real params carry 'Meriadoc' /
-            # 'Peregrin' (never 'Merry'/'Pippin') and Gollum / Gandalf
-            # the White are legal guides — the stale list zeroed
-            # feat[23] for all four (identity still reached the net via
-            # the character multi-hot, so this sub-feature was
-            # redundant-wrong, not a hard collapse)
+            # Params carry 'Meriadoc' / 'Peregrin' (never 'Merry'/'Pippin');
+            # Gollum and Gandalf the White are legal guides (review P2
+            # 2026-07-27).
             companion_names = ['Gandalf the Grey', 'Strider', 'Legolas',
                                'Gimli', 'Boromir', 'Meriadoc', 'Peregrin',
                                'Aragorn', 'Gandalf the White', 'Gollum']
@@ -3584,6 +3648,26 @@ if HAS_TORCH:
             feat[_ACT_CARDOPT_OFF] = 1.0
             from card_options import option_region as _optreg
             _cho = p.get('choices') or {}
+            # Axe and Horn share one pending menu. The selected payment's
+            # card identity must override that menu's constant source ID.
+            if (_COMBAT_ROUND_CONTEXT_ON and _cho.get('use_hunt_reduction') == 1
+                    and _cho.get('card_id')):
+                feat[_ACTION_CARD_IDX_DIM] = float(
+                    _get_card_idx_map().get(_cho['card_id'], -1))
+            # Worn's choice names a public table card or a random hand
+            # source. The random victim is not known when this is encoded.
+            if 'wwsat_source' in _cho:
+                feat[_ACT_OPTVAL_OFF] = {
+                    'table': 1.0, 'hand': -1.0, 'decline': 0.5,
+                }[_cho['wwsat_source']]
+                if _cho['wwsat_source'] == 'table':
+                    feat[_ACTION_CARD_IDX_DIM] = float(
+                        _get_card_idx_map().get(_cho.get('card_id', ''), -1))
+            # Guards of the Citadel's printed Regular/Elite choice reuses
+            # the existing unit-kind meaning; no feature dimensions shift.
+            if _cho.get('unit_type') in ('regular', 'elite'):
+                feat[_ACT_OPTKIND_OFF] = {
+                    'regular': 0.34, 'elite': 0.67}[_cho['unit_type']]
             _r = _optreg(_cho)
             if _r:
                 feat[15] = (REGION_INDEX.get(sanitize(str(_r)), 0)
@@ -3592,12 +3676,12 @@ if HAS_TORCH:
             # options flying a nazgul to the same destination from
             # different regions were byte-identical (option_region
             # returns to_region first; feat[14] is free for options)
-            _fr9 = _cho.get('from_region')
+            _fr9 = _cho.get('from_region') or _cho.get('attack_from')
             if _fr9:
                 feat[14] = (REGION_INDEX.get(sanitize(str(_fr9)), 0)
                             / float(NUM_REGIONS))
-            # decision-audit 2026-07-08: NON-region option keys were
-            # invisible (Wisdom of Elrond nation options collapsed).
+            # NON-region option keys (e.g. nation) are decision inputs
+            # (decision-audit 2026-07-08).
             _cn = _cho.get('nation')
             if _cn:
                 # Slot order MUST match nat_list ([25:33] one meaning
@@ -3605,7 +3689,7 @@ if HAS_TORCH:
                 nat_list2 = ['gondor', 'rohan', 'the_north', 'dwarves',
                              'elves', 'isengard', 'sauron',
                              'southrons_easterlings']
-                _cns = sanitize(str(_cn)).replace(' ', '_')
+                _cns = sanitize(str(getattr(_cn, 'value', _cn))).replace(' ', '_')
                 _alias = {'north': 'the_north',
                           'southrons_and_easterlings':
                               'southrons_easterlings'}
@@ -3627,17 +3711,25 @@ if HAS_TORCH:
                     sanitize(_ca.split('_', 1)[1].replace('_', ' ')))
                 if _i3 is not None:
                     feat[_ACT_CHAR_OFF + _i3] = 1.0
+            if 'cas_downgrades' in _cho:
+                raise ValueError('Legacy card casualty labels require re-extraction')
+            if 'casualty_operation' in _cho:
+                operation = _cho['casualty_operation']
+                if operation not in _CASUALTY_COST:
+                    raise ValueError('Invalid card casualty operation')
+                feat[23] = 1.0 if operation == 'reduce_elite' else 0.0
+                feat[24] = 1.0 if operation == 'remove_elite' else 0.0
             if _cho.get('dice_count') is not None:
                 feat[23] = float(_cho['dice_count']) / 3.0
             if _cho.get('count') is not None:
                 feat[23] = float(_cho['count']) / 8.0
-            # v28 (USER 2026-07-24): a WK chain hop and a plain-nazgul
-            # hop on the same route encoded identically
+            # v28 (USER 2026-07-24): a WK chain hop and a plain-nazgul hop
+            # on the same route must encode differently
             if _cho.get('include_wk'):
                 feat[24] = 1.0
-            # LOW-5 (2026-07-20): Dead Men recruit magnitude — without
-            # this, options differing only in recruit_count encode
-            # byte-identically (the SoMM spatial-invisibility class)
+            # LOW-5 (2026-07-20): Dead Men recruit magnitude is a decision
+            # input (options differing only in recruit_count must not
+            # collide)
             if _cho.get('recruit_count') is not None:
                 feat[23] = float(_cho['recruit_count']) / 3.0
             # v14: nested option specs surface their fields
@@ -3712,6 +3804,20 @@ if HAS_TORCH:
                     str(_cho['target_card']), -1)
                 if _tci9 >= 0:
                     feat[_ACTION_CARD_IDX_DIM] = float(_tci9)
+            # EX-8: the table-kill PAYMENT pair is the decision - the
+            # Army-type card rides the card-idx slot (the pending's own
+            # card is constant across options), the Character card the
+            # count slot (free for this option shape)
+            if _cho.get('army_card'):
+                _aci9 = _get_card_idx_map().get(
+                    str(_cho['army_card']), -1)
+                if _aci9 >= 0:
+                    feat[_ACTION_CARD_IDX_DIM] = float(_aci9)
+            if _cho.get('character_card'):
+                _cci9 = _get_card_idx_map().get(
+                    str(_cho['character_card']), -1)
+                if _cci9 >= 0:
+                    feat[23] = (_cci9 + 1) / 100.0
             # v14/v15: chain terminators; a '__remove_from_play__'
             # destination (Mordor-track separation) rides the same slot
             # (no board destination - the card idx disambiguates)
@@ -3736,9 +3842,21 @@ if HAS_TORCH:
                 feat[_ACT_COMP_OFF + 1] = float(_cne9 or 0) / 10.0
                 feat[_ACT_OPTSIZE_OFF] = min(
                     float(_cnr9 or 0) + float(_cne9 or 0), 10) / 10.0
-        # [80] acting-die face; [81] freed by the skip removal — now
-        # the nazgul_move include_wk flag (else the two variants would
-        # encode identically = an encoding collapse)
+            if p.get('card_id') == '__gandalf_draw__':
+                _gidx = _gandalf_source_index(p)
+                _take = _cho.get('gandalf_draw')
+                if type(_take) is not bool:
+                    raise ValueError('Gandalf action must encode draw or decline')
+                # The policy embeds card indices and maps every negative
+                # index to padding. Use the real source embedding plus a
+                # RETAINED negative numeric marker to identify the ability.
+                feat[_ACTION_CARD_IDX_DIM] = float(_gidx)
+                feat[23] = -float(_gidx + 1) / 100.0
+                feat[24] = 0.5 if p['deck'] == 'character' else 1.0
+                feat[_ACT_OPTVAL_OFF] = 1.0 if _take else -1.0
+        # [_ACT_DIEFACE_OFF] acting-die face; [_ACT_SKIP_OFF] doubles as
+        # the nazgul_move include_wk flag (the two variants must not
+        # collide)
         if p.get('include_wk'):
             feat[_ACT_SKIP_OFF] = 1.0
         if action.action_type == 'skip':
@@ -3746,12 +3864,9 @@ if HAS_TORCH:
             _fname = str(p.get('face', '') or '')
             feat[_ACT_DIEFACE_OFF] = _FACE_ORDER.get(_fname, 0) / 7.0
         elif action.action_type == 'pass':
-            # v30 skew fix (2026-07-26): pass is canonically FACE-LESS.
-            # Extraction passes ride the staged die (idx 0, face set) so
-            # the die-idx branch stamped col 81 on them, while live
-            # passes (die_idx=-1) encoded 0 — the only face-less-pass
-            # positives were the decline-declare samples, and the live
-            # prior collapsed onto pass (=1.0000 at every root).
+            # v30 skew fix (2026-07-26): pass is canonically FACE-LESS on
+            # every path (extraction passes ride a staged die; live passes
+            # carry die_idx=-1) - never stamp the face column here.
             pass
         elif action.die_idx is not None and action.die_idx >= 0:
             try:
@@ -3772,13 +3887,19 @@ if HAS_TORCH:
                 # Choice magnitude (like rearguard size): sacrifice /
                 # forfeit count, 0 = decline
                 feat[23] = p.get('count', 0) / 10.0
+                # 1.254 (audit CB-7): the WHICH-figure pick rides the
+                # EXISTING character multi-hot (see _mark_char below -
+                # no dim growth); a plain-Leader pick lights the
+                # unit-kind scalar's 'leader' value
+                if p.get('target') == 'leader':
+                    feat[_ACT_OPTKIND_OFF] = 1.0
             elif action.action_type in ('shine', 'shine_none'):
                 # binary shine decision rides the count slot (item 11)
                 feat[23] = 1.0 if action.action_type == 'shine' else 0.0
         elif action.action_type == 'companion_separate':
             # v32 (2026-07-28): a FORCED hunt-casualty hobbit placement
-            # reuses the companion_separate type — mark it with its own
-            # subtype so the net can tell it from a VOLUNTARY separation
+            # reuses companion_separate - its own subtype bit separates it
+            # from a VOLUNTARY separation
             _ph9e = getattr(state, 'pending_hunt', None)
             if isinstance(_ph9e, dict) \
                     and _ph9e.get('phase') == 'hobbit_place':
@@ -3791,7 +3912,13 @@ if HAS_TORCH:
             """(reg, elite, leaders+nazgul) of want_side at region."""
             if not region:
                 return 0, 0, 0
-            a = _armies_lookup(state, str(region))
+            if _batch is not None:
+                _ck = (region, want_side)
+                _cached_comp = _batch.compositions.get(_ck)
+                if _cached_comp is not None:
+                    return _cached_comp
+            a = (source_army if isinstance(source, str) and region == source
+                 else _lookup(state, str(region)))
             if a is None:
                 return 0, 0, 0
             r = e = l = 0
@@ -3812,16 +3939,34 @@ if HAS_TORCH:
                     continue
                 if ls == want_side:
                     l += 1
+            if _batch is not None:
+                _batch.compositions[_ck] = (r, e, l)
             return r, e, l
 
         # [55:59] action-moved composition
         n_r = n_e = n_l = n_z = 0
         src_r, src_e, src_l = _army_comp(p.get('from'), side)
+        # [16] own source size uses the composition scan already needed
+        # by [72:75].  Preserve the raw-key behavior for unusual legacy
+        # inputs (including an empty or non-string source).
+        if source_army:
+            _own_src = (src_r + src_e if isinstance(source, str) and source
+                        else sum(1 for u in source_army.units
+                                 if _side_of_nation(u.nation) == side))
+            feat[16] = _own_src / 10.0
+            if at in ('army_move', 'victor_advance') \
+                    and p.get('n_regular') is not None:
+                _mv9 = (int(p.get('n_regular') or 0)
+                        + int(p.get('n_elite') or 0))
+                _left9 = max(0, _own_src - _mv9)
+                feat[_ACT_LEAVE_OFF] = _left9 / 10.0
+                feat[_ACT_EMPTIES_OFF] = 1.0 if _left9 == 0 else 0.0
         if at == 'army_move':
             n_r = int(p.get('n_regular') or 0)
             n_e = int(p.get('n_elite') or 0)
             if p.get('take_leaders', True):
-                a0 = _armies_lookup(state, str(p.get('from', '')))
+                a0 = (source_army if isinstance(source, str)
+                      else _lookup(state, str(p.get('from', ''))))
                 if a0 is not None:
                     for ld in a0.leaders:
                         if isinstance(ld, Nazgul):
@@ -3838,12 +3983,14 @@ if HAS_TORCH:
                                 continue
                             if ls == side:
                                 n_l += 1
-            # v16.1 (amendment 1.130): the 1.128 n_nazgul split was
-            # documented but never wired here - '(L)' and '(L nz=0)'
-            # variants encoded byte-identically (label noise + a
-            # non-choice for the net).  The explicit count wins.
+            # 1.130 (v16.1): the explicit n_nazgul count wins over the
+            # take_leaders inference ('(L)' and '(L nz=0)' must differ).
             if p.get('n_nazgul') is not None:
                 n_z = int(p.get('n_nazgul') or 0)
+            # LA-8: an explicit per-count leader split wins (the
+            # n_leaders variants must not encode like the all-leaders one)
+            if p.get('n_leaders') is not None:
+                n_l = int(p.get('n_leaders') or 0)
         elif at == 'victor_advance':
             # 1.150: the advance composition (incl. n_nazgul) is a
             # decision dimension; without this the nz variants encoded
@@ -3851,21 +3998,42 @@ if HAS_TORCH:
             n_r = int(p.get('n_regular') or 0)
             n_e = int(p.get('n_elite') or 0)
             n_z = int(p.get('n_nazgul') or 0)
-        elif at in ('army_attack', 'combat_retreat'):
-            # the whole own force at the source/battle region moves/fights
-            n_r, n_e, n_l = _army_comp(p.get('from') or p.get('to'), side)
+            if p.get('n_leaders') is not None:
+                n_l = int(p.get('n_leaders') or 0)   # LA-8
+        elif at == 'army_attack':
+            from army_participants import select_forced_attack
+            if source_army is not None:
+                _form = select_forced_attack(state, source_army, side)
+                n_r = sum(u.kind == UnitKind.REGULAR for u in _form.attacking_units)
+                n_e = sum(u.kind == UnitKind.ELITE for u in _form.attacking_units)
+                n_l = len(_form.attacking_leaders)
+                feat[_ACT_LEAVE_OFF] = len(_form.rearguard_units) / 10.0
+        elif at == 'combat_retreat':
+            _ret_region = source or p.get('to')
+            _ret_army = _battle_army(state, _ret_region, side) if _ret_region else None
+            if _ret_army is not None:
+                n_r = sum(u.kind == UnitKind.REGULAR for u in _ret_army.units)
+                n_e = sum(u.kind == UnitKind.ELITE for u in _ret_army.units)
+                n_l = len(_ret_army.leaders)
         elif at == 'muster_recruit':
             typ = str(p.get('type', 'regular'))
             n_r = 1 if typ == 'regular' else 0
             n_e = 1 if typ == 'elite' else 0
             n_l = 1 if typ == 'leader' else 0
             n_z = 1 if typ == 'nazgul' else 0
+            if p.get('saruman') == 'settlements':
+                # S-001: the 1.266 ability places THREE Regulars on one
+                # die (Orthanc + both Dunlands) - the composition column
+                # carries the true placement (see ACT_ENC_SARUMAN_DISTINCT)
+                n_r = 3
         elif at == 'muster_elite':
-            n_e = 1
+            # S-001: swap2 = two Orthanc Regulars -> two Elites
+            n_e = 2 if p.get('saruman') == 'swap2' else 1
         elif at == 'muster_minion':
             n_l = 1
         elif at == 'nazgul_move':
-            a0 = _armies_lookup(state, str(p.get('from', '')))
+            a0 = (source_army if isinstance(source, str)
+                  else _lookup(state, str(p.get('from', ''))))
             n_z = sum(1 for ld in (a0.leaders if a0 else [])
                       if isinstance(ld, Nazgul))
             # v16.1 (amendment 1.130): count subsets were invisible -
@@ -3901,7 +4069,8 @@ if HAS_TORCH:
                 names.append(p.get('companion'))
             if not names:
                 # engine group semantics: moves every Companion at 'from'
-                a0 = _armies_lookup(state, str(p.get('from', '')))
+                a0 = (source_army if isinstance(source, str)
+                      else _lookup(state, str(p.get('from', ''))))
                 names = [ld.name for ld in (a0.leaders if a0 else [])
                          if isinstance(ld, Companion)]
             for nm in names:
@@ -3911,13 +4080,13 @@ if HAS_TORCH:
             if not nm and state.fellowship.guide is not None:
                 nm = state.fellowship.guide.name
             _mark_char(nm)
-        # hunt_sacrifice_random: the victim is a FUTURE random draw.
-        # Encoding the log's drawn name (forced_companion) LEAKED the
-        # label — teacher samples had the character bit lit, live
-        # candidates never do, so the trained prior for random was
-        # floored to 0.0 in every live scenario while scoring 9/9 on
-        # (leaked) corpus samples (USER 2026-07-09 root cause). The
-        # random candidate encodes NO character identity.
+        elif at == 'combat_effect_choice':
+            # 1.254: WHICH Companion / Minion the card effect takes
+            if p.get('target') and p.get('target') != 'leader':
+                _mark_char(p.get('target'))
+        # hunt_sacrifice_random: the victim is a FUTURE random draw - the
+        # candidate encodes NO character identity (USER 2026-07-09:
+        # encoding the log's drawn name leaked the label).
         elif at == 'muster_minion':
             _mark_char(p.get('minion'))
         elif at == 'crown_aragorn':
@@ -3941,15 +4110,21 @@ if HAS_TORCH:
             _dreg = sanitize(str(p.get('region', '') or p.get('to', '')))
             if _dreg in ('morannon', 'minas morgul')                     or p.get('mordor_entry'):
                 feat[_ACT_MORDOR_OFF] = 1.0
+        if _ACT_CARD_CHOICES_ON and action.action_type == 'card_option':
+            from action_choice_tail import encode_tail
+            feat[_ACT_CARD_CHOICE_TAIL_OFF:_ACT_CARD_CHOICE_TAIL_OFF + CARD_CHOICE_TAIL_DIM] = encode_tail(action, REGION_INDEX)
+        if _COMBAT_ROUND_CONTEXT_ON:
+            from combat_round_observation import encode_action_tail
+            feat[105:133] = encode_action_tail(action, state)
+            from card_cargo_observation import encode_tail as encode_cargo_tail
+            feat[133:] = encode_cargo_tail(action)
         return feat
 
     def _get_action_region_index(action) -> int:
         """Return primary region index (0-104) for an action, or -1 if non-regional."""
         p = action.params
         # card_option: the region lives inside the choices dict (USER
-        # 2026-07-08: SoMM Mount-Gram-vs-Moria was spatially INVISIBLE —
-        # both options returned -1 and the GNN scorer could not
-        # distinguish them; priors came out exactly uniform)
+        # 2026-07-08: options must be spatially distinguishable)
         if action.action_type == 'card_option':
             from card_options import option_region
             r = option_region(p.get('choices') or {})
@@ -3971,9 +4146,8 @@ if HAS_TORCH:
         return -1  # pass, draw_card, fellowship, etc.
 
     # -----------------------------------------------------------------
-    # Cached encoding for the MCTS hot path. encode_action depends on the
-    # state ONLY through the unit count of the source army (feat[16]), so
-    # results are globally cacheable by action identity + that count.
+    # Cached encodings include action parameters and every state-dependent
+    # feature: die face, source/target composition, guide and pending context.
     # -----------------------------------------------------------------
     _ENC_CACHE: dict = {}
     _RIDX_CACHE: dict = {}
@@ -3981,14 +4155,11 @@ if HAS_TORCH:
     def _action_cache_key(action, state, side, comp_memo=None):
         p = action.params or {}
         if action.action_type == 'companion_separate'                 and p.get('companions') and comp_memo is not None:
-            # FAST PATH (profiled 2026-08-22, uncapped lattice: the
-            # ~35-element key was built ~800k times per search).  The
-            # elements the full key carries that can DIFFER for a group
-            # separation: die face, the hobbit_place subtype, the
-            # companions, the destination and the ENEMY composition at
-            # the destination ([75:78]); everything else is None for
-            # this shape.  The guard test (key-equality implies
-            # encoding-equality) covers this path through test_rules.
+            # FAST PATH (profiled 2026-08-22): for a group separation only
+            # the die face, the hobbit_place subtype, the companions, the
+            # destination and the ENEMY composition there can differ; the
+            # key-equality-implies-encoding-equality guard in test_rules
+            # covers this path.
             _face = None
             if action.die_idx is not None and action.die_idx >= 0:
                 _dl = state.dice.get(side, [])
@@ -4007,11 +4178,8 @@ if HAS_TORCH:
                     tuple(p['companions']), _tgt9, _tgt_en)
 
         def _comp_at(rname):
-            # PROFILE (session 34): within one expansion the state is
-            # fixed and ~500 candidates share a handful of regions —
-            # comp_memo (fresh dict per expansion) collapses 150K+
-            # army scans per search to a few dozen.  KEY CONTENT is
-            # unchanged (memo only avoids recomputation).
+            # comp_memo (fresh dict per expansion) memoizes army scans
+            # within one expansion; KEY CONTENT is unchanged.
             if comp_memo is not None and rname in comp_memo:
                 return comp_memo[rname]
             r9 = _comp_at_raw(rname)
@@ -4020,11 +4188,9 @@ if HAS_TORCH:
             return r9
 
         def _comp_at_raw(rname):
-            # complete own-side composition (r, e, l, z) - covers
-            # feat[16]/leave-off AND the [55:59] composition slots
-            # (1.132: the old total-unit count missed the r/e split,
-            # leaders and nazgul, so attacks/moves cached at one
-            # composition were reused at another)
+            # complete own-side composition (r, e, l, z): feat[16]/leave-
+            # off AND the composition slots (1.132: the r/e split, leaders
+            # and nazgul are all encoded, so the key must carry them)
             if rname is None:
                 return None
             a = _armies_lookup(state, str(rname))
@@ -4059,16 +4225,10 @@ if HAS_TORCH:
         if n_at_from is None and action.action_type in (
                 'army_attack', 'combat_retreat'):
             n_at_from = _comp_at(p.get('to'))
-        # 1.132 (user QA, serial guide-burn root cause): encode_action
-        # is state-dependent BEYOND the source count -
-        # (a) the acting die's FACE rides feat[80]; the die at an index
-        #     changes between action windows AND episodes (the cache is
-        #     process-wide), so a stale face poisoned die-action priors;
-        # (b) hunt_sacrifice_guide encodes the VICTIM (current guide) at
-        #     the character one-hot - a cached Gandalf-victim encoding
-        #     served at a Strider decision made the net answer the wrong
-        #     question (humans burn Gandalf 73%, Strider 6%), driving
-        #     Gandalf->Strider->Legolas->Gimli serial sacrifices.
+        # 1.132: encode_action is state-dependent BEYOND the source count -
+        # (a) the acting die's FACE (the die at an index changes between
+        #     windows and episodes; the cache is process-wide);
+        # (b) hunt_sacrifice_guide encodes the VICTIM (current guide).
         _face = None
         if action.die_idx is not None and action.die_idx >= 0:
             _dl = state.dice.get(side, [])
@@ -4083,19 +4243,14 @@ if HAS_TORCH:
         ch = p.get('choices')
         ch_key = (tuple(sorted((k, str(v)) for k, v in ch.items()))
                   if isinstance(ch, dict) else None)
-        # 1.138 (review agent C, probe-confirmed): the key MUST mirror
-        # every param encode_action reads - missing fields collided
-        # companion GROUP moves (full group vs subsets shared one slot,
-        # 'move Aragorn alone' served the whole-group encoding into the
-        # live MCTS priors), minion identities, n_nazgul escorts,
-        # include_wk, token types.  Guard test in test_rules asserts
-        # key-equality implies encoding-equality.
+        # 1.138: the key MUST mirror every param encode_action reads
+        # (companion groups, minion identities, n_nazgul, include_wk,
+        # token types, ...).  Guard test in test_rules: key-equality
+        # implies encoding-equality.
         _comps = p.get('companions')
         _comps_k = tuple(sorted(str(c) for c in _comps))             if _comps else None
         # v32 (2026-07-28): the hobbit_place subtype bit reads the
-        # pending-hunt phase — the key must mirror it (a cached
-        # voluntary-separation encoding must not serve a forced
-        # placement, or vice versa)
+        # pending-hunt phase - the key mirrors it
         _hplace = None
         if action.action_type == 'companion_separate':
             _phk9 = getattr(state, 'pending_hunt', None)
@@ -4120,48 +4275,45 @@ if HAS_TORCH:
             if comp_memo is not None and _ek9 in comp_memo:
                 _tgt_en = comp_memo[_ek9]
             else:
-                _a9e = _armies_lookup(state, str(_tgt9))
-                if _a9e is None:
-                    _tgt_en = (0, 0, 0)
-                else:
-                    _er = _ee = _el = 0
-                    for u in _a9e.units:
-                        if _side_of_nation(u.nation) == side:
-                            continue
-                        if u.kind == UnitKind.REGULAR:
-                            _er += 1
-                        else:
-                            _ee += 1
-                    for ld in _a9e.leaders:
-                        if isinstance(ld, Nazgul):
-                            if side == Side.FREE_PEOPLES:
-                                _el += 1
-                            continue
-                        try:
-                            ls = (Side.FREE_PEOPLES
-                                  if isinstance(ld, Companion)
-                                  else Side.SHADOW
-                                  if type(ld).__name__ == 'Minion'
-                                  else _side_of_nation(ld.nation))
-                        except Exception:
-                            continue
-                        if ls != side:
-                            _el += 1
-                    _tgt_en = (_er, _ee, _el)
+                _tgt_en = _enemy_comp_at(state, side, _tgt9)
                 if comp_memo is not None:
                     comp_memo[_ek9] = _tgt_en
-        return (_hplace, side, action.action_type, action.die_idx, frm,
+        _rear_key = (getattr(state, 'pending_combat', None) or {}).get('attacker_rearguard')
+        if action.action_type == 'army_attack' and frm:
+            from army_participants import select_forced_attack
+            _src = _armies_lookup(state, str(frm))
+            if _src is not None:
+                _rear_key = select_forced_attack(state, _src, side).rearguard_signature
+        # Flat action parameters avoid rebuilding a long mostly-empty key.
+        # Keep every parameter and the same state context; compound unhashable
+        # choices use the established key below. No Action-object memo is used,
+        # so later parameter mutations are visible on the next lookup.
+        _params_key = tuple(p.items())
+        try:
+            hash(_params_key)
+        except TypeError:
+            pass
+        else:
+            return ('all_params', _rear_key, _hplace, side,
+                    action.action_type, action.die_idx, _params_key,
+                    n_at_from, _face, _guide, _comps_k, _tgt_en)
+        return (_rear_key, _hplace, side, action.action_type, action.die_idx, frm,
                 p.get('to'), p.get('region'), p.get('to_region'),
                 getattr(nation, 'value', nation), p.get('type'),
-                p.get('count'), p.get('card_id'), p.get('companion'),
-                p.get('deck'), p.get('new_face'), p.get('target_die_idx'),
+                p.get('count'), p.get('operation'), p.get('card_id'), p.get('companion'),
+                p.get('deck'), p.get('source_card_id'),
+                p.get('new_face'), p.get('target_die_idx'),
                 p.get('n_regular'), p.get('n_elite'), p.get('take_leaders'),
                 ch_key, n_at_from, _face, _guide,
                 _comps_k, p.get('minion'), p.get('n_nazgul'),
                 p.get('include_wk'), p.get('token_type'),
                 p.get('character'), p.get('old_face'), p.get('face'),
                 p.get('leave_behind'), p.get('forced_companion'),
-                p.get('elites_back'), p.get('excess'), _tgt_en)
+                p.get('elites_back'), p.get('excess'), _tgt_en,
+                p.get('n_leaders'), p.get('target'),
+                # Saruman's two-Elite/three-Regular modes change the
+                # composition features; explicit entry changes its flag.
+                p.get('saruman'), bool(p.get('mordor_entry')))
 
     def _enemy_comp_at(state, side, tgt):
         """(regulars, elites, leaders) of the ENEMY of `side` at `tgt` -
@@ -4228,7 +4380,7 @@ if HAS_TORCH:
                 _st = _ad['_encs'] = {}
             enc = _st.get(_sk)
             if enc is None:
-                enc = encode_action(action, state, side)
+                enc = encode_action(action, state, side, _batch=active_batch(comp_memo))
                 if len(_st) > 64:
                     _st.clear()
                 _st[_sk] = enc
@@ -4236,7 +4388,7 @@ if HAS_TORCH:
         key = _action_cache_key(action, state, side, comp_memo)
         enc = _ENC_CACHE.get(key)
         if enc is None:
-            enc = encode_action(action, state, side)
+            enc = encode_action(action, state, side, _batch=active_batch(comp_memo))
             if len(_ENC_CACHE) > 500_000:
                 _ENC_CACHE.clear()
             _ENC_CACHE[key] = enc
@@ -4266,8 +4418,8 @@ if HAS_TORCH:
     # ---------------------------------------------------------------
     # Value Network with GNN + Card Embeddings + Action Scorer
     # ---------------------------------------------------------------
-    # Feature layout (stale-doc fix 2026-07-13; the numbers below are
-    # COMPUTED, never hardcode them - get_feature_dim() is the truth):
+    # Feature layout (the numbers below are COMPUTED, never hardcode
+    # them - get_feature_dim() is the truth):
     #   [0 : 105*NODE_FEAT_DIM]                per-region grid -> GNN
     #   [_CARD_IDX_START : +MAX_HAND_SIZE]     card indices -> Embedding
     #   everything else                        global features
@@ -4363,12 +4515,14 @@ if HAS_TORCH:
             return self.scale * torch.tanh(x / self.scale)
 
     def _value_head_act():
-        """Head activation for NEWLY-CONSTRUCTED nets.  Env-gated,
-        default = legacy Tanh (byte-identical behavior until the
-        package flips the flag); checkpoints saved by the v2 trainer
-        carry 'head_act' and load deterministically regardless of
-        this env."""
-        if os.environ.get('WOTR_VALUE_HEAD_ACT', 'tanh') == 'scaled2':
+        """Head activation for NEWLY-CONSTRUCTED nets.  Env-gated;
+        default = scaled2 (SPB addendum 2026-08-29: the collapsed-
+        regime defaults are flipped - plain Tanh clipped 13-36% of TD
+        targets; legacy Tanh only via an explicit
+        WOTR_VALUE_HEAD_ACT=tanh).  Checkpoints saved by the v2
+        trainer carry 'head_act' and load deterministically
+        regardless of this env."""
+        if os.environ.get('WOTR_VALUE_HEAD_ACT', 'scaled2') == 'scaled2':
             return _ScaledTanhHead(2.0)
         return nn.Tanh()
 
@@ -4568,7 +4722,7 @@ if HAS_TORCH:
         def _embed_action_encs(self, action_encodings):
             """Split raw encodings into (features, card_embedding).
 
-            The last column carries a raw card index for play_event actions
+            Column 33 carries a raw card index for play_event actions
             (-1 otherwise); it is looked up in the shared card_embedding so
             the scorer can tell WHICH card a play action refers to.
             """
@@ -4691,17 +4845,18 @@ if HAS_TORCH:
             return priors
 
 
-# ===================================================================
-# Holdout Evaluation
-# ===================================================================
-
-
-
 def _policy_delta_enabled() -> bool:
     """1.226a kill-switch: WOTR_POLICY_DELTA env, '1' default.  Read
     per call so A/B flips need no re-import (cheap: one getenv per
     node expansion)."""
     return os.environ.get('WOTR_POLICY_DELTA', '1') != '0'
+
+
+# W4-031: the three BoardGNN buffers derived from board.adj (see
+# _load_state_dict_compat).
+_GNN_GRAPH_BUFFERS = frozenset(('board_gnn.edge_src',
+                                'board_gnn.edge_dst',
+                                'board_gnn.deg_inv_sqrt'))
 
 
 def _load_state_dict_compat(net, sd, path=''):
@@ -4710,18 +4865,51 @@ def _load_state_dict_compat(net, sd, path=''):
     load with the fresh ZERO-INIT delta (an exact behavioral no-op);
     any OTHER missing/unexpected key raises loudly.  Returns the list
     of delta keys that were left at fresh init (empty for new-format
-    checkpoints)."""
-    missing, unexpected = net.load_state_dict(sd, strict=False)
+    checkpoints).
+
+    SPTR-11 (session-34 chimera class): key AND shape validation runs
+    BEFORE any tensor copy - torch's load_state_dict copies the
+    compatible tensors first and raises after, so a failed load used
+    to leave a partially-spliced net behind."""
+    own = net.state_dict()
+    missing = [k for k in own if k not in sd]
+    unexpected = [k for k in sd if k not in own]
     bad_missing = [k for k in missing
                    if not k.startswith('policy_delta')]
-    if bad_missing or unexpected:
+    shape_bad = [(k, tuple(sd[k].shape), tuple(own[k].shape))
+                 for k in own
+                 if k in sd and hasattr(sd[k], 'shape')
+                 and tuple(sd[k].shape) != tuple(own[k].shape)]
+    # W4-031 (board fix, sponsor option C): the board graph is a
+    # checkpoint BUFFER (BoardGNN.edge_src / edge_dst / deg_inv_sqrt
+    # are register_buffer'd from board.adj), so a corrected adjacency
+    # graph changes the edge buffers' length and a strict load would
+    # refuse every pre-fix net.  When the ONLY shape mismatches are
+    # those graph buffers, the net keeps its own board-derived buffers
+    # (all three - deg_inv_sqrt keeps its (num_nodes,) shape but its
+    # VALUES follow the edges) and the load proceeds with ONE loud
+    # notice.  Any learned-weight mismatch still raises exactly as
+    # before, BEFORE any copy.  v42 nets run on the corrected graph
+    # until the v43 retrain.
+    if shape_bad and not bad_missing and not unexpected and all(
+            k in _GNN_GRAPH_BUFFERS for k, _s, _o in shape_bad):
+        n_ckpt = int(sd['board_gnn.edge_src'].shape[0])
+        n_now = int(own['board_gnn.edge_src'].shape[0])
+        print('[AI] checkpoint graph %d directed edges != current board '
+              '%d (W4-031 board fix): GNN runs on the current board (%s)'
+              % (n_ckpt, n_now, path))
+        sd = {k: v for k, v in sd.items() if k not in _GNN_GRAPH_BUFFERS}
+        shape_bad = []
+    if bad_missing or unexpected or shape_bad:
         raise RuntimeError(
-            'checkpoint %s key mismatch: missing=%s unexpected=%s'
-            % (path, bad_missing, list(unexpected)))
+            'checkpoint %s key mismatch: missing=%s unexpected=%s '
+            'shape=%s (validated BEFORE load - net untouched)'
+            % (path, bad_missing, list(unexpected), shape_bad))
+    net.load_state_dict(sd, strict=False)
     return [k for k in missing if k.startswith('policy_delta')]
 
 
-def load_value_net(path: str, side: str = None) -> Optional['WOTRValueNet']:
+def load_value_net(path: str, side: str = None, profile=None) -> Optional['WOTRValueNet']:
     """Load a CURRENT-GENERATION value net (strict, stale sweep
     2026-07-27): the old MLP->GNN / spatial-migration / very-old-format
     branches targeted deleted pre-v31 generations and silently
@@ -4734,6 +4922,29 @@ def load_value_net(path: str, side: str = None) -> Optional['WOTRValueNet']:
     if not os.path.exists(path):
         return None
     ckpt = torch.load(path, weights_only=True, map_location=DEVICE)
+    from trace_decisions import validate_action_encoding_contract
+    from reward_contract import PREDECISION
+    recorded_action_contract = validate_action_encoding_contract(
+        ckpt, required=(ckpt.get('reward_contract') in PREDECISION
+                        or 'observation_contract' in ckpt
+                        or 'selector_contract' in ckpt))
+    recorded_observation = ckpt.get('observation_contract')
+    if ckpt.get('training_status') == 'warm_start_not_retrained':
+        print('[CHECKPOINT] explicit warm start: newly introduced features have not been retrained')
+    if recorded_observation is not None and recorded_observation != OBSERVATION_CONTRACT:
+        raise ValueError('Checkpoint observation contract %r differs from active %r: %s'
+                         % (recorded_observation, OBSERVATION_CONTRACT, path))
+    if recorded_observation is None:
+        print('[CHECKPOINT] unversioned observation weights are a legacy warm start; regenerate replay data for %s' % OBSERVATION_CONTRACT)
+    from reward_contract import current_contract
+    recorded_contract = ckpt.get('reward_contract')
+    if recorded_contract is not None and recorded_contract != current_contract():
+        raise ValueError('Checkpoint reward contract %r differs from active %r: %s'
+                         % (recorded_contract, current_contract(), path))
+    recorded_profile = ckpt.get('reward_profile')
+    if profile is not None and recorded_profile is not None and recorded_profile != profile:
+        raise ValueError('Checkpoint profile %r differs from requested %r: %s'
+                         % (recorded_profile, profile, path))
     sd = ckpt.get('model_state') or ckpt.get('model_state_dict') or ckpt
     current_dim = get_feature_dim()
     ck_dim = ckpt.get('input_dim')
@@ -4755,6 +4966,17 @@ def load_value_net(path: str, side: str = None) -> Optional['WOTRValueNet']:
         side = 'fp' if ('_fp_' in b or b.startswith('fp_')) else (
             'sh' if ('_sh_' in b or b.startswith('sh_')) else None)
     net = WOTRValueNet(current_dim, side=side).to(DEVICE)
+    net.action_encoding_contract = recorded_action_contract
+    net.observation_contract = recorded_observation
+    net.warm_start = copy.deepcopy(ckpt.get('warm_start'))
+    net.training_status = ckpt.get('training_status')
+    net.training_scope = copy.deepcopy(ckpt.get('training_scope'))
+    if net.training_scope is not None:
+        from observation_training import validate_training_scope
+        validate_training_scope(net.training_scope, net=net)
+    net.warm_start_updates = copy.deepcopy(ckpt.get('warm_start_updates') or {})
+    net.reward_contract = recorded_contract
+    net.reward_profile = recorded_profile
     # VALUE package: the head activation is CHECKPOINT-DESCRIBED —
     # 'head_act' absent means legacy Tanh (older checkpoints keep
     # their exact eval behavior whatever WOTR_VALUE_HEAD_ACT says;
@@ -4781,8 +5003,14 @@ def load_value_net(path: str, side: str = None) -> Optional['WOTRValueNet']:
                 os.environ.get('WOTR_CONF_AUTOREG', '1') == '1':
             import confidence as _conf9
             _conf9.register_from_checkpoint(ckpt, side)
-    except Exception:
-        pass
+    except Exception as _cerr9:
+        # SPTR-12: the sanction covers NON-FATALITY, not silence - a
+        # malformed confidence stamp must leave a visible line
+        import logging
+        logging.getLogger('wotr.conf').warning(
+            '[CONF] confidence auto-registration failed for %s '
+            '(net loads without it): %s', path,
+            str(_cerr9)[:200].encode('ascii', 'replace').decode())
     return net
 
 
@@ -4840,6 +5068,120 @@ def _die_faces_for_action(face: ActionDieFace) -> Set[str]:
     return set()
 
 
+# FLE-11 (2026-08-30): faces that natively fund a play of each printed
+# card type (rulebook p.22: a typed die plays ONLY its own card type;
+# the Event and Will faces play any type).  The play_event executor
+# consumes against THIS set on the live/self-play path so a play the
+# rolled face cannot fund falls through to the Elven-Ring waiver branch
+# (spends the waiver) instead of consuming natively.
+_PLAY_EVENT_FACES_BY_TYPE = {
+    'Character': (ActionDieFace.EVENT, ActionDieFace.CHARACTER,
+                  ActionDieFace.WILL_OF_WEST),
+    'Army': (ActionDieFace.EVENT, ActionDieFace.ARMY,
+             ActionDieFace.MUSTER_ARMY, ActionDieFace.WILL_OF_WEST),
+    'Muster': (ActionDieFace.EVENT, ActionDieFace.MUSTER,
+               ActionDieFace.MUSTER_ARMY, ActionDieFace.WILL_OF_WEST),
+}
+
+
+# Elven-Ring waiver FACE (audit LA-1/LA-2, 2026-08-29).
+# game_logic.use_elven_ring raises the waiver as a side-level flag (A7:
+# legality expansion, the die keeps its rolled face) and discards
+# `new_face`; the elven_ring executor records the requested face here.
+# The waiver flag stays THE truth (game_logic.ring_waiver_active); the
+# face is its record, read only while the flag is up.  Menu: a permitted
+# die widens ONLY to this face's categories.  Executors: an action funded
+# by the waiver treats the die AS this face (Army-family -> the Army
+# die's two moves, MUSTER_ARMY combined semantics) and spends the waiver
+# when the die is consumed - whatever the die's rolled face.
+_RING_WAIVER_FACE_ATTR = {Side.FREE_PEOPLES: 'fp_ring_waiver_face',
+                          Side.SHADOW: 'sh_ring_waiver_face'}
+_RING_WAIVED_CATS_ALL = frozenset(('character', 'army', 'muster', 'event'))
+
+
+def _ring_waiver_face(state: GameState,
+                      side: Side) -> Optional[ActionDieFace]:
+    """Face the side's LIVE Elven-Ring waiver was paid for; None when no
+    waiver is up or it was raised without a recorded face (a direct
+    game_logic.use_elven_ring call)."""
+    import game_logic as _glw
+    if not _glw.ring_waiver_active(state, side):
+        return None
+    f = getattr(state, _RING_WAIVER_FACE_ATTR[side], None)
+    if f is None or isinstance(f, ActionDieFace):
+        return f
+    try:
+        return ActionDieFace(f)
+    except (ValueError, TypeError):
+        return None
+
+
+def _clear_ring_waiver_face(state: GameState, side: Side) -> None:
+    setattr(state, _RING_WAIVER_FACE_ATTR[side], None)
+
+
+def _ring_waived_categories(state: GameState, side: Side,
+                            face) -> Set[str]:
+    """Action categories a die showing `face` may fund BEYOND its native
+    ones while the side's waiver is up: the recorded waiver face's
+    categories ('special' is Will-only and never ring-bought); empty
+    when no waiver permits this die.  An unrecorded face keeps the
+    pre-record widening (every ordinary category)."""
+    import game_logic as _glw
+    if not (_glw.ring_waiver_active(state, side)
+            and _glw.ring_waiver_permits(side, face)):
+        return set()
+    wf = _ring_waiver_face(state, side)
+    if wf is None:
+        return set(_RING_WAIVED_CATS_ALL)
+    return set(_die_faces_for_action(wf)) - {'special'}
+
+
+def _army_action_die_face(state: GameState, side: Side, die_idx: int,
+                          army, p: dict):
+    """(face, waived) for the army_move / army_attack executors.
+
+    Natively fundable (waived=False, face = rolled face): an Army-family
+    face, the Mouth's muster-as-army stamp, or a Character face with a
+    Leader/Character in the army (rulebook 2427-2428).  Otherwise the
+    action exists only through the Elven-Ring waiver (LA-1/LA-2): the
+    die is treated AS the recorded waiver face and the waiver is spent
+    when the die is consumed (_consume_die_for_face(waived=True)).
+    Nothing funds it -> RuntimeError (LA-10 executor defence; the
+    teacher keeps its lenient log-is-truth reading).  Die-less card
+    follow-ups return (None, False)."""
+    face = _get_die_face(state, die_idx, side=side)
+    if face is None:
+        return None, False
+    has_leader = (game_logic.army_has_leader_figure(state, army, side=side)
+                  if army is not None else False)
+
+    def _funds(f):
+        cats = _die_faces_for_action(f)
+        return 'army' in cats or ('character' in cats and has_leader)
+
+    if _funds(face) or (face == ActionDieFace.MUSTER
+                        and p.get('mouth_muster')):
+        return face, False
+    import combat as _cmbaf
+    if _cmbaf.FINAL_HITS_HOOK is not None:
+        return face, False
+    import game_logic as _glw
+    if not (_glw.ring_waiver_active(state, side)
+            and _glw.ring_waiver_permits(side, face)):
+        raise RuntimeError(
+            'die %d of %s (%s) cannot fund an army action for an army '
+            'without a Leader/Character, and no Elven-Ring waiver '
+            'permits it' % (die_idx, side.name, face.name))
+    wf = _ring_waiver_face(state, side) or ActionDieFace.ARMY
+    if not _funds(wf):
+        raise RuntimeError(
+            'die %d of %s: the Elven-Ring waiver was paid for %s, which '
+            'cannot fund this army action (no Leader/Character)'
+            % (die_idx, side.name, wf.name))
+    return wf, True
+
+
 def _is_shadow_controlled_stronghold(state: GameState, rkey: str) -> bool:
     """Stronghold currently controlled by the Shadow (original Shadow
     stronghold not captured by FP, or FP stronghold captured by Shadow)."""
@@ -4854,25 +5196,19 @@ def _is_shadow_controlled_stronghold(state: GameState, rkey: str) -> bool:
     return rkey in state.enemy_controlled.get(Side.SHADOW, set())
 
 
-def _companion_terminus_ok(state: GameState, dest, army_by_san=None) -> bool:
-    """May a companion group END its move/separation at *dest*?
-    ONE answerer for all six generation sites (USER ruling 2026-08-17,
-    complete, the moria specimen): a Shadow-controlled STRONGHOLD is a
-    LEGAL terminus — entering it is exactly ending there, because
-    stop-on-entry is per movement action (_companion_reachable stops
-    expansion at it); leaving on a LATER action is free, so the
-    rivendell -> moria -> east emnet -> minas tirith crown route is
-    legal across actions.  The W5 B-2 p.20 rule keeps governing
-    NON-stronghold regions: a Shadow ARMY may be passed through but
-    not ended on."""
-    d = sanitize(str(dest))
-    if _is_shadow_controlled_stronghold(state, d):
-        return True
-    if army_by_san is None:
-        army_by_san = {sanitize(k): a for k, a in state.armies.items()}
-    a = army_by_san.get(d)
-    return not (a and any(_side_of_nation(u.nation) == Side.SHADOW
-                          for u in a.units))
+def _friendly_besieged_strongholds(state: GameState) -> set:
+    """Besieged strongholds CONTROLLED BY THE FREE PEOPLES - the only
+    regions the companion siege bar applies to (rulebook 2117-2119:
+    "a friendly Stronghold besieged by an enemy Army"; 3513-3516; audit
+    LA-3).  A Shadow stronghold besieged by the Free Peoples is a normal
+    stop-on-entry terminus that companions may leave and join freely.
+
+    Terminus rule (USER ruling 1.252, 2026-08-29): companions may END a
+    move/separation/placement ANYWHERE their walk reaches - Shadow FIELD
+    armies never inhibit companion movement; a Shadow-controlled
+    stronghold is a legal terminus with stop-on-entry per action (1.249)."""
+    return {r for r in getattr(state, 'besieged_strongholds', set())
+            if _stronghold_controller(state, r) == Side.FREE_PEOPLES}
 
 
 def is_legal_companion_action(state: GameState, action,
@@ -4890,9 +5226,9 @@ def is_legal_companion_action(state: GameState, action,
     Returns (ok, reason); *cache* is an optional per-mask dict that
     memoizes reachable-set BFS across candidates.
 
-    The rule organs (_companion_reachable = stop-on-entry path,
-    _companion_terminus_ok = terminus ruling 1.249,
-    _companion_group_movement = allowance) are private to this
+    The rule organs (_companion_reachable = stop-on-entry path + the
+    friendly-siege bar (LA-3); no terminus bar besides it (ruling
+    1.252); _companion_group_movement = allowance) are private to this
     validator + the explainer's unreachable-why probe."""
     if cache is None:
         cache = {}
@@ -4924,9 +5260,6 @@ def is_legal_companion_action(state: GameState, action,
         if d not in _reach(cur, mv):
             return False, _companion_unreachable_why(
                 state, cur, d, mv)
-        if not _companion_terminus_ok(state, d):
-            return False, ('%s holds a Shadow army - companions '
-                           'may pass through but not end there' % d)
         return True, None
 
     if at == 'companion_separate':
@@ -4940,6 +5273,9 @@ def is_legal_companion_action(state: GameState, action,
             if comp != str(ph.get('companion', '')):
                 return False, ('%s is not the hobbit being placed'
                                % comp)
+            bound = ph.get('group_destination')
+            if bound is not None and d != bound:
+                return False, 'companions separating on one Hunt tile must move together'
             return _place_check(ph.get('level', 1))
         # voluntary separation
         if state.fellowship.mordor_entered:
@@ -4956,8 +5292,10 @@ def is_legal_companion_action(state: GameState, action,
             return False, ('%s not in the Fellowship'
                            % '/'.join(missing or sorted(want)))
         cur = sanitize(str(game_logic.fellowship_region(state)))
-        if cur in getattr(state, 'besieged_strongholds', set()):
-            # under siege: may only separate INTO the stronghold
+        if cur in _friendly_besieged_strongholds(state):
+            # under siege in a FRIENDLY stronghold (rulebook 3513-3516):
+            # may only separate INTO the stronghold (LA-3: an
+            # FP-besieged Shadow stronghold does not bind)
             if d == cur:
                 return True, None
             return False, ('the fellowship is besieged - companions '
@@ -4970,14 +5308,11 @@ def is_legal_companion_action(state: GameState, action,
         if d not in _reach(cur, mv):
             return False, _companion_unreachable_why(
                 state, cur, d, mv)
-        if not _companion_terminus_ok(state, d):
-            return False, ('%s holds a Shadow army - companions may '
-                           'pass through but not end there' % d)
         return True, None
     if at == 'companion_move':
         src = sanitize(str(p.get('from', '')))
-        if not src or d == src:
-            return False, 'move needs distinct from/to'
+        if not src:
+            return False, 'move needs a source'
         army = None
         for k, a in state.armies.items():
             if sanitize(k) == src:
@@ -4996,31 +5331,35 @@ def is_legal_companion_action(state: GameState, action,
             group = comps_all
         if not group:
             return False, 'no companions at %s' % src
+        if d == src:
+            if game_logic._companion_activation_nation(state, src, group) is not None:
+                return True, None
+            return False, 'stationary movement must activate a nation'
         mv = _companion_group_movement(group)
         if mv <= 0:
             return False, 'group movement allowance is 0'
         if d not in _reach(src, mv):
             return False, _companion_unreachable_why(
                 state, src, d, mv)
-        if not _companion_terminus_ok(state, d):
-            return False, ('%s holds a Shadow army - companions may '
-                           'pass through but not end there' % d)
         return True, None
     return False, 'not a companion-family action'
 
 
+@_companion_search_cache.cache_reachable(sys.modules[__name__])
 def _companion_reachable(state: GameState, start: str, max_steps: int) -> set:
     """Regions a Companion group can reach (user-confirmed rules):
 
     - CAN enter regions with Shadow armies and Shadow-controlled
       strongholds — but a Shadow stronghold STOPS movement (enter, not
       pass through)
-    - Cannot enter strongholds currently under siege
-    - Cannot leave a besieged stronghold (empty result)
+    - Cannot enter a FRIENDLY (FP-controlled) stronghold under siege
+    - Cannot leave a besieged friendly stronghold (empty result)
+      (LA-3: an FP-besieged SHADOW stronghold is a normal stop-on-entry
+      terminus - companions may leave it and join the besiegers)
     """
-    besieged = getattr(state, 'besieged_strongholds', set())
+    besieged = _friendly_besieged_strongholds(state)
     if start in besieged:
-        return set()  # cannot leave a besieged stronghold
+        return set()  # cannot leave a besieged friendly stronghold
     reachable = set()
     frontier = {start}
     visited = {start}
@@ -5033,7 +5372,7 @@ def _companion_reachable(state: GameState, start: str, max_steps: int) -> set:
                     continue
                 visited.add(a)
                 if a in besieged:
-                    continue  # cannot enter a besieged stronghold
+                    continue  # cannot enter a besieged friendly stronghold
                 reachable.add(a)
                 if _is_shadow_controlled_stronghold(state, a):
                     continue  # may ENTER but movement stops here
@@ -5085,7 +5424,7 @@ def _get_companion_move_actions(state: GameState, die_idx: int) -> List[Action]:
         if movement > 0:
             # full group first (legacy params shape - the teacher
             # matcher's (from,to) fallback keeps picking this one)
-            for dest in sorted(_companion_reachable(state, src, movement)):
+            for dest in sorted(_companion_reachable(state, src, movement) | {src}):
                 a9 = Action(die_idx=die_idx,
                             action_type='companion_move',
                             params={'from': src, 'to': dest})
@@ -5103,11 +5442,9 @@ def _get_companion_move_actions(state: GameState, die_idx: int) -> List[Action]:
         # companions, so partitions of a large stack stay reachable.
         if len(comps) > 1:
             from itertools import combinations
-            # USER 2026-08-22: NO CAP on the legal surface ("why is
-            # there a cap at all for anything, I don't want one") -
-            # every proper subset is a legal group choice (p.20);
-            # the old <=4 lattice / singles-beyond bound hid legal
-            # gestures from the human seat and choices from the AI.
+            # USER 2026-08-22: NO CAP on the legal surface ("why is there
+            # a cap at all for anything, I don't want one") - every proper
+            # subset is a legal group choice (p.20).
             _subs9 = [list(c9) for r9 in range(1, len(comps))
                       for c9 in combinations(comps, r9)]
             # COST (2026-08-22, uncapped lattice): a companion move's
@@ -5135,7 +5472,14 @@ def _get_companion_move_actions(state: GameState, die_idx: int) -> List[Action]:
                         if _dest_ok(a9):
                             ok9.append(dest)
                     _legal_by_mv9[mv9] = ok9
-                for dest in _legal_by_mv9[mv9]:
+                destinations = list(_legal_by_mv9[mv9])
+                stationary = Action(
+                    die_idx=die_idx, action_type='companion_move',
+                    params={'from': src, 'to': src, 'companions': nm9})
+                if _dest_ok(stationary):
+                    destinations.append(src)
+                    destinations.sort()
+                for dest in destinations:
                     actions.append(Action(
                         die_idx=die_idx,
                         action_type='companion_move',
@@ -5144,44 +5488,89 @@ def _get_companion_move_actions(state: GameState, die_idx: int) -> List[Action]:
     return actions
 
 
-def _get_mouth_move_actions(state: GameState, die_idx: int) -> List[Action]:
-    """USER RULING 2026-07-20 (P2-02): the Mouth of Sauron moves on a
-    Character die with RANGE 3 and no other movement restrictions
-    (unlike Nazgul he is not barred from FP-army regions).  Before
-    this, only true Nazgul figures were enumerated, so a Mouth left
-    alone (his army marched off, no nazgul to ride) was stranded
-    forever.  Self-play path only — the teacher replays logged
-    ride-alongs unchanged."""
+def _mouth_region(state: GameState) -> Optional[str]:
+    """Sanitized region of the in-play Mouth of Sauron Minion figure
+    (None when he is not on the board)."""
     if not getattr(getattr(state, 'mouth_of_sauron', None),
                    'in_play', False):
-        return []
-    src = None
+        return None
     for k, a in state.armies.items():
         for ld in a.leaders:
             if (type(ld).__name__ == 'Minion'
                     and 'mouth' in str(getattr(ld, 'name', '')).lower()):
-                src = sanitize(k)
-                break
-        if src is not None:
-            break
-    if src is None:
-        return []
-    seen = {src}
-    frontier = {src}
-    dests = set()
+                return sanitize(k)
+    return None
+
+
+def _mouth_reachable(state: GameState, start: str) -> set:
+    """W4-027 (USER ruling 1.262, 2026-09-02; rulebook p.20 L2138-2151):
+    regions the Mouth of Sauron moving ALONE can reach within 3 steps,
+    companion-style (mirror of _companion_reachable):
+
+    - ignores enemy armies (may pass through and may end on an FP
+      field army - L2144-2145);
+    - cannot leave or enter a FRIENDLY (Shadow-controlled) stronghold
+      besieged by an enemy army (L2146-2147) - empty result from
+      inside one, never entered from outside;
+    - "cannot be moved into a region containing a Stronghold
+      controlled by the Free Peoples unless it is besieged by a
+      Shadow Army" (L2149-2151) - an unbesieged FP stronghold is
+      barred outright; a Shadow-besieged one may be ENTERED and
+      entering ends the move (mirror of 1.249, conservative);
+    - impassable terrain is already absent from board.adjacent.
+    Supersedes P2-02's "no other restrictions" (1.177b)."""
+    besieged = set(getattr(state, 'besieged_strongholds', set()) or ())
+    sh_besieged = {r for r in besieged
+                   if _stronghold_controller(state, r) == Side.SHADOW}
+    if start in sh_besieged:
+        return set()
+    reachable = set()
+    frontier = {start}
+    visited = {start}
     for _ in range(3):
         nxt = set()
         for r in frontier:
             for adj in state.board.adjacent(r):
-                a9 = sanitize(adj)
-                if a9 not in seen:
-                    seen.add(a9)
-                    nxt.add(a9)
-        dests.update(nxt)
+                a = sanitize(adj)
+                if a in visited:
+                    continue
+                visited.add(a)
+                if a in sh_besieged:
+                    continue
+                ctl = _stronghold_controller(state, a)
+                if ctl == Side.FREE_PEOPLES:
+                    if a not in besieged:
+                        continue
+                    reachable.add(a)
+                    continue  # enters the siege ring; movement stops
+                reachable.add(a)
+                nxt.add(a)
         frontier = nxt
+    return reachable
+
+
+def _get_mouth_move_actions(state: GameState, die_idx: int) -> List[Action]:
+    """USER RULING 2026-07-20 (P2-02): the Mouth of Sauron moves on a
+    Character die with RANGE 3.  Before this, only true Nazgul figures
+    were enumerated, so a Mouth left alone (his army marched off, no
+    nazgul to ride) was stranded forever.  W4-027 (1.262): the path
+    follows the rulebook's Minion-alone restrictions (_mouth_reachable)
+    - P2-02's "no other restrictions" is superseded."""
+    src = _mouth_region(state)
+    if src is None:
+        return []
     return [Action(die_idx=die_idx, action_type='mouth_move',
                    params={'from': src, 'to': d})
-            for d in sorted(dests)]
+            for d in sorted(_mouth_reachable(state, src))]
+
+
+def _nazgul_destination_allowed(state: GameState, region: str) -> bool:
+    """Flights use current Stronghold control, including conquered Shadow ones."""
+    key = sanitize(region)
+    if key not in board.regions:
+        return False
+    return (_stronghold_controller(state, key) != Side.FREE_PEOPLES
+            or key in getattr(state, 'besieged_strongholds', set()))
 
 
 def _get_nazgul_move_actions(state: GameState, die_idx: int) -> List[Action]:
@@ -5192,8 +5581,8 @@ def _get_nazgul_move_actions(state: GameState, die_idx: int) -> List[Action]:
     COUNT subsets (nazgul are fungible); on the learned path the
     executor then chains a '__nazgul_moves__' pending so further
     flights (one nazgul per decision) may pick DIFFERENT destinations
-    within the same die.  Destinations exclude regions containing Free
-    Peoples Army units and FP-controlled Strongholds not under siege.
+    within the same die. Destinations exclude FP-controlled Strongholds
+    not under siege; Free Peoples field armies do not block flights.
     """
     actions = []
     army_by_san = {sanitize(k): a for k, a in state.armies.items()}
@@ -5215,41 +5604,23 @@ def _get_nazgul_move_actions(state: GameState, die_idx: int) -> List[Action]:
     if not sources:
         return actions
 
-    # UNCAPPED (USER 2026-08-22, no-legal-surface-caps: "why is there
-    # a cap at all for anything, I don't want one"): Nazgul fly to ANY
-    # region (rulebook p.20, unlimited movement) - the old
-    # "strategically meaningful set" filter here was a legal-surface
-    # bound of exactly the class removed from the companion lattices
-    # the same day, and it was human-visible: the live matcher judges
-    # gestures from THIS menu, so a flight to an unlisted region was
-    # refused as illegal.  The legality gates below (no ending on an
-    # enemy field army; FP strongholds only under siege) are RULES,
-    # not strategy, and stay.  Search cost is the sliders' business
-    # (MCTS_MAX_CHILDREN prior-prunes wide menus), never the menu's.
+    # UNCAPPED (USER 2026-08-22, no-legal-surface-caps): Nazgul fly to
+    # ANY region (rulebook p.20).  The legality gate below (FP
+    # strongholds only under siege) is a RULE and stays; search cost is
+    # the sliders' business (MCTS_MAX_CHILDREN), never the menu's.
     dests = set(board.regions.keys())
 
-    sh_captured = state.enemy_controlled.get(Side.SHADOW, set())
-    besieged = getattr(state, 'besieged_strongholds', set())
     for dest in sorted(dests):
         meta = board.regions.get(dest)
         if meta is None:
             continue
-        d_army = army_by_san.get(dest)
-        # Cannot end movement in a region with enemy Army units —
-        # UNLESS the region is under siege (nazgul join the besiegers;
-        # the FP units there are the garrison inside the stronghold)
-        if (d_army and dest not in besieged
-                and any(_side_of_nation(u.nation) == Side.FREE_PEOPLES
-                        for u in d_army.units)):
-            continue
+        # Ruling 1.251 (USER 2026-08-29): a Nazgul may END its flight
+        # in a region holding a Free Peoples FIELD army; the ONLY
+        # destination bar is an FP-controlled stronghold not besieged
+        # by the Shadow (rulebook 2124-2131).
         # FP-controlled Stronghold: only if a Shadow army is besieging it
-        if meta.get('is_stronghold'):
-            nat = _region_nation(dest)
-            fp_stronghold = (nat is not None
-                             and _side_of_nation(nat) == Side.FREE_PEOPLES
-                             and dest not in sh_captured)
-            if fp_stronghold and dest not in besieged:
-                continue
+        if not _nazgul_destination_allowed(state, dest):
+            continue
         for src in sources:
             if src == dest:
                 continue
@@ -5306,8 +5677,7 @@ def _get_army_move_actions(state: GameState, side: Side, die_idx: int,
     """
     actions = []
 
-    # Pre-index armies by sanitized key once (the previous inner scan made
-    # this function O(armies^2 x neighbors) — the top hot spot in MCTS)
+    # Pre-index armies by sanitized key once (MCTS hot path)
     army_by_san = {sanitize(k): a for k, a in state.armies.items()}
     exclude_san = sanitize(exclude_from) if exclude_from else None
     _bs144 = getattr(state, 'besieged_strongholds', set())
@@ -5319,8 +5689,7 @@ def _get_army_move_actions(state: GameState, side: Side, die_idx: int,
 
     # "A Power too Great" / "The Power of Tom Bombadil" (QA 2026-07-09):
     # the protection blocks Shadow MOVES into the listed regions, not
-    # just attacks - the GUI checked this, the AI enumeration/executor
-    # never did (validate_army_move had no callers).
+    # just attacks.
     _csmt = None
     if side == Side.SHADOW:
         from game_state import PersistentCardType as _PCT
@@ -5344,9 +5713,8 @@ def _get_army_move_actions(state: GameState, side: Side, die_idx: int,
             continue
 
         # All nations can move armies (even passive/box-0 nations can move
-        # within their own borders). Border-crossing is restricted below.
-        # Only the acting side's OWN nations matter for restrictions.
-        army_nations = set(u.nation for u in own_units)
+        # within their own borders). Border-crossing is restricted below
+        # (_border_pred9: only the acting side's OWN nations matter).
 
         # Character die: army must have a leader or character (Saruman's
         # ability: Isengard Elites count as Leaders while he is in play)
@@ -5366,26 +5734,61 @@ def _get_army_move_actions(state: GameState, side: Side, die_idx: int,
         # stronghold - its only offensive option is the sortie
         # (from == to attack).  The BESIEGER may still leave (thinning
         # or lifting the siege).
-        if from_san in _bs144 and \
-                _stronghold_controller(state, from_san) == side:
-            continue
+        _source_garrison = (from_san in _bs144 and
+                            _stronghold_controller(state, from_san) == side)
         _cap = None
+        _physical_own_count = len(own_units)
         if exclude_san and from_san == exclude_san:
             if not _preexist:
                 continue  # no snapshot — conservative old behavior
             _cap = _preexist
             if _cap.get('regular', 0) + _cap.get('elite', 0) <= 0:
                 continue
+            from army_move_participants import preexisting
+            army = preexisting(army, _cap)
+            own_units = [u for u in army.units if _side_of_nation(u.nation) == side]
+            if not own_units:
+                continue
+        # LA-8 (rulebook 2437-2441): plain Leader/Companion/Minion
+        # figures of the moving side that may split off (Saruman never
+        # moves; Nazgul have their own n_nazgul dimension)
+        _n_pl9 = sum(1 for l in army.leaders
+                     if not isinstance(l, Nazgul)
+                     and not game_logic._is_saruman(l)
+                     and game_logic._leader_side(l) == side)
+        # D2 (2026-09-10): the UNCAPPED count = the non-Nazgul figures a
+        # take_leaders=True row really moves (the executor ignores the cap)
+        _n_pl9_all = _n_pl9
+        if _cap is not None:
+            _n_pl9 = min(_n_pl9, int(_cap.get('leaders', 0)))
+        # W4-035 (rulebook L2436-2445; ruling W4-Q12 2026-09-03): only
+        # plain Leaders must follow a full vacate - Companions, named
+        # Minions and Nazgul "are not obliged to move with an Army, as
+        # they can remain in a region on their own".  _must_go9 = the
+        # moving side's plain Leaders; a full vacate may leave the
+        # stay-capable figures behind when no such Leader is present
+        # (Nazgul already have their own n_nazgul dimension).
+        _must_go9 = sum(1 for l in army.leaders
+                        if game_logic.leader_must_follow(l)
+                        and game_logic._leader_side(l) == side)
+        if _cap is not None:
+            _must_go9 = min(_must_go9, _n_pl9)
+        _stay_ok9 = (_must_go9 == 0 and _n_pl9 > 0)
+        # W4-038 (a): the leaders that stay need OWN units left to hold
+        # them - units of ANY own nation, the non-belligerent ones that
+        # may not cross included (FP Leaders lead any FP units, rulebook
+        # L787-789); the old guard counted the movable pool only, so a
+        # full crossing of the at-war part read as a full vacate.
+        n_hold9 = _physical_own_count
 
-        # Rulebook p.33 (iter 38): the non-belligerent restriction applies
-        # "if at least one of the units in the Army belongs to a
-        # non-belligerent Nation" — cross-border movement into another
-        # nation's territory needs ALL unit nations At War (the old
-        # ANY-at-war test was inverted for mixed stacks).
-        all_at_war = all(state.political.is_at_war(n) for n in army_nations)
-        neighbors = state.board.adjacent(from_san)
+        neighbors = [] if _source_garrison else list(state.board.adjacent(from_san))
+        if side == Side.FREE_PEOPLES and game_logic._companion_activation_nation(
+                state, from_san, army.leaders) is not None:
+            neighbors.append(from_san)
+            neighbors.sort()
 
         for to_san in neighbors:
+            stationary = to_san == from_san
             # protected-region move block (see _csmt above)
             if _csmt is not None and not _csmt(state, to_san)[0]:
                 continue
@@ -5393,38 +5796,59 @@ def _get_army_move_actions(state: GameState, side: Side, die_idx: int,
             # - the garrison's side cannot MOVE into its own besieged
             # stronghold region; relief comes only via an adjacent
             # attack on the besiegers.
-            if to_san in _bs144 and \
+            if not stationary and to_san in _bs144 and \
                     _stronghold_controller(state, to_san) == side:
                 continue
             # Non-belligerent border restriction (rulebook p.33).  1.213
             # (USER 2026-07-22): legality keys on the MOVING SUBSET's
-            # nations, NOT the whole source army — a mixed stack may still
-            # send an ALL-AT-WAR detachment across into another nation's
-            # territory (2025-02-05 Vayze/ProniX T8: an Elven-only group,
-            # Elves always At War, left a Dale stack that also held not-
-            # At-War North units, Dale -> Erebor, and was wrongly refused).
-            # Voluntary moves only; retreats/advances are exempt (they may
-            # cross freely).  For such a foreign crossing, restrict the
-            # movable pool to the at-war-nation units.
+            # nations, not the whole source army (2025-02-05 Vayze/ProniX
+            # T8).  Voluntary moves only; retreats/advances are exempt.
+            # For a foreign crossing the movable pool is the at-war /
+            # destination-nation units (W4-038: ONE predicate body,
+            # _border_pred9, shared with the executor).
             _move_pool = own_units
-            if not all_at_war:
-                dest_nation = _region_nation(to_san)
-                if dest_nation is not None:
-                    # METROLOGY 2026-07-27 (13 moves / 11 games, two
-                    # agents independently): the old `dest_nation not
-                    # in army_nations` skip let PASSIVE units piggyback
-                    # wholesale into an at-war teammate's home nation
-                    # (p.35: an army with ANY not-at-war units may not
-                    # enter another Nation's borders).  1.213's
-                    # moving-subset principle applied per unit: a unit
-                    # may enter nation D's territory only if its nation
-                    # is at war OR it is D's own unit (passive units
-                    # move freely inside their OWN borders).
-                    _move_pool = [u for u in own_units
-                                  if state.political.is_at_war(u.nation)
-                                  or u.nation == dest_nation]
-                    if not _move_pool:
-                        continue
+            _nok9 = None if stationary else _border_pred9(
+                state, own_units, army.leaders, side, to_san)
+            _n_plX, _must_goX, _stay_okX = _n_pl9, _must_go9, _stay_ok9
+            _n_plX_all = _n_pl9_all
+            if _nok9 is not None:
+                # p.35: an army with ANY not-at-war unit may not enter
+                # another Nation's borders; 1.213's moving-subset
+                # principle per unit: a unit may enter nation D's
+                # territory only if its nation is at war OR it is D's
+                # own unit (2026-07-27).
+                _move_pool = [u for u in own_units if _nok9(u.nation)]
+                if not _move_pool:
+                    continue
+                # W4-038 (b) (rulebook L3093-3096: "Army units and
+                # Leaders of a non-belligerent Nation ... can never move
+                # across the borders of other Nations"): the leader
+                # figures that may ride on this crossing are the
+                # Companions / Minions and the plain Leaders of at-war or
+                # destination nations; a non-belligerent Leader stays
+                # (and, left without an Army, is removed - L783-785).
+                _n_plX = sum(1 for l in army.leaders
+                             if not isinstance(l, Nazgul)
+                             and not game_logic._is_saruman(l)
+                             and game_logic._leader_side(l) == side
+                             and (not game_logic.leader_must_follow(l)
+                                  or _nok9(l.nation)))
+                _n_plX_all = _n_plX
+                if _cap is not None:
+                    _n_plX = min(_n_plX, int(_cap.get('leaders', 0)))
+                _must_goX = sum(1 for l in army.leaders
+                                if game_logic.leader_must_follow(l)
+                                and game_logic._leader_side(l) == side
+                                and _nok9(l.nation))
+                if _cap is not None:
+                    _must_goX = min(_must_goX, _n_plX)
+                _stay_okX = (_must_goX == 0 and _n_plX > 0)
+                # a Character-die move must carry a leader figure with
+                # the movers (L2440-2442): when the army's only such
+                # figures are non-belligerent plain Leaders none may
+                # ride on this crossing -> no Character-die move here
+                if require_leader and _n_plX == 0 and _n_pl9 > 0:
+                    continue
 
             existing = army_by_san.get(to_san)
 
@@ -5440,25 +5864,19 @@ def _get_army_move_actions(state: GameState, side: Side, die_idx: int,
                     # This is an attack, not a move
                     continue
 
-            # Split menu (rulebook p.25 "Splitting an Army"): moving
-            # any portion of the units is legal — the FULL
-            # (n_regular, n_elite, take_leaders) composition grid is
-            # offered (USER 2026-07-08: the old full/half/single
-            # compact menu could not express human splits), each
-            # option validated against the destination stacking limit.
-            # Stacking counts OWN units only: a besieged region's shared
-            # army entry holds the enemy garrison too, which must not
-            # count against the moving side's 10-unit limit.
+            # Split menu (rulebook p.25 "Splitting an Army"): the FULL
+            # (n_regular, n_elite, take_leaders) grid is offered (USER
+            # 2026-07-08), each option validated against the destination
+            # stacking limit.  Stacking counts OWN units only: a besieged
+            # region's shared entry holds the enemy garrison too.
             existing_units = sum(
                 1 for u in existing.units
-                if _side_of_nation(u.nation) == side) if existing else 0
+                if _side_of_nation(u.nation) == side) if existing and not stationary else 0
             n_r = sum(1 for u in _move_pool if u.kind == UnitKind.REGULAR)
             n_e = sum(1 for u in _move_pool if u.kind == UnitKind.ELITE)
-            # own units that stay put no matter what this split takes:
-            # on a capped second leg the leg-1 arrivals cannot re-move,
-            # so they still hold any left-behind leaders (review P1
-            # 2026-07-27: the old `< n_total` guard made a leaderless
-            # pre-existing garrison impossible to move out WHOLE)
+            # own units that stay put whatever this split takes: on a
+            # capped second leg the leg-1 arrivals cannot re-move, so they
+            # hold any left-behind leaders (review P1 2026-07-27).
             n_pool = n_r + n_e
             if _cap is not None:
                 # second-half move out of the first move's destination:
@@ -5470,23 +5888,48 @@ def _get_army_move_actions(state: GameState, side: Side, die_idx: int,
                 continue
 
             take_ok = _cap is None or int(_cap.get('leaders', 0)) > 0
-            # FULL composition grid (USER finding 2026-07-08: the old
-            # full/half/single menu could not express e.g. 4R+1E out of
-            # 7R+1E — the half split's n_e//2 dropped lone elites, human
-            # splits were unrepresentable -> extraction dropped them and
-            # self-play left elites behind).  Moving any portion is
-            # legal (p.25); the composition IS the decision.
+            # D2 (2026-09-10, USER "fix the python"; rulebook p.25 "no figure
+            # is moved twice using the same action"): on the second half out
+            # of the first half's destination EVERY leader figure a row moves
+            # - plain Leaders, Companions / Minions AND Nazgul - counts
+            # against the leader figures that were already there
+            # (pending_army_move_preexist['leaders'] = len(dst.leaders) at
+            # the first half, Nazgul included).  This is the native
+            # executor's rule (army_move.inc: moving_leaders.size() <=
+            # preexist.leaders); the old menu capped plain leaders only, so
+            # a Nazgul that arrived with the first half could move again
+            # (bruteforce/BRUTEFORCE_NOTES.md 4.2 D2).  Row -> figures moved:
+            # take_leaders (no counts) = every non-Nazgul figure + every
+            # Nazgul; n_nazgul = (non-Nazgul figures if take_leaders) + n;
+            # n_leaders = n_leaders + n_nazgul.
+            _capL9 = (int(_cap.get('leaders', 0)) if _cap is not None
+                      else None)
+            # A peaceful plain Leader barred from this destination must
+            # keep an own Army unit behind, even with take_leaders=True.
+            # Match move_army's existing guard before offering the action.
+            _held_plain9 = _nok9 is not None and any(
+                game_logic.leader_must_follow(l)
+                and game_logic._leader_side(l) == side
+                and not _nok9(l.nation) for l in army.leaders)
+            # FULL composition grid (USER 2026-07-08): moving any portion
+            # is legal (p.25); the composition IS the decision.
             options = []
             for mr in range(n_r + 1):
                 for me in range(n_e + 1):
                     if mr + me == 0:
                         continue
+                    if _held_plain9 and mr + me == n_hold9:
+                        continue
                     if take_ok:
                         options.append((mr, me, True))
                     # leaders stay only if units remain to hold them
                     # (and never on Character-die moves: the moving
-                    # group must contain the leader figure)
-                    if not require_leader and mr + me < n_pool:
+                    # group must contain the leader figure); W4-035: a
+                    # full vacate may leave Companions / Minions behind
+                    # when no plain Leader would be stranded; W4-038
+                    # (a): "units remain" counts every own unit
+                    if not require_leader and (stationary or mr + me < n_hold9
+                                               or _stay_okX):
                         options.append((mr, me, False))
 
             seen_opts = set()
@@ -5498,6 +5941,11 @@ def _get_army_move_actions(state: GameState, side: Side, die_idx: int,
             _mv_naz9 = (sum(1 for l in army.leaders
                             if isinstance(l, Nazgul))
                         if side == Side.SHADOW else 0)
+            _isg_ldr9 = (side == Side.SHADOW
+                         and game_logic.saruman_in_play(state)
+                         and any(u.nation == Nation.ISENGARD
+                                 and u.kind == UnitKind.ELITE
+                                 for u in _move_pool))
             # QUEUE_2 (2026-08-17): the destination cap is the ONE
             # siege-aware body (menu == executor == card path)
             _dcap9 = game_logic.army_stack_cap(state, to_san, side)
@@ -5507,20 +5955,36 @@ def _get_army_move_actions(state: GameState, side: Side, die_idx: int,
                 seen_opts.add((mr, me, take_leaders))
                 if existing_units + mr + me > _dcap9:
                     continue
-                actions.append(Action(
-                    die_idx=die_idx,
-                    action_type='army_move',
-                    params={'from': akey, 'to': to_san,
-                            'n_regular': mr, 'n_elite': me,
-                            'take_leaders': take_leaders,
-                            'side': 'fp' if side == Side.FREE_PEOPLES
-                            else 'sh'}
-                ))
+                # D2: figures a take_leaders row moves (no count keys)
+                _ldr_base9 = (_n_plX_all + _mv_naz9) if take_leaders else 0
+                if _capL9 is None or _ldr_base9 <= _capL9:
+                    actions.append(Action(
+                        die_idx=die_idx,
+                        action_type='army_move',
+                        params={'from': akey, 'to': to_san,
+                                'n_regular': mr, 'n_elite': me,
+                                'take_leaders': take_leaders,
+                                'side': 'fp' if side == Side.FREE_PEOPLES
+                                else 'sh'}
+                    ))
                 if _mv_naz9 > 0:
                     for _nn9 in range(_mv_naz9 + 1):
                         # skip the legacy-equivalent variant (all naz
                         # ride when take_leaders, none when not)
                         if _nn9 == (_mv_naz9 if take_leaders else 0):
+                            continue
+                        # W4-035 constraint (a) (rulebook L2440-2442):
+                        # a Character-die move must carry >= 1 leader
+                        # figure - with no non-Nazgul figure to ride,
+                        # the n_nazgul=0 variant moves none (Saruman's
+                        # Isengard elites count as Leaders and keep it)
+                        if (require_leader and _nn9 == 0 and _n_plX == 0
+                                and not (me > 0 and _isg_ldr9)):
+                            continue
+                        # D2: (non-Nazgul figures if take_leaders) + n
+                        if _capL9 is not None and \
+                                (_n_plX_all if take_leaders else 0) \
+                                + _nn9 > _capL9:
                             continue
                         actions.append(Action(
                             die_idx=die_idx,
@@ -5531,7 +5995,65 @@ def _get_army_move_actions(state: GameState, side: Side, die_idx: int,
                                     'n_nazgul': _nn9,
                                     'side': 'sh'}
                         ))
+                # LA-8 (rulebook 2437-2441): on a split each Leader may
+                # move or stay - per-count variants (n_leaders, the
+                # n_nazgul twin) strictly between the all-or-none pair;
+                # a Character-die move keeps >= 1 leader figure with the
+                # movers (n_leaders >= 1) and the leaders staying need
+                # units left to hold them (same guard as take_leaders
+                # False above).
+                if take_leaders and _n_plX > 1:
+                    for _nl9 in range(1, _n_plX):
+                        # W4-035: the figures staying need units left to
+                        # hold them UNLESS every plain Leader rides
+                        # (nl >= _must_go9: only Companions / Minions
+                        # stay behind, which they may); W4-038 (a)/(b):
+                        # own units of any nation hold them, and the
+                        # counts are the crossing-eligible figures
+                        if not (stationary or mr + me < n_hold9 or _nl9 >= _must_goX):
+                            continue
+                        # D2: n_leaders (+ n_nazgul) figures move
+                        if _capL9 is not None and _nl9 > _capL9:
+                            continue
+                        _prm9 = {'from': akey, 'to': to_san,
+                                 'n_regular': mr, 'n_elite': me,
+                                 'take_leaders': True, 'n_leaders': _nl9,
+                                 'side': ('fp' if side == Side.FREE_PEOPLES
+                                          else 'sh')}
+                        if _mv_naz9 > 0:
+                            for _nn9 in range(_mv_naz9 + 1):
+                                if _capL9 is not None and \
+                                        _nl9 + _nn9 > _capL9:
+                                    continue
+                                actions.append(Action(
+                                    die_idx=die_idx,
+                                    action_type='army_move',
+                                    params=dict(_prm9, n_nazgul=_nn9)))
+                        else:
+                            actions.append(Action(
+                                die_idx=die_idx,
+                                action_type='army_move',
+                                params=_prm9))
 
+    if require_leader or any(sanitize(a.params['from']) == a.params['to'] for a in actions):
+        from army_move_participants import selected
+        eligible = []
+        for action in actions:
+            p = action.params
+            army = _armies_lookup(state, p['from'])
+            if exclude_san and sanitize(p['from']) == exclude_san:
+                from army_move_participants import preexisting
+                army = preexisting(army, _preexist)
+            stationary = sanitize(p['from']) == p['to']
+            nation_ok = None if stationary else _border_pred9(
+                state, army.units, army.leaders, side, p['to'])
+            moving = selected(army, side, p, nation_ok)
+            if stationary and game_logic._companion_activation_nation(
+                    state, p['to'], moving.leaders) is None:
+                continue
+            if not require_leader or game_logic.army_has_leader_figure(state, moving, side=side):
+                eligible.append(action)
+        actions = eligible
     return actions
 
 
@@ -5585,6 +6107,7 @@ def _get_army_attack_actions(state: GameState, side: Side, die_idx: int,
         require_leader: If True, only armies with leaders/characters can attack
                        (required for Character die).
     """
+    from persistent_effects import can_shadow_attack
     actions = []
     _attack_index = {sanitize(k): (k, a) for k, a in state.armies.items()}
 
@@ -5597,22 +6120,10 @@ def _get_army_attack_actions(state: GameState, side: Side, die_idx: int,
         if not any(_side_of_nation(u.nation) == side for u in army.units):
             continue
 
-        # Rulebook p.33 (iter 38, user finding: SH attacked Lorien with a
-        # stack of 8 Sauron + 1 Isengard before Sauron was At War): the
-        # non-belligerent restriction applies "if at least one of the
-        # units in the Army belongs to a non-belligerent Nation" — an
-        # army may ATTACK only when ALL its units' nations are At War.
-        # QUEUE_4 (2026-08-17): game_logic.can_attack_with_army(side=)
-        # is THE at-war body - menu and GUI share it.
-        if not game_logic.can_attack_with_army(state, army,
-                                               side=side)[0]:
-            continue
-
-        # Character die: army must have a leader or character (Saruman's
-        # ability: Isengard Elites count as Leaders while he is in play)
-        if require_leader and not game_logic.army_has_leader_figure(
-                state, army,
-                side=side):
+        from army_participants import select_forced_attack
+        formation = select_forced_attack(
+            state, army, side, require_leader=require_leader)
+        if not formation.available:
             continue
 
         from_san = sanitize(akey)
@@ -5622,10 +6133,12 @@ def _get_army_attack_actions(state: GameState, side: Side, die_idx: int,
         _own_and_enemy_here = (
             any(_side_of_nation(u.nation) == side for u in army.units)
             and any(_side_of_nation(u.nation) != side for u in army.units))
-        if _own_and_enemy_here:
+        if _own_and_enemy_here and (
+                side != Side.SHADOW
+                or can_shadow_attack(state, from_san)[0]):
             # from == to covers BOTH the besieger's assault and the
             # garrison's SORTIE (p.32) - stamp the acting side so the
-            # executor never has to infer it (2026-07-10 sortie fix)
+            # executor never infers it (2026-07-10)
             actions.append(Action(
                 die_idx=die_idx,
                 action_type='army_attack',
@@ -5650,7 +6163,6 @@ def _get_army_attack_actions(state: GameState, side: Side, die_idx: int,
             # Persistent cards (A Power too Great / Tom Bombadil) block
             # Shadow attacks into protected regions
             if side == Side.SHADOW:
-                from persistent_effects import can_shadow_attack
                 ok_atk, _ = can_shadow_attack(state, to_san)
                 if not ok_atk:
                     continue
@@ -5747,12 +6259,11 @@ def _get_table_kill_actions(state: GameState, side: Side, die_idx: int,
                     params={'card_id': folly.card_id,
                             'card_name': _fname, 'payment': 'will'}))
             else:
-                try:
-                    from persistent_effects import \
-                        get_denethors_folly_discard_options as _gdf
-                    _any_ok = bool(_gdf(state).get('any_die'))
-                except Exception:
-                    _any_ok = False
+                # LA-9: no swallow - a failure here must not silently
+                # delete the any-die removal (1.177c) from the surface
+                from persistent_effects import \
+                    get_denethors_folly_discard_options as _gdf
+                _any_ok = bool(_gdf(state).get('any_die'))
                 if _any_ok:
                     out.append(Action(
                         die_idx=die_idx,
@@ -5802,13 +6313,21 @@ def _get_political_advance_actions(state: GameState, side: Side, die_idx: int) -
 
 # Companions that can advance their nation's political track with ANY
 # action die while inside a CITY OR STRONGHOLD of their nation
-# (rulebook character abilities; user ruling 2026-07-03 — the old code
-# required a stronghold for Legolas/Gimli, see data/rules_amendments.md).
+# (rulebook character abilities; user ruling 2026-07-03: a CITY or a
+# stronghold qualifies, see data/rules_amendments.md).
 _COMPANION_MUSTER_NATION = {
     'Legolas': Nation.ELVES,
     'Gimli': Nation.DWARVES,
     'Boromir': Nation.GONDOR,
 }
+
+
+def _tp_on_table(state: GameState) -> bool:
+    """Threats and Promises (Shadow) lies on the table."""
+    from game_state import PersistentCardType as _PCTtp
+    pcs = getattr(state, 'persistent_cards', None)
+    return bool(pcs is not None
+                and pcs.has_card_type(_PCTtp.THREATS_AND_PROMISES))
 
 
 def _get_companion_muster_advances(state: GameState, die_idx: int) -> List[Action]:
@@ -5941,15 +6460,16 @@ def _get_recruit_actions(state: GameState, side: Side, die_idx: int,
         allowed_types = ['regular', 'leader']
     actions = []
     my_nations = FP_NATIONS if side == Side.FREE_PEOPLES else SHADOW_NATIONS
-    # GENERATOR/VALIDATOR SPLIT (QUEUE round 2026-08-17): PROPOSE
-    # only - is_legal_muster_action is the ONE rule body (at-war /
-    # own-settlement / besieged / controller / stacking / leader
-    # rules / pool all live THERE).  exclude_region stays here: the
-    # two-recruits-in-separate-settlements rule is a MULTI-action
-    # constraint of the pending context, not single-action legality.
+    # Prefilter impossible nation/settlement pairs before constructing actions;
+    # the remaining candidates still pass the authoritative muster validator.
+    # exclude_region preserves the second recruit's distinct-settlement rule.
     _vc9 = {}
     for nat in my_nations:
+        if state.political.boxes.get(nat, 0) < 3:
+            continue
         for rkey in _get_settlement_regions():
+            if _region_nation(sanitize(str(rkey))) != nat:
+                continue
             if exclude_region and sanitize(rkey) ==                     sanitize(exclude_region):
                 continue
             for typ in allowed_types:
@@ -5972,11 +6492,15 @@ def _get_muster_elite_actions(state: GameState, side: Side, die_idx: int) -> Lis
     """
     actions = []
     my_nations = FP_NATIONS if side == Side.FREE_PEOPLES else SHADOW_NATIONS
-    # GENERATOR/VALIDATOR SPLIT (QUEUE round 2026-08-17): PROPOSE
-    # only - is_legal_muster_action is the ONE rule body.
+    # Prefilter impossible nation/settlement pairs before constructing actions;
+    # the remaining candidates still pass the authoritative muster validator.
     _vc9 = {}
     for nat in my_nations:
+        if state.political.boxes.get(nat, 0) < 3:
+            continue
         for rkey in _get_settlement_regions():
+            if _region_nation(sanitize(str(rkey))) != nat:
+                continue
             a9 = Action(
                 die_idx=die_idx,
                 action_type='muster_elite',
@@ -5984,6 +6508,171 @@ def _get_muster_elite_actions(state: GameState, side: Side, die_idx: int) -> Lis
             if is_legal_muster_action(state, a9, _vc9)[0]:
                 actions.append(a9)
     return actions
+
+
+# W4-032 (USER rulings 1.266 / 1.266-b / 1.270, 2026-09-02/03): Saruman's
+# Muster-die ability.  The three Isengard settlements, in the engine's
+# fixed order (the R3 placements are applied in this order).
+_SARUMAN_SETTLEMENTS = ('orthanc', 'north dunland', 'south dunland')
+_MUSTER_FACES = (ActionDieFace.MUSTER, ActionDieFace.MUSTER_ARMY,
+                 ActionDieFace.WILL_OF_WEST)
+
+
+def _saruman_swap_check(state: GameState, deployed=None):
+    """(ok, reason) for Saruman's E2 variant at Orthanc: Isengard at war,
+    Orthanc not besieged / not enemy-controlled, the Orthanc army holds
+    >= 2 Isengard Regulars and the Isengard Elite pool holds >= 2
+    (2 out / 2 in: the stacking cap is untouched)."""
+    if not game_logic.saruman_in_play(state):
+        return False, 'Saruman is not in play'
+    if state.political.boxes.get(Nation.ISENGARD, 0) < 3:
+        return False, 'Isengard is not At War'
+    if 'orthanc' in getattr(state, 'besieged_strongholds', set()):
+        return False, 'Orthanc is besieged'
+    if _settlement_controller(state, 'orthanc') == Side.FREE_PEOPLES:
+        return False, 'Orthanc is enemy-controlled'
+    army = _armies_lookup(state, 'orthanc')
+    n_reg = sum(1 for u in (army.units if army else [])
+                if u.nation == Nation.ISENGARD
+                and u.kind == UnitKind.REGULAR)
+    if n_reg < 2:
+        return False, ('Orthanc holds %d Isengard Regular(s), the ability '
+                       'replaces two' % n_reg)
+    if figures_available(state, Nation.ISENGARD, 'elite', deployed) < 2:
+        return False, 'the Isengard Elite pool cannot supply two'
+    return True, None
+
+
+def _get_saruman_muster_actions(state: GameState,
+                                die_idx: int) -> List[Action]:
+    """W4-032 - Saruman's Muster-die ability (USER 2026-09-02 verbatim
+    "Yes, it is saruman's ability"; amendments 1.266 / 1.266-b / 1.270):
+    with a Muster die while Saruman is in play the Shadow player may
+    EITHER (R3) place one Isengard Regular in EACH free Isengard
+    settlement - Orthanc, North Dunland, South Dunland, up to three
+    units from ONE die - OR (E2) replace BOTH of two Isengard Regulars
+    in Orthanc with two Isengard Elites.  Both consume the die; neither
+    opens the pending second recruit (never additive).
+
+    ALL-OR-NOTHING (1.266-b): no mixed Regular + Elite shape is ever the
+    ability (that is the event card A New Power is Rising), and a
+    placement short of the full set is legal ONLY when the reinforcement
+    pool cannot supply it - which is exactly the normal single / double
+    Isengard muster already in the surface (same outcome, same actions),
+    so R3 is offered only with ALL THREE settlements placeable AND the
+    Isengard Regular pool >= 3, and E2 only with both Regulars at
+    Orthanc AND the Elite pool >= 2.  The plain 1R / 2R Isengard and
+    Dunland recruits STAY legal beside the ability (1.270 verbatim "yes,
+    you can still muster normally in isengard / north or south dunland"
+    - no narrowing, no cap).
+
+    Params only, no new action_type: R3 = muster_recruit with
+    saruman='settlements' + placements (the engine order above); E2 =
+    muster_elite with saruman='swap2'.  The v41 action encoder reads
+    type / nation / region / unit-type for musters, so each variant
+    encodes byte-identically to the plain single-figure muster at
+    Orthanc (GEN43_DESIGN.md (e): the v43 encoder line lights the
+    composition columns n_r = 3 / n_e = 2 under the saruman param) -
+    stated, not coded (USER encoding hold)."""
+    if not game_logic.saruman_in_play(state):
+        return []
+    actions = []
+    _vc9 = {}
+    placeable = []
+    for rk in _SARUMAN_SETTLEMENTS:
+        a9 = Action(die_idx=die_idx, action_type='muster_recruit',
+                    params={'nation': Nation.ISENGARD, 'region': rk,
+                            'type': 'regular'})
+        if is_legal_muster_action(state, a9, _vc9)[0]:
+            placeable.append(rk)
+    deployed = _vc9.get('deployed')
+    if deployed is None:
+        deployed = _count_deployed_all(state)
+    if len(placeable) == len(_SARUMAN_SETTLEMENTS) and figures_available(
+            state, Nation.ISENGARD, 'regular', deployed) >= 3:
+        actions.append(Action(
+            die_idx=die_idx,
+            action_type='muster_recruit',
+            params={'nation': Nation.ISENGARD, 'region': 'orthanc',
+                    'type': 'regular', 'saruman': 'settlements',
+                    'placements': list(_SARUMAN_SETTLEMENTS)}))
+    if _saruman_swap_check(state, deployed)[0]:
+        actions.append(Action(
+            die_idx=die_idx,
+            action_type='muster_elite',
+            params={'nation': Nation.ISENGARD, 'region': 'orthanc',
+                    'saruman': 'swap2'}))
+    return actions
+
+
+def _execute_saruman_settlements(state: GameState, side: Side,
+                                 die_idx: int, p: dict) -> None:
+    """W4-032 R3 executor: one Isengard Regular in each of the three
+    settlements, one die, no pending second recruit.  Transactional on
+    the live path (EX-7 idiom: every placement re-validated and the pool
+    re-counted BEFORE any mutation; a refused ability spends nothing and
+    records a loud invariant); the teacher (log = truth) is exempt."""
+    placements = [sanitize(str(r)) for r in
+                  (p.get('placements') or _SARUMAN_SETTLEMENTS)]
+    import combat as _cmb32
+    if _cmb32.FINAL_HITS_HOOK is None:
+        _vc = {}
+        why = None
+        if not game_logic.saruman_in_play(state):
+            why = 'Saruman is not in play'
+        for rk in ([] if why else placements):
+            ok, reason = is_legal_muster_action(
+                state, Action(die_idx=die_idx, action_type='muster_recruit',
+                              params={'nation': Nation.ISENGARD,
+                                      'region': rk, 'type': 'regular'}),
+                _vc)
+            if not ok:
+                why = '%s: %s' % (rk, reason)
+                break
+        if why is None and figures_available(
+                state, Nation.ISENGARD, 'regular',
+                _vc.get('deployed')) < len(placements):
+            why = 'the Isengard Regular pool cannot supply %d' % len(placements)
+        if why is not None:
+            import state_invariants as _si32
+            _si32.VIOLATIONS.append({
+                'code': 'saruman_muster_refused',
+                'ctx': 'T%s settlements %s' % (getattr(state, 'turn', '?'),
+                                               ','.join(placements)),
+                'detail': 'refused - no die spent, nothing placed (%s)' % why})
+            return
+    for rk in placements:
+        game_logic._muster_one(state, side, rk, 'regular',
+                               nation=Nation.ISENGARD)
+    _consume_die_for_face(state, side, die_idx, _MUSTER_FACES)
+
+
+def _execute_saruman_swap(state: GameState, side: Side, die_idx: int,
+                          p: dict) -> None:
+    """W4-032 E2 executor: two Isengard Regulars leave the Orthanc army
+    (back to the pool by construction - the pool is derived from the
+    deployed figures, ai.figures_available) and two Isengard Elites are
+    placed there; one die, no pending second recruit.  Live path
+    transactional (validated before any mutation), teacher exempt."""
+    import combat as _cmb32
+    if _cmb32.FINAL_HITS_HOOK is None:
+        ok, why = _saruman_swap_check(state)
+        if not ok:
+            import state_invariants as _si32
+            _si32.VIOLATIONS.append({
+                'code': 'saruman_muster_refused',
+                'ctx': 'T%s swap2 orthanc' % getattr(state, 'turn', '?'),
+                'detail': 'refused - no die spent, nothing placed (%s)' % why})
+            return
+    army = _armies_lookup(state, 'orthanc')
+    regs = [u for u in (army.units if army else [])
+            if u.nation == Nation.ISENGARD and u.kind == UnitKind.REGULAR]
+    for u in regs[:2]:
+        army.units.remove(u)
+    for _ in range(min(2, len(regs))):
+        game_logic._muster_one(state, side, 'orthanc', 'elite',
+                               nation=Nation.ISENGARD)
+    _consume_die_for_face(state, side, die_idx, _MUSTER_FACES)
 
 
 def _get_play_event_for_die(state: GameState, side: Side, die_idx: int,
@@ -6025,18 +6714,13 @@ def _get_play_event_for_die(state: GameState, side: Side, die_idx: int,
             can_play, _ = check_event_requirement(state, card_id)
             if not can_play:
                 continue
-            # The dry-run clones the full state — memoize within one
-            # enumeration (state is constant), since the same card is
-            # checked for both the Event face and its matching face
-            if effect_memo is not None:
-                has_eff = effect_memo.get(card_id)
-                if has_eff is None:
-                    has_eff = _event_card_has_effect(state, side, card_id)
-                    effect_memo[card_id] = has_eff
-            else:
-                has_eff = _event_card_has_effect(state, side, card_id)
-            if not has_eff:
-                continue
+            # USER RULING 1.230 (2026-08-28, verbatim: "zero effect
+            # plays are allowed, always. even in self play"): the
+            # legal surface never prunes a card for having no effect -
+            # only the card's own play condition gates it.  The
+            # _event_card_has_effect dry-run remains as telemetry
+            # (effect_memo kept for signature stability) but no longer
+            # decides legality.
             actions.append(Action(
                 die_idx=die_idx,
                 action_type='play_event',
@@ -6062,10 +6746,8 @@ def _event_state_signature(state: GameState, side: Side):
                        for n, v in state.political.active.items()))
     ec = tuple(sorted(len(state.enemy_controlled.get(s, set()))
                       for s in (Side.FREE_PEOPLES, Side.SHADOW)))
-    # QA 2026-07-10: PersistentCardState stores fp_cards/sh_cards (no
-    # 'cards' attr) — the old getattr silently read 0 forever, so every
-    # "play on the table" card (The Last Battle, A Power too Great, Tom
-    # Bombadil...) looked like a no-op and was pruned from self-play.
+    # PersistentCardState stores fp_cards/sh_cards (no 'cards' attr);
+    # table plays must register as a delta (QA 2026-07-10).
     pcards = 0
     try:
         _pcs = state.persistent_cards
@@ -6073,15 +6755,9 @@ def _event_state_signature(state: GameState, side: Side):
                   + len(getattr(_pcs, 'sh_cards', []) or []))
     except Exception:
         pass
-    # RED EX-1 (2026-08-17): the signature hashed dice as (count,
-    # unused) - BLIND TO FACES - so Mirror of Galadriel's face-change
-    # effect compared as a no-op and the prune made the card
-    # AI-unplayable in every self-play game ever (0 offers in 162
-    # chaos games; apply_action plays it fine).  Same class as the
-    # 2026-07-10 pcards sibling.  The audit below adds every
-    # dimension the old signature omitted vs full state: FACES,
-    # companion/guide IDENTITY, elven RINGS, hand CONTENT, deck
-    # lengths, besieged set.
+    # The signature carries every dimension a card can change: dice
+    # FACES (RED EX-1 2026-08-17: Mirror of Galadriel), companion/guide
+    # IDENTITY, elven RINGS, hand CONTENT, deck lengths, besieged set.
     _dice_sig = tuple(
         (len(state.dice.get(sd, [])),
          sum(1 for d in state.dice.get(sd, []) if not d.used),
@@ -6119,6 +6795,10 @@ def _event_state_signature(state: GameState, side: Side):
     }
 
 
+# EE1-09: card ids whose menu dry-run raised (logged once per process)
+_DRYRUN_FAILED_CARDS = set()
+
+
 def _event_card_has_effect(state: GameState, side: Side, card_id: str) -> bool:
     """Dry-run an event card on a cloned state with empty choices to
     detect TRUE no-ops: a card that changes nothing even best-case
@@ -6126,17 +6806,8 @@ def _event_card_has_effect(state: GameState, side: Side, card_id: str) -> bool:
     Optioned cards are NOT pruned — an option spec yielding choices
     defers into pending_card_option (a learned decision, see below).
     """
-    # TEACHER MODE (iter 39): never prune — the humans DID play the card
-    # and supplied choices; the closed loop replicates them from the
-    # logged fx records.  Pruning re-routed teacher plays through the
-    # forced-play chain and lost the fx-derived choices (AngryBird
-    # canary caught it when the honest no-op reporting fix landed).
-    # Optioned cards (QA 2026-07-09, Cirdan's Ships / Paths of the
-    # Woses): the empty-choices dry-run below no-ops any handler that
-    # needs a region choice, silently pruning legally playable cards
-    # from self-play.  If the option spec yields choices, the real play
-    # defers into pending_card_option (or auto-picks a single option) -
-    # it is NOT a no-op.
+    # Optioned cards (QA 2026-07-09): an option spec yielding choices
+    # defers into pending_card_option - it is NOT a no-op.
     try:
         from cards import get_card as _gc_eff
         from card_options import get_card_options as _gco_eff
@@ -6151,20 +6822,13 @@ def _event_card_has_effect(state: GameState, side: Side, card_id: str) -> bool:
         import game_logic as _gl_eff
         clone = clone_state(state)
         before = _event_state_signature(clone, side)
-        # USER RULING 2026-07-18 (amendment 1.174): for a card whose effect
-        # includes a die roll (Return to Valinor class), THE ROLL IS THE
-        # EFFECT for legality.  Legality must be a DETERMINISTIC function
-        # of preconditions (phase, valid targets exist) — never of a roll
-        # outcome — or the no-op filter FLICKERS with the RNG (Return to
-        # Valinor legal in one enumeration, pruned in the next: the
-        # 12-vs-13 flicker) and enumeration silently burns randomness.
-        # Dry-run every d6 at its BEST case (all 6s — "cannot possibly
-        # matter even on a good roll" still gates illegal: no targets ->
-        # no roll -> no delta -> not offered) and REWIND the global RNG so
-        # enumeration consumes ZERO randomness.  roll_d6_batch is the sole
-        # d6 funnel (hunt rolls via _hunt_roll route through it too), so
-        # this one patch covers the class.  The REAL roll still happens
-        # exactly once, live, inside play_event_card on ACTUAL play.
+        # USER RULING 2026-07-18 (amendment 1.174): THE ROLL IS THE EFFECT
+        # for legality - legality is a DETERMINISTIC function of
+        # preconditions, never of a roll outcome, and enumeration
+        # consumes ZERO randomness.  Every d6 dry-runs at its BEST case
+        # (all 6s) and the global RNG is rewound; roll_d6_batch is the
+        # sole d6 funnel.  The REAL roll happens once, live, inside
+        # play_event_card.
         _rng_state = _rng_eff.getstate()
         _orig_roll = _gl_eff.roll_d6_batch
         _orig_pick = _gl_eff.pick_random_companion
@@ -6185,7 +6849,26 @@ def _event_card_has_effect(state: GameState, side: Side, card_id: str) -> bool:
             _gl_eff.draw_event_card = \
                 lambda st9, sd9, dk9: st9.hands[sd9].hand.append(
                     '__dryrun_draw__')
-            result = play_event_card(clone, side, card_id)
+            try:
+                result = play_event_card(clone, side, card_id)
+            except Exception as _dre9:
+                # EE1-09: play_event_card re-raises a broken handler.
+                # A dry-run failure must not delete the card from the
+                # legal surface (legality is not a function of a
+                # handler bug; 1.230 zero-effect plays are legal
+                # anyway): log the hard invariant ONCE per card and
+                # OFFER the play - the real play's raise is the
+                # rejected action (EX-4).
+                if card_id not in _DRYRUN_FAILED_CARDS:
+                    _DRYRUN_FAILED_CARDS.add(card_id)
+                    import state_invariants as _sidr9
+                    _sidr9.VIOLATIONS.append({
+                        'code': 'event_dryrun_failed',
+                        'ctx': 'T%s %s' % (getattr(state, 'turn', '?'),
+                                           card_id),
+                        'detail': '%s: %s' % (type(_dre9).__name__,
+                                              str(_dre9)[:160])})
+                return True
         finally:
             _gl_eff.roll_d6_batch = _orig_roll
             _gl_eff.pick_random_companion = _orig_pick
@@ -6195,24 +6878,23 @@ def _event_card_has_effect(state: GameState, side: Side, card_id: str) -> bool:
         if not result.get("success"):
             return False
         # USER FIX 2026-07-08: judge by the ACTUAL STATE DELTA, not the
-        # handler's effects strings.  Many handlers append "Healed 1
-        # Corruption" / "Recruited ..." even when nothing changed (heal
-        # at corruption 0; blocked recruit) — the old effects-list check
-        # let the net play those useless cards (e.g. There is Another Way
-        # T1 at corruption 0 with no Gollum).  Discount the played card's
-        # OWN removal from the actor's hand (that is not an "effect").
+        # handler's effects strings.  Discount the played card's OWN
+        # removal from the actor's hand (that is not an effect).
         after = _event_state_signature(clone, side)
         _hkey = 'hand_fp' if side == Side.FREE_PEOPLES else 'hand_sh'
-        # Discount the played card's own hand exit by RE-ADDING its
-        # name to the after-hand.  The 2026-08-17 signature extension
-        # made hand_fp/hand_sh tuples of names; the old `+= 1` then
-        # raised TypeError into the blanket except -> True, so the
-        # whole delta check was dead and genuinely no-op cards were
-        # offered again (fail-open; found 2026-08-24).
+        # Discount the played card's own hand exit by RE-ADDING its name
+        # to the after-hand (hand_fp/hand_sh are tuples of names since
+        # the 2026-08-17 signature extension).
         after[_hkey] = tuple(sorted(after[_hkey] + (str(card_id),)))
         return after != before
-    except Exception:
-        return True  # On dry-run failure, fall back to offering the card
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        # BL-100: NeedClientCall is a BaseException - an Exception-only
+        # guard would let a STARVING dry-run escape and strand a
+        # playable card off the legal surface.  Effect-unknown ALWAYS
+        # keeps the card offered.
+        return True
 
 
 def _get_fellowship_actions(state: GameState, die_idx: int) -> List[Action]:
@@ -6233,12 +6915,9 @@ def _get_fellowship_actions(state: GameState, die_idx: int) -> List[Action]:
                 params={}
             ))
 
-    # In Mordor: move on mordor track.  RULING 1.227 (USER 2026-08-02,
-    # closes the 2026-07-11 open question): a stop tile ends ONLY THAT
-    # ONE MOVEMENT, never the whole turn — the stop's step-retraction
-    # stands and further fellowship moves the same turn stay legal
-    # (certified GenericPie T7: Shelob stop at L816, second move at
-    # L929).  Current behavior confirmed correct.
+    # In Mordor: move on the track.  RULING 1.227 (USER 2026-08-02): a
+    # stop tile ends ONLY THAT ONE MOVEMENT, never the whole turn -
+    # further fellowship moves the same turn stay legal.
     if (can_move and state.fellowship.mordor_entered
             and state.fellowship.mordor_step < 5):
         actions.append(Action(
@@ -6258,8 +6937,6 @@ def _get_fellowship_actions(state: GameState, die_idx: int) -> List[Action]:
     return actions
 
 
-
-
 def _get_declare_actions(state: GameState,
                          allow_in_place: bool = False) -> List[Action]:
     """Enumerate fellowship declaration actions (no die cost).
@@ -6268,8 +6945,8 @@ def _get_declare_actions(state: GameState,
     TURN-START Fellowship Phase ONLY (USER 2026-07-20c) — never
     mid-turn.  Per the rulebook, the pawn may be placed in any region
     at distance UP TO the progress counter (including staying in
-    place; effectful in-place declares at progress 0 are legal on the
-    self-play drivers via allow_in_place — see below).  The
+    place; in-place declares at progress 0 are legal on the self-play
+    drivers via allow_in_place, effect or not - 1.230).  The
     behavioral-cloning-trained policy decides WHEN and WHERE — no
     hand-coded direction filter.
 
@@ -6284,80 +6961,23 @@ def _get_declare_actions(state: GameState,
         return actions
     if state.fellowship.mordor_entered:
         return actions
-    # iter 39 (user finding: fellowship dithers at the Mordor doorstep):
-    # declaring moves the figure UP TO progress regions — declaring IN
-    # PLACE with progress 0 is legal (RAW; it is how a fellowship at
-    # Morannon/Minas Morgul ENTERS Mordor from a standstill, and how it
-    # heals by declaring in an FP city/stronghold).  allow_in_place is
-    # passed by the SELF-PLAY drivers only: the teacher/replay paths keep
-    # the historical progress>0 gate (enabling it there regressed the
-    # kapcerz canary via the replay-sample enumeration).
+    # iter 39: declaring IN PLACE at progress 0 is legal (RAW: gateway
+    # entry from a standstill; the stay-heal).  allow_in_place is
+    # passed by the SELF-PLAY drivers only; teacher/replay paths keep
+    # the progress>0 gate.
     if state.fellowship.progress <= 0 and not allow_in_place:
         return actions
     if state.fellowship.progress < 0:
         return actions
 
-    cur = game_logic.fellowship_region(state)
-    progress = state.fellowship.progress
+    # Use the same passable map graph as the executor's choose_path.
+    from fellowship_reveal_route import reachable_regions
+    reachable = reachable_regions(state)
 
-    # All regions within `progress` steps (official: up to, not exactly)
-    reachable = {cur}
-    frontier = {cur}
-    for _ in range(progress):
-        frontier = {sanitize(adj)
-                    for r in frontier
-                    for adj in state.board.adjacent(r)}
-        reachable |= frontier
-
-    # USER RULING 2026-07-20b (w5_g2 T9): never DECLARE into Mordor's
-    # interior — the pawn declares AT a gateway, and the SAME turn
-    # start's entry check (run after the declaration opportunity,
-    # USER FINAL 2026-08-16) puts it on the track.  Self-play only
-    # (humans never declare into gorgoroth, so the teacher loses
-    # nothing).
-    reachable -= game_logic._MORDOR_INTERIOR
-
-    # Rarity-audit fix (2026-07-28, skip-in-disguise doctrine — same
-    # class as the siege_continue removal): declaring IN PLACE at
-    # progress 0 is a literal no-op (pawn stays, progress 0->0, still
-    # hidden, no die) UNLESS it has an effect: arming Mordor entry at
-    # a gateway (1.155), healing in an unconquered FP city/stronghold
-    # with corruption > 0, or ACTIVATING the settlement's passive
-    # nation (rulebook p.34, audit A10 — activation has no
-    # enemy-control exception).  The corpus has no coverage of the
-    # progress-0 declare window (decline twins are gated progress>=1
-    # by USER ruling), so the net was blind there and declared-in-place
-    # at Rivendell in 81/84 self-play games — a no-op menu entry, not
-    # exploration.  Effectful in-place declares stay in the menu.
-    if progress == 0 and cur in reachable:
-        _keep_ip = cur in ('morannon', 'minas morgul')
-        if not _keep_ip:
-            _meta9 = board.regions.get(cur, {})
-            _is_settle9 = bool(_meta9.get('is_city')
-                               or _meta9.get('is_stronghold'))
-            if _is_settle9 and game_logic.is_fp_region(cur):
-                # heal effect (mirrors declare_fellowship's heal check)
-                if (state.fellowship.corruption > 0
-                        and cur not in state.enemy_controlled.get(
-                            Side.SHADOW, set())):
-                    _keep_ip = True
-                else:
-                    # activation effect (mirrors
-                    # _activate_nation_for_fellowship_declaration)
-                    from board import fid_to_name as _f2n9
-                    _fac9 = _f2n9.get(_meta9.get('parent_id'),
-                                      '').lower()
-                    _nm9 = {'gondor': Nation.GONDOR,
-                            'rohan': Nation.ROHAN,
-                            'elves': Nation.ELVES,
-                            'dwarves': Nation.DWARVES,
-                            'the north': Nation.THE_NORTH,
-                            'north': Nation.THE_NORTH}.get(_fac9)
-                    if _nm9 is not None and not \
-                            state.political.active.get(_nm9, False):
-                        _keep_ip = True
-        if not _keep_ip:
-            reachable.discard(cur)
+    # 1.230 (USER 2026-08-28, verbatim "zero effect plays are allowed,
+    # always. even in self play"): the in-place declaration at progress
+    # 0 stays on the menu whether or not it heals / activates / arms a
+    # gateway; game_logic.declare_fellowship completes it.
 
     for region in sorted(reachable):
         actions.append(Action(
@@ -6373,8 +6993,8 @@ def companion_separate_action_for(state: GameState, die_idx: int,
                                   names, dest) -> Optional[Action]:
     """The NAMED-subset separation action IF legal, else None.  ONE
     implementation of the p.38 group-separation rule (movement =
-    progress + the group's highest level; terminus per
-    _companion_terminus_ok — USER 2026-08-17: a Shadow stronghold IS a
+    progress + the group's highest level; terminus anywhere the walk
+    reaches (ruling 1.252) - USER 2026-08-17: a Shadow stronghold IS a
     legal terminus, stop-on-entry per action; Mordor bars separation),
     shared by the menu's (uncapped, USER 2026-08-22) subset lattice
     and the live matcher's construct-then-verify (history: the old
@@ -6413,9 +7033,17 @@ def _companion_unreachable_why(state: GameState, cur: str, d: str,
     the stop-on-entry rule; if the target becomes reachable, the stop
     rule is what cut the path."""
     import collections as _c9
+    besieged = _friendly_besieged_strongholds(state)
+    if sanitize(cur) in besieged:
+        return ('%s is a friendly stronghold besieged by the enemy - '
+                'companions can never leave it (rulebook: Moving '
+                'Companions)' % cur)
+    if d in besieged:
+        return ('%s is a friendly stronghold besieged by the enemy - '
+                'companions can never enter it (rulebook: Moving '
+                'Companions)' % d)
     dist = {sanitize(cur): 0}
     q = _c9.deque([sanitize(cur)])
-    besieged = getattr(state, 'besieged_strongholds', set())
     while q:
         x = q.popleft()
         if dist[x] >= movement:
@@ -6452,14 +7080,38 @@ def _get_companion_separate_actions(state: GameState, die_idx: int) -> List[Acti
     cur = game_logic.fellowship_region(state)
     progress = state.fellowship.progress
     # GENERATOR/VALIDATOR SPLIT (USER 2026-08-17): this menu only
-    # PROPOSES (per-group reachable universe + in-place); every
-    # candidate passes is_legal_companion_action - the ONE rule body
-    # (mordor bar / besieged-only-into-cur / range / stop-on-entry /
-    # terminus all live THERE).  Under siege _companion_reachable is
-    # empty, so the proposals collapse to in-place and the validator
-    # keeps exactly those - the old dedicated besieged branch is
-    # absorbed.
+    # PROPOSES; is_legal_companion_action is the ONE rule body (mordor
+    # bar / besieged-only-into-cur / range / stop-on-entry / terminus).
+    # Under siege _companion_reachable is empty, so proposals collapse
+    # to in-place.
     _vc9 = {}
+
+    # All proposed voluntary groups consist of distinct, present companions.
+    # Their legality varies only by allowance and destination. Pending hunt
+    # placement remains identity-sensitive and uses the original validator.
+    _ph_batch = getattr(state, 'pending_hunt', None)
+    _reuse_answers = not (isinstance(_ph_batch, dict) and _ph_batch.get('phase') == 'hobbit_place')
+    _reuse_answers = _reuse_answers and all(type(c.name) is str and type(c.level) is int for c in separable)
+    _reuse_answers = _reuse_answers and len({c.name for c in separable}) == len(separable)
+    _answer_batch = (_companion_search_cache.answer_table(
+        sys.modules[__name__], state, cur, progress, separable)
+        if _reuse_answers else {})
+    _proposal_batch = {}
+
+    def _proposal_reachable(state, origin, allowance):
+        key = (origin, allowance)
+        if key not in _proposal_batch:
+            _proposal_batch[key] = _companion_reachable(state, origin, allowance)
+        # Callers add the Fellowship's position; do not mutate the shared set.
+        return set(_proposal_batch[key])
+
+    def _legal_proposal(action, allowance, destination):
+        if not _reuse_answers:
+            return is_legal_companion_action(state, action, _vc9)[0]
+        key = (allowance, destination)
+        if key not in _answer_batch:
+            _answer_batch[key] = is_legal_companion_action(state, action, _vc9)[0]
+        return _answer_batch[key]
 
     def _prop9(names, mv, dest):
         if len(names) == 1:
@@ -6472,59 +7124,44 @@ def _get_companion_separate_actions(state: GameState, die_idx: int) -> List[Acti
                         action_type='companion_separate',
                         params={'companions': sorted(names),
                                 'to_region': dest})
-        if is_legal_companion_action(state, a9, _vc9)[0]:
+        if _legal_proposal(a9, mv, dest):
             actions.append(a9)
 
     for comp in separable:
         movement = progress + comp.level
         if movement <= 0:
             continue
-        reachable = _companion_reachable(state, cur, movement)
+        reachable = _proposal_reachable(state, cur, movement)
         reachable.add(cur)  # separating in place is always allowed
         for dest in sorted(reachable):
             _prop9([comp.name], movement, dest)
     # Rulebook p.38: ONE die separates "one Companion or one GROUP of
-    # Companions" — group movement = progress + HIGHEST level in the
-    # group (audit A15, 2026-07-26; singles-only burned N dice for N
-    # companions in self-play).  One group action (all separable) per
-    # destination; encode_action already carries the multi-hot.
+    # Companions" - group movement = progress + HIGHEST level (audit
+    # A15 2026-07-26).  One all-separable group action per destination.
     if len(separable) > 1:
         _gmv15 = progress + max(c.level for c in separable)
         if _gmv15 > 0:
-            _grch15 = _companion_reachable(state, cur, _gmv15)
+            _grch15 = _proposal_reachable(state, cur, _gmv15)
             _grch15.add(cur)
             _gnames15 = [c.name for c in separable]
             for dest in sorted(_grch15):
                 _prop9(_gnames15, _gmv15, dest)
-        # PROPER SUBSETS (USER live session 2026-08-17: the human
-        # separated Strider+Boromir out of a larger fellowship and
-        # the singles+all-group menu had no matching action - the
-        # LEGAL gesture refused).  Rulebook p.38 'one Companion or
-        # one GROUP' means ANY group; 1.112.4/1.122 already settled
-        # the same question for companion MOVES with the same
-        # explosion bound: full subset lattice while the separable
-        # set is <= 4, singles only beyond (7 companions max; a
-        # subset's movement = progress + ITS OWN highest level).
-        # USER 2026-08-22: NO CAP - every proper subset of the
-        # separable companions, whatever the fellowship size (the
-        # <=4 bound refused the legal Strider+Boromir pair out of a
-        # 7-companion fellowship on the real client, twice)
+        # PROPER SUBSETS (USER 2026-08-17; rulebook p.38 'one Companion
+        # or one GROUP' means ANY group; 1.112.4/1.122 settled the same
+        # for companion MOVES).  USER 2026-08-22: NO CAP - every proper
+        # subset of the separable companions, whatever the fellowship
+        # size; a subset's movement = progress + ITS OWN highest level.
         if len(separable) >= 2:
             from itertools import combinations
-            # COST (profiled 2026-08-22 after the cap removal: 693k
-            # validator calls inside one 300-sim search, 44 s): a
-            # separation's legality depends on (allowance, dest) only
-            # - never on WHICH members form the group (the validator's
-            # separation branch reads progress + max level, the
-            # reachable set and the terminus).  So the validator - still
-            # the ONE answerer - is asked once per distinct allowance
-            # with a representative group, and every subset with that
-            # allowance takes its destination set from the answer.
+            # COST (profiled 2026-08-22): a separation's legality depends
+            # on (allowance, dest) only, never on WHICH members form the
+            # group - the validator (still the ONE answerer) is asked once
+            # per distinct allowance with a representative group.
             _legal_by_mv = {}
 
             def _dests_for(mv, rep_names):
                 if mv not in _legal_by_mv:
-                    rch = _companion_reachable(state, cur, mv)
+                    rch = _proposal_reachable(state, cur, mv)
                     rch.add(cur)
                     ok = []
                     for dest in sorted(rch):
@@ -6532,16 +7169,15 @@ def _get_companion_separate_actions(state: GameState, die_idx: int) -> List[Acti
                                     action_type='companion_separate',
                                     params={'companions': rep_names,
                                             'to_region': dest})
-                        if is_legal_companion_action(state, a9, _vc9)[0]:
+                        if _legal_proposal(a9, mv, dest):
                             ok.append(dest)
                     _legal_by_mv[mv] = ok
                 return _legal_by_mv[mv]
-            # LATTICE MEMO: the proper-subset block is a pure function
-            # of (die, position, progress, the companions, the legal
+            # LATTICE MEMO: the proper-subset block is a pure function of
+            # (die, position, progress, the companions, the legal
             # destinations per allowance) - computed once per distinct
             # context and REUSED across the search's nodes (the same
-            # Action objects; nothing mutates an Action).  Before this
-            # every FP expansion rebuilt ~3,000 Action objects.
+            # Action objects; nothing mutates an Action).
             _mvs = sorted(set(progress + max(c.level for c in _sub)
                               for _r in range(2, len(separable))
                               for _sub in combinations(separable, _r)))
@@ -6621,16 +7257,13 @@ def _get_pending_combat_actions(state: GameState) -> List[Action]:
     if phase == _CC_REVEAL_PHASE:
         return []
 
-    # CHAOS-1 (RED 2026-08-17, chaos seed 95376): a pending battle
-    # whose entry lost ONE SIDE ENTIRELY outside the round machinery
-    # (the stale-siege class: besieger vacated/died elsewhere while
-    # the flag stayed) must not build card menus - setup_combat
-    # raises 'missing attacker units' and every menu degrades with a
-    # [STATE-INVARIANT].  MUTATION-FREE here (generators never
-    # mutate): offer the decline; the EXECUTOR's twin guard finishes
-    # the battle as a wipe.  Decision windows that legally hold
-    # one-sided compositions (casualty allocation, victor_advance,
-    # post-casualty effects) are exempt.
+    # CHAOS-1 (2026-08-17): a pending battle whose entry lost ONE SIDE
+    # ENTIRELY outside the round machinery (stale-siege class) must not
+    # build card menus.  MUTATION-FREE here (generators never mutate):
+    # offer the decline; the EXECUTOR's twin guard finishes the battle
+    # as a wipe.  Windows that legally hold one-sided compositions
+    # (casualty allocation, victor_advance, post-casualty effects) are
+    # exempt.
     if phase in _WIPE_GUARD_PHASES:
         _wg9 = _pending_battle_wiped(state, pc)
         if _wg9 is not None:
@@ -6641,9 +7274,9 @@ def _get_pending_combat_actions(state: GameState) -> List[Action]:
                            params={'side': _tag9})]
 
     if phase == 'attacker_rearguard':
-        # USER RULE 2026-07-08: rearguard REMOVED — this phase should be
-        # transitioned through at attack time; if reached (legacy state),
-        # offer only the no-rearguard continuation.
+        # USER RULE 2026-07-08: rearguard REMOVED - this phase is
+        # transitioned through at attack time; a legacy state here
+        # offers only the no-rearguard continuation.
         actions.append(Action(die_idx=-1, action_type='rearguard_none',
                               params={}))
 
@@ -6673,18 +7306,20 @@ def _get_pending_combat_actions(state: GameState) -> List[Action]:
         if not pc.get('is_siege') \
                 and _defender_controls_stronghold(state, pc):
             actions.append(Action(die_idx=-1, action_type='retreat_into_siege', params={}))
-        # A retreat combat card (Scouts) COMMITS the retreat — playing
-        # it and standing was a wasted card + rules violation (USER
-        # 2026-07-09 T7 Fords of Isen)
-        if not pc.get('_card_retreat_mandatory'):
-            actions.append(Action(die_idx=-1, action_type='combat_no_retreat', params={}))
+        # FLB-1 (par5 g2#3, ruling 1.230): the decline row is ALWAYS
+        # published - the Scouts pre-battle window included.  A
+        # committed retreat card left standing is a zero-effect play
+        # (1.230: it COMPLETES, never refunded), and the chat lane's
+        # 'stand' resolves combat_no_retreat from THIS menu; the
+        # executor pops _card_retreat_mandatory when the stand commits.
+        actions.append(Action(die_idx=-1, action_type='combat_no_retreat', params={}))
 
     elif phase == 'victor_advance':
         # Victor chooses the advancing portion (free split, may stay).
         atk_r = pc['attacker_region']
         def_r = pc['defender_region']
-        army = _armies_lookup(state, atk_r)
         side_v = pc['attacker_side']
+        army = _battle_army(state, atk_r, side_v, pc)
         if army:
             own = [u for u in army.units
                    if _side_of_nation(u.nation) == side_v]
@@ -6696,27 +7331,28 @@ def _get_pending_combat_actions(state: GameState) -> List[Action]:
             n_naz = (sum(1 for l in army.leaders
                          if isinstance(l, Nazgul))
                      if side_v == Side.SHADOW else 0)
-            # review P2 (2026-07-27): board minions carry no 'immobile'
-            # attr (only the off-board template does), so the old
-            # getattr check was dead AND a redundant `or any(...)`
-            # clause re-admitted every non-Nazgul anyway.  Saruman is
-            # the one immobile figure — exclude him by identity.
+            # Board minions carry no 'immobile' attr; Saruman is the one
+            # immobile figure - exclude him by identity (review P2
+            # 2026-07-27).
             has_pl = any(
                 not isinstance(l, Nazgul)
                 and not game_logic._is_saruman(l)
                 for l in army.leaders)
+            # LA-8: per-count leader variants on a partial advance
+            _n_pl_v9 = sum(1 for l in army.leaders
+                           if not isinstance(l, Nazgul)
+                           and not game_logic._is_saruman(l)
+                           and game_logic._leader_side(l) == side_v)
             _stag = 'fp' if side_v == Side.FREE_PEOPLES else 'sh'
             for mr in range(n_r + 1):
                 for me in range(n_e + 1):
                     if mr + me == 0:
                         continue
-                    # USER RULING 2026-07-27 (supersedes the same-day
-                    # C1 menu cap): the advance MAY overstack — the
-                    # relief example: 10 attackers may all advance
-                    # into a 5-unit garrison (15) and then TRIM to 10
-                    # as the learned decision (excess to
-                    # reinforcements), or advance fewer.  The
-                    # victor_advance EXECUTOR registers + resolves.
+                    # USER RULING 2026-07-27: the advance MAY overstack
+                    # (e.g. 10 attackers into a 5-unit garrison) and then
+                    # TRIM as the learned decision (excess to
+                    # reinforcements); the victor_advance EXECUTOR
+                    # registers + resolves.
                     full = (mr + me == n_r + n_e)
                     if has_pl:
                         tl_opts = [True] if full else [True, False]
@@ -6733,16 +7369,29 @@ def _get_pending_combat_actions(state: GameState) -> List[Action]:
                                 die_idx=-1,
                                 action_type='victor_advance',
                                 params=prm))
+                        # LA-8 (rulebook 2437-2441): on a partial
+                        # advance each Leader may advance or stay -
+                        # per-count variants between all and none
+                        if has_pl and not full and _n_pl_v9 > 1:
+                            for _nl9 in range(1, _n_pl_v9):
+                                prm = {'from': atk_r, 'to': def_r,
+                                       'n_regular': mr, 'n_elite': me,
+                                       'take_leaders': True,
+                                       'n_leaders': _nl9, 'side': _stag}
+                                if n_naz:
+                                    prm['n_nazgul'] = nz
+                                actions.append(Action(
+                                    die_idx=-1,
+                                    action_type='victor_advance',
+                                    params=prm))
         actions.append(Action(die_idx=-1, action_type='victor_stay',
                               params={}))
 
     elif phase == 'attacker_siege_decision':
-        # USER AUDIT 2026-07-08: paying an attack die and then choosing
-        # 'siege_continue' (do nothing) is a die burned for nothing —
-        # skip-in-disguise.  In SELF-PLAY the only continuation is the
-        # assault; 'maintaining' a siege costs no die (just don't act).
-        # The TEACHER keeps siege_continue: logs contain attack drags
-        # with no rolls after them, which it consumes gracefully.
+        # USER AUDIT 2026-07-08: in SELF-PLAY the only continuation is the
+        # assault ('siege_continue' = a die burned for nothing;
+        # maintaining a siege costs no die).  The TEACHER keeps
+        # siege_continue for logged attack drags with no rolls after them.
         actions.append(Action(die_idx=-1, action_type='siege_assault', params={}))
 
     elif phase == 'combat_round_result':
@@ -6750,8 +7399,7 @@ def _get_pending_combat_actions(state: GameState) -> List[Action]:
         # or stop after the round. The co-located siege entry holds BOTH
         # sides' units — only ATTACKER-side elites enable a press.
         _atk_san = sanitize(pc['attacker_region'])
-        atk_army = next((a for k, a in state.armies.items()
-                         if sanitize(k) == _atk_san), None)
+        atk_army = _battle_army(state, _atk_san, pc.get('attacker_side'), pc)
         atk_side_pc = pc.get('attacker_side')
         has_elites = bool(atk_army) and any(
             u.kind == UnitKind.ELITE and (
@@ -6795,33 +7443,11 @@ def _get_pending_combat_actions(state: GameState) -> List[Action]:
         actions.extend(_get_combat_card_actions(state, pc))
 
     elif phase == 'casualty_allocation':
-        # POST-ROLL allocation: k = elite downgrades absorbing 1 hit
-        # each; the rest kills regulars first (USER 2026-07-09 — chosen
-        # AFTER the roll, replacing the pre-battle policy coin-flip)
-        stage = pc.get('alloc_stage')
-        if stage == 'attacker':
-            _reg9, _side9 = pc['attacker_region'], pc['attacker_side']
-            _hits9 = int(pc.get('atk_hits', 0) or 0)
-        else:
-            _reg9, _side9 = pc['defender_region'], pc['defender_side']
-            _hits9 = int(pc.get('def_hits', 0) or 0)
-        _n_e = len(_alloc_side_units(state, _reg9, _side9,
-                                     UnitKind.ELITE))
-        # k ranges over the elites regardless of replacement supply
-        # (K6 / USER ruling 2026-08-18): an elite downgraded with no
-        # replacement Regular is ELIMINATED outright, hit absorbed -
-        # a legal allocation, so the menu must carry it.  The executor
-        # (_apply_allocation) resolves the source per downgrade.
-        for k in range(0, min(_hits9, _n_e) + 1):
-            # 'count' = k elite-downgrades (the learned DECISION — consumed
-            # by the executor + encoder + teacher matcher, must stay k).
-            # 'casualties' = total hits actually being allocated: the old
-            # trace only showed count=k, which reads as "0 casualties"
-            # whenever the owner kills regulars instead of downgrading
-            # (USER 2026-07-15 logging bug). Display side reads 'casualties'.
-            actions.append(Action(die_idx=-1,
-                                  action_type='casualty_allocate',
-                                  params={'count': k, 'casualties': _hits9}))
+        stage = pc['alloc_stage']
+        prefix = 'atk' if stage == 'attacker' else 'def'
+        actions.extend(_casualty_operations(
+            state, pc[stage + '_region'], pc[stage + '_side'],
+            int(pc.get(prefix + '_hits', 0) or 0)))
 
     elif phase == 'siege_trim':
         # USER RULING 2026-07-20: withdrawing >5 units into a siege,
@@ -6849,8 +7475,33 @@ def _get_pending_combat_actions(state: GameState) -> List[Action]:
         # Heroic Death: 0=decline / 1=leader / level=companion)
         ec = pc.get('effect_choice') or {}
         cid = ec.get('card_id', '')
+        if ec.get('stage') in ('round', 'onslaught_payment'):
+            options = ec.get('options')
+            if not options:
+                raise RuntimeError('Paused combat round has no legal choices')
+            return [Action(die_idx=-1, action_type='combat_effect_choice',
+                           params={'card_id': cid, **option})
+                    for option in options]
         if ec.get('stage') == 'post':
             counts = list(range(0, int(ec.get('max_count', 0) or 0) + 1))
+        elif ec.get('pairs'):
+            # 1.254: Heroic Death (count, WHICH figure) pairs
+            counts = []
+            for k, tg in ec['pairs']:
+                _pp9 = {'card_id': cid, 'count': int(k)}
+                if tg is not None:
+                    _pp9['target'] = tg
+                actions.append(Action(
+                    die_idx=-1, action_type='combat_effect_choice',
+                    params=_pp9))
+        elif ec.get('targets'):
+            # 1.254: Words of Power / Black Breath / Blade of
+            # Westernesse - one action per legal figure
+            counts = []
+            for tg in ec['targets']:
+                actions.append(Action(
+                    die_idx=-1, action_type='combat_effect_choice',
+                    params={'card_id': cid, 'target': tg}))
         else:
             counts = list(ec.get('counts') or [0])
         for k in counts:
@@ -6881,26 +7532,36 @@ def _get_retreat_actions(state: GameState, pc: dict, defending: bool) -> List[Ac
 
     _foe = (Side.SHADOW if retreat_side == Side.FREE_PEOPLES
             else Side.FREE_PEOPLES)
-    # USER RULING 2026-07-27 (supersedes the same-day C2 menu ban):
-    # a retreat MAY overstack the destination — the excess is resolved
-    # ONCE THE MOVE ENDS as the learned trim decision (excess to
-    # reinforcements, same decision as stronghold overstacking).  The
-    # combat_retreat EXECUTOR registers + resolves the overstack.
+    _bs253 = getattr(state, 'besieged_strongholds', set())
+    # USER RULING 2026-07-27: a retreat MAY overstack the destination -
+    # the excess resolves ONCE THE MOVE ENDS as the learned trim
+    # decision (the combat_retreat EXECUTOR registers + resolves).
     # Find adjacent regions the retreating army can move to
     for nb_key in state.board.adjacent(sanitize(retreat_region)):
         nb_army = _armies_lookup(state, nb_key)
+        # Ruling 1.253 (USER 2026-08-29): an enemy stronghold the
+        # retreating side is itself BESIEGING is a free region for it
+        # (rulebook 913-916) - the walled-in garrison does not bar the
+        # retreat; the garrison's own side can never retreat through
+        # the siege lines (relief is an attack, never a retreat).
+        _my_siege9 = (
+            sanitize(nb_key) in _bs253
+            and _stronghold_controller(state, nb_key) == _foe
+            and nb_army is not None
+            and any(_side_of_nation(u.nation) == retreat_side
+                    for u in nb_army.units))
         # Can retreat to: empty region, or friendly region (never into a
-        # region holding ANY enemy unit)
-        if nb_army and nb_army.units:
+        # region holding ANY enemy unit - except the walled-in garrison
+        # of the retreating side's own siege, 1.253)
+        if nb_army and nb_army.units and not _my_siege9:
             if any(_side_of_nation(u.nation) == _foe
                    for u in nb_army.units):
                 continue  # Can't retreat into enemy-occupied region
         # USER 2026-07-15: cannot retreat into an enemy-CONTROLLED
-        # settlement — captured OR the enemy's native town/city/stronghold
-        # — even when empty of units (the old check only caught the
-        # enemy_controlled CAPTURED set, so retreats into an uncaptured
-        # Shadow stronghold/city/town slipped through).
-        if _settlement_controller(state, nb_key) == _foe:
+        # settlement - captured OR the enemy's native town/city/
+        # stronghold - even when empty of units.
+        if _settlement_controller(state, nb_key) == _foe \
+                and not _my_siege9:
             continue
         actions.append(Action(
             die_idx=-1,
@@ -6981,16 +7642,14 @@ def _get_elven_ring_actions(state: GameState, side: Side) -> List[Action]:
 
     dice_pool = state.dice.get(side, [])
     # All possible faces (excluding constraints per side)
-    all_faces = [ActionDieFace.CHARACTER, ActionDieFace.ARMY,
+    all_faces = [ActionDieFace.CHARACTER,
                  ActionDieFace.MUSTER, ActionDieFace.EVENT,
                  ActionDieFace.MUSTER_ARMY]
     if side == Side.SHADOW:
-        all_faces.append(ActionDieFace.EYE)
-    # F-4 (fuzz seed 9317, 2026-07-20): the old `side != FP` branch
-    # appended WILL_OF_WEST to the SHADOW menu — Shadow ringed a die
-    # into Will of the West and spent it as a wild. The ring may NEVER
-    # produce Will of the West (rulebook: any result except Will), and
-    # Will is not a Shadow face at all. No side gets it.
+        all_faces.extend([ActionDieFace.ARMY, ActionDieFace.EYE])
+    # F-4 (2026-07-20): the ring may NEVER produce Will of the West
+    # (rulebook: any result except Will), and Will is not a Shadow face
+    # at all - no side gets it.
 
     for i, die in enumerate(dice_pool):
         if die.used or die.current is None:
@@ -7016,9 +7675,9 @@ def _get_event_actions(state: GameState, side: Side, die_idx: int,
                        effect_memo: Optional[Dict] = None) -> List[Action]:
     """Enumerate event die actions: draw card or play event."""
     actions = []
-    # NOTE: drawing at the 6-card hand limit IS legal (rulebook: draw,
-    # then immediately discard down) — the discard is a learned decision
-    # via pending_discard. The old early-return here blocked legal draws.
+    # Drawing at the 6-card hand limit IS legal (rulebook: draw, then
+    # discard down) - the discard is a learned decision via
+    # pending_discard.
 
     # Draw a card — check actual deck lists (initialized via initialize_decks)
     if side == Side.FREE_PEOPLES:
@@ -7133,44 +7792,23 @@ def get_legal_actions(state: GameState, side: Side) -> List[Action]:
 
     Returns a list of Action objects that can be passed to apply_action().
     """
-    # (Declaration and reveal phases removed — using auto-declare/auto-reveal)
-
-    # --- Pending multi-phase states (combat, hunt, guide) ---
     if state.pending_combat is not None:
+        _ds9 = state.pending_combat.get('deciding_side')
+        if _ds9 is not None and side is not None and (_ds9 != side):
+            return []
         return _get_pending_combat_actions(state)
-
-    # guide choice BEFORE hunt options: mid-hunt guide ties (e.g. a
-    # sacrifice leaves Merry+Pippin) must resolve first — the new
-    # guide's ability determines the remaining hunt options
     if state.pending_guide_change is not None:
-        return [Action(die_idx=-1, action_type='choose_guide',
-                       params={'companion': name})
-                for name in state.pending_guide_change['candidates']]
-
+        if side != Side.FREE_PEOPLES:
+            return []
+        return [Action(die_idx=-1, action_type='choose_guide', params={'companion': name, 'side': 'fp'}) for name in state.pending_guide_change['candidates']]
     if state.pending_hunt is not None:
         return _get_pending_hunt_actions(state)
-
-    # --- Hunt-reveal placement (USER RULING 2026-08-16: LEARNED FP
-    # decision).  Reachable only after the reveal's damage fully
-    # settled AND open_reveal_placement left a real choice open (the
-    # forced cases resolve at the settle point and clear the flag).
-    # Branch position mirrors _pending_decision_side EXACTLY. ---
-    if getattr(state, '_reveal_place_due', False) \
-            and not getattr(state, '_pending_hunt_damage', 0):
+    if getattr(state, '_reveal_place_due', False) and (not game_logic._reveal_hunt_pending(state)):
         _rp_acts9 = _get_reveal_placement_actions(state)
         if _rp_acts9:
             return _rp_acts9
-
-    # --- Hand-limit discard (learned decision: which card to give up) ---
     _pd = getattr(state, 'pending_discard', None)
-    if _pd is not None and side == _pd['side']:
-        # The discard belongs to the hand's OWNER only.  A wrong-side
-        # ask FALLS THROUGH to the asker's own menu (B6 2026-08-24:
-        # the turn-start coexistence - one side over the hand limit
-        # while the other side's declare phase is armed - is
-        # legitimate, turn order D2-D4).  The wrong side never
-        # RECEIVES discard_card actions, and describe_pending still
-        # routes the discard to its owner first.
+    if _pd is not None and side == _pd['side'] and (_pending_option_owner(state) is not _pd['side']):
         _d_side = _pd['side']
         _d_tag = 'fp' if _d_side == Side.FREE_PEOPLES else 'sh'
         _seen = set()
@@ -7178,73 +7816,46 @@ def get_legal_actions(state: GameState, side: Side) -> List[Action]:
         for c in state.hands[_d_side].hand:
             if c not in _seen:
                 _seen.add(c)
-                _acts.append(Action(die_idx=-1, action_type='discard_card',
-                                    params={'card_id': c, 'side': _d_tag}))
+                _acts.append(Action(die_idx=-1, action_type='discard_card', params={'card_id': c, 'side': _d_tag}))
         if _acts:
             return _acts
-        state.pending_discard = None  # Empty hand — nothing to discard
-
-    # --- Fellowship declaration phase (FP, start of turn) ---
+        state.pending_discard = None
     if getattr(state, '_declare_phase', False):
         _decl = _get_declare_actions(state, allow_in_place=True)
         _decl.append(Action(die_idx=-1, action_type='pass', params={}))
         return _decl
-
-    # --- Eye allocation phase (Shadow pre-roll) ---
     if getattr(state, '_eye_allocation_phase', False):
-        # Rulebook p.17 sidebar: the maximum is the number of Companions
-        # currently in the Fellowship (Ring-bearers do not count), and
-        # 'the Shadow player may always place at least one die in the
-        # Hunt Box, even if all the Companions have left'.  At least 1
-        # is REQUIRED if the FP retrieved a die from the Hunt Box.
-        # 1.134 (USER QA): the old 'p.39 Mordor exception' lifting the
-        # cap on the Mordor track was an INVENTION - no such rule
-        # exists; TD self-play exploited it (7 eyes vs 3 companions)
-        # into a degenerate zero-VP hunt-camp strategy.
         n_companions = len(state.fellowship.companions)
         unused = len([d for d in state.dice.get(Side.SHADOW, []) if not d.used])
         max_eyes = min(max(n_companions, 1), unused)
         min_eyes = 1 if getattr(state, '_fp_used_hunt_box_last_turn', False) else 0
         min_eyes = min(min_eyes, max_eyes)
-        return [Action(die_idx=-1, action_type='eye_allocate',
-                       params={'count': n})
-                for n in range(min_eyes, max_eyes + 1)]
-
-    # --- Card-granted FOLLOW-UP army action (USER audit 2026-07-08:
-    # Ringwraiths Are Abroad / Black Captain Commands grant a free
-    # move/attack afterwards — 'the whole purpose of the card') ---
+        return [Action(die_idx=-1, action_type='eye_allocate', params={'count': n}) for n in range(min_eyes, max_eyes + 1)]
     _pcf = getattr(state, 'pending_card_followup', None)
     if _pcf is not None:
         _f_side = Side.FREE_PEOPLES if _pcf['side'] == 'fp' else Side.SHADOW
         if side != _f_side:
-            raise RuntimeError(
-                f"pending_card_followup belongs to {_f_side.name}, "
-                f"but {side.name} was asked for legal actions")
+            raise RuntimeError(f'pending_card_followup belongs to {_f_side.name}, but {side.name} was asked for legal actions')
         acts_f = []
         _needs_wk = _pcf['kind'] == 'wk_army'
         from game_state import Nazgul as _NazF
         for _k, _a in state.armies.items():
             if not _a.units:
                 continue
-            if not any(_side_of_nation(u.nation) == _f_side
-                       for u in _a.units):
+            if not any((_side_of_nation(u.nation) == _f_side for u in _a.units)):
                 continue
-            if _needs_wk and not any(
-                    game_logic.is_nazgul_figure(l)
-                    and not isinstance(l, _NazF)
-                    for l in _a.leaders):
-                # QA 2026-07-11 (BCC C6): the engine WK is named 'Witch
-                # King' - the exact-name gate made the follow-up
-                # unreachable; match the WK Minion via the shared helper
+            if _needs_wk and (not any((game_logic.is_nazgul_figure(l) and (not isinstance(l, _NazF)) for l in _a.leaders))):
                 continue
-            if not _needs_wk and not any(
-                    game_logic.is_nazgul_figure(l) for l in _a.leaders):
-                # QA 2026-07-11 (RWA C9): the WK Minion counts too
+            if not _needs_wk and (not any((game_logic.is_nazgul_figure(l) for l in _a.leaders))):
                 continue
             if sanitize(_k) in _pcf.get('exclude', ()):
                 continue
             for _mv in _get_army_move_actions(state, _f_side, -1):
                 if sanitize(str(_mv.params.get('from'))) == sanitize(_k):
+                    from army_move_participants import selected, card_followup_qualifies
+                    _border = _border_pred9(state, _a.units, _a.leaders, _f_side, _mv.params['to'])
+                    if not card_followup_qualifies(selected(_a, _f_side, _mv.params, _border), _pcf['kind']):
+                        continue
                     _mv.params['card_followup'] = True
                     acts_f.append(_mv)
             if not _pcf.get('moved_any'):
@@ -7253,230 +7864,156 @@ def get_legal_actions(state: GameState, side: Side) -> List[Action]:
                         _at2.params['card_followup'] = True
                         _at2.params['followup_attack'] = True
                         acts_f.append(_at2)
-        acts_f.append(Action(die_idx=-1, action_type='followup_done',
-                             params={}))
+        acts_f.append(Action(die_idx=-1, action_type='followup_done', params={}))
         return acts_f
-
-    # --- Pending card-option decision (deferred optioned event card) ---
     _pco = getattr(state, 'pending_card_option', None)
     if _pco is not None:
-        _o_side = (Side.FREE_PEOPLES
-                   if _pco.get('decider', _pco['side']) == 'fp'
-                   else Side.SHADOW)
+        _o_side = Side.FREE_PEOPLES if _pco.get('decider', _pco['side']) == 'fp' else Side.SHADOW
         if side != _o_side:
-            # owner-guard (2026-07-10, same class as the discard guard):
-            # the option choice belongs to the card's player — a
-            # wrong-side ask means a routing bug upstream, and the
-            # wrong net would pick the option / the trajectory sample
-            # would be attributed to the wrong side.
-            raise RuntimeError(
-                f"pending_card_option ({_pco.get('card_name')}) belongs"
-                f" to {_o_side.name}, but {side.name} was asked for "
-                f"legal actions")
-        return [Action(die_idx=-1, action_type='card_option',
-                       params={'idx': i, 'card_id': _pco['card_id'],
-                               'card_name': _pco['card_name'],
-                               'side': _pco['side'], 'choices': opt})
-                for i, opt in enumerate(_pco['options'])]
-
-    # --- Pending Army die double-move (second move) ---
-    # F-2 guard (USER 2026-07-19): the chain belongs to the side that
-    # spent the die — never offer the leftover second half to the
-    # opponent (pre-guard, a chain surviving a turn boundary handed
-    # Shadow's second army move to Free Peoples).
-    if (state.pending_army_move_die is not None
-            and state.pending_army_move_side in (None, side)):
-        actions = _get_army_move_actions(
-            state, side, state.pending_army_move_die,
-            exclude_from=state.pending_army_move_from)
-        # Can always end the double-move early (pass consumes the die)
-        actions.append(Action(
-            die_idx=state.pending_army_move_die,
-            action_type='pass',
-            params={}
-        ))
+            raise RuntimeError(f"pending_card_option ({_pco.get('card_name')}) belongs to {_o_side.name}, but {side.name} was asked for legal actions")
+        _choice_options = _table_kill_payment_options(state) if _pco.get('table_kill_payment') else _pco['options']
+        return [Action(die_idx=-1, action_type='card_option', params={'idx': i, 'card_id': _pco['card_id'], 'card_name': _pco['card_name'], 'side': _pco['side'], 'choices': opt, **({'source_card_id': _pco['source_card_id'], 'deck': _pco['deck']} if _pco.get('gandalf_draw') else {})}) for i, opt in enumerate(_choice_options)]
+    if state.pending_army_move_die is not None and state.pending_army_move_side in (None, side):
+        actions = _get_army_move_actions(state, side, state.pending_army_move_die, exclude_from=state.pending_army_move_from)
+        actions.append(Action(die_idx=state.pending_army_move_die, action_type='pass', params={}))
         return actions
-
-    # --- Pending Muster die double-recruit (second recruit) ---
-    # F-2 guard: same ownership rule as the army-move chain above.
-    if (state.pending_muster_die is not None
-            and getattr(state, 'pending_muster_side', None) in (None, side)):
-        # Per rulebook p.26: valid combos are 2 regulars, 2 leaders/nazgul,
-        # or 1 regular + 1 leader. All three allow any second type.
-        # Second figure must be in a DIFFERENT settlement.
-        actions = _get_recruit_actions(
-            state, side, state.pending_muster_die,
-            allowed_types=['regular', 'leader'],
-            exclude_region=state.pending_muster_region)
-        actions.append(Action(
-            die_idx=state.pending_muster_die,
-            action_type='pass',
-            params={}
-        ))
+    if state.pending_muster_die is not None and getattr(state, 'pending_muster_side', None) in (None, side):
+        actions = _get_recruit_actions(state, side, state.pending_muster_die, allowed_types=['regular', 'leader'], exclude_region=state.pending_muster_region)
+        actions.append(Action(die_idx=state.pending_muster_die, action_type='pass', params={}))
         return actions
-
-    # --- Normal action generation ---
     actions = []
+    _move_templates = {}
+    _mouth_can_stamp = side == Side.SHADOW and state.mouth_of_sauron is not None and state.mouth_of_sauron.in_play and (not getattr(state, 'sh_mouth_muster_used_this_turn', False))
+
+    def _moves_for_die(state, side, die_idx, require_leader=False, exclude_from=None):
+        key = (side, require_leader, exclude_from)
+        if key in _move_templates:
+                templates = _move_templates[key]
+                return [Action(die_idx=die_idx, action_type=a.action_type, params=dict(a.params)) for a in templates]
+        actions = _get_army_move_actions(state, side, die_idx, require_leader=require_leader, exclude_from=exclude_from)
+        _move_templates[key] = [Action(a.die_idx, a.action_type, dict(a.params)) for a in actions] if _mouth_can_stamp else actions
+        return actions
     unused_dice = _get_unused_dice(state, side)
-
-    # Deduplicate: only generate actions once per unique face
     faces_seen: Set[ActionDieFace] = set()
-    # Shared across faces: event-card dry-run results (state is constant
-    # for the whole enumeration; the Event face and a card's matching
-    # face would otherwise dry-run the same card twice)
     effect_memo: Dict = {}
-
-    # A7 (USER ruling 2026-08-19): while an Elven-Ring legality waiver
-    # is up, the dice it permits may fund ANY of the four ordinary
-    # action categories.  Without this the ring is paid and buys
-    # NOTHING - the menu would still refuse the move the human paid for,
-    # which is the very symptom (USER live C2).  'special' is excluded
-    # on purpose: it is granted only by Will of the West, and the ring
-    # may never produce Will of the West.
     import game_logic as _gl7m
     _ring_waived = _gl7m.ring_waiver_active(state, side)
-    _WAIVED_CATS = frozenset(('character', 'army', 'muster', 'event'))
-
     for die_idx, die in unused_dice:
         face = die.current
-        if face in faces_seen:
+        if face in faces_seen and (not _ring_waived):
             continue
         faces_seen.add(face)
-
         allowed = _die_faces_for_action(face)
-        if _ring_waived and _gl7m.ring_waiver_permits(side, face):
-            allowed = set(allowed) | _WAIVED_CATS
-
+        if _ring_waived:
+            allowed = set(allowed) | _ring_waived_categories(state, side, face)
         if 'army' in allowed:
-            # Army die: 2 moves (pending) or 1 attack
-            actions.extend(_get_army_move_actions(state, side, die_idx))
+            actions.extend(_moves_for_die(state, side, die_idx))
             actions.extend(_get_army_attack_actions(state, side, die_idx))
-            # Army die can play Army event cards
-            actions.extend(_get_play_event_for_die(state, side, die_idx,
-                                                   'army', effect_memo))
-
+            if 'event' not in allowed:
+                actions.extend(_get_play_event_for_die(state, side, die_idx, 'army', effect_memo))
         if 'muster' in allowed:
-            # Muster die: advance political, or recruit (2 units), or elite upgrade
             actions.extend(_get_political_advance_actions(state, side, die_idx))
             actions.extend(_get_recruit_actions(state, side, die_idx))
             actions.extend(_get_muster_elite_actions(state, side, die_idx))
             if side == Side.SHADOW:
+                actions.extend(_get_saruman_muster_actions(state, die_idx))
                 actions.extend(_get_muster_minion_actions(state, die_idx))
-            # Muster die can play Muster event cards
-            actions.extend(_get_play_event_for_die(state, side, die_idx,
-                                                   'muster', effect_memo))
-            # Mouth of Sauron ability (user ruling 2026-07-03): once per
-            # turn, while the Mouth is in play, Shadow may use a plain
-            # Muster die as an Army die (army move pair / attack).
-            if (side == Side.SHADOW and 'army' not in allowed
-                    and state.mouth_of_sauron is not None
-                    and state.mouth_of_sauron.in_play
-                    and not getattr(state,
-                                    'sh_mouth_muster_used_this_turn',
-                                    False)):
-                mouth_actions = (
-                    _get_army_move_actions(state, side, die_idx)
-                    + _get_army_attack_actions(state, side, die_idx))
+            if 'event' not in allowed:
+                actions.extend(_get_play_event_for_die(state, side, die_idx, 'muster', effect_memo))
+            if side == Side.SHADOW and 'army' not in allowed and (state.mouth_of_sauron is not None) and state.mouth_of_sauron.in_play and (not getattr(state, 'sh_mouth_muster_used_this_turn', False)):
+                mouth_actions = _moves_for_die(state, side, die_idx) + _get_army_attack_actions(state, side, die_idx)
+                if 'event' not in allowed:
+                    mouth_actions.extend(_get_play_event_for_die(state, side, die_idx, 'army', effect_memo))
                 for a in mouth_actions:
                     a.params['mouth_muster'] = True
                 actions.extend(mouth_actions)
-
-        # 1.149: table-card kills ride ANY action die (the Palantír
-        # variant self-gates on WotW face / available Elven Ring)
-        actions.extend(_get_table_kill_actions(state, side, die_idx,
-                                               face))
-
-        # Legolas/Gimli/Boromir: any die musters their nation from its
-        # stronghold (skip when a muster die already generated the action)
-        if side == Side.FREE_PEOPLES and 'muster' not in allowed:
-            actions.extend(_get_companion_muster_advances(state, die_idx))
-
+        actions.extend(_get_table_kill_actions(state, side, die_idx, face))
+        if side == Side.FREE_PEOPLES:
+            _cab9 = _get_companion_muster_advances(state, die_idx)
+            if _cab9 and 'muster' in allowed and (not _tp_on_table(state)):
+                _plain9 = {a.params.get('nation') for a in actions if a.die_idx == die_idx and a.action_type == 'advance_political' and (not a.params.get('companion_ability'))}
+                _cab9 = [a for a in _cab9 if a.params.get('nation') not in _plain9]
+            actions.extend(_cab9)
         if 'character' in allowed:
             if side == Side.FREE_PEOPLES:
                 actions.extend(_get_fellowship_actions(state, die_idx))
                 actions.extend(_get_companion_separate_actions(state, die_idx))
-                # FP Character die: move separated Companions (rulebook p.20)
                 actions.extend(_get_companion_move_actions(state, die_idx))
             else:
-                # Shadow Character die: move Nazgul anywhere (rulebook p.20)
                 actions.extend(_get_nazgul_move_actions(state, die_idx))
                 actions.extend(_get_mouth_move_actions(state, die_idx))
-            # Character die: move ONE army with leader, or attack with leader
-            if 'army' not in allowed:  # Avoid re-enumerating if army already done
-                actions.extend(_get_army_move_actions(
-                    state, side, die_idx, require_leader=True))
-                actions.extend(_get_army_attack_actions(
-                    state, side, die_idx, require_leader=True))
-            # Character die: play Character/Army/Muster event cards
-            if 'event' not in allowed:  # Avoid duplicates
-                actions.extend(_get_play_event_for_die(
-                    state, side, die_idx, 'character', effect_memo))
-
+            if 'army' not in allowed:
+                actions.extend(_moves_for_die(state, side, die_idx, require_leader=True))
+                actions.extend(_get_army_attack_actions(state, side, die_idx, require_leader=True))
+            if 'event' not in allowed:
+                actions.extend(_get_play_event_for_die(state, side, die_idx, 'character', effect_memo))
         if 'event' in allowed:
-            actions.extend(_get_event_actions(state, side, die_idx,
-                                              effect_memo))
-
+            actions.extend(_get_event_actions(state, side, die_idx, effect_memo))
         if 'special' in allowed:
             actions.extend(_get_special_actions(state, side, die_idx))
-            # ('special' is granted only by WILL_OF_WEST, an FP-only
-            # face; Shadow minion musters ride the 'muster' branch.)
-
-    # Fellowship declaration removed from action resolution --
-    # per rulebook, declaration happens during Fellowship Phase (Phase 2)
-    # at the START of a turn, before dice are rolled.  Handled separately
-    # in the turn loop via _fellowship_phase_declare().
-
-    # Strider's Guide ability: hide the Fellowship using ANY Action die
-    # result (not just Character)
-    if (side == Side.FREE_PEOPLES and not state.fellowship.hidden
-            and state.fellowship.guide is not None
-            and 'Strider' in getattr(state.fellowship.guide, 'name', '')):
+    if side == Side.FREE_PEOPLES and (not state.fellowship.hidden) and (state.fellowship.guide is not None) and ('Strider' in getattr(state.fellowship.guide, 'name', '')):
         seen_hide_faces = set()
         for die_idx2, die2 in unused_dice:
-            if die2.current in (ActionDieFace.CHARACTER,
-                                ActionDieFace.WILL_OF_WEST):
-                continue  # Character/WoW hide already generated
+            if die2.current in (ActionDieFace.CHARACTER, ActionDieFace.WILL_OF_WEST):
+                continue
             if die2.current in seen_hide_faces:
                 continue
             seen_hide_faces.add(die2.current)
-            actions.append(Action(
-                die_idx=die_idx2,
-                action_type='fellowship_hide',
-                params={'strider_ability': True}
-            ))
-
-    # Elven ring (free action, no die consumed — changes an existing die face)
+            actions.append(Action(die_idx=die_idx2, action_type='fellowship_hide', params={'strider_ability': True}))
     actions.extend(_get_elven_ring_actions(state, side))
-
-    # USER RULE 2026-07-08: 'skip' (burn a die for nothing) is REMOVED
-    # from the action space — humans never kill dice for no reason; any
-    # parser detection of a skip is likely a mistake.  (The executor
-    # branch remains for legacy traces; nothing generates it.)
-
-    # Action tokens + Dwarven rings (bid compensation; user ruling
-    # 2026-07-03 — free actions outside the dice)
     actions.extend(_get_token_actions(state, side))
     actions.extend(_get_dwarven_ring_actions(state, side))
-
-    # Pass: do nothing, don't consume a die — legal when you hold FEWER
-    # unused ACTION DICE than the opponent (printed rule counts dice).
-    # AMENDMENT 1.223 (USER 2026-07-28): the pass-eligibility comparison
-    # is DICE-ONLY.  The old token-inflated totals (2026-07-03 token
-    # ruling) wrongly suppressed 313 real human tempo passes in the t138
-    # pilot ("token-equalized" misclassified as table courtesy).  Tokens
-    # still grant their extra turn-order actions elsewhere; they no
-    # longer block a pass.
+    # 1.272 (USER 2026-09-10, verbatim): "if the decks are empty, and the
+    # player only has palantirs and nothing playable, allow the option to
+    # kill the die for no benefit".  Rulebook 1678-1680 (discard a die
+    # without effect) restored in exactly this situation; ruling 1.67 (no
+    # voluntary die kill) stands everywhere else.  Conditions: every unused
+    # die of this side shows the Event face (a Will of the West die is
+    # usable -> no row); both of this side's decks are empty; the die has
+    # no event row (no playable card - a zero-effect play IS playable,
+    # 1.230 - and no deck to draw from).  ONE row for the first unused
+    # Event die (this menu's one-die-per-face dedupe); it re-appears for
+    # the next die once this one is spent.  Encoding: the existing 'skip'
+    # kind (category pass + SKIP flag + die face); executor: the named die
+    # is spent, nothing else.  selfplay F3: the empty Shadow menu behind
+    # 4,990 Free Peoples passes in one turn.
+    if unused_dice and all(_d9.current == ActionDieFace.EVENT
+                           for _, _d9 in unused_dice):
+        _kd9 = unused_dice[0][0]
+        _kdecks9 = (('fp_char_deck', 'fp_strat_deck')
+                    if side == Side.FREE_PEOPLES
+                    else ('sh_char_deck', 'sh_strat_deck'))
+        if (not any(getattr(state, _n9, None) for _n9 in _kdecks9)
+                and not _get_event_actions(state, side, _kd9, effect_memo)):
+            actions.append(Action(
+                die_idx=_kd9, action_type='skip',
+                params={'face': 'EVENT',
+                        'side': 'fp' if side == Side.FREE_PEOPLES
+                        else 'sh'}))
     other_side = Side.SHADOW if side == Side.FREE_PEOPLES else Side.FREE_PEOPLES
     my_unused = len(unused_dice)
-    other_unused = sum(1 for d in state.dice.get(other_side, [])
-                       if not d.used and d.current is not None)
-    if my_unused > 0 and my_unused < other_unused:
-        actions.append(Action(
-            die_idx=-1,  # No die consumed
-            action_type='pass',
-            params={}
-        ))
-
+    other_unused = sum((1 for d in state.dice.get(other_side, []) if not d.used and d.current is not None))
+    # MC6: once the opponent has no legal action, this side plays its
+    # remaining actions consecutively. A pass cannot hand control back
+    # to an empty menu forever. Probe a clone because menu generation
+    # can normalize pending state. Recursion stops here: the opponent
+    # has MORE dice, so its inverse fewer-dice condition is false.
+    # (production repair turn_loop_repair_r1, ai.py fc049472 -> 4275899a;
+    # ported onto the pinned static_r4 text by python_sync, 2026-09-10)
+    if (my_unused > 0 and my_unused < other_unused
+            and get_legal_actions(clone_state(state), other_side)):
+        actions.append(Action(die_idx=-1, action_type='pass', params={}))
+    # Rulebook p21 permits discarding an action die without effect. Keep the
+    # AI's no-voluntary-discard policy: expose it only if the complete ordinary
+    # menu is empty, including after a Ring conversion. Pending choices return
+    # above, so missing casualty/card decisions cannot be hidden by this row.
+    if not actions:
+        for dead_idx, dead_die in unused_dice:
+            if dead_die.current != ActionDieFace.EYE:
+                actions.append(Action(dead_idx, 'skip', {
+                    'face': dead_die.current.name,
+                    'side': 'fp' if side == Side.FREE_PEOPLES else 'sh'}))
+                break
     return actions
 
 
@@ -7554,6 +8091,17 @@ def _get_dwarven_ring_actions(state: GameState, side: Side) -> List[Action]:
 # Step 7: Action Application
 # ===================================================================
 
+def get_ai_policy(state: GameState, side: Side):
+    """AI conventions over the full human-legal menu, with forced provenance."""
+    from ai_policies import project_ai_actions
+    return project_ai_actions(state, side, get_legal_actions(state, side))
+
+
+def get_ai_actions(state: GameState, side: Side) -> List[Action]:
+    """Actions available to the AI; get_legal_actions remains human legality."""
+    return list(get_ai_policy(state, side).actions)
+
+
 def apply_action(state: GameState, action: Action) -> GameState:
     """Apply an action to a cloned state and return the new state.
 
@@ -7574,20 +8122,13 @@ def _get_die_face(state: GameState, die_idx: int,
     card-followup army_move whose side's last die showed Army opened a
     phantom free double-move chain (pending_army_move_die=-1).
 
-    If side is provided, looks up in that side's dice pool only.
-    Otherwise falls back to searching both (legacy behavior).
+    side is required (every caller passes it); None -> None.
     """
-    if die_idx is None or die_idx < 0:
+    if die_idx is None or die_idx < 0 or side is None:
         return None
-    if side is not None:
-        dice = state.dice.get(side, [])
-        if die_idx < len(dice):
-            return dice[die_idx].current
-        return None
-    for s in [Side.FREE_PEOPLES, Side.SHADOW]:
-        dice = state.dice.get(s, [])
-        if die_idx < len(dice):
-            return dice[die_idx].current
+    dice = state.dice.get(side, [])
+    if die_idx < len(dice):
+        return dice[die_idx].current
     return None
 
 
@@ -7614,6 +8155,10 @@ def _post_rearguard_transition(state: GameState, pc: dict) -> None:
     - Plain field battle: the first round is fought immediately — there is
       NO pre-round retreat to an adjacent region.
     """
+    if pc.get('attacker_rearguard') is None and not pc.get('rounds_fought', 0):
+        from army_participants import freeze_attack
+        freeze_attack(state, pc)
+
     if pc.get('is_siege'):
         pc['phase'] = 'attacker_siege_decision'
         pc['deciding_side'] = pc['attacker_side']
@@ -7634,28 +8179,65 @@ def _is_siege_battle(state: GameState, defender_region: str) -> bool:
     return meta.get('is_stronghold', False)
 
 
-def _restore_rearguard(state: GameState, pc: dict) -> None:
-    """Restore rearguard units to the attacker's original region after combat.
-
-    Called when combat ends (pending_combat about to be cleared).  The
-    rearguard units are added back to whatever army exists in the
-    attacker's region, or a new army is created there.
-    """
-    rearguard_units = pc.get('rearguard_units')
-    if not rearguard_units:
-        return
-    atk_region = pc['attacker_region']
-    atk_army = _armies_lookup(state, atk_region)
-    if atk_army is None:
-        # Army may have been fully destroyed or moved -- create a fresh one
-        region_obj = state.board.region(sanitize(atk_region))
-        atk_army = Army(region=region_obj, units=[], leaders=[])
-        state.armies[atk_region] = atk_army
-    atk_army.units.extend(rearguard_units)
-    # Also restore any rearguard leaders
-    rearguard_leaders = pc.get('rearguard_leaders', [])
-    if rearguard_leaders:
-        atk_army.leaders.extend(rearguard_leaders)
+def _begin_siege(state: GameState, pc: dict) -> None:
+    """BL-83 (shgame10 E2): ONE body for establishing a siege - the
+    besieged flag AND the p.31 attacker move-in (the siege is
+    maintained by the CO-LOCATED besieger; the engine's from==to
+    assault model depends on it).  retreat_into_siege had the
+    move-in (iter 36 + BL-55 hardening); siege_continue set only the
+    flag, so the attacker stayed adjacent - engine and client agreed
+    on the rules-wrong state (Helm's Deep: assault offered from the
+    ADJACENT region, entry only at victor_advance).  Idempotent when
+    the attacker is already co-located (Corsairs of Umbar lands the
+    attacker inside before the withdrawal)."""
+    if not hasattr(state, 'besieged_strongholds'):
+        state.besieged_strongholds = set()
+    def_san = sanitize(pc['defender_region'])
+    state.besieged_strongholds.add(def_san)
+    if sanitize(pc['attacker_region']) != def_san:
+        try:
+            # BL-55: side= makes the executor's whole-stack move
+            # own-units-only and the cap siege-aware
+            game_logic.move_army(state, pc['attacker_region'],
+                                 pc['defender_region'],
+                                 side=pc.get('attacker_side'), combat_context=pc)
+            # BL-136(i): the move-in is STAMPED for the live driver (a
+            # human attacker's relocation happens inside the DEFENDER's
+            # apply, where no gesture lane can see it); transient, like
+            # _siege_movein_failed.
+            state._siege_movein = {
+                'from': sanitize(pc['attacker_region']),
+                'to': def_san,
+                'side': getattr(pc.get('attacker_side'), 'name',
+                                str(pc.get('attacker_side')))}
+            pc['attacker_region'] = pc['defender_region']
+        except Exception as _sm55:
+            # BL-55: a rules-mandated move (p.31) must NEVER fail in
+            # silence; the driver alarms on the stamp at the next commit
+            # sweep.
+            print('  [BL-55] SIEGE MOVE-IN FAILED: %r' % _sm55)
+            state._siege_movein_failed = repr(_sm55)[:200]
+    # BL-128 (shgame15 Q5): POST-CONDITION BY STATE, never by
+    # absence-of-exception - a silent no-op (mixed army-key
+    # conventions, a co-located assumption that wasn't) is invisible
+    # to any try/except forever.  The besieger must ACTUALLY stand in
+    # the stronghold region when this returns.
+    try:
+        _atk128 = pc.get('attacker_side')
+        _army128 = next((a for k, a in state.armies.items()
+                         if sanitize(str(k)) == def_san), None)
+        _ok128 = _army128 is not None and any(
+            _side_of_nation(u.nation) == _atk128
+            for u in _army128.units)
+        if not _ok128 and getattr(state, '_siege_movein_failed',
+                                  None) is None:
+            print('  [BL-128] SIEGE MOVE-IN POST-CONDITION FAILED: '
+                  'no %s units at %s after _begin_siege'
+                  % (getattr(_atk128, 'name', _atk128), def_san))
+            state._siege_movein_failed = (
+                'post-condition: no attacker units at %s' % def_san)
+    except Exception:
+        pass
 
 
 def _maybe_casualty_policy_phase(state: GameState, pc: dict) -> bool:
@@ -7783,15 +8365,14 @@ def _commit_combat_card(state: GameState, pc: dict, role: str,
     # of the same deck type after the round (1.152 ordering).
     if cid is not None and pc.get('rounds_fought', 0) == 0 \
             and cc_side == Side.SHADOW:
-        _wk_here = False
-        for _reg9 in (pc.get('attacker_region'), pc.get('defender_region')):
-            _ar9 = _armies_lookup(state, str(_reg9))
-            if _ar9 and any(
-                    type(l).__name__ == 'Minion'
-                    and 'witch' in str(getattr(l, 'name', '')).lower()
-                    for l in _ar9.leaders):
-                _wk_here = True
-                break
+        from army_participants import partition_battle_army
+        _reg9 = pc['attacker_region' if role == 'atk' else 'defender_region']
+        _units9, _leaders9, _, _ = partition_battle_army(
+            state, _armies_lookup(state, str(_reg9)), _reg9, cc_side, pc)
+        _wk_here = bool(_units9) and any(
+            type(l).__name__ == 'Minion'
+            and 'witch' in str(getattr(l, 'name', '')).lower()
+            for l in _leaders9)
         if _wk_here:
             pc['_wk_sorcerer_deck'] = (game_logic.card_deck_of(cid)
                                        or 'strategy')
@@ -7811,6 +8392,25 @@ _CC_REVEAL_PHASE = 'combat_card_reveal'
 class IllegalPlay(Exception):
     """A play the engine refuses.  The state is untouched when this is
     raised, so the caller may refuse it to the client (undo + notice)."""
+
+
+def _hidden_commit_card(state: GameState, side: Side):
+    """MC2/MC3 ONE predicate: the attacker's committed combat-card id
+    while it is committed and UNREVEALED and `side` is not the
+    committer (USER ruling 2026-08-16 / 1.246: identity hidden, type
+    visible - until the defender's own commit reveals both, rulebook
+    2633); None otherwise.  Unrevealed = the defender has not
+    committed yet (phase 'defender_combat_card') or the commit is a
+    hidden human card (atk_hidden_cc, K1)."""
+    pc = getattr(state, 'pending_combat', None)
+    if not pc:
+        return None
+    cid = pc.get('atk_combat_card')
+    if not cid or pc.get('attacker_side') == side:
+        return None
+    if pc.get('atk_hidden_cc') or pc.get('phase') == 'defender_combat_card':
+        return cid
+    return None
 
 
 def combat_cards_unrevealed(state: GameState) -> List[Side]:
@@ -7953,19 +8553,21 @@ def cancel_hidden_combat_card(state: GameState, side: Side) -> None:
 
 
 def _maybe_combat_effect_choice_phase(state: GameState, pc: dict) -> bool:
-    """Enter the pre-roll combat-card effect-choice phase when a committed
-    card carries a choice-bearing 'Before the Combat roll' effect (Dread
-    and Despair: forfeit K Nazgul leadership; Relentless Assault: K
-    self-hits; Heroic Death: which figure to sacrifice, applied at its
-    printed pre-casualty timing).
+    """Open Words of Power's pre-roll target choice or a legacy teacher menu.
 
-    Returns True if a decision phase was entered (the combat_effect_choice
-    executor stores the count and resumes _run_combat_round). Onslaught is
-    NOT handled here — its choice point is after casualties, deferred via
-    combat.deferred_effect (see _run_combat_round's post-battle handling).
+    Live Dread, Relentless Assault, Mighty Attack and initiative-six choices
+    pause inside the round cursor at their actual timing. The historical
+    FINAL_HITS_HOOK extraction adapter retains its count-only menus here.
+    Onslaught opens separately after ordinary casualties.
     """
     from cards import get_card
-    from combat import combat_effect_kind, setup_combat
+    from combat import (combat_effect_kind, combat_effect_targets,
+                        setup_combat)
+    import combat as _cmbec
+    # TEACHER (log = truth, FINAL_HITS_HOOK set): the logged round is
+    # matched by count only (ai.py matcher) - no target pendings, Heroic
+    # Death keeps its bare-count enumeration
+    _teacher9 = _cmbec.FINAL_HITS_HOOK is not None
     for role in ('atk', 'def'):
         if pc.get(f'{role}_effect_asked'):
             continue
@@ -7979,11 +8581,20 @@ def _maybe_combat_effect_choice_phase(state: GameState, pc: dict) -> bool:
             card = None
         kind = combat_effect_kind(getattr(card, 'combat_name', '') or '') \
             if card else None
+        # Target classification is separate from fixed AI victim policy.
+        # Words of Power still selects its target before the rolls.
+        tkind = _combat_target_kind(card)
+        # Outcome-dependent choices belong to the live round cursor. The
+        # historical extraction adapter retains its explicit count-only path.
+        if not _teacher9 and (kind in ('dread_despair', 'relentless_assault', 'heroic_death')
+                             or tkind in ('black_breath', 'blade_of_westernesse')):
+            continue
         if kind not in ('dread_despair', 'relentless_assault',
-                        'heroic_death'):
+                        'heroic_death') and tkind is None:
             continue
         side = pc['attacker_side'] if role == 'atk' else pc['defender_side']
         counts = None
+        targets = None
         try:
             tmp = setup_combat(state, pc['attacker_region'],
                                pc['defender_region'],
@@ -7991,16 +8602,17 @@ def _maybe_combat_effect_choice_phase(state: GameState, pc: dict) -> bool:
                                attacker_side=pc.get('attacker_side'))
         except Exception:
             continue  # battle setup failed — heuristic fallback applies
+        if kind == 'heroic_death' or tkind is not None:
+            # combat_effect_targets reads the side's committed card
+            _cc9 = card.to_combat_card()
+            if role == 'atk':
+                tmp.attacker_card = _cc9
+            else:
+                tmp.defender_card = _cc9
         if kind == 'dread_despair':
             n = tmp.nazgul_in_battle
-            # USER RULE 2026-07-08: forfeiting reduces the FP roll one die
-            # per point but only DOWN TO A MINIMUM OF 1 — forfeiting more
-            # than (FP dice - 1) is pointless and was offered (count=3 vs
-            # a 2-unit defender).  Cap at the enemy's dice minus one.
-            _enemy = tmp.defender_army if role == 'atk' else tmp.attacker_army
-            from combat import calc_combat_strength as _ccs
-            _cap9 = max(0, _ccs(_enemy) - 1)
-            n = min(n, _cap9)
+            # Historical human choices retain the full legal payment range.
+            # The FP one-die floor does not cap forfeited leadership.
             if n >= 1:
                 counts = list(range(1, n + 1))  # 'forfeit one or more'
         elif kind == 'relentless_assault':
@@ -8008,7 +8620,7 @@ def _maybe_combat_effect_choice_phase(state: GameState, pc: dict) -> bool:
             mx = max(0, min(2, len(army.units) - 1))
             if mx >= 1:
                 counts = list(range(0, mx + 1))
-        elif kind == 'heroic_death':
+        elif kind == 'heroic_death' and _teacher9:
             army = tmp.attacker_army if role == 'atk' else tmp.defender_army
             opts = {0}
             if any(not isinstance(l, (Companion, Nazgul))
@@ -8019,14 +8631,42 @@ def _maybe_combat_effect_choice_phase(state: GameState, pc: dict) -> bool:
                     opts.add(min(3, c.level))
             if len(opts) > 1:
                 counts = sorted(opts)
-        if counts:
-            pc['effect_choice'] = {'stage': 'pre', 'owner': role,
-                                   'effect': kind, 'card_id': cid,
-                                   'counts': counts}
+        elif tkind is not None and not _teacher9:
+            # Black Breath and Blade use the cursor; only Words of Power
+            # reaches this live pre-roll target menu.
+            _tg9 = combat_effect_targets(tmp, role == 'atk')
+            if len(_tg9) > 1:
+                targets = list(_tg9)
+        if counts or targets:
+            ec = {'stage': 'pre', 'owner': role,
+                  'effect': kind or tkind, 'card_id': cid}
+            if counts:
+                ec['counts'] = counts
+            if targets:
+                ec['targets'] = targets
+            pc['effect_choice'] = ec
             pc['phase'] = 'combat_effect_choice'
             pc['deciding_side'] = side
             return True
     return False
+
+
+def _combat_target_kind(card) -> 'Optional[str]':
+    """Classify target-bearing cards independently of the AI's victim policy.
+
+    Words of Power and Black Breath learn their target. Blade retains human
+    target choices but the AI uses its fixed legal victim priority. Heroic
+    Death's target and magnitude are represented by its separate effect kind.
+    """
+    nm = ((getattr(card, 'combat_name', '') or '').strip().lower()
+          if card is not None else '')
+    if 'words of power' in nm:
+        return 'words_of_power'
+    if 'black breath' in nm:
+        return 'black_breath'
+    if 'westernesse' in nm:
+        return 'blade_of_westernesse'
+    return None
 
 
 def _battle_map_companions(combat) -> List[Companion]:
@@ -8073,8 +8713,8 @@ def _extra_combat_card_ok(state, card, combat) -> bool:
         return True
     map_comps = _battle_map_companions(combat)
     if getattr(card, 'requires_hobbit', False):
-        hobbit_names = {"Meriadoc", "Peregrin", "Frodo", "Sam"}
-        if not any(getattr(c, 'name', '') in hobbit_names for c in map_comps):
+        from cards import is_hobbit_identity
+        if not any(is_hobbit_identity(c) for c in map_comps):
             return False
     _req_chars = getattr(card, 'requires_character_in_battle', None)
     if _req_chars:
@@ -8089,12 +8729,10 @@ def _extra_combat_card_ok(state, card, combat) -> bool:
                                           "Bilbo's Song"):
         if not _battle_has_shadow_minion(combat):
             return False
-    # USER catch 2026-07-28 (rarity-audit batch, lorien sieges): a
-    # retreat-effect combat card (Scouts — The Red Arrow / The Spirit
-    # of Mordor / Grimbeorn) is UNPLAYABLE in a siege battle: the
-    # besieged garrison is already withdrawn and has no retreat leg
-    # (the F-5 execution gate already refuses the effect there, so the
-    # play only burned the card).  Menu must mirror the executor.
+    # USER 2026-07-28: a retreat-effect combat card (Scouts / The Red
+    # Arrow / The Spirit of Mordor / Grimbeorn) is UNPLAYABLE in a
+    # siege battle - the besieged garrison has no retreat leg (the F-5
+    # execution gate refuses the effect there).  Menu mirrors executor.
     if getattr(combat, 'is_siege', False):
         _ce9 = (getattr(card, 'combat_effect', '') or '').lower()
         if 'retreat your army' in _ce9:
@@ -8186,11 +8824,9 @@ def _get_combat_card_actions(state: GameState, pc: dict) -> List[Action]:
                             die_idx=-1, action_type='combat_card_play',
                             params=_prm9))
         except Exception as _cce9:
-            # review P2 (2026-07-27): NEVER silent — a throw here made
-            # every legal combat card vanish and forced a decline,
-            # changing game results with no signal.  Menu still
-            # degrades to decline-only (robustness), but the failure is
-            # logged as a HARD invariant.
+            # NEVER silent (review P2 2026-07-27): the menu degrades to
+            # decline-only (robustness) but the failure is logged as a
+            # HARD invariant.
             try:
                 import state_invariants as _si9
                 _si9.VIOLATIONS.append({
@@ -8208,12 +8844,23 @@ def _get_combat_card_actions(state: GameState, pc: dict) -> List[Action]:
     return actions
 
 
-def _alloc_side_units(state, region, side, kind=None):
-    army = _armies_lookup(state, region)
+def _battle_army(state, region, side, pc=None):
+    from army_participants import battle_army_view
+    return battle_army_view(state, _armies_lookup(state, region), region, side, pc)
+
+
+def _alloc_side_units(state, region, side, kind=None, pc=None):
+    army = _battle_army(state, region, side, pc)
     if army is None:
         return []
+    card = getattr(state, 'pending_card_option', None) or {}
+    eligible = None
+    if (card.get('card_casualty') and card.get('cas_side') == side
+            and sanitize(str(card.get('cas_region', ''))) == sanitize(str(region))):
+        eligible = card.get('cas_eligible_nations')
     return [u for u in army.units
             if _side_of_nation(u.nation) == side
+            and (eligible is None or u.nation in eligible)
             and (kind is None or u.kind == kind)]
 
 
@@ -8292,11 +8939,9 @@ def _alloc_choice_exists(state, region, side, hits):
     n_r = len(_alloc_side_units(state, region, side, UnitKind.REGULAR))
     # AUTO-WIPE (USER 2026-07-20 "no decision if everyone dies"): when
     # hits meet/exceed the side's whole absorption capacity (2/elite +
-    # 1/regular) every figure dies regardless of the downgrade split;
-    # under the FP downgrade ruling a doomed-army downgrade only burns
-    # extra pool Regulars. No real choice — caller auto-applies k=0
-    # (minimal loss). SELF-PLAY only: the teacher replays the logged
-    # human composition via apply_casualties_spec.
+    # 1/regular) every figure dies regardless of the split - no real
+    # choice, caller auto-applies k=0.  SELF-PLAY only: the teacher
+    # replays the logged composition via apply_casualties_spec.
     if hits >= 2 * n_e + n_r:
         return False
     if not n_e:
@@ -8311,9 +8956,120 @@ def _alloc_choice_exists(state, region, side, hits):
     return hits >= 2 and n_e >= 2
 
 
+_CASUALTY_COST = {'remove_regular': 1, 'reduce_elite': 1, 'remove_elite': 2}
+
+
+def _casualty_operations(state, region, side, hits):
+    """One explicit, nation-specific loss; subsequent losses remain owner choices."""
+    if hits <= 0:
+        return []
+    roster = {(u.nation, u.kind) for u in _alloc_side_units(state, region, side)}
+    actions = []
+    for nation in ALL_NATIONS:
+        for operation, kind in (('remove_regular', UnitKind.REGULAR),
+                                ('reduce_elite', UnitKind.ELITE),
+                                ('remove_elite', UnitKind.ELITE)):
+            if (nation, kind) in roster and _CASUALTY_COST[operation] <= hits:
+                actions.append(Action(die_idx=-1, action_type='casualty_allocate',
+                                      params={'nation': nation, 'operation': operation,
+                                              'casualties': hits}))
+    return actions
+
+
+def _apply_casualty_operation(state, region, side, hits, params):
+    """Validate before mutation and apply one loss using current physical supply."""
+    operation, nation = params.get('operation'), params.get('nation')
+    if 'count' in params or operation not in _CASUALTY_COST:
+        raise ValueError('Invalid casualty operation; legacy count actions require re-extraction')
+    if not any(a.params['nation'] == nation and a.params['operation'] == operation
+               for a in _casualty_operations(state, region, side, hits)):
+        raise ValueError('Casualty operation exceeds hit budget or participating roster')
+    kind = UnitKind.REGULAR if operation == 'remove_regular' else UnitKind.ELITE
+    unit = next(u for u in _alloc_side_units(state, region, side, kind)
+                if u.nation == nation)
+    army = _armies_lookup(state, region)
+    from combat import _track_fp_casualties, _cas_box_regulars, _dg_stamp
+    source = None
+    if operation == 'reduce_elite':
+        # Operations write casualties immediately. A removed Shadow Regular
+        # is therefore available to a later reduction in this same allocation.
+        source = ('cas' if _cas_box_regulars(state, nation) > 0 else
+                  'pool' if figures_available(state, nation, 'regular') > 0 else None)
+        if source == 'cas':
+            state.fp_casualties[nation]['regular'] -= 1
+        _dg_stamp(state, nation, source)
+        army.units.remove(unit)
+        if source is not None:
+            army.units.append(gs.Unit(nation, UnitKind.REGULAR))
+    else:
+        army.units.remove(unit)
+    if side == Side.FREE_PEOPLES:
+        _track_fp_casualties(state, [unit], side)
+    card_context = getattr(state, 'pending_card_option', None) or {}
+    witness = {'stage': ('card' if card_context.get('card_casualty') else
+                         (getattr(state, 'pending_combat', None) or {}).get('alloc_stage')),
+               'region': region, 'side': side, 'nation': nation,
+               'operation': operation, 'cost': _CASUALTY_COST[operation],
+               'remaining_before': hits, 'replacement_source': source}
+    state._casualty_operations = list(getattr(state, '_casualty_operations', None) or []) + [witness]
+    return _CASUALTY_COST[operation]
+
+
+def _apply_card_casualty_choice(state, params):
+    """Resolve one paid card's casualty operation without replaying its effect."""
+    pc = state.pending_card_option
+    from event_effects import _card_casualty_options, _complete_card_casualty
+    choice = params.get('choices')
+    options = _card_casualty_options(state, pc['cas_region'], pc['cas_side'], pc['cas_hits'])
+    if (params.get('card_id') not in (None, pc['card_id'])
+            or params.get('side') not in (None, pc['side'])
+            or not isinstance(choice, dict) or choice not in options):
+        raise ValueError('Card casualty choice is not available')
+    cost = _apply_casualty_operation(
+        state, pc['cas_region'], pc['cas_side'], pc['cas_hits'],
+        {'nation': choice['nation'], 'operation': choice['casualty_operation']})
+    remaining = _forced_casualty_allocation(
+        state, pc['cas_region'], pc['cas_side'], pc['cas_hits'] - cost)
+    pc['cas_hits'] = remaining
+    if remaining > 0:
+        pc['options'] = _card_casualty_options(
+            state, pc['cas_region'], pc['cas_side'], remaining)
+        return
+    state.pending_card_option = None
+    _complete_card_casualty(state, pc['cas_region'], pc['cas_side'],
+                            {'effects': []}, card_name=pc.get('card_name'))
+
+
+def _forced_casualty_allocation(state, region, side, hits):
+    """Resolve unique operations only; equal final army counts can hide pool choices."""
+    units = _alloc_side_units(state, region, side)
+    capacity = sum(2 if u.kind == UnitKind.ELITE else 1 for u in units)
+    if hits >= capacity and (side == Side.SHADOW or
+                             all(u.kind == UnitKind.REGULAR for u in units)):
+        # These wipes have one full physical outcome, including reserves.
+        # FP Elite wipes remain choices: using a reserve replacement and
+        # then losing it changes the permanent Regular casualty box.
+        for unit in units:
+            operation = ('remove_elite' if unit.kind == UnitKind.ELITE
+                         else 'remove_regular')
+            hits -= _apply_casualty_operation(
+                state, region, side, hits,
+                {'nation': unit.nation, 'operation': operation})
+        return 0
+    while hits > 0:
+        actions = _casualty_operations(state, region, side, hits)
+        if not actions:
+            return 0
+        if len(actions) != 1:
+            break
+        hits -= _apply_casualty_operation(state, region, side, hits, actions[0].params)
+    return hits
+
+
 def _enter_casualty_allocation(state, pc):
     """Advance the post-roll allocation stages; pause on a pending
-    decision when a side has a real choice, auto-apply otherwise."""
+    decision when a side has a real choice, auto-apply otherwise.
+    The attacker removes casualties first (Rulebook p30; Almanac p36)."""
     while True:
         stage = pc.get('alloc_stage')
         if stage == 'defender':
@@ -8324,12 +9080,13 @@ def _enter_casualty_allocation(state, pc):
             hits = int(pc.get('atk_hits', 0) or 0)
         else:
             break
-        if _alloc_choice_exists(state, reg, side, hits):
+        hits = _forced_casualty_allocation(state, reg, side, hits)
+        pc['atk_hits' if stage == 'attacker' else 'def_hits'] = hits
+        if hits > 0:
             pc['phase'] = 'casualty_allocation'
             pc['deciding_side'] = side
             return
-        _apply_allocation(state, reg, side, hits, 0)
-        pc['alloc_stage'] = ('attacker' if stage == 'defender' else None)
+        pc['alloc_stage'] = ('defender' if stage == 'attacker' else None)
     _complete_allocated_round(state, pc)
 
 
@@ -8340,7 +9097,8 @@ def _complete_allocated_round(state, pc):
     post-round transitions."""
     from combat import (_check_settlement_capture, garrison_side_for,
                         reconcile_destroyed_army,
-                        resume_deferred_post_casualty)
+                        resume_deferred_post_casualty,
+                        _wipe_captures_in_place)
     atk_r, def_r = pc['attacker_region'], pc['defender_region']
     atk_s, def_s = pc['attacker_side'], pc['defender_side']
     atk_dead = not _alloc_side_units(state, atk_r, atk_s)
@@ -8348,19 +9106,46 @@ def _complete_allocated_round(state, pc):
     # Phase 9 resumes here on the deferred path: the standalone
     # resolve_combat_round runs it right after Phase-8 casualties; the
     # deferred path reaches that point only once allocation resolved.
-    _p9 = pc.pop('_p9', None) or {}
-    _p9_role = None
-    if (_p9.get('atk_card') or _p9.get('def_card')) \
-            and not (atk_dead and def_dead):
+    # USER RULING 1.254 (audit CB-7): the We-Come-to-Kill / Great-Host
+    # hits against the ENEMY are the enemy OWNER's learned allocation -
+    # deferred out of the resume (defer_post_hits), opened as a
+    # casualty_allocate stage, and this tail RE-ENTERED once it resolves
+    # (_p9_done / _p9_role make the re-entry skip the resume; every
+    # board mutation of an earlier pass is idempotent on the next).
+    _p9 = pc.get('_p9') or {}
+    _p9_role = pc.get('_p9_role')
+    if (not pc.get('_p9_done')
+            and (_p9.get('atk_card') or _p9.get('def_card'))
+            and not (atk_dead and def_dead)):
+        _out9 = {}
         _a_d9, _d_d9, _p9_role = resume_deferred_post_casualty(
             state, atk_r, def_r, atk_s, def_s,
             _p9.get('atk_card'), _p9.get('def_card'),
             _p9.get('atk_cancelled', False),
             _p9.get('def_cancelled', False),
             is_siege=pc.get('is_siege', False),
-            choices={'defer_onslaught': True})
+            choices={'defer_onslaught': True, 'defer_post_hits': True},
+            out=_out9)
+        pc['_p9_done'] = True
+        pc['_p9_role'] = _p9_role
         atk_dead = atk_dead or _a_d9
         def_dead = def_dead or _d_d9
+        _hd9 = (int(_out9.get('post_hits_on_defender', 0) or 0)
+                if not def_dead else 0)
+        _ha9 = (int(_out9.get('post_hits_on_attacker', 0) or 0)
+                if not atk_dead else 0)
+        if _hd9 > 0 or _ha9 > 0:
+            pc['def_hits'] = _hd9
+            pc['atk_hits'] = _ha9
+            pc['alloc_stage'] = 'attacker'
+            # pauses on a real choice (_alloc_choice_exists), else the
+            # k=0 auto-apply, then re-enters this tail
+            _enter_casualty_allocation(state, pc)
+            return
+    _onslaught_done9 = bool(pc.pop('_onslaught_done', False))
+    pc.pop('_p9', None)
+    pc.pop('_p9_done', None)
+    pc.pop('_p9_role', None)
     for reg, side, dead in ((atk_r, atk_s, atk_dead),
                             (def_r, def_s, def_dead)):
         if not dead:
@@ -8370,26 +9155,31 @@ def _complete_allocated_round(state, pc):
         # deferred-onslaught / deferred-allocation resume of a battle,
         # so no card exception applies).
         reconcile_destroyed_army(state, reg, side)
+    _p9_cid = (_p9.get('atk_card') if _p9_role == 'attacker'
+               else _p9.get('def_card'))
+    # The surviving Onslaught owner may still sacrifice its final units.
+    # Resolve that post-combat choice before capture or siege cleanup: a
+    # mutual wipe retains the pre-battle controller (Almanac p44). Figures
+    # accompanying an already destroyed army were correctly removed above.
+    if not _onslaught_done9 and _open_deferred_onslaught(
+            state, pc, _p9_role, _p9_cid, atk_dead, def_dead):
+        return
     # 1.152: mutual elimination captures nothing (the original
-    # controller keeps the region) - same rule as _finish_wiped_battle
+    # controller keeps the region) - same rule as _finish_wiped_battle.
+    # USER RULING 1.255: a wipe captures only when the victor already
+    # stands IN the region (co-located); from an adjacent region the
+    # capture fires on the victor's ENTRY (victor_advance executor).
     if def_dead and not atk_dead \
-            and garrison_side_for(state, sanitize(str(def_r))) == def_s:
+            and garrison_side_for(state, sanitize(str(def_r))) == def_s \
+            and _wipe_captures_in_place(atk_r, def_r):
         _check_settlement_capture(state, sanitize(str(def_r)), atk_s)
     try:
         game_logic.cleanup_sieges(state)
     except Exception:
         pass
-    _p9_cid = (_p9.get('atk_card') if _p9_role == 'attacker'
-               else _p9.get('def_card'))
     if atk_dead or def_dead:
-        if _open_deferred_onslaught(state, pc, _p9_role, _p9_cid,
-                                    atk_dead, def_dead):
-            return
         _finish_battle(state, pc, atk_dead, def_dead)
     else:
-        if _open_deferred_onslaught(state, pc, _p9_role, _p9_cid,
-                                    False, False):
-            return
         _set_post_round_phase(state, pc, pc.get('is_siege', False))
 
 
@@ -8420,13 +9210,12 @@ def _register_move_overstack(state: GameState, region, side) -> None:
 
 
 def _resolve_wk_sorcerer(state: GameState, pc: dict) -> None:
-    """Resolve a queued Witch-king 'Sorcerer' draw (set at combat-card
-    play).  USER bug report 2026-07-27: the draw only resolved in the
-    post-round section of _run_combat_round, so a battle terminated
-    BEFORE any round (Scouts retreat-before-round, siege maintained
-    without assault) silently dropped it — the card WAS played, the
-    draw is owed on every termination path.  Pop-based: safe to call
-    from multiple sites."""
+    """Resolve Sorcerer after casualties and continuation/retreat choices.
+
+    Almanac p46 includes siege continuation payment in that timing and
+    excludes a Witch-king eliminated during the first round. Termination
+    paths also resolve it before any victor advance. Pop-based, once only.
+    """
     _wk_deck9 = pc.pop('_wk_sorcerer_deck', None)
     if _wk_deck9 is not None:
         # RULING 1.228b (USER 2026-08-03): if Fateful Strike / Blade
@@ -8500,7 +9289,8 @@ def _finish_wiped_battle(state: GameState, pc: dict,
     _finish_battle runs cleanup_sieges so the stale flag lifts."""
     from combat import (reconcile_destroyed_army as _rda9,
                         _check_settlement_capture as _csc9,
-                        garrison_side_for as _gsf9)
+                        garrison_side_for as _gsf9,
+                        _wipe_captures_in_place as _wcip9)
     for _rg9, _sd9, _dead9 in (
             (pc['attacker_region'], pc['attacker_side'], atk_dead),
             (pc['defender_region'], pc['defender_side'], def_dead)):
@@ -8509,7 +9299,10 @@ def _finish_wiped_battle(state: GameState, pc: dict,
                 _rda9(state, _rg9, _sd9)
             except Exception:
                 pass
-    if def_dead and not atk_dead:
+    # USER RULING 1.255: capture at the wipe only when the victor is
+    # already IN the region; otherwise on ENTRY (victor_advance)
+    if def_dead and not atk_dead \
+            and _wcip9(pc['attacker_region'], pc['defender_region']):
         try:
             _drs9 = sanitize(str(pc['defender_region']))
             if _gsf9(state, _drs9) == pc['defender_side']:
@@ -8526,19 +9319,26 @@ def _run_combat_round(state: GameState, pc: dict,
     Sets phase to 'combat_round_result' if both armies survive,
     or clears pending_combat if one army is destroyed.
     """
-    # CHAOS-1 ROOT (measured, seed 96327 T24 rivendell): the entry
-    # never checked that BOTH sides still exist - a siege_press whose
-    # downgrade killed the attacker's last unit (no regular in the
-    # casualty box or pool: the elite dies outright) opened the NEXT
-    # card window on a one-sided battle, leaving the stale besieged
-    # flag + the combat_card_menu_failed degradation.  A wiped side =
-    # the battle is over, before any phase opener.
+    if pc.get('_round_resume') is not None:
+        raise RuntimeError('Paused combat must resume with its observed-stage choice')
+    pc.pop('_observed_round_completed', None)
+    if pc.get('attacker_rearguard') is None and not pc.get('rounds_fought', 0):
+        from army_participants import freeze_attack
+        freeze_attack(state, pc)
+
+    # CHAOS-1 (seed 96327): a wiped side = the battle is over, before
+    # any phase opener (a siege_press downgrade can kill the attacker's
+    # last unit outright).
     _wgr9 = _pending_battle_wiped(state, pc)
     if _wgr9 is not None:
         print('[combat] battle over before the round: a side is '
               'wiped (%s)' % pc.get('defender_region'))
         _finish_wiped_battle(state, pc, _wgr9[0], _wgr9[1])
         return
+    if pc.get('rounds_fought', 0):
+        # Continuation and its payment are settled. The wipe check above
+        # first removes a Witch-king lost with the last paying Elite.
+        _resolve_wk_sorcerer(state, pc)
     # Seeds per-battle casualty-policy DEFAULTS only (never opens a
     # decision phase; the real decision is the per-round learned
     # casualty allocation)
@@ -8563,9 +9363,8 @@ def _run_combat_round(state: GameState, pc: dict,
         pc['deciding_side'] = None
         return
 
-    # Choice-bearing pre-roll card effects (Dread and Despair, Relentless
-    # Assault, Heroic Death): the owner picks the magnitude (learned).
-    # The combat_effect_choice executor stores the count and resumes here.
+    # Words of Power chooses before rolls. Other live timed card choices
+    # pause inside the round; legacy extraction keeps its old adapter here.
     if _maybe_combat_effect_choice_phase(state, pc):
         return
 
@@ -8573,12 +9372,30 @@ def _run_combat_round(state: GameState, pc: dict,
     # Mordor — "Before the Combat roll, retreat your Army to an adjacent
     # free region or withdraw into a siege").  When the defender commits
     # such a card, the retreat is a LEARNED decision (destination) taken
-    # BEFORE round 1 via the existing defender_retreat phase: the teacher
+    # BEFORE the current round via the existing defender_retreat phase: the teacher
     # forces it from the log's retreat record and it becomes a training
-    # sample; self-play's net chooses.  Guarded to fire once per battle.
-    if (pc.get('rounds_fought', 0) == 0
-            and not pc.get('_card_retreat_offered')):
+    # sample; self-play's net chooses. Guarded to fire once per round.
+    if pc.get('_card_retreat_round') != pc.get('rounds_fought', 0):
         _dcid = pc.get('def_combat_card')
+        _acid = pc.get('atk_combat_card')
+        # Resolve initiative-0 cancellation before exposing a retreat choice.
+        # The ordinary round applies the same effects later; this preview
+        # changes neither the committed cards nor the board state.
+        from cards import get_card as _retreat_card
+        _retreat_atk = _retreat_card(_acid) if _acid else None
+        _retreat_def = _retreat_card(_dcid) if _dcid else None
+        if any(card is not None and 'retreat your army' in (card.combat_effect or '').lower()
+               for card in (_retreat_atk, _retreat_def)):
+            from combat import setup_combat as _retreat_setup, apply_cancel_effects as _retreat_cancel
+            _retreat_preview = _retreat_setup(state, pc['attacker_region'], pc['defender_region'],
+                is_siege=pc.get('is_siege', False), attacker_side=pc['attacker_side'])
+            _retreat_preview.attacker_card = _retreat_atk.to_combat_card() if _retreat_atk else None
+            _retreat_preview.defender_card = _retreat_def.to_combat_card() if _retreat_def else None
+            _retreat_cancel(_retreat_preview)
+            if _retreat_preview.attacker_card_cancelled:
+                _acid = None
+            if _retreat_preview.defender_card_cancelled:
+                _dcid = None
         _deff = ''
         if _dcid:
             try:
@@ -8588,22 +9405,17 @@ def _run_combat_round(state: GameState, pc: dict,
             except Exception:
                 _deff = ''
         if 'retreat your army' in _deff and not pc.get('is_siege'):
-            # F-5 gate (fuzz seed 9322, 2026-07-20): the card's siege
-            # half is "or withdraw into a siege" — a besieged garrison
-            # is already withdrawn and has NO retreat leg. Pre-gate,
-            # the siege-defender's card retreat moved the CO-LOCATED
-            # entry: the six Woodland Realm besiegers "retreated" into
-            # FP-held Dale (mixed army, phantom attacks downstream).
-            pc['_card_retreat_offered'] = True
+            # F-5 gate (2026-07-20): the card's siege half is "or withdraw
+            # into a siege" - a besieged garrison is already withdrawn and
+            # has NO retreat leg (a co-located entry must never 'retreat').
+            pc['_card_retreat_round'] = pc.get('rounds_fought', 0)
             pc['_card_retreat_mandatory'] = True
             pc['phase'] = 'defender_retreat'
             pc['deciding_side'] = pc['defender_side']
             return
-        # W5 G-2 fix (2026-07-20): the ATTACKER's committed
-        # 'retreat your army' card was silently inert — only
-        # def_combat_card was checked. Same gates (once per battle,
-        # never from a siege), attacker decides.
-        _acid = pc.get('atk_combat_card')
+        # W5 G-2 (2026-07-20): the ATTACKER's committed 'retreat your
+        # army' card gets the same gates (once per round, never from a
+        # siege); attacker decides.
         _aeff = ''
         if _acid:
             try:
@@ -8613,7 +9425,7 @@ def _run_combat_round(state: GameState, pc: dict,
             except Exception:
                 _aeff = ''
         if 'retreat your army' in _aeff and not pc.get('is_siege'):
-            pc['_card_retreat_offered'] = True
+            pc['_card_retreat_round'] = pc.get('rounds_fought', 0)
             pc['_card_retreat_mandatory'] = True
             pc['phase'] = 'attacker_card_retreat'
             pc['deciding_side'] = pc['attacker_side']
@@ -8631,6 +9443,9 @@ def _run_combat_round(state: GameState, pc: dict,
     def_card_id = pc.pop('def_combat_card', None)
     atk_effect_count = pc.pop('atk_effect_count', None)
     def_effect_count = pc.pop('def_effect_count', None)
+    # 1.254: the owners' WHICH-figure picks (combat.py hooks)
+    atk_effect_target = pc.pop('atk_effect_target', None)
+    def_effect_target = pc.pop('def_effect_target', None)
     pc.pop('atk_effect_asked', None)
     pc.pop('def_effect_asked', None)
 
@@ -8652,6 +9467,8 @@ def _run_combat_round(state: GameState, pc: dict,
                                       'preserve_elites'),
         'atk_effect_count': atk_effect_count,
         'def_effect_count': def_effect_count,
+        'atk_effect_target': atk_effect_target,
+        'def_effect_target': def_effect_target,
         # P2 (Help Unlooked For): 'for this entire battle' - in pc
         'attacker_dice_reduction': pc.get('atk_dice_reduction', 0),
         'defender_dice_reduction': pc.get('def_dice_reduction', 0),
@@ -8659,6 +9476,9 @@ def _run_combat_round(state: GameState, pc: dict,
         # Onslaught's sacrifice count is a learned post-casualty
         # decision
         'defer_onslaught': True,
+        # Historical extraction uses an explicit final-hit adapter; live
+        # play pauses at the actual owner decision instead of predeclaring it.
+        'defer_round_choices': __import__('combat').FINAL_HITS_HOOK is None,
     }
     # kernel-node capture: everything the in-tree exchange kernel needs
     # to reproduce THIS round (read post-apply; never inherited across
@@ -8668,6 +9488,7 @@ def _run_combat_round(state: GameState, pc: dict,
         'atk_side': pc.get('attacker_side'),
         'def_side': pc.get('defender_side'),
         'atk_card': atk_card_id, 'def_card': def_card_id,
+        'attacker_rearguard': pc.get('attacker_rearguard'),
         'is_siege': bool(is_siege), 'gtw_shine': pc.get('gtw_shine'),
         'choices': dict(_round_choices)}
     result = game_logic.battle(state, atk_region, def_region,
@@ -8676,15 +9497,48 @@ def _run_combat_round(state: GameState, pc: dict,
                                is_siege=is_siege, max_rounds=1,
                                auto_press=False,
                                choices=_round_choices)
-    state._last_battle_result = result
-    pc['rounds_fought'] = pc.get('rounds_fought', 0) + 1
+    _accept_combat_round_result(state, pc, result, atk_card_id, def_card_id)
 
-    _resolve_wk_sorcerer(state, pc)
+
+def _accept_combat_round_result(state, pc, result, atk_card_id, def_card_id):
+    """Publish the next decision, or finalize this round exactly once."""
+    state._last_battle_result = result
+    if getattr(result, 'round_paused', False):
+        import copy
+        pending = copy.deepcopy(result.round_pending)
+        owner = pending['owner']
+        if owner not in ('atk', 'def') or not pending.get('options'):
+            raise RuntimeError('Invalid combat round pending descriptor')
+        pending['round_stage'] = pending['stage']
+        pending['stage'] = 'round'
+        # Pre-combat casualties are chosen by the victim of the opposing
+        # card. Preserve that decision owner while encoding the hit source.
+        card_owner = ('def' if owner == 'atk' else 'atk') if pending['effect'] == 'pre_combat_casualty' else owner
+        pending['card_id'] = atk_card_id if card_owner == 'atk' else def_card_id
+        pc['_round_resume'] = result.round_resume
+        pc['_round_cards'] = (atk_card_id, def_card_id)
+        pc['effect_choice'] = pending
+        pc['phase'] = 'combat_effect_choice'
+        pc['deciding_side'] = pc['attacker_side' if owner == 'atk' else 'defender_side']
+        return
+    pc.pop('_round_resume', None)
+    pc.pop('_round_cards', None)
+    pc.pop('effect_choice', None)
+    pc['rounds_fought'] = pc.get('rounds_fought', 0) + 1
+    # Extraction must distinguish a genuinely resolved live round from an
+    # old recovery path that merely fabricates a post-casualty choice menu.
+    # Keep only small provenance through clones and the Onslaught payments.
+    import combat as _completed_combat
+    if _completed_combat.FINAL_HITS_HOOK is None:
+        pc['_observed_round_completed'] = {
+            'schema': 'observed_round_v1', 'round': pc['rounds_fought'] - 1,
+            'attacker_card': atk_card_id, 'defender_card': def_card_id}
+    is_siege = pc.get('is_siege', False)
 
     if getattr(result, 'casualties_deferred', False):
         pc['def_hits'] = int(result.deferred_hits_on_defender)
         pc['atk_hits'] = int(result.deferred_hits_on_attacker)
-        pc['alloc_stage'] = 'defender'
+        pc['alloc_stage'] = 'attacker'
         if atk_card_id or def_card_id:
             # Phase-9 payload: allocation completion resumes the
             # post-casualty card effects with the round's true
@@ -8721,12 +9575,13 @@ def _run_combat_round(state: GameState, pc: dict,
 
 def _finish_battle(state: GameState, pc: dict, attacker_destroyed: bool,
                    defender_destroyed: bool) -> None:
-    """Battle decided: victor advance, siege cleanup, rearguard restore.
+    """Battle decided: victor advance, siege cleanup.
 
     USER RULE 2026-07-08: the victor chooses HOW MANY units advance
     (free split — 0, some, or all), it is not an automatic full-stack
     move.  The advance becomes a pending 'victor_advance' decision
     (composition grid + stay)."""
+    _resolve_wk_sorcerer(state, pc)
     atk_region = pc['attacker_region']
     def_region = pc['defender_region']
     if (defender_destroyed and not attacker_destroyed
@@ -8737,9 +9592,9 @@ def _finish_battle(state: GameState, pc: dict, attacker_destroyed: bool,
                 game_logic.cleanup_sieges(state)
             except Exception:
                 pass
-            _restore_rearguard(state, pc)
             state.pending_combat = {
                 'phase': 'victor_advance',
+                'attacker_rearguard': pc.get('attacker_rearguard'),
                 'attacker_region': atk_region,
                 'defender_region': def_region,
                 'attacker_side': pc['attacker_side'],
@@ -8749,20 +9604,17 @@ def _finish_battle(state: GameState, pc: dict, attacker_destroyed: bool,
                     pc.get('rounds_fought', 0),
             }
             return
-    # F-7 (fuzz seed 9531, 2026-07-20): the old unconditional
-    # `bs.discard(def_region)` LIFTED THE SIEGE when a failed RELIEF
-    # attack ended (the relief battle's def_region IS the besieged
-    # stronghold — the besiegers defend there); garrison + besiegers
-    # were left co-located with no siege flag: phantom from==to
-    # attacks, illegal muster/move offers. cleanup_sieges implements
-    # the correct condition (flag lifts only when one side no longer
-    # holds the region).
+    # F-7 (2026-07-20): never lift the siege unconditionally here - a
+    # failed RELIEF attack's def_region IS the besieged stronghold.
+    # cleanup_sieges implements the correct condition (the flag lifts
+    # only when one side no longer holds the region).
     try:
         game_logic.cleanup_sieges(state)
     except Exception:
         pass
-    _restore_rearguard(state, pc)
     state.pending_combat = None
+    if pc.get('corsairs_relief_garrison') and defender_destroyed:
+        _register_move_overstack(state, def_region, pc['attacker_side'])
     _maybe_open_palantir_draw(state)   # USER 1.208m: deferred Palantir draw
 
 
@@ -8805,50 +9657,40 @@ def _retreat_army(state: GameState, from_region: str,
     army = state.armies.get(_fk) if _fk is not None else None
     if not army or not army.units:
         return
-    # F-5 hardening (fuzz seed 9322, 2026-07-20): on a MIXED entry
-    # (co-located siege model) move ONLY the retreating side's units
-    # and leaders — the whole-entry move_army dragged the opposing
-    # army along with the retreat.
-    if side is not None:
-        _other = [u for u in army.units
-                  if _side_of_nation(u.nation) != side]
-        if _other:
-            from combat import _combat_leader_side as _cls5
-            _mv_u = [u for u in army.units
-                     if _side_of_nation(u.nation) == side]
-            _mv_l = [l for l in army.leaders
-                     if _cls5(l) == side
-                     and not game_logic._is_saruman(l)]
-            if not _mv_u:
-                return
-            army.units = [u for u in army.units if u not in _mv_u]
-            army.leaders = [l for l in army.leaders if l not in _mv_l]
-            dest = game_logic.get_or_create_army(state, sanitize(to_region))
-            dest.units.extend(_mv_u)
-            dest.leaders.extend(_mv_l)
-            return
-    try:
-        game_logic.move_army(state, _fk, to_region)
-    except Exception:
-        # Fallback: manually move (Saruman never leaves Orthanc — keep
-        # him behind exactly like move_army does)
-        from_key = _fk
-        to_key = sanitize(to_region)
-        if from_key in state.armies:
-            _stay = [l for l in army.leaders if game_logic._is_saruman(l)]
-            if _stay:
-                army.leaders = [l for l in army.leaders
-                                if not game_logic._is_saruman(l)]
-            existing = _armies_lookup(state, to_key)
-            if existing and existing.units:
-                existing.units.extend(army.units)
-                existing.leaders.extend(army.leaders)
-            else:
-                state.armies[to_key] = army
-            del state.armies[from_key]
-            if _stay:
-                back = game_logic.get_or_create_army(state, from_key)
-                back.leaders.extend(_stay)
+    pc = getattr(state, 'pending_combat', None) or {}
+    if side is not None and pc.get('attacker_side') == side \
+            and pc.get('attacker_rearguard') is not None:
+        from army_participants import partition_battle_army
+        units, leaders, _, _ = partition_battle_army(state, army, from_region, side, pc)
+        movable = [l for l in leaders if not game_logic._is_saruman(l)]
+        unit_ids, leader_ids = {id(u) for u in units}, {id(l) for l in movable}
+        army.units = [u for u in army.units if id(u) not in unit_ids]
+        army.leaders = [l for l in army.leaders if id(l) not in leader_ids]
+        dest = game_logic.get_or_create_army(state, sanitize(to_region))
+        dest.units.extend(units)
+        dest.leaders.extend(movable)
+        if not army.units and not army.leaders:
+            state.armies.pop(_fk, None)
+        return
+    # Retreats may overstack and cross peaceful borders; their caller opens
+    # the trim. They are not movement actions and do not activate nations
+    # (Almanac pp29-30). Move only the retreating side's figures even when
+    # enemy Characters share an otherwise single-side Army entry.
+    moving_side = side if side is not None else _side_of_nation(army.units[0].nation)
+    units = [u for u in army.units if _side_of_nation(u.nation) == moving_side]
+    leaders = [l for l in army.leaders
+               if game_logic._leader_side(l) == moving_side
+               and not game_logic._is_saruman(l)]
+    if not units:
+        return
+    unit_ids, leader_ids = {id(u) for u in units}, {id(l) for l in leaders}
+    army.units = [u for u in army.units if id(u) not in unit_ids]
+    army.leaders = [l for l in army.leaders if id(l) not in leader_ids]
+    dest = game_logic.get_or_create_army(state, sanitize(to_region))
+    dest.units.extend(units)
+    dest.leaders.extend(leaders)
+    if not army.units and not army.leaders:
+        state.armies.pop(_fk, None)
 
 
 def _pop_hobbit_place_queue(state: GameState) -> None:
@@ -8857,33 +9699,36 @@ def _pop_hobbit_place_queue(state: GameState) -> None:
     game_logic.pop_hobbit_place_queue(state)
 
 
+def _palantir_action_pending(state: GameState) -> bool:
+    """A bonus draw follows the complete printed action and its consequences."""
+    return (any(getattr(state, key, None) is not None for key in (
+                'pending_combat', 'pending_hunt', 'pending_guide_change',
+                'pending_card_option', 'pending_card_followup', 'pending_discard',
+                'pending_army_move_die', 'pending_muster_die',
+                '_fellowship_move_die_pending'))
+            or any(getattr(state, key, None) for key in (
+                '_pending_hunt_damage', '_hunt_reveal_pending', '_reveal_place_due',
+                '_pending_reveal_strongholds', '_fellowship_route_event',
+                '_hobbit_place_queue', '_overstack_regions', '_wwsat_owed',
+                '_mithril_stash', '_wizardstaff_stash')))
+
+
 def _open_palantir_deck_choice(state: GameState) -> None:
     """USER 1.208m(1): the Palantir of Orthanc bonus draw is a LEARNED
     which-deck decision (Character / Strategy).  Rides pending_card_option
     (frozen encode).  Self-play only; the teacher replays the logged
     draw's deck via forced_draw."""
-    if getattr(state, 'pending_card_option', None) is not None:
+    if _palantir_action_pending(state):
         # I3 (USER live 2026-08-18, verbatim: "Palantir of Orthanc was
-        # in play (engine knew) but the AI never drew from it -
-        # multiple occurrences").  This early return used to DROP the
-        # bonus draw on the floor, and it fired every time, because the
-        # collision it guards against is the NORMAL case: the card the
-        # Shadow just played usually opens its OWN card option first.
-        # MEASURED on his session - all three owed Palantir draws were
-        # option-bearing plays (The Shadow Lengthens client 310, The
-        # Ringwraiths are Abroad 357, Grond 422) and all three were
-        # lost, while the two Witch-king draws that owed nothing to
-        # this path both fired.
-        # The deferral mechanism already exists for exactly this shape
-        # (the P-die-still-resolving case), so reuse it rather than
-        # inventing a second one: _maybe_open_palantir_draw re-offers
-        # the choice from nine resolution sites once the way is clear.
+        # in play (engine knew) but the AI never drew from it - multiple
+        # occurrences"): the card the Shadow just played usually opens
+        # its OWN card option first, so the bonus draw DEFERS (never
+        # drops); _maybe_open_palantir_draw re-offers it once the way is
+        # clear.
         state._palantir_draw_pending = True
         return
-    # 2026-08-16: only offer decks that can actually be drawn from —
-    # WOTR has no reshuffle, so an exhausted deck is simply not a
-    # choice (offering it produced an unguarded RuntimeError that
-    # halted a live game).  No drawable deck at all = no decision.
+    # WOTR has no reshuffle: only decks that can actually be drawn from
+    # are offered (2026-08-16); no drawable deck = no decision.
     _decks9 = [d for d, _a9 in (('character', 'sh_char_deck'),
                                 ('strategy', 'sh_strat_deck'))
                if getattr(state, _a9, None)]
@@ -8907,7 +9752,7 @@ def _maybe_open_palantir_draw(state: GameState) -> None:
     queued draw dies too — re-check the table card at fire time,
     mirroring the 1.228b Witch-king Sorcerer gate."""
     if getattr(state, '_palantir_draw_pending', False) \
-            and state.pending_combat is None:
+            and not _palantir_action_pending(state):
         state._palantir_draw_pending = False
         try:
             from persistent_effects import should_draw_extra_card_on_event
@@ -8948,14 +9793,10 @@ def _recover_from_failed_action(state: GameState, action: Action,
     the offending die so the same invalid action can't be re-selected
     forever (turn progress requires dice to run out).
     """
+    state._wormtongue_attack_pending = None
     if (state.pending_combat is not None or state.pending_hunt is not None
             or state.pending_guide_change is not None
             or getattr(state, '_reveal_place_due', False)):
-        if state.pending_combat is not None:
-            try:
-                _restore_rearguard(state, state.pending_combat)
-            except Exception:
-                pass
         state.pending_combat = None
         state.pending_hunt = None
         state.pending_guide_change = None
@@ -9025,11 +9866,49 @@ def _traced_execute(state: GameState, action: Action, tracer):
     if tracer is None:
         return _execute_action(state, action)
     import game_trace as _gt
+    attempted = {'action_type': action.action_type, 'die_idx': action.die_idx,
+                 'params': copy.deepcopy(action.params)}
     _gt.ACTIVE_TRACER = tracer
     try:
         return _execute_action(state, action)
+    except Exception:
+        # One real-execution boundary also covers free phase decisions such
+        # as guide/Hunt/card choices. Never label this as a committed row.
+        tracer.meta['failure_action'] = attempted
+        raise
     finally:
         _gt.ACTIVE_TRACER = None
+
+
+def _validate_tdaan_pending_action(state: GameState, action: Action):
+    """Match the owned pending descriptor before any continuation mutation."""
+    if action.action_type != 'card_option':
+        return
+    pending = getattr(state, 'pending_card_option', None)
+    params = action.params
+    name = 'Through a Day and a Night'
+    card_id = 'FREE_PEOPLES_Strategy_Through_a_Day_and_a_Night'
+    if pending is None or pending.get('card_name') != name:
+        if isinstance(params, dict) and (params.get('card_name') == name
+                                        or params.get('card_id') == card_id):
+            raise ValueError('No Through a Day and a Night choice is pending')
+        return
+    keys = {'idx', 'card_id', 'card_name', 'side', 'choices'}
+    if (type(action.die_idx) is not int or action.die_idx != -1
+            or type(params) is not dict or set(params) != keys):
+        raise ValueError('Through a Day and a Night descriptor is stale')
+    idx = params['idx']
+    options = pending['options']
+    if (type(idx) is not int or not 0 <= idx < len(options)
+            or any(type(params[k]) is not type(pending[k])
+                   or params[k] != pending[k]
+                   for k in ('card_id', 'card_name', 'side'))):
+        raise ValueError('Through a Day and a Night descriptor is stale')
+    choice, expected = params['choices'], options[idx]
+    if (type(choice) is not dict or choice.keys() != expected.keys()
+            or any(type(choice[k]) is not type(value) or choice[k] != value
+                   for k, value in expected.items())):
+        raise ValueError('Through a Day and a Night choice is not available')
 
 
 def _execute_action(state: GameState, action: Action):
@@ -9040,16 +9919,16 @@ def _execute_action(state: GameState, action: Action):
     next enumeration must see canonical armies or stacking checks and
     unit lookups go wrong (enumeration/execution mismatches).
     """
+    _validate_tdaan_pending_action(state, action)
+    state._casualty_operations = []
     _dedupe_armies(state)
-    # CHAOS-1 (RED 2026-08-17) EXECUTOR TWIN of the menu guard: a
-    # pending battle whose entry lost one whole side outside the
-    # round machinery FINISHES as a wipe here (the menu offered only
-    # the decline; executing it against the ghost battle raised
-    # action_exec_failed forever).  Characters die with the army
-    # (USER 2026-08-15, reconcile_destroyed_army = the one wipe
-    # implementation), capture settles, cleanup_sieges lifts the
-    # stale flag inside _finish_battle.  The incoming action was
-    # generated against the ghost menu - absorbed.
+    # CHAOS-1 (2026-08-17) EXECUTOR TWIN of the menu guard: a pending
+    # battle whose entry lost one whole side outside the round
+    # machinery FINISHES as a wipe here.  Characters die with the army
+    # (USER 2026-08-15, reconcile_destroyed_army = the one wipe body),
+    # capture settles, cleanup_sieges lifts the stale flag inside
+    # _finish_battle.  The incoming action (generated against the ghost
+    # menu) is absorbed.
     _pcw9 = getattr(state, 'pending_combat', None)
     if isinstance(_pcw9, dict) \
             and _pcw9.get('phase') in _WIPE_GUARD_PHASES:
@@ -9060,8 +9939,7 @@ def _execute_action(state: GameState, action: Action):
                   % _pcw9.get('defender_region'))
             _finish_wiped_battle(state, _pcw9, _wg9[0], _wg9[1])
             return
-    # Bug-1 turn-routing (SH attacking FP with combat cards + a FP retreat
-    # used to hand SH two actions in a row): a whole battle is ONE action
+    # Bug-1 turn-routing: a whole battle is ONE action
     # spent by the ATTACKER, but its multi-step resolution (combat cards,
     # retreat, cease) flips the acting side through the defender.  When a
     # battle RESOLVES, remember the attacker so the next die-action routes
@@ -9088,16 +9966,54 @@ def _execute_action(state: GameState, action: Action):
         _execute_action_inner(state, action)
     finally:
         _dedupe_armies(state)
+        game_logic.settle_hunt_reveal(state)
+        # BL-128 witness: the ARMIES-KEY INVARIANT - no two keys may
+        # sanitize equal (the P1-1 duplicate-army hazard: mixed key
+        # conventions split garrisons and made move_army lookups
+        # silently miss).  Loud, never silent.
+        try:
+            _seen128 = {}
+            for _k128 in state.armies:
+                _s128 = sanitize(str(_k128))
+                if _s128 in _seen128 and _seen128[_s128] != _k128:
+                    import state_invariants as _si128
+                    _si128.VIOLATIONS.append({
+                        'code': 'armies_key_collision',
+                        'ctx': 'T%s' % getattr(state, 'turn', '?'),
+                        'detail': '%r vs %r sanitize equal'
+                                  % (_seen128[_s128], _k128)})
+                _seen128[_s128] = _k128
+        except Exception:
+            pass
         _check_hand_limits(state)
-        # iter 36 siege upkeep (SELF-PLAY only — the teacher replay
-        # manages siege state from the humans' logged drags): at stable
-        # points, a stronghold stays besieged only while both sides
-        # occupy the region; a dead/departed besieger lifts the siege.
+        # BL-138: the DEFERRED Palantir bonus draw fires at the next
+        # quiet point after ANY apply (same guards as the wwsat drain
+        # below: nothing open).
+        if (getattr(state, '_palantir_draw_pending', False)
+                and state.pending_combat is None
+                and getattr(state, 'pending_card_option', None) is None
+                and state.pending_hunt is None):
+            try:
+                _maybe_open_palantir_draw(state)
+            except Exception:
+                # EX-9: the owed draw must not vanish silently on the
+                # live/self-play path (the flag is cleared before the
+                # deck choice opens); the teacher stays lenient
+                import combat as _cmbpd9
+                if _cmbpd9.FINAL_HITS_HOOK is None:
+                    raise
+        # Siege upkeep (SELF-PLAY only - the teacher manages siege state
+        # from the logged drags): at stable points a stronghold stays
+        # besieged only while both sides occupy the region.
         if state.pending_combat is None:
             try:
                 game_logic.cleanup_sieges(state)
             except Exception:
-                pass
+                # EX-9: stale siege/control state is not a silent
+                # outcome on the live/self-play path
+                import combat as _cmbcs9
+                if _cmbcs9.FINAL_HITS_HOOK is None:
+                    raise
         # "Play on the table" upkeep (The Last Battle, Denethor's
         # Folly) - BOTH modes (USER directive 2026-07-10: nothing
         # self-play only); teacher's logged discard finds the card
@@ -9113,14 +10029,11 @@ def _execute_action(state: GameState, action: Action):
                 and state.pending_hunt is None
                 and getattr(state, '_wwsat_owed', None)):
             _offer_wwsat_discard(state)
-        # 1.132 (USER RULE): deferred reveal placement - the revealing
-        # tile's own damage decision resolved first.  USER RULING
-        # 2026-08-16: the placement itself is a LEARNED FP DECISION —
-        # open_reveal_placement resolves the forced/no-choice cases
-        # via the certified auto path and otherwise leaves
-        # _reveal_place_due set as an OPEN FP pending (menu served by
-        # get_legal_actions, routed by _pending_decision_side, applied
-        # by the fellowship_reveal_place executor).
+        # 1.132: deferred reveal placement - the revealing tile's own
+        # damage resolves first.  USER RULING 2026-08-16: the placement
+        # is a LEARNED FP DECISION - open_reveal_placement resolves the
+        # forced cases and otherwise leaves _reveal_place_due as an OPEN
+        # FP pending.
         open_reveal_placement(state)
 
         # Bug-7 guide invariant: a Guide must always exist while any
@@ -9140,6 +10053,18 @@ def _execute_action(state: GameState, action: Action):
         except Exception:
             pass
 
+        # The replaced Hunt tile remains unavailable through damage,
+        # reveal placement and every extra draw belonging to this action.
+        game_logic.return_mithril_tile_if_settled(state)
+        from fellowship_action_timing import finish_if_settled
+        finish_if_settled(state)
+        game_logic.settle_wormtongue_attack(state)
+        _maybe_open_palantir_draw(state)
+
+        # Almanac4/16/46: the optional guide draw comes after the whole
+        # printed action, its guide changes and its first hand-limit step.
+        _maybe_open_gandalf_draw(state)
+
         # Bug-1 turn-routing marker upkeep (see the pre-try capture above):
         if _pre_pc is not None and state.pending_combat is None:
             # a battle just resolved via THIS action -> the next die-action
@@ -9148,16 +10073,13 @@ def _execute_action(state: GameState, action: Action):
         elif _unused_die_total(state) < _pre_unused \
                 or action.action_type == 'pass':
             # a real die-spending action landed OR the routed side chose
-            # to PASS (its voluntary turn-order action) -> the battle
-            # marker has done its job.  Passing consumes no die, so the
-            # old die-count-only test left the marker set and
-            # _post_action_active bounced control back to the SAME side
-            # after every pass — an infinite pass loop that silently
-            # burned self-play's iteration cap (and stalled live games).
+            # to PASS (its voluntary turn-order action) -> the marker has
+            # done its job (a pass consumes no die, so a die-count test
+            # alone would leave the marker set and loop control back to
+            # the same side).
             state._battle_resolved_attacker = None
         # else: a die-less forced reaction (discard / hunt / guide) -> keep
         # the marker so it still routes the post-reaction die-action
-
 
 
 def _recheck_last_battle(state: GameState) -> None:
@@ -9193,11 +10115,10 @@ def _recheck_last_battle(state: GameState) -> None:
 def _offer_wwsat_discard(state: GameState) -> None:
     """1.211f: drain ONE owed 'Worn with Sorrow and Toil' discard.
 
-    When both a table FP Character card AND an FP hand Character card
-    still exist, open a learned Shadow SOURCE pending (kill a named
-    table card, or discard a random FP hand Character card - NO decline
-    per 1.210g).  When only one source remains, resolve it directly.
-    Self-play only (drained from the _execute_action finally block)."""
+    Each named FP table Character card, a random hand Character discard,
+    and declining the optional effect are distinct choices. Even one
+    available card is not forced: the printed effect says "may".
+    Drained after the triggering Hunt casualty has settled."""
     owed = getattr(state, '_wwsat_owed', None)
     if not owed:
         return
@@ -9209,15 +10130,13 @@ def _offer_wwsat_discard(state: GameState) -> None:
     pcards = getattr(state, 'persistent_cards', None)
     table_chars = (pcards.get_fp_character_cards()
                    if pcards is not None else [])
-    if not table_chars:
-        game_logic._wwsat_resolve(state, 'hand')
-        return
-    if not chars:
-        game_logic._wwsat_resolve(state, 'table')
+    if not table_chars and not chars:
         return
     options = [{'wwsat_source': 'table', 'card_id': c.card_id}
                for c in table_chars]
-    options.append({'wwsat_source': 'hand'})
+    if chars:
+        options.append({'wwsat_source': 'hand'})
+    options.append({'wwsat_source': 'decline'})
     state.pending_card_option = {
         'card_id': 'Worn with Sorrow and Toil',
         'card_name': '__wwsat_discard__',
@@ -9243,6 +10162,92 @@ def _check_hand_limits(state: GameState) -> None:
     game_logic.open_hand_limit_discard(state)
 
 
+def _table_kill_payment_cards(state: GameState):
+    """(army_ids, character_ids) the Shadow may pay a 1.149 table-card
+    kill with: Army-type cards (card_type 'Army' - USER 2026-07-19:
+    Muster-type Strategy cards cannot pay) and Character cards, in hand
+    order, distinct ids."""
+    from cards import get_card as _gc
+    army, chars = [], []
+    for c in state.hands[Side.SHADOW].hand:
+        if not isinstance(c, str):
+            continue
+        if getattr(_gc(c), 'card_type', None) == 'Army':
+            if c not in army:
+                army.append(c)
+        elif '_Character_' in c:
+            if c not in chars:
+                chars.append(c)
+    return army, chars
+
+
+def _table_kill_payment_options(state: GameState):
+    """Payment pairs from the currently held cards, including sampled hands."""
+    army, chars = _table_kill_payment_cards(state)
+    return [{'army_card': a, 'character_card': c} for a in army for c in chars]
+
+
+def _open_table_kill_payment(state: GameState, p: dict) -> None:
+    """EX-8: the payment pair as the Shadow's learned pending_card_option
+    (every legal (Army-type, Character) pair; the card_option executor
+    resolves it through pay_table_card_kill)."""
+    options = _table_kill_payment_options(state)
+    if not options:
+        raise IllegalPlay(
+            'table-card kill: the Shadow holds no Army-type + Character '
+            'pair to pay with')
+    state.pending_card_option = {
+        'card_id': p.get('card_id', ''),
+        'card_name': p.get('card_name', p.get('card_id', '')),
+        'side': 'sh', 'decider': 'sh', 'direct': True,
+        'table_kill_payment': True,
+        'options': options}
+
+
+def pay_table_card_kill(state: GameState, army_card_id: str,
+                        character_card_id: str) -> None:
+    """ONE payment body for the 1.149 Shadow table-card kill: the named
+    Army-type card and Character card leave the Shadow hand FACE-DOWN
+    to the payer's discarded_face_down (1.261: the client masks their
+    names - the identities are the Shadow's private knowledge; card
+    conservation preserved, the pile is tracked).  IllegalPlay, with
+    the state untouched, when the pair is not a legal payment from the
+    current hand."""
+    army, chars = _table_kill_payment_cards(state)
+    if army_card_id not in army or character_card_id not in chars:
+        raise IllegalPlay(
+            'table-card kill payment %r + %r is not an (Army-type, '
+            'Character) pair in the Shadow hand'
+            % (army_card_id, character_card_id))
+    hand = state.hands[Side.SHADOW].hand
+    for cid in (army_card_id, character_card_id):
+        hand.remove(cid)
+        state.hands[Side.SHADOW].discarded_face_down.append(cid)
+
+
+def table_kill_payment_action(state: GameState, army_card_id: str,
+                              character_card_id: str) -> Action:
+    """The card_option action answering the open table-kill payment
+    pending with this pair - the live bridge's single entry point (the
+    human's two physical discards -> one engine action to commit).
+    IllegalPlay when no such pending is open or the pair is not among
+    its options."""
+    pco = getattr(state, 'pending_card_option', None)
+    if not (isinstance(pco, dict) and pco.get('table_kill_payment')):
+        raise IllegalPlay('no table-card kill payment is pending')
+    want = {'army_card': army_card_id, 'character_card': character_card_id}
+    for i, opt in enumerate(_table_kill_payment_options(state)):
+        if opt == want:
+            return Action(die_idx=-1, action_type='card_option',
+                          params={'idx': i, 'card_id': pco['card_id'],
+                                  'card_name': pco['card_name'],
+                                  'side': pco['side'],
+                                  'choices': dict(opt)})
+    raise IllegalPlay(
+        'table-card kill payment %r + %r is not an offered pair'
+        % (army_card_id, character_card_id))
+
+
 def _discard_played_combat_card(state, cid):
     """A combat card committed in battle leaves the hand and goes FACE-UP
     to its deck's discard pile (physical pile in the app) - it must not
@@ -9260,7 +10265,133 @@ def _discard_played_combat_card(state, cid):
         if isinstance(d, dict) and dk in d:
             d[dk].append(cid)
     except Exception:
+        # EX-9: a card that left a hand and reached no pile is a
+        # conservation break - loud on the live/self-play path
+        import combat as _cmbdc9
+        if _cmbdc9.FINAL_HITS_HOOK is None:
+            raise
+
+
+def _gandalf_source_index(payload: dict) -> int:
+    """Validate source/deck identity before encoding an ability context."""
+    source = payload.get('source_card_id', '')
+    if not isinstance(source, str):
+        raise ValueError('Gandalf draw requires its real source card and deck')
+    index = _get_card_idx_map().get(source, -1)
+    expected = 'character' if '_Character_' in source else 'strategy'
+    if index < 0 or payload.get('deck') != expected:
+        raise ValueError('Gandalf draw requires its real source card and deck')
+    return index
+
+
+def _gandalf_draw_context(state: GameState):
+    """Return (stage, payload) for queued/open guide ability, or (None, None)."""
+    pending = getattr(state, 'pending_card_option', None)
+    if pending is not None and pending.get('gandalf_draw'):
+        return 'open', pending
+    queued = getattr(state, '_gandalf_draw_pending', None)
+    return ('queued', queued) if queued is not None else (None, None)
+
+
+def _maybe_open_gandalf_draw(state: GameState) -> None:
+    """Offer Gandalf's optional draw at the end of the funded action.
+
+    Almanac4/46 checks the guide at this boundary, not at card commitment.
+    Almanac16/46 requires any first hand-limit discard before the bonus is
+    offered. The queue owns no die/card payment and is drained exactly once.
+    """
+    queued = getattr(state, '_gandalf_draw_pending', None)
+    if queued is None:
+        return
+    if any(getattr(state, key, None) for key in (
+            'pending_combat', 'pending_hunt', 'pending_guide_change',
+            'pending_card_option', 'pending_card_followup', 'pending_discard',
+            '_pending_hunt_damage', '_hunt_reveal_pending', '_reveal_place_due', '_pending_reveal_strongholds', '_fellowship_route_event', '_hobbit_place_queue',
+            '_overstack_regions', '_wwsat_owed')):
+        return
+    # A direct rules-layer caller can have an over-limit hand without having
+    # opened the AI's pending yet. Do not reveal a later card in that case.
+    if game_logic.open_hand_limit_discard(state):
+        return
+    guide = state.fellowship.guide
+    eligible = (guide is not None and guide in state.fellowship.companions
+                and getattr(guide, 'name', '') == 'Gandalf the Grey')
+    deck = queued['deck']
+    drawable = bool(getattr(state, 'fp_char_deck' if deck == 'character'
+                           else 'fp_strat_deck', None))
+    state._gandalf_draw_pending = None
+    if not eligible or not drawable:
+        return
+    state.pending_card_option = {
+        'card_id': '__gandalf_draw__', 'card_name': 'Gandalf guide draw',
+        'side': 'fp', 'decider': 'fp', 'direct': True, 'gandalf_draw': True,
+        'source_card_id': queued['source_card_id'], 'deck': deck,
+        'die_face': queued['die_face'],
+        'options': [{'gandalf_draw': True}, {'gandalf_draw': False}]}
+
+
+def _grant_event_play_draw(state: GameState, side: Side, card_id: str,
+                           deck, face) -> None:
+    """Schedule an event-funded ability after the played card leaves hand.
+
+    Gandalf's optional same-deck draw waits for the complete action and
+    first hand-limit step; eligibility is checked at that later boundary
+    (Almanac4/16/46). Palantir retains its separate mandatory either-deck
+    choice after an Event-funded Shadow play and never self-triggers.
+    `face` is the effective funding face: a Will of the West or an Elven
+    Ring conversion used as an Event result qualifies for Gandalf.
+
+    Optioned cards call this only after their card_option resolves; the
+    original play stores deck/face metadata on that pending. Neither the
+    queued ability nor its final optional choice charges another die/card.
+    """
+    if deck not in ('character', 'strategy'):
+        return
+    if isinstance(face, str):
+        try:
+            face = ActionDieFace[face]
+        except KeyError:
+            face = None
+    try:
+        if side == Side.FREE_PEOPLES:
+            if (face in (ActionDieFace.EVENT, ActionDieFace.WILL_OF_WEST)
+                    and card_id not in state.hands[side].hand):
+                # A separation/guide change may still be pending. Record
+                # the funded play now and test the guide at action end.
+                queued = {'source_card_id': card_id, 'deck': deck,
+                          'die_face': face.name}
+                previous = getattr(state, '_gandalf_draw_pending', None)
+                if previous is not None and previous != queued:
+                    raise ValueError('An earlier Gandalf draw is still pending')
+                state._gandalf_draw_pending = queued
+        else:
+            from persistent_effects import \
+                should_draw_extra_card_on_event as _pal
+            # USER RULING 2026-08-15: the Palantir does NOT self-trigger;
+            # the accented, underscored canonical id is normalized (pin:
+            # test_palantir_no_self_trigger.py)
+            _is_pal_self9 = ('palantir of orthanc'
+                             in str(card_id).lower()
+                             .replace('_', ' ').replace('í', 'i'))
+            # card text: "use an Event Action Die result to play an
+            # Event card" - the rolled face decides
+            if (_pal(state) and not _is_pal_self9
+                    and face == ActionDieFace.EVENT):
+                if state.pending_combat is not None:
+                    # P-die action still resolving: defer (USER 1.208m)
+                    state._palantir_draw_pending = True
+                else:
+                    _open_palantir_deck_choice(state)
+    except RuntimeError:
+        # deck empty: the grant is unfulfillable (WOTR has no reshuffle)
+        # - a legitimate no-draw, game_logic.grant_draw's contract
         pass
+    except Exception:
+        # EX-9: any other failure loses an OWED draw - loud on the
+        # live/self-play path; the teacher (log = truth) stays lenient
+        import combat as _cmbgd9
+        if _cmbgd9.FINAL_HITS_HOOK is None:
+            raise
 
 
 def _execute_action_inner(state: GameState, action: Action):
@@ -9286,29 +10417,48 @@ def _execute_action_inner(state: GameState, action: Action):
     die_idx = action.die_idx
 
     if atype == 'skip':
-        # Skip: discard one die without effect (always available)
-        _consume_die(state, die_idx)
+        if p.get('side') is not None:
+            # A no-effect discard pays the named non-Eye die. Menus expose
+            # this only for the historical empty-deck Event exception or an
+            # otherwise empty ordinary menu, never beside useful actions.
+            skip_side = Side.FREE_PEOPLES if p.get('side') == 'fp' else Side.SHADOW
+            skip_face = ActionDieFace[str(p.get('face', 'EVENT'))]
+            skip_pool = state.dice.get(skip_side, ())
+            if (skip_face == ActionDieFace.EYE or die_idx < 0
+                    or die_idx >= len(skip_pool) or skip_pool[die_idx].used
+                    or skip_pool[die_idx].current != skip_face):
+                raise RuntimeError('die discard requires the named unused non-Eye face')
+            if (_pending_decision_side(state) is not None
+                    or state.pending_army_move_die is not None
+                    or state.pending_muster_die is not None):
+                raise RuntimeError('die discard cannot bypass a pending decision')
+            _consume_die_for_face(state, skip_side, die_idx, (skip_face,))
+        else:
+            # legacy traces (pre-1.67 side-less skip rows): discard one die
+            # without effect
+            _consume_die(state, die_idx)
 
     elif atype == 'pass':
         # Pass: do nothing, no die consumed (only when fewer dice than opponent)
         # OR: consume pending multi-step die
         # If pending multi-step action, consume that die
         if state.pending_army_move_die is not None:
-            # fix 86 (Feanor T6 gate-1): if the stored pending die is
-            # ALREADY USED (a teacher forcer settled the second leg and
-            # consumed it directly), closing the window must not fall
-            # back onto a FRESH die — that double-charged the pair and
-            # starved the next Muster/Army record.
+            # fix 86: if the stored pending die is ALREADY USED (a teacher
+            # forcer settled the second leg), closing the window must not
+            # fall back onto a FRESH die.
             _pd86 = state.pending_army_move_die
             _pdice86 = state.dice.get(state.pending_army_move_side, [])
             if not (0 <= _pd86 < len(_pdice86)
                     and _pdice86[_pd86].used):
-                # (MUSTER included for the Mouth's muster-as-army ability)
+                # (MUSTER included for the Mouth's muster-as-army ability;
+                # LA-1: a waiver-funded pair spends the waiver here)
                 _consume_die_for_face(
                     state, state.pending_army_move_side,
                     state.pending_army_move_die,
                     (ActionDieFace.ARMY, ActionDieFace.MUSTER_ARMY,
-                     ActionDieFace.WILL_OF_WEST, ActionDieFace.MUSTER))
+                     ActionDieFace.WILL_OF_WEST, ActionDieFace.MUSTER),
+                    waived=bool((state.pending_army_move_preexist
+                                 or {}).get('waived')))
             state.pending_army_move_die = None
             state.pending_army_move_from = None
             state.pending_army_move_side = None
@@ -9325,7 +10475,6 @@ def _execute_action_inner(state: GameState, action: Action):
             state.pending_muster_side = None
         elif state.pending_combat is not None:
             # Pass during combat clears pending combat
-            _restore_rearguard(state, state.pending_combat)
             state.pending_combat = None
             _maybe_open_palantir_draw(state)   # USER 1.208m deferred draw
         elif state.pending_hunt is not None:
@@ -9343,27 +10492,10 @@ def _execute_action_inner(state: GameState, action: Action):
     elif atype == 'army_move':
         from_key = p['from']
         to_key = p['to']
-        # card-granted follow-up bookkeeping (RWA: up to 2 moves OR 1
-        # attack; BCC: one move/attack with the WK's army)
-        _pcf9 = getattr(state, 'pending_card_followup', None)
-        if p.get('card_followup') and _pcf9 is not None:
-            # rebind, never add in place: the set may still be shared
-            # with a parent state
-            _pcf9['exclude'] = (set(_pcf9.get('exclude') or ())
-                                | {sanitize(str(to_key))})
-            _pcf9['moved_any'] = True
-            _pcf9['moves_left'] = _pcf9.get('moves_left', 1) - 1
-            if _pcf9['moves_left'] <= 0 or _pcf9['kind'] == 'wk_army':
-                state.pending_card_followup = None
-
-        # Mouth of Sauron ability: this army action rides a Muster die
-        # (once per turn while the Mouth is in play)
-        if p.get('mouth_muster'):
-            state.sh_mouth_muster_used_this_turn = True
-
-        # Track army as moved this turn (rulebook: each army once per turn)
-        # Mark both source and destination — army is the same whether it's at
-        # the old or new location
+        # (EX-10: the card-follow-up / Mouth bookkeeping is written
+        # AFTER game_logic.move_army succeeds - see below - so a
+        # refused move cannot burn the once-per-turn ability or the
+        # follow-up's move count on the in-place episode path)
 
         # Split support (rulebook p.25): n_regular/n_elite/take_leaders params
         # select a portion of the army; absent params move the whole stack.
@@ -9381,20 +10513,19 @@ def _execute_action_inner(state: GameState, action: Action):
             n_e = sum(1 for u in _army.units if u.kind == UnitKind.ELITE)
             mr = min(int(p.get('n_regular') or 0), n_r)
             me = min(int(p.get('n_elite') or 0), n_e)
-            if mr >= n_r and me >= n_e and _nn9 is None and _nl9 is None:
-                return {}  # whole stack — simple merge path
             take = p.get('take_leaders', True)
-            # C (1.211): an explicit n_leaders count (teacher leader-PARTIAL
-            # split) pins the non-Nazgul leader figures precisely - an int,
-            # never None, so take() cannot fall to its None->0 stranding
-            # path.  Only the teacher sets n_leaders; self-play never does.
-            # WK-STRANDING FIX (tester 2026-08-24, the 1.150 pattern
-            # victor_advance already carries): with take_leaders=True
-            # and an explicit n_nazgul, move_leaders=None fell into
-            # take()'s None->ZERO path and STRANDED every non-Nazgul
-            # leader figure - the Witch-King Minion stayed behind on a
-            # C-die army move.  99 is clamped by move_army to the
-            # movable non-Nazgul figures.
+            # W4-035: a full vacate that leaves Companions / Minions /
+            # Nazgul behind (take_leaders=False) is a split, not the
+            # whole-stack merge
+            if (mr >= n_r and me >= n_e and _nn9 is None
+                    and _nl9 is None and take):
+                return {}  # whole stack — simple merge path
+            # C (1.211): an explicit n_leaders count pins the non-Nazgul
+            # leader figures precisely (teacher only).  WK-STRANDING
+            # (tester 2026-08-24, the 1.150 pattern): with
+            # take_leaders=True and an explicit n_nazgul, move_leaders
+            # must be an int (99 = all, clamped by move_army), never None
+            # (take()'s None->ZERO path).
             _ml9 = (int(_nl9) if _nl9 is not None
                     else (99 if take else 0))
             if _nn9 is not None:
@@ -9423,15 +10554,44 @@ def _execute_action_inner(state: GameState, action: Action):
             _act_side = _side_of_nation(_a0.units[0].nation) \
                 if (_a0 and _a0.units) else Side.FREE_PEOPLES
         mv_kwargs['side'] = _act_side
+        # W4-038 (c): the executor hands the kernel the SAME border
+        # predicate the menu used (ONE body, _border_pred9), so a
+        # legal-looking split never carries a non-belligerent unit or
+        # Leader across another Nation's border (the count-based take()
+        # picked list-order figures: 2024-05-21 L842 Dale -> Woodland
+        # Realm executed as the North Regular + North Leader crossing).
+        _a38 = _armies_lookup(state, from_key)
+        if _a38 is not None and sanitize(from_key) != sanitize(to_key):
+            _nok38 = _border_pred9(
+                state,
+                [u for u in _a38.units
+                 if _side_of_nation(u.nation) == _act_side],
+                _a38.leaders, _act_side, sanitize(to_key))
+            if _nok38 is not None:
+                mv_kwargs['nation_ok'] = _nok38
+
+        from army_move_participants import selected, preexisting, inventory
+        _move_source = _a38
+        if (state.pending_army_move_die is not None
+                and sanitize(from_key) == sanitize(state.pending_army_move_from or '')):
+            _move_source = preexisting(_move_source, state.pending_army_move_preexist or {})
+        _moving = selected(_move_source, _act_side, p, mv_kwargs.get('nation_ok'))
+        if p.get('card_followup'):
+            from army_move_participants import card_followup_qualifies
+            _followup = getattr(state, 'pending_card_followup', None)
+            if (not _followup or _followup.get('side') != ('fp' if _act_side == Side.FREE_PEOPLES else 'sh')
+                    or _followup.get('kind') not in ('nazgul_armies', 'wk_army')):
+                raise RuntimeError('No matching card army followup')
+            if not card_followup_qualifies(_moving, _followup['kind']):
+                raise RuntimeError('Card army move requires participating Nazgul or Witch-king')
+        if _move_source is not _a38:
+            mv_kwargs['movement_roster'] = (tuple(_moving.units), tuple(_moving.leaders))
 
         if state.pending_army_move_die is not None:
-            # Second move of Army die double-move (MUSTER included for
-            # the Mouth of Sauron's muster-as-army ability).  Consume
-            # BEFORE moving so a die-accounting failure cannot leave a
-            # half-applied move (free-action leak fix, 2026-07-08).
-            # fix 86: unless the stored die is ALREADY USED (a teacher
-            # forcer settled it directly) — the fallback would burn a
-            # fresh die and double-charge the pair.
+            # Second move of the Army-die pair (MUSTER included for the
+            # Mouth's muster-as-army).  Consume BEFORE moving (free-action
+            # leak fix 2026-07-08); fix 86: unless the stored die is
+            # ALREADY USED (a teacher forcer settled it directly).
             _pd86b = state.pending_army_move_die
             _pdice86b = state.dice.get(state.pending_army_move_side, [])
             if not (0 <= _pd86b < len(_pdice86b)
@@ -9440,7 +10600,9 @@ def _execute_action_inner(state: GameState, action: Action):
                     state, state.pending_army_move_side,
                     state.pending_army_move_die,
                     (ActionDieFace.ARMY, ActionDieFace.MUSTER_ARMY,
-                     ActionDieFace.WILL_OF_WEST, ActionDieFace.MUSTER))
+                     ActionDieFace.WILL_OF_WEST, ActionDieFace.MUSTER),
+                    waived=bool((state.pending_army_move_preexist
+                                 or {}).get('waived')))
             game_logic.move_army(state, from_key, to_key, **mv_kwargs)
             state.pending_army_move_die = None
             state.pending_army_move_from = None
@@ -9448,9 +10610,15 @@ def _execute_action_inner(state: GameState, action: Action):
             state.pending_army_move_preexist = None
         else:
             # Determine die face to decide if this is an Army die (2 moves)
-            # or Character die (1 move)
+            # or Character die (1 move).  LA-1/LA-2: a die funded by the
+            # Elven-Ring waiver is treated AS the face the ring was paid
+            # for; LA-10: nothing funds a leaderless Character-die move.
             side = _act_side
-            face = _get_die_face(state, die_idx, side=side)
+            face, _waived9 = _army_action_die_face(
+                state, side, die_idx, _moving, p)
+            if face == ActionDieFace.CHARACTER and not game_logic.army_has_leader_figure(
+                    state, _moving, side=side):
+                raise RuntimeError('Character move requires participating leadership')
 
             if face in (ActionDieFace.ARMY, ActionDieFace.MUSTER_ARMY,
                         ActionDieFace.WILL_OF_WEST) \
@@ -9466,6 +10634,12 @@ def _execute_action_inner(state: GameState, action: Action):
                 # snapshot the pre-existing counts for the second half.
                 _pre = next((a for k, a in state.armies.items()
                              if sanitize(k) == sanitize(to_key)), None)
+                if sanitize(from_key) == sanitize(to_key):
+                    moving_ids = {id(f) for f in _moving.units + _moving.leaders}
+                    _pre = Army(
+                        region=_pre.region,
+                        units=[u for u in _pre.units if id(u) not in moving_ids],
+                        leaders=[l for l in _pre.leaders if id(l) not in moving_ids])
                 _pre_own = [u for u in (_pre.units if _pre else [])
                             if _side_of_nation(u.nation) == side]
                 state.pending_army_move_preexist = {
@@ -9474,6 +10648,10 @@ def _execute_action_inner(state: GameState, action: Action):
                     'elite': sum(1 for u in _pre_own
                                  if u.kind == UnitKind.ELITE),
                     'leaders': len(_pre.leaders) if _pre else 0,
+                    'figures': inventory(_pre, side),
+                    # LA-1: the pair rides the Elven-Ring waiver - the
+                    # second half / pass spends it when the die pays
+                    'waived': bool(_waived9),
                 }
                 game_logic.move_army(state, from_key, to_key, **mv_kwargs)
                 state.pending_army_move_die = die_idx
@@ -9483,19 +10661,33 @@ def _execute_action_inner(state: GameState, action: Action):
                 # Character die: single move, consume immediately
                 _consume_die_for_face(state, side, die_idx,
                                       (ActionDieFace.CHARACTER,
-                                       ActionDieFace.WILL_OF_WEST))
+                                       ActionDieFace.WILL_OF_WEST),
+                                      waived=_waived9)
                 game_logic.move_army(state, from_key, to_key, **mv_kwargs)
+        # card-granted follow-up bookkeeping (RWA: up to 2 moves OR 1
+        # attack; BCC: one move/attack with the WK's army) - EX-10:
+        # only once the move itself has landed
+        _pcf9 = getattr(state, 'pending_card_followup', None)
+        if p.get('card_followup') and _pcf9 is not None:
+            # rebind, never add in place: the set may still be shared
+            # with a parent state
+            _pcf9['exclude'] = (set(_pcf9.get('exclude') or ())
+                                | {sanitize(str(to_key))})
+            _pcf9['moved_any'] = True
+            _pcf9['moves_left'] = _pcf9.get('moves_left', 1) - 1
+            if _pcf9['moves_left'] <= 0 or _pcf9['kind'] == 'wk_army':
+                state.pending_card_followup = None
+        # Mouth of Sauron ability: this army action rides a Muster die
+        # (once per turn while the Mouth is in play)
+        if p.get('mouth_muster'):
+            state.sh_mouth_muster_used_this_turn = True
         # Walking into an undefended enemy settlement CAPTURES it
         # (rulebook: enemy-controlled settlements free of enemy units are
         # valid move destinations — and occupying one takes control).
         # SIDE-AWARE (2026-07-04): the capturing side is the MOVER
-        # (_act_side), never _occ.units[0] — a shared entry with an enemy
-        # residue unit sitting first credited the WRONG side (game 2
-        # T9/T10: Shadow moves into Morannon / Minas Morgul / Umbar were
-        # recorded as FP captures -> phantom FP military victory at 6
-        # VP).  And walking in only captures when NO enemy units remain
-        # at the destination (otherwise it is a siege/assault situation;
-        # combat resolution handles those captures).
+        # (_act_side), never _occ.units[0] (a shared entry with an enemy
+        # residue unit first credited the WRONG side).  Walking in
+        # captures only when NO enemy units remain at the destination.
         try:
             from combat import _check_settlement_capture
             _occ = next((a for k, a in state.armies.items()
@@ -9516,24 +10708,14 @@ def _execute_action_inner(state: GameState, action: Action):
     elif atype == 'army_attack':
         from_key = p['from']
         to_key = p['to']
-        # METROLOGY 2026-07-27: heal any stale conquest flag BEFORE the
-        # battle forms — a non-combat reoccupation (card recruit,
-        # retreat) left enemy_controlled stale, and once the region
-        # went two-sided the standing invariant skipped it forever
-        # (garrison_side_for then mis-answered for the whole siege).
-        # Self-play only; the teacher keeps its certified call pattern.
+        # Heal any stale conquest flag BEFORE the battle forms (a
+        # non-combat reoccupation leaves enemy_controlled stale; once
+        # two-sided the standing invariant skips it).  Self-play only
+        # (2026-07-27).
         try:
             game_logic.enforce_settlement_control(state)
         except Exception:
             pass
-        if p.get('card_followup'):
-            state.pending_card_followup = None  # attack ends the follow-up
-
-        # Mouth of Sauron ability: this attack rides a Muster die
-        # (once per turn while the Mouth is in play)
-        if p.get('mouth_muster'):
-            state.sh_mouth_muster_used_this_turn = True
-
         army = _armies_lookup(state, from_key)
         if army is None:
             army = next((a for k, a in state.armies.items()
@@ -9541,10 +10723,9 @@ def _execute_action_inner(state: GameState, action: Action):
         if army and army.units:
             _p_side9 = p.get('side')
             if _p_side9 in ('fp', 'sh'):
-                # 2026-07-10 sortie fix: the enumeration stamped the
-                # acting side - never infer (the garrison-opposite
-                # inference misattributed garrison SORTIES to the
-                # besieger and consumed the wrong side's dice)
+                # the enumeration stamped the acting side - never infer
+                # (2026-07-10 sortie fix: inference misattributed garrison
+                # SORTIES)
                 side = (Side.FREE_PEOPLES if _p_side9 == 'fp'
                         else Side.SHADOW)
             else:
@@ -9561,13 +10742,53 @@ def _execute_action_inner(state: GameState, action: Action):
                     _gar = garrison_side_for(state, to_key)
                     side = (Side.SHADOW if _gar == Side.FREE_PEOPLES
                             else Side.FREE_PEOPLES)
+            # The printed protection includes siege assaults and applies to
+            # every funding source, including a free card follow-up.
+            if side == Side.SHADOW:
+                from persistent_effects import can_shadow_attack
+                _attack_ok, _attack_blocker = can_shadow_attack(state, to_key)
+                if not _attack_ok:
+                    raise RuntimeError('Shadow attack blocked by ' + _attack_blocker)
+            from army_participants import select_forced_attack
+            _formation = select_forced_attack(state, army, side)
+            if not _formation.available:
+                raise RuntimeError('Cannot form attacking army: ' + _formation.unavailable_reason)
+            _fighting_army = gs.Army(region=army.region,
+                                    units=list(_formation.attacking_units),
+                                    leaders=list(_formation.attacking_leaders))
             _attack_faces = (ActionDieFace.ARMY, ActionDieFace.MUSTER_ARMY,
                              ActionDieFace.CHARACTER,
                              ActionDieFace.WILL_OF_WEST)
             if p.get('mouth_muster'):
                 # Mouth ability: the attack legitimately rides a Muster die
                 _attack_faces = _attack_faces + (ActionDieFace.MUSTER,)
-            _consume_die_for_face(state, side, die_idx, _attack_faces)
+            # BL-87(a): validate the DEFENDER before ANY die spend or
+            # mutation - an attack against a region holding NO enemy
+            # units must never form a battle (recapturing an emptied
+            # settlement is an army_move); refused TRANSACTIONALLY with a
+            # loud invariant.  The no-army teacher branch below keeps its
+            # corpus tolerance.
+            _def87 = _armies_lookup(state, to_key)
+            if not any(_side_of_nation(u.nation) != side
+                       for u in (_def87.units if _def87 else [])):
+                try:
+                    import state_invariants as _si87
+                    _si87.VIOLATIONS.append({
+                        'code': 'attack_without_defender',
+                        'ctx': 'T%s %s->%s side=%s'
+                               % (getattr(state, 'turn', '?'),
+                                  from_key, to_key, p.get('side')),
+                        'detail': 'attack refused transactionally - '
+                                  'no enemy units at the target'})
+                except Exception:
+                    pass
+                return
+            # Character funding is tested against participating figures;
+            # a peaceful Leader in the physical source cannot pay for it.
+            _face9a, _waived9a = _army_action_die_face(
+                state, side, die_idx, _fighting_army, p)
+            _consume_die_for_face(state, side, die_idx, _attack_faces,
+                                  waived=_waived9a)
         else:
             # No army found: still honor the enumeration's side stamp —
             # a stale 'sh' attack must not form a pending_combat with
@@ -9576,6 +10797,14 @@ def _execute_action_inner(state: GameState, action: Action):
             _p_side9 = p.get('side')
             side = (Side.SHADOW if _p_side9 == 'sh'
                     else Side.FREE_PEOPLES)
+        # BL-87(a): the follow-up/Mouth flags mutate only once the
+        # attack is PAST the transactional refusal above (both the
+        # live branch and the teacher's no-army branch land here)
+        if p.get('card_followup'):
+            state.pending_card_followup = None  # attack ends the follow-up
+        if p.get('mouth_muster'):
+            # once per turn while the Mouth is in play
+            state.sh_mouth_muster_used_this_turn = True
         # Track region attacked
 
         # Stronghold region? (defender MAY withdraw into a siege there.)
@@ -9586,12 +10815,10 @@ def _execute_action_inner(state: GameState, action: Action):
             state, 'besieged_strongholds', set())
         # SORTIE (rulebook p.32): the garrison attacking its besiegers
         # fights a FIELD battle - no 6+ assault threshold.  Same for a
-        # RELIEF attack from an adjacent region (GAME19 T8 fix 75): when
-        # the attacker is the garrison's own side, the hostile units are
-        # the BESIEGERS standing in the region - a field battle against
-        # them, never an assault on the (friendly) stronghold.  Before
-        # this gate the from!=to relief case inherited is_siege=True and
-        # parked forever at attacker_siege_decision (zero rounds).
+        # RELIEF attack from an adjacent region (fix 75): when the
+        # attacker is the garrison's own side the hostiles are the
+        # BESIEGERS - a field battle, never an assault on the friendly
+        # stronghold.
         _is_sortie9 = False
         if already_besieged:
             from combat import garrison_side_for as _gsf9
@@ -9609,9 +10836,7 @@ def _execute_action_inner(state: GameState, action: Action):
                         else Side.FREE_PEOPLES)
 
         # Set up pending_combat for multi-phase resolution.
-        # USER RULE 2026-07-08: the REARGUARD decision is REMOVED — humans
-        # go hundreds of games without leaving one; the phase routes
-        # straight to the post-rearguard flow (siege choice / field round).
+        # Compulsory rear figures are automatic; there is no voluntary AI split.
         state.pending_combat = {
             'attacker_region': from_key,
             'defender_region': to_key,
@@ -9623,6 +10848,11 @@ def _execute_action_inner(state: GameState, action: Action):
             'defender_side': def_side,
             'rounds_fought': 0,
         }
+        # RB28: form the two armies before defender choices or political
+        # changes. This fixed split opens no extra policy decision.
+        if army and army.units:
+            from army_participants import freeze_attack
+            freeze_attack(state, state.pending_combat, _formation)
         # Rulebook p.35: the defending nation activates + advances when
         # the attack is DECLARED (fires even for sieges established
         # without an assault round)
@@ -9633,41 +10863,93 @@ def _execute_action_inner(state: GameState, action: Action):
     elif atype == 'victor_advance':
         pc = state.pending_combat
         state.pending_combat = None
-        _maybe_open_palantir_draw(state)   # USER 1.208m deferred draw
+        # W2-025: on the post-siege-retreat advance the garrison trim
+        # may still open below - the deferred draw fires once the
+        # battle is FULLY closed (1.208m), so it is deferred with it.
+        _psr25 = bool(pc and pc.get('post_siege_retreat'))
+        if not _psr25:
+            _maybe_open_palantir_draw(state)   # USER 1.208m deferred draw
         if pc:
             _vside9 = (Side.FREE_PEOPLES if p.get('side') == 'fp'
                        else Side.SHADOW)
             try:
-                # 1.150: move_army's take() treats qty=None as ZERO
-                # when unit counts are supplied - 'None means all' was
-                # a silent no-op and every advance stranded all
-                # leadership at the attack region
+                # 1.150: move_army's take() treats qty=None as ZERO when
+                # unit counts are supplied - pass explicit counts (99 =
+                # all).
                 game_logic.move_army(
                     state, p['from'], p['to'],
                     move_units=int(p.get('n_regular') or 0),
                     move_elite=int(p.get('n_elite') or 0),
-                    move_leaders=(99 if p.get('take_leaders') else 0),
+                    # LA-8: an explicit per-count leader split wins
+                    move_leaders=(int(p['n_leaders'])
+                                  if p.get('n_leaders') is not None
+                                  else (99 if p.get('take_leaders')
+                                        else 0)),
                     move_nazgul=(int(p['n_nazgul'])
                                  if p.get('n_nazgul') is not None
                                  else (99 if p.get('take_leaders')
                                        else 0)),
-                    side=_vside9)
+                    side=_vside9, combat_context=pc, defer_stacking=True)
             except Exception:
-                if pc.get('post_retreat'):
-                    raise   # live/learned path: a failed advance is LOUD
-                pass  # stacking or lookup issue — victor stays
+                # a failed advance is LOUD on the live/learned path
+                # (post-retreat and won-battle alike, EX-9); only the
+                # teacher keeps 'victor stays' for corpus tolerance
+                import combat as _cmbva9
+                if pc.get('post_retreat') or _psr25 \
+                        or _cmbva9.FINAL_HITS_HOOK is None:
+                    raise
             else:
-                if pc.get('post_retreat'):
-                    # entering the region the defender vacated CAPTURES
-                    # its settlement (a won battle registers the
-                    # capture at the wipe; a retreat only on entry)
+                if _psr25:
+                    # W2-025: the entering portion ESTABLISHES the siege
+                    # (rulebook L2861-2865) - flag + BL-128 post-condition
+                    # through the one _begin_siege body (co-located
+                    # now: no second move), never a capture (the garrison
+                    # holds the Stronghold, 1.255 is about EMPTY
+                    # settlements).  Rulebook L2870-2873: the garrison
+                    # cap binds "when a Stronghold comes under siege" -
+                    # the excess is the OWNER's learned siege_trim
+                    # (USER RULING 2026-07-20), opened here as the
+                    # retreat_into_siege executor opened it before.
+                    _def25 = sanitize(str(pc['defender_region']))
+                    _pc25 = dict(pc)
+                    _pc25['attacker_region'] = pc['defender_region']
+                    _pc25['is_siege'] = True
+                    _begin_siege(state, _pc25)
+                    _register_move_overstack(state, p['to'], _vside9)
+                    _dside25 = pc.get('defender_side')
+                    _darmy25 = _armies_lookup(state, pc['defender_region'])
+                    _gar25 = [u for u in (_darmy25.units if _darmy25
+                                          else [])
+                              if _dside25 is None
+                              or _side_of_nation(u.nation) == _dside25]
+                    if len(_gar25) - game_logic.MAX_SIEGE_UNITS > 0:
+                        state.pending_combat = {
+                            'phase': 'siege_trim',
+                            'deciding_side': _dside25,
+                            'trim_region': _def25,
+                            'attacker_region': pc['defender_region'],
+                            'defender_region': pc['defender_region'],
+                            'attacker_side': pc.get('attacker_side'),
+                            'defender_side': _dside25,
+                            'is_siege': True,
+                            'rounds_fought': pc.get('rounds_fought', 0),
+                            'post_siege_retreat': True,
+                        }
+                    else:
+                        _maybe_open_palantir_draw(state)   # USER 1.208m
+                else:
+                    # USER RULING 1.255 (2026-08-29): a settlement is
+                    # captured only when the enemy army actually ENTERS
+                    # it - after a wipe from an adjacent region exactly
+                    # as after a retreat, the advance IS the entry (the
+                    # destination holds no enemy units on either path)
                     from combat import _check_settlement_capture
                     _check_settlement_capture(
                         state, sanitize(str(p['to'])), _vside9)
-                # USER RULING 2026-07-27: the advance may overstack
-                # (relieve-and-merge play) — trim is the learned
-                # decision once the move ends
-                _register_move_overstack(state, p['to'], _vside9)
+                    # USER RULING 2026-07-27: the advance may overstack
+                    # (relieve-and-merge play) — trim is the learned
+                    # decision once the move ends
+                    _register_move_overstack(state, p['to'], _vside9)
 
     elif atype == 'victor_stay':
         state.pending_combat = None
@@ -9700,9 +10982,43 @@ def _execute_action_inner(state: GameState, action: Action):
     elif atype == 'retreat_into_siege':
         # Stronghold defender withdraws into the stronghold (rulebook p.30:
         # allowed at the beginning of any combat round). Max 5 units inside;
-        # excess units are removed.
+        # excess units are removed.  Siege establishment (flag + p.31
+        # move-in) is _begin_siege - ONE body shared with
+        # siege_continue (BL-83).
         pc = state.pending_combat
         if pc:
+            _resolve_wk_sorcerer(state, pc)
+        if pc and sanitize(str(pc.get('attacker_region', ''))) \
+                != sanitize(pc['defender_region']):
+            # W2-025 (amendment 1.49 sub-bullet 2026-09-03; rulebook
+            # L2832-2834 + L2861-2865, 1.42): the withdrawal OPENS the
+            # region - the ATTACKER decides whether (and with how much)
+            # to advance.  The forced whole-stack move-in + flag stamp
+            # that lived here made that decision inside the DEFENDER's
+            # action (no learned row, no gesture, no partial / declined
+            # advance).  Open the SAME victor_advance pending the
+            # field-battle end uses (composition grid + victor_stay);
+            # the executor establishes the siege (flag + garrison trim,
+            # rulebook L2870-2873: the 5-unit cap binds only "when a
+            # Stronghold comes under siege") on an advance and closes
+            # the battle with NO siege on victor_stay.  The die was
+            # consumed at the declaration either way (1.49).
+            state.pending_combat = {
+                'phase': 'victor_advance',
+                'attacker_rearguard': pc.get('attacker_rearguard'),
+                'attacker_region': pc['attacker_region'],
+                'defender_region': pc['defender_region'],
+                'attacker_side': pc.get('attacker_side'),
+                'defender_side': pc.get('defender_side'),
+                'deciding_side': pc.get('attacker_side'),
+                'is_siege': False,
+                'rounds_fought': pc.get('rounds_fought', 0),
+                'post_siege_retreat': True,
+            }
+        elif pc:
+            # CO-LOCATED attacker (Corsairs of Umbar, almanac A10): no
+            # advance exists - the withdrawal establishes the siege at
+            # once (pre-W2-025 body, byte-identical).
             def_san = sanitize(pc['defender_region'])
             if not hasattr(state, 'besieged_strongholds'):
                 state.besieged_strongholds = set()
@@ -9738,37 +11054,18 @@ def _execute_action_inner(state: GameState, action: Action):
                 pc['deciding_side'] = _dside
                 pc['trim_region'] = def_san
                 _trim_pending = True
-            # iter 36 (rulebook p.31): the attacking army MOVES INTO the
-            # region — the siege is maintained by the co-located besieger
-            # (the engine's from==to assault model).  Without this the
-            # attacker stayed adjacent forever and cleanup_sieges would
-            # (correctly) dissolve the siege it just created.
-            # (fix-92 EXPERIMENT REVERTED 2026-07-25: unconditional
-            # move-in cured nothing for game 20 — its Isengard unit
-            # diverges upstream — and broke game 16 by dragging leaders
-            # the humans left behind; game 20's deduped arrival drags
-            # remain an open parser-side item, see rules_amendments.)
-            if sanitize(pc['attacker_region']) != def_san:
-                try:
-                    game_logic.move_army(state, pc['attacker_region'],
-                                         pc['defender_region'])
-                    pc['attacker_region'] = pc['defender_region']
-                except Exception:
-                    pass  # stacking or lookup issue: attacker stays put
-            # iter 38 SIEGE TWO-STEP (user ruling + rulebook p.30: "If
-            # the defending Army retreats into a Siege, the battle ends
-            # immediately"): the attack die bought the declaration; the
-            # defender's withdrawal ENDS the action — no combat round
-            # against the besieged army on this die.  Damaging units
-            # inside the stronghold requires a SEPARATE siege-assault
-            # action (its own die) later.  The old flow continued into
-            # 'attacker_siege_decision' and could resolve assault rounds
-            # within the same action.
-            # (USER RULING 2026-07-20: if a siege_trim decision opened
-            # above, the battle end waits for it — its executor runs
-            # the restore/clear.)
+            # Rulebook p.31: the attacking army MOVES INTO the region -
+            # the siege is maintained by the co-located besieger (the
+            # engine's from==to assault model).
+            _begin_siege(state, pc)
+            # SIEGE TWO-STEP (rulebook p.30: "If the defending Army
+            # retreats into a Siege, the battle ends immediately"): the
+            # attack die bought the declaration; the withdrawal ENDS the
+            # action - no combat round on this die; damaging the garrison
+            # needs a SEPARATE siege-assault action.  (USER RULING
+            # 2026-07-20: an open siege_trim decision runs the
+            # restore/clear from its executor.)
             if not _trim_pending:
-                _restore_rearguard(state, pc)
                 state.pending_combat = None
                 _maybe_open_palantir_draw(state)   # USER 1.208m deferred draw
 
@@ -9799,15 +11096,13 @@ def _execute_action_inner(state: GameState, action: Action):
                     _bk = set(map(id, back))
                     d_army.units = [u for u in d_army.units
                                     if id(u) not in _bk]
-            _restore_rearguard(state, pc)
             state.pending_combat = None
             _maybe_open_palantir_draw(state)   # USER 1.208m deferred draw
 
     elif atype == 'combat_cease':
         # Attacker ceases the attack — surviving units stay where they were
-        pc = state.pending_combat
-        if pc:
-            _restore_rearguard(state, pc)
+        if state.pending_combat:
+            _resolve_wk_sorcerer(state, state.pending_combat)
         state.pending_combat = None
         _maybe_open_palantir_draw(state)   # USER 1.208m deferred draw
 
@@ -9828,6 +11123,21 @@ def _execute_action_inner(state: GameState, action: Action):
                 # original casing.
                 _retreat_army(state, pc['defender_region'], to_region,
                               side=pc.get('defender_side'))
+                # W2-023 (2026-09-02): the retreat ENDS the battle exactly
+                # as a wipe does - settle the siege flags now (mirror of
+                # _finish_battle) BEFORE the advance pending opens.  A
+                # RELIEF battle's defender is the besieging army: once it
+                # has left, the Stronghold entry is garrison-only and the
+                # stale flag made army_stack_cap apply the 5-unit garrison
+                # cap to the relieving army, so every offered
+                # victor_advance raised on execution (2023-09-07 L1250,
+                # 2023-11-26 L435, 2024-01-04 L634, 2024-02-25 L537).
+                # cleanup_sieges only lifts a flag whose entry holds ONE
+                # side (a live siege the attacker retreats from stays).
+                try:
+                    game_logic.cleanup_sieges(state)
+                except Exception:
+                    pass
                 _atk_k = next((k for k in state.armies if sanitize(str(k))
                                == sanitize(str(pc['attacker_region']))),
                               pc['attacker_region'])
@@ -9851,6 +11161,7 @@ def _execute_action_inner(state: GameState, action: Action):
                     else:
                         _advance_pending = {
                             'phase': 'victor_advance',
+                            'attacker_rearguard': pc.get('attacker_rearguard'),
                             'attacker_region': _atk_k,
                             'defender_region': _def_k,
                             'attacker_side': pc['attacker_side'],
@@ -9867,11 +11178,12 @@ def _execute_action_inner(state: GameState, action: Action):
                 _retreat_army(state, pc['attacker_region'], to_region,
                               side=pc.get('attacker_side'))
             _resolve_wk_sorcerer(state, pc)   # Scouts pre-round retreat
-            _restore_rearguard(state, pc)
             state.pending_combat = None
             # USER RULING 2026-07-27: a retreat merge may overstack —
             # open the learned trim now that the combat pending is down
             _register_move_overstack(state, to_region, retreating_side)
+            if pc.get('corsairs_relief_garrison') and retreating_side == pc['defender_side']:
+                _register_move_overstack(state, pc['defender_region'], pc['attacker_side'])
             if _advance_pending is not None:
                 # the attacker decides next; a retreat-merge trim pending
                 # (card_option) is served once this pending closes
@@ -9887,14 +11199,12 @@ def _execute_action_inner(state: GameState, action: Action):
             _run_combat_round(state, pc, is_siege=True)
 
     elif atype == 'siege_continue':
-        # Attacker maintains siege without combat — stronghold is now besieged
+        # Attacker maintains the siege without combat.  BL-83:
+        # establishment goes through _begin_siege (flag + p.31 move-in).
         pc = state.pending_combat
         if pc:
-            if not hasattr(state, 'besieged_strongholds'):
-                state.besieged_strongholds = set()
-            state.besieged_strongholds.add(sanitize(pc['defender_region']))
+            _begin_siege(state, pc)
             _resolve_wk_sorcerer(state, pc)   # no-assault termination
-            _restore_rearguard(state, pc)
         state.pending_combat = None
         _maybe_open_palantir_draw(state)   # USER 1.208m deferred draw
 
@@ -9916,30 +11226,28 @@ def _execute_action_inner(state: GameState, action: Action):
             _atk_san = sanitize(pc['attacker_region'])
             atk_army = next((a for k, a in state.armies.items()
                              if sanitize(k) == _atk_san), None)
-            # no_reduce (2025-04-06 demanray T19 Umbar): a teacher-
-            # synthesized siege press that carries NO log press evidence
-            # (no siege_press record, no attacker downgrade mark — the
-            # extra siege rounds were fought on CASUALTIES, not paid
-            # reductions) advances the round WITHOUT reducing an elite.
-            # The parser recorded the attacker's per-round elite losses as
-            # kills (kill_elite) and the client census shows the survivors
-            # keeping their Elite rank; a press-downgrade here double-
-            # removes those elites (4E -> 0E instead of the true 2E).
+            # no_reduce (teacher; 2025-04-06 demanray T19 Umbar): a
+            # synthesized siege press with NO log press evidence advances
+            # the round WITHOUT reducing an elite (the attacker's
+            # per-round elite losses were already applied as kills).
             if atk_army and not p.get('no_reduce'):
                 atk_side_pc = pc.get('attacker_side')
-                # fix 76 (GAME19 T8): the parser stamps the press record
-                # with the PAID elite's nation (log evidence) — prefer
-                # that nation's elite; first-in-list order paid with the
-                # wrong nation whenever the attacker mixed elites.
+                # fix 76: the parser stamps the press with the PAID
+                # elite's nation (log evidence) - prefer that nation's
+                # elite.
                 _want_nat9 = p.get('nation')
-                _want_nat9 = (str(_want_nat9).lower()
+                _want_nat9 = (str(getattr(_want_nat9, 'value', _want_nat9)).lower()
                               if _want_nat9 is not None else None)
+                _eligible = {id(u) for u in _alloc_side_units(
+                    state, _atk_san, atk_side_pc, UnitKind.ELITE)}
+                if not _eligible:
+                    raise RuntimeError('No participating Elite can pay for siege press')
                 _press_i9 = None
                 for _i9, _u9 in enumerate(atk_army.units):
-                    if _u9.kind == UnitKind.ELITE and (
+                    if id(_u9) in _eligible and _u9.kind == UnitKind.ELITE and (
                             atk_side_pc is None
                             or _side_of_nation(_u9.nation) == atk_side_pc):
-                        if _press_i9 is None:
+                        if _press_i9 is None and _want_nat9 is None:
                             _press_i9 = _i9
                         if (_want_nat9 is None
                                 or str(getattr(_u9.nation, 'value',
@@ -9947,6 +11255,8 @@ def _execute_action_inner(state: GameState, action: Action):
                                 == _want_nat9):
                             _press_i9 = _i9
                             break
+                if _press_i9 is None:
+                    raise RuntimeError('No participating Elite of the requested nation can pay for siege press')
                 if _press_i9 is not None:
                     i, u = _press_i9, atk_army.units[_press_i9]
                     # ONE downgrade-supply answerer (R7 / K6):
@@ -9970,7 +11280,7 @@ def _execute_action_inner(state: GameState, action: Action):
     elif atype == 'siege_no_press':
         # Attacker stops siege pressing
         if state.pending_combat:
-            _restore_rearguard(state, state.pending_combat)
+            _resolve_wk_sorcerer(state, state.pending_combat)
         state.pending_combat = None
         _maybe_open_palantir_draw(state)   # USER 1.208m deferred draw
 
@@ -9989,19 +11299,17 @@ def _execute_action_inner(state: GameState, action: Action):
 
     elif atype == 'casualty_allocate':
         pc = state.pending_combat
-        if pc:
-            stage = pc.get('alloc_stage')
-            if stage == 'attacker':
-                _reg9, _side9 = pc['attacker_region'], pc['attacker_side']
-                _hits9 = int(pc.get('atk_hits', 0) or 0)
-            else:
-                _reg9, _side9 = pc['defender_region'], pc['defender_side']
-                _hits9 = int(pc.get('def_hits', 0) or 0)
-            _apply_allocation(state, _reg9, _side9, _hits9,
-                              int(p.get('count', 0) or 0))
-            pc['alloc_stage'] = ('attacker' if stage == 'defender'
-                                 else None)
-            _enter_casualty_allocation(state, pc)
+        if not pc or pc.get('phase') != 'casualty_allocation':
+            raise ValueError('No active casualty allocation')
+        stage = pc.get('alloc_stage')
+        if stage not in ('attacker', 'defender'):
+            raise ValueError('Invalid casualty owner stage')
+        key = 'atk_hits' if stage == 'attacker' else 'def_hits'
+        hits = int(pc.get(key, 0) or 0)
+        cost = _apply_casualty_operation(
+            state, pc[stage + '_region'], pc[stage + '_side'], hits, p)
+        pc[key] = hits - cost
+        _enter_casualty_allocation(state, pc)
 
     elif atype in ('casualty_preserve_units', 'casualty_preserve_elites'):
         # Owner locks in casualty allocation for this battle, then combat
@@ -10046,13 +11354,55 @@ def _execute_action_inner(state: GameState, action: Action):
         # normal post-round decisions.
         pc = state.pending_combat
         if pc:
-            ec = pc.pop('effect_choice', None) or {}
+            ec = pc.get('effect_choice') or {}
+            if ec.get('stage') == 'onslaught_payment':
+                from onslaught_choices import pay
+                pay(state, pc, p)
+                return
+            if (ec.get('stage') == 'post' and ec.get('effect') == 'onslaught'
+                    and __import__('combat').FINAL_HITS_HOOK is None):
+                from onslaught_choices import begin
+                begin(state, pc, p)
+                return
+            if ec.get('stage') == 'round':
+                selection = {key: value for key, value in p.items()
+                             if key != 'card_id'}
+                if (p.get('card_id') != ec.get('card_id')
+                        or selection not in ec.get('options', ())):
+                    raise IllegalPlay('Choice is not legal at the observed combat stage')
+                from combat import resume_combat
+                cards = pc['_round_cards']
+                state._last_round_phase_call = True
+                result = resume_combat(state, pc['_round_resume'], selection)
+                _accept_combat_round_result(state, pc, result, *cards)
+                return
+            _tg9 = p.get('target')
+            # 1.254: a pick outside the offered set is an INVALID action
+            # (refused before any mutation), never a silent default
+            if ec.get('targets') and _tg9 not in ec['targets']:
+                raise IllegalPlay(
+                    'combat_effect_choice target %r is not among %r'
+                    % (_tg9, ec['targets']))
+            if ec.get('pairs') and (int(p.get('count', 0) or 0), _tg9) \
+                    not in [tuple(x) for x in ec['pairs']]:
+                raise IllegalPlay(
+                    'combat_effect_choice (count, target) %r is not among '
+                    '%r' % ((int(p.get('count', 0) or 0), _tg9),
+                            ec['pairs']))
+            pc.pop('effect_choice', None)
             count = int(p.get('count', 0) or 0)
             owner = ec.get('owner', 'atk')
             if ec.get('stage') == 'post':
                 from combat import apply_onslaught_choice
                 role = 'attacker' if owner == 'atk' else 'defender'
                 other = 'defender' if role == 'attacker' else 'attacker'
+                # USER RULING 1.254 (audit CB-7): the Onslaught's enemy
+                # hits are the ENEMY owner's learned allocation - not
+                # applied here (defer_enemy_hits); with hits scored and
+                # an enemy still standing, the enemy's casualty_allocate
+                # stage opens and the shared round tail
+                # (_complete_allocated_round) then reconciles, captures
+                # (1.255) and finishes.
                 own_dead, enemy_dead, rolls, hits = apply_onslaught_choice(
                     state,
                     pc[f'{role}_region'], pc[f'{other}_region'],
@@ -10063,12 +11413,24 @@ def _execute_action_inner(state: GameState, action: Action):
                     enemy_policy=pc.get(
                         'def_casualty_policy' if owner == 'atk'
                         else 'atk_casualty_policy', 'preserve_elites'),
-                    enemy_is_defender=(other == 'defender'))
+                    enemy_is_defender=(other == 'defender'),
+                    defer_enemy_hits=True)
                 # fix 78: the round that opened this phase may already
                 # have destroyed an army (stashed flags) — combine
                 _pf_atk78 = pc.pop('_finish_atk_dead', False)
                 _pf_def78 = pc.pop('_finish_def_dead', False)
-                if own_dead or enemy_dead or _pf_atk78 or _pf_def78:
+                _enemy_gone9 = (_pf_def78 if other == 'defender'
+                                else _pf_atk78)
+                if int(hits or 0) > 0 and not _enemy_gone9:
+                    pc['def_hits' if other == 'defender' else 'atk_hits'] \
+                        = int(hits)
+                    pc['atk_hits' if other == 'defender' else 'def_hits'] \
+                        = 0
+                    pc['alloc_stage'] = 'attacker'
+                    pc['_p9_done'] = True
+                    pc['_onslaught_done'] = True
+                    _enter_casualty_allocation(state, pc)
+                elif own_dead or enemy_dead or _pf_atk78 or _pf_def78:
                     atk_dead = (own_dead if role == 'attacker'
                                 else enemy_dead) or _pf_atk78
                     def_dead = (enemy_dead if role == 'attacker'
@@ -10078,15 +11440,21 @@ def _execute_action_inner(state: GameState, action: Action):
                     _set_post_round_phase(state, pc,
                                           pc.get('is_siege', False))
             else:
-                pc[f'{owner}_effect_count'] = count
+                if ec.get('targets'):
+                    # 1.254 target-only pick (WoP / BB / BoW): no
+                    # magnitude - the round consumes the target
+                    pc[f'{owner}_effect_target'] = _tg9
+                else:
+                    pc[f'{owner}_effect_count'] = count
+                    if _tg9 is not None:
+                        pc[f'{owner}_effect_target'] = _tg9
                 _run_combat_round(state, pc)
 
     elif atype == 'advance_political':
         nation = p['nation']
         side = _side_of_nation(nation)
-        # QA 2026-07-11 (T&P CASE 7): a COMPANION-ability advance may
-        # use ANY Action die (Boromir/Legolas/Gimli rule) - the
-        # Muster-family consumption raised on a Character die
+        # QA 2026-07-11 (T&P CASE 7): a COMPANION-ability advance may use
+        # ANY Action die (Boromir/Legolas/Gimli rule)
         _adv_faces = (ActionDieFace.MUSTER, ActionDieFace.MUSTER_ARMY,
                       ActionDieFace.WILL_OF_WEST)
         if p.get('companion_ability'):
@@ -10104,10 +11472,10 @@ def _execute_action_inner(state: GameState, action: Action):
 
     elif atype == 'discard_table_card':
         # 1.149 (USER 2026-07-19): deliberate kill of an opponent's
-        # play-on-table card.  SH: any die + discard 1 Strategy + 1
+        # play-on-table card.  SH: any die + discard 1 Army-type + 1
         # Character card from hand (A Power too Great / Tom Bombadil).
-        # FP: WotW die alone, or any die + one Elven Ring (Palantír —
-        # a spent ring flips to its Flame side and goes to Shadow).
+        # FP: WotW die alone, or any die + one Elven Ring (Palantir - a
+        # spent ring flips to its Flame side and goes to Shadow).
         _any_faces = (ActionDieFace.CHARACTER, ActionDieFace.ARMY,
                       ActionDieFace.MUSTER, ActionDieFace.MUSTER_ARMY,
                       ActionDieFace.EVENT, ActionDieFace.EYE,
@@ -10121,22 +11489,20 @@ def _execute_action_inner(state: GameState, action: Action):
             # payment = one ARMY card (card_type 'Army') + one
             # Character card (USER 2026-07-19 correction: Muster-type
             # Strategy cards cannot pay)
-            from cards import get_card as _gc149x
-            _hand9 = state.hands[Side.SHADOW].hand
-            # CARD CONSERVATION (2026-08-15): the two payment cards are
-            # DISCARDED, not annihilated - they used to leave the hand
-            # and reach no pile at all, deleting them from the game.
-            for _c9 in list(_hand9):
-                if isinstance(_c9, str) and getattr(
-                        _gc149x(_c9), 'card_type', None) == 'Army':
-                    _hand9.remove(_c9)
-                    _discard_played_combat_card(state, _c9)
-                    break
-            for _c9 in list(_hand9):
-                if isinstance(_c9, str) and '_Character_' in _c9:
-                    _hand9.remove(_c9)
-                    _discard_played_combat_card(state, _c9)
-                    break
+            # EX-8 (learned-decision doctrine, 1.254): WHICH Army-type
+            # + Character pair pays is the Shadow's pending
+            # (_open_table_kill_payment -> card_option ->
+            # pay_table_card_kill, the one payment body; 1.261: both
+            # cards file FACE-DOWN to the payer's tracked pile).  Only
+            # the teacher (log = truth) keeps the first-in-hand
+            # auto-pick.
+            import combat as _cmb149p
+            if _cmb149p.FINAL_HITS_HOOK is not None:
+                _army9, _chr9 = _table_kill_payment_cards(state)
+                if _army9 and _chr9:
+                    pay_table_card_kill(state, _army9[0], _chr9[0])
+            else:
+                _open_table_kill_payment(state, p)
         else:
             if p.get('payment') == 'will':
                 _consume_die_for_face(state, Side.FREE_PEOPLES, die_idx,
@@ -10155,9 +11521,8 @@ def _execute_action_inner(state: GameState, action: Action):
                     state.sh_elven_rings += 1
         _pc9 = getattr(state, 'persistent_cards', None)
         if _pc9 is not None and p.get('card_id'):
-            # CARD CONSERVATION (2026-08-15): a table card killed by
-            # this action is physically DISCARDED face-up, not deleted
-            # (auto35 live game lost The Palantir of Orthanc here).
+            # CARD CONSERVATION (2026-08-15): a killed table card is
+            # physically DISCARDED face-up, never deleted.
             from persistent_effects import discard_table_card as _dtc9
             _dtc9(state, _pc9.remove_card(p['card_id']))
 
@@ -10166,7 +11531,28 @@ def _execute_action_inner(state: GameState, action: Action):
         region = p['region']
         typ = p['type']
         side = _side_of_nation(nation)
+        if p.get('saruman') == 'settlements':
+            # W4-032 R3 (1.266): one Regular in EACH free Isengard
+            # settlement from one die, no pending second recruit
+            _execute_saruman_settlements(state, side, die_idx, p)
+            return
 
+        # EX-7 (BL-116(b) twin): the pool check runs BEFORE any
+        # mutation - _muster_one's figure-pool guard silently returns
+        # None, so an exhausted pool would open the pair / burn the die
+        # for NOTHING.  Refuse transactionally with a loud invariant;
+        # the teacher (log = truth) is exempt.
+        import combat as _cmb116r
+        if _cmb116r.FINAL_HITS_HOOK is None \
+                and not _can_recruit(state, nation, typ):
+            import state_invariants as _si116r
+            _si116r.VIOLATIONS.append({
+                'code': 'muster_pool_empty',
+                'ctx': 'T%s %s %s at %s'
+                       % (getattr(state, 'turn', '?'),
+                          getattr(nation, 'value', nation), typ, region),
+                'detail': 'refused - no die spent, nothing placed'})
+            return
         if state.pending_muster_die is not None:
             # Second recruit of Muster die double-recruit
             game_logic._muster_one(state, side, region, typ, nation=nation)
@@ -10192,12 +11578,38 @@ def _execute_action_inner(state: GameState, action: Action):
         nation = p['nation']
         region = p['region']
         side = _side_of_nation(nation)
+        if p.get('saruman') == 'swap2':
+            # W4-032 E2 (1.266): both Orthanc Regulars -> two Elites
+            _execute_saruman_swap(state, side, die_idx, p)
+            return
+        # BL-116(b): the pool check runs BEFORE the die spend (the
+        # surface can change between enumeration and apply) - refuse
+        # transactionally with a loud invariant; teacher exempt (the
+        # log is truth for its own musters).
+        import combat as _cmb116
+        if _cmb116.FINAL_HITS_HOOK is None \
+                and not _can_recruit(state, nation, 'elite'):
+            try:
+                import state_invariants as _si116
+                _si116.VIOLATIONS.append({
+                    'code': 'muster_pool_empty',
+                    'ctx': 'T%s %s elite at %s'
+                           % (getattr(state, 'turn', '?'),
+                              getattr(nation, 'value', nation),
+                              region),
+                    'detail': 'refused - no die spent, nothing '
+                              'placed'})
+            except Exception:
+                pass
+            return
         _consume_die_for_face(state, side, die_idx,
                               (ActionDieFace.MUSTER, ActionDieFace.MUSTER_ARMY,
                                ActionDieFace.WILL_OF_WEST))
         game_logic._muster_one(state, side, region, 'elite', nation=nation)
 
     elif atype == 'fellowship_move':
+        if getattr(state, '_fellowship_move_die_pending', None) is not None:
+            raise ValueError('Previous Fellowship movement has not finished')
         # P1 (USER ruling 1.112): with Flocks of Crebain on the table
         # and hunt dice about to roll, the SHADOW first decides whether
         # to discard it for +1 to all Hunt dice - a learned cross-turn
@@ -10230,6 +11642,8 @@ def _execute_action_inner(state: GameState, action: Action):
         # Move fellowship with hunt — skip auto-sacrifice so AI can decide.
         # Per rulebook: the FP die goes into hunt box AFTER the hunt resolves,
         # not before.  The hunt uses only dice already in the box.
+        from fellowship_action_timing import queue
+        queue(state, _fm_used_idx)
         was_hidden = state.fellowship.hidden
         game_logic.move_fellowship(state, skip_hunt=False,
                                    skip_auto_sacrifice=True)
@@ -10238,17 +11652,8 @@ def _execute_action_inner(state: GameState, action: Action):
         # the die placement - so the die DOES go into the Hunt Box as
         # the last step.  BOTH modes (USER directive 2026-07-10).
         _recheck_last_battle(state)
-        # NOW add die to hunt box (after hunt resolution).
-        # "The Last Battle" persistent card: FP movement dice bypass the box.
-        # The die placed in the box must be the die actually CONSUMED
-        # (the consume fallback may have marked a different index) —
-        # otherwise an unused die lands in the box and stays spendable.
-        from persistent_effects import should_add_dice_to_hunt_box
-        if should_add_dice_to_hunt_box(state) and _fm_used_idx is not None \
-                and _fm_used_idx < len(state.dice[Side.FREE_PEOPLES]):
-            d = state.dice[Side.FREE_PEOPLES][_fm_used_idx]
-            if d not in state.hunt_box:
-                state.hunt_box.append(d)
+        # Payment is consumed now; its Hunt Box placement is deferred until
+        # the executor settles every damage, redraw and reveal choice.
         # Check for pending hunt damage that needs AI decision.
         # USER RULING 2026-07-21: offer the LEARNED Axe/Horn reduction
         # FIRST (card text order: reduce, then confront); the interpose
@@ -10263,8 +11668,8 @@ def _execute_action_inner(state: GameState, action: Action):
         # Declaration is a free action (die_idx=-1, no die consumed).
         # The AI learns when and where to declare.
         region = p['region']
-        _balrog_from9 = sanitize(game_logic.fellowship_region(state))
-        _balrog_prog9 = state.fellowship.progress
+        from fellowship_reveal_route import choose_path, declared
+        _declared_route = choose_path(state, region, p.get('path'), declaration=True)
         try:
             game_logic.declare_fellowship(state, region=region)
         except Exception:
@@ -10272,7 +11677,7 @@ def _execute_action_inner(state: GameState, action: Action):
             # reachability model, so the logged position is forced.
             # Self-play must NEVER force an engine-rejected declare
             # (the raise IS the legality guard: unreachable region,
-            # no-move turn, Mordor-interior ban) — propagate so the
+            # no-move turn) — propagate so the
             # driver rejects the action.
             import combat as _cmb_fd
             if _cmb_fd.FINAL_HITS_HOOK is None:
@@ -10283,61 +11688,23 @@ def _execute_action_inner(state: GameState, action: Action):
                 state.fellowship.hidden = True
             except Exception:
                 pass
-        # No Mordor entry here (USER FINAL 2026-08-16): declaring only
-        # PLACES the pawn.  Entry resolves in the turn-start sequence's
-        # entry check, which runs AFTER the declaration opportunity in
-        # the same turn start - never inside this action, never
-        # mid-turn.  (The same-action entry variant was built and
-        # REVERTED 2026-08-16.)
-        # P5 (USER ruling 1.112, almanac C17): a declaration FROM,
-        # INTO or THROUGH Moria with 'Balrog of Moria' on the table
-        # gives the SHADOW a discard-for-hunt-tile decision (fully
-        # after the declaration resolves).  THROUGH = Moria lies on at
-        # least one legal declaration path of length <= the
-        # pre-declaration progress (BFS over board adjacency - the same
-        # reachability model declare_fellowship uses; see
-        # _balrog_moria_on_declare_path).  The stationary turn-start
-        # trigger is handled at the Phase 2 pre-step.
+        # Declaration completes healing/upkeep before Balrog. The turn-start
+        # tail performs Mordor entry only after this route event has finished.
         import combat as _cmb_balg
-        if (_cmb_balg.FINAL_HITS_HOOK is None
-                and _balrog_moria_on_declare_path(
-                    state, _balrog_from9, sanitize(region),
-                    _balrog_prog9)):
-            from game_state import PersistentCardType as _PCT9
-            _pcb9 = getattr(state, 'persistent_cards', None)
-            _cb9 = (_pcb9.get_by_type(_PCT9.BALROG_OF_MORIA)
-                    if _pcb9 else None)
-            if _cb9 is not None and getattr(state, 'pending_card_option',
-                                            None) is None:
-                state.pending_card_option = {
-                    'card_id': getattr(_cb9, 'card_id', '__balrog__'),
-                    'card_name': 'Balrog of Moria',
-                    'side': 'sh', 'decider': 'sh', 'direct': True,
-                    'options': [{'balrog_declare_draw': True},
-                                {'balrog_declare_draw': False}]}
-        elif _cmb_balg.FINAL_HITS_HOOK is not None \
-                and _balrog_moria_on_declare_path(
-                    state, _balrog_from9, sanitize(region),
-                    _balrog_prog9):
-            # fix 100 (game 11 T5): the P5 declare-trigger had NO
-            # teacher branch — the Rizino1 Moria declare's Balrog draw
-            # (tiles L339/L359, Legolas guide-sacrifice L360) never
-            # fired and the whole chain orphaned.  Log-driven: fire
-            # exactly when the evidence gate (fix 98) shows a queued
-            # tile belonging to this event.
-            from game_state import PersistentCardType as _PCT9
-            _pcb9 = getattr(state, 'persistent_cards', None)
-            _cb9 = (_pcb9.get_by_type(_PCT9.BALROG_OF_MORIA)
-                    if _pcb9 else None)
-            if _cb9 is not None and (
-                    game_logic.BALROG_TILE_GATE is None
-                    or game_logic.BALROG_TILE_GATE(state)):
+        if _cmb_balg.FINAL_HITS_HOOK is None:
+            if not state.dice_rolled:
+                # Declaration itself starts the existing Fellowship tail.
+                # A driver may resume after this route has already settled;
+                # it must not create a second stationary Balrog opportunity.
+                state._fellowship_tail_phase = True
+            declared(state, _declared_route)
+        elif 'moria' in _declared_route:
+            from fellowship_reveal_route import balrog_card
+            card = balrog_card(state)
+            if card is not None and (game_logic.BALROG_TILE_GATE is None
+                                     or game_logic.BALROG_TILE_GATE(state)):
                 from event_effects import _effect_balrog_of_moria
-                try:
-                    _effect_balrog_of_moria(
-                        state, _cb9, {'balrog_declare_draw': True})
-                except Exception:
-                    pass
+                _effect_balrog_of_moria(state, card, {'balrog_declare_draw': True})
 
     elif atype == 'fellowship_hide':
         if p.get('strider_ability'):
@@ -10371,15 +11738,25 @@ def _execute_action_inner(state: GameState, action: Action):
     elif atype == 'play_event':
         card_id = p['card_id']
         side = Side.FREE_PEOPLES if p.get('side', 'fp') == 'fp' else Side.SHADOW
-        # PHANTOM-PLAY GUARD (2026-07-20, defense-in-depth behind the
-        # tree-reuse own-hand check): a play_event for a card NOT in
-        # the real hand must never consume a die — the old flow burned
-        # the die first, then play_event_card rejected 'Card not in
-        # hand' as a silent no-op (10/23 plays in trace w5_g2).
-        # SELF-PLAY only: the teacher replays logged plays (log = truth
-        # for hand contents there).
+        # PHANTOM-PLAY GUARD (2026-07-20): a play_event for a card NOT in
+        # the real hand must never consume a die.  SELF-PLAY only: the
+        # teacher replays logged plays (log = truth for hand contents).
         if card_id not in state.hands[side].hand:
             return
+        if card_id == "FREE_PEOPLES_Strategy_Faramir's_Rangers":
+            from event_effects import _validate_faramir_choices
+            _validate_faramir_choices(state, p.get('choices'))
+        if card_id == 'FREE_PEOPLES_Strategy_Guards_of_the_Citadel' \
+                and p.get('choices') is not None:
+            # Explicit replay/caller choices must fail before this public
+            # play spends its die, just as pending choices fail before clear.
+            from event_effects import _validate_guards_recruit_choice
+            _validate_guards_recruit_choice(state, p['choices'])
+        if card_id == 'FREE_PEOPLES_Character_House_of_the_Stewards' \
+                and p.get('choices') is not None:
+            from event_effects import _validate_stewards_recruit_choice
+            _validate_stewards_recruit_choice(state, p['choices'],
+                                              require_complete=True)
         # Capture the die face + card deck BEFORE consuming the die — needed
         # for the Gandalf-the-Grey / Palantír same-deck redraw below.
         _pe_face = _get_die_face(state, die_idx, side=side) if die_idx >= 0 \
@@ -10387,36 +11764,80 @@ def _execute_action_inner(state: GameState, action: Action):
         try:
             from cards import get_card as _gc_deck
             _pe_deck = (getattr(_gc_deck(card_id), 'deck', '') or '').lower()
+            _pe_ctype = getattr(_gc_deck(card_id), 'card_type', '') or ''
         except Exception:
             _pe_deck = ''
-        # Snapshot die.used BEFORE consuming the action die: a no-op
-        # play (out-of-range dest / absent choice) must refund the
-        # action die too, not just dice spent inside the effect.
+            _pe_ctype = ''
+        # FLE-11 (2026-08-30): the faces that natively fund THIS card's
+        # type (rulebook p.22 - a typed die plays only its own card
+        # type; Event/Will play any).  On the live/self-play path a die
+        # whose rolled face is NOT here can pay only through the
+        # Elven-Ring waiver, so _consume_die_for_face's A7 branch
+        # spends the waiver (par5b_g1#2: the wide any-face tuple let a
+        # waiver-funded play consume natively and kept the waiver live
+        # = one ring, two die-face changes).  The teacher keeps the
+        # wide tuple (log = truth die accounting).
+        import combat as _cmbpv9
+        _pe_valid = (ActionDieFace.EVENT, ActionDieFace.CHARACTER,
+                     ActionDieFace.ARMY, ActionDieFace.MUSTER,
+                     ActionDieFace.MUSTER_ARMY, ActionDieFace.WILL_OF_WEST)
+        if _cmbpv9.FINAL_HITS_HOOK is None:
+            _pe_valid = _PLAY_EVENT_FACES_BY_TYPE.get(_pe_ctype, _pe_valid)
+        # W1-031 (2026-09-02, amendment 1.2): a mouth_muster-tagged play
+        # rides the Mouth of Sauron's once-per-turn Muster-as-Army die -
+        # the plain Muster face funds the Army card NATIVELY (no waiver
+        # spend); the ability is consumed with the die below, exactly
+        # like the tagged army_move / army_attack.
+        _mm31 = bool(side == Side.SHADOW and p.get('mouth_muster'))
+        if _mm31 and ActionDieFace.MUSTER not in _pe_valid:
+            _pe_valid = tuple(_pe_valid) + (ActionDieFace.MUSTER,)
+        # Effective FUNDING face for the same-deck redraw (USER FIX
+        # 2026-07-08 + LA-1/LA-2 doctrine: an action funded by the
+        # waiver treats the die AS the recorded waiver face) - a
+        # ring-waived event-category play counts as an Event-die play.
+        _pe_eff_face = _pe_face
+        if _pe_face is not None and _pe_face not in _pe_valid:
+            _pe_eff_face = _ring_waiver_face(state, side)
+        # Snapshot die.used AND the ring-waiver BEFORE consuming: a
+        # no-op play (out-of-range dest / absent choice) must refund
+        # the action die and a waiver it spent, not just dice spent
+        # inside the effect.
         _used_before = [d.used for d in state.dice.get(side, [])]
-        _consume_die_for_face(state, side, die_idx,
-                              (ActionDieFace.EVENT, ActionDieFace.CHARACTER,
-                               ActionDieFace.ARMY, ActionDieFace.MUSTER,
-                               ActionDieFace.MUSTER_ARMY, ActionDieFace.WILL_OF_WEST))
+        _rw_attr9 = ('fp_ring_waiver' if side == Side.FREE_PEOPLES
+                     else 'sh_ring_waiver')
+        _rw_before9 = bool(getattr(state, _rw_attr9, False))
+        _rwf_before9 = getattr(state, _RING_WAIVER_FACE_ATTR[side], None)
+        _mm_before31 = bool(getattr(state, 'sh_mouth_muster_used_this_turn',
+                                    False))
+        _cons31 = _consume_die_for_face(state, side, die_idx, _pe_valid)
+        if _mm31 and _cons31 is not None:
+            # W1-031: once per turn while the Mouth is in play
+            state.sh_mouth_muster_used_this_turn = True
         _defer = False
         _play_choices = p.get('choices')
         if _play_choices is None and CARD_OPTION_DEFER:
-            # AUTO-RESOLVER CENSUS 2026-08-16 (systemic finding): this
-            # guard used to be `except Exception: _opts0 = []` - ANY
-            # option-spec bug silently converted a learned decision
-            # into the card's in-effect fallback heuristic (no halt,
-            # no log line).  A spec failure on the LIVE path now halts
-            # loudly instead of quietly un-learning the decision; the
-            # teacher (log-forced choices) never enters this branch.
+            # A spec failure on the LIVE path halts loudly (census
+            # 2026-08-16: a swallowed option-spec bug silently un-learned
+            # the decision); the teacher (log-forced choices) never
+            # enters this branch.
             try:
                 from cards import get_card as _gc0
                 from card_options import get_card_options as _gco
                 _cn0 = getattr(_gc0(card_id), 'card_name', '') or ''
                 _opts0 = _gco(state, side, _cn0) if _cn0 else []
-            except NeedClientCall:
-                raise
             except Exception as _ose0:
+                # Client deferrals inherit BaseException and pass through
+                # naturally; the core engine need not import the bridge.
                 import combat as _cmbose
                 if _cmbose.FINAL_HITS_HOOK is None:
+                    # Enumeration failed before the card was played.
+                    # Restore its payment before surfacing the failure.
+                    for _die0, _was_used0 in zip(
+                            state.dice.get(side, []), _used_before):
+                        _die0.used = _was_used0
+                    setattr(state, _rw_attr9, _rw_before9)
+                    setattr(state, _RING_WAIVER_FACE_ATTR[side], _rwf_before9)
+                    state.sh_mouth_muster_used_this_turn = _mm_before31
                     raise RuntimeError(
                         'card option spec FAILED for %r - a learned '
                         'decision would have silently fallen to the '
@@ -10442,7 +11863,14 @@ def _execute_action_inner(state: GameState, action: Action):
                     'card_id': card_id, 'card_name': _cn0,
                     'side': _own0,
                     'decider': _dec0 or _own0,
-                    'options': _opts0}
+                    'options': _opts0,
+                    # BL-150 E1: the funding die's face + deck ride the
+                    # pending so the resolver can grant the same-deck
+                    # redraw once the card has actually left the hand
+                    # (FLE-11: the EFFECTIVE face - a waiver-funded play
+                    # is treated as the recorded waiver face)
+                    'die_face': getattr(_pe_eff_face, 'name', None),
+                    'deck': _pe_deck}
                 _defer = True
             elif len(_opts0) == 1:
                 # the auto-pick IS the pending path (teacher-supplied
@@ -10450,10 +11878,33 @@ def _execute_action_inner(state: GameState, action: Action):
                 # (Stormcrow stage 2, TSiM moves 2-4) key on the marker
                 _play_choices = dict(_opts0[0])
                 _play_choices['_from_pending'] = True
+            else:
+                from card_options import CARD_OPTION_SPECS as _COS109
+                if _cn0 and str(_cn0).lower() in _COS109 \
+                        and card_id in state.hands[side].hand:
+                    # BL-109 / USER RULING 1.230 (2026-08-28): a
+                    # CHOICE-BEARING card whose spec yields ZERO legal
+                    # options at apply time is a ZERO-EFFECT play - it
+                    # proceeds with no choices, the card is discarded and
+                    # the die stays spent (conversion in play_event_card);
+                    # NO refund.  The enumeration-vs-apply drift stays
+                    # visible as telemetry.
+                    try:
+                        import state_invariants as _si109
+                        _si109.VIOLATIONS.append({
+                            'code': 'card_play_no_legal_choice',
+                            'ctx': 'T%s %s' % (getattr(state, 'turn',
+                                                       '?'),
+                                               card_id),
+                            'detail': 'zero legal choices at apply '
+                                      'time - completed as a '
+                                      'zero-effect play (ruling 1.230)'})
+                    except Exception:
+                        pass
         if not _defer:
-            # CARD-FLEET LOW-6/LOW-8 (2026-07-21): on a refund restore
-            # the pre-consumption die snapshot (taken above) — a play
-            # doing nothing must not burn the action die.
+            # refund: restore the pre-consumption die snapshot (LOW-6/
+            # LOW-8 2026-07-21) - a play doing nothing must not burn the
+            # action die.
             _pe_res = None
             try:
                 from event_effects import play_event_card
@@ -10480,56 +11931,39 @@ def _execute_action_inner(state: GameState, action: Action):
                             _dfu.setdefault(_dk, []).append(card_id)
                     except Exception:
                         pass
+                # EX-4: never commit a half-applied play silently -
+                # self-play / live re-raise (apply_action's clone is
+                # rejected; the in-place episode path lands in
+                # _record_exec_failure + _recover_from_failed_action);
+                # the teacher (log = truth) keeps the lenient path.
+                import combat as _cmbpe9
+                if _cmbpe9.FINAL_HITS_HOOK is None:
+                    raise
             if _pe_res is not None and _pe_res.get("refund"):
                 for _d, _u in zip(state.dice.get(side, []),
                                   _used_before):
                     _d.used = _u
-        # USER FIX 2026-07-08: the SAME-DECK REDRAW that already worked in
-        # the GUI but not the AI.  Gandalf the Grey (guide) draws a card of
-        # the SAME DECK when FP plays a card with an Event/Will die; The
-        # Palantír of Orthanc draws same-deck each Shadow event play.
-        if _pe_deck in ('character', 'strategy'):
-            try:
-                if side == Side.FREE_PEOPLES:
-                    g = state.fellowship.guide
-                    if (g is not None
-                            and getattr(g, 'name', '') == 'Gandalf the Grey'
-                            and _pe_face in (ActionDieFace.EVENT,
-                                             ActionDieFace.WILL_OF_WEST)):
-                        # engine-granted draw: grant_draw is the one
-                        # writer of the owed-draw ledger
-                        game_logic.grant_draw(state, side, _pe_deck)
-                else:
-                    from persistent_effects import \
-                        should_draw_extra_card_on_event as _pal
-                    # USER RULING 2026-08-15: the Palantir does NOT
-                    # self-trigger — playing the card itself grants no
-                    # bonus draw; the ability starts with the NEXT
-                    # Shadow event play.  REGRESSION FIX 2026-08-16:
-                    # the original guard compared against a spaced
-                    # ascii name but the canonical id is
-                    # SHADOW_Character_The_Palantír_of_Orthanc
-                    # (underscores + i-acute) — it could NEVER match
-                    # and the ruling was never enforced (born dead).
-                    # Normalize both differences; the live-registry
-                    # pin lives in test_palantir_no_self_trigger.py.
-                    _is_pal_self9 = ('palantir of orthanc'
-                                     in str(card_id).lower()
-                                     .replace('_', ' ')
-                                     .replace('í', 'i'))
-                    # card text: "use an Event Action Die result to
-                    # play an Event card" - the rolled face decides
-                    # (a ring waiver never changes the face)
-                    if (_pal(state) and not _is_pal_self9
-                            and _pe_face == ActionDieFace.EVENT):
-                        if state.pending_combat is not None:
-                            # P-die action still resolving: defer until
-                            # the action fully resolves (USER 1.208m)
-                            state._palantir_draw_pending = True
-                        else:
-                            _open_palantir_deck_choice(state)
-            except Exception:
-                pass
+                # FLE-11: a refunded play also restores the Elven-Ring
+                # waiver its consumption spent (invariant: refund = the
+                # play never happened)
+                setattr(state, _rw_attr9, _rw_before9)
+                setattr(state, _RING_WAIVER_FACE_ATTR[side], _rwf_before9)
+                # W1-031: ... and the Mouth's once-per-turn ability
+                if _mm31:
+                    state.sh_mouth_muster_used_this_turn = _mm_before31
+        # Same-deck redraw (USER FIX 2026-07-08): Gandalf the Grey
+        # (guide) draws same-deck on an Event/Will-die play; the Palantir
+        # draws same-deck on each Shadow event play.  BL-150 E1: earned
+        # only once the card has LEFT the hand - immediately for a
+        # resolved play, from the card_option resolver for a deferred
+        # one.
+        if not _defer and not (_pe_res is not None
+                               and _pe_res.get("refund")):
+            # BL-150 E1: earned only by a play that actually completed
+            # (a refunded play left the card in hand - no spend, no
+            # redraw)
+            _grant_event_play_draw(state, side, card_id, _pe_deck,
+                                   _pe_eff_face)
         # A card-driven hunt (Nazgul Strike!'s roll-for-the-Hunt option)
         # leaves its tile damage in _pending_hunt_damage — convert it to
         # the learned sacrifice decision exactly like the
@@ -10537,16 +11971,100 @@ def _execute_action_inner(state: GameState, action: Action):
         # sacrifice at L787 resolves the L764 '2' tile).
         _phd = getattr(state, '_pending_hunt_damage', 0)
         if _phd > 0 and state.pending_hunt is None:
-            # 2026-07-21: learned Axe/Horn reduction on the self-play
-            # card-driven hunt path (reduce, then confront; the shared
-            # settle also aligns the Gollum reveal with the
-            # fellowship_move twin). TEACHER: historical
-            # sacrifice-or-apply kept byte-identical (log = truth).
+            # learned Axe/Horn reduction on the card-driven hunt path
+            # (2026-07-21; reduce, then confront - the shared settle).
+            # TEACHER: log = truth.
             if not game_logic._offer_hunt_reduction(state):
                 game_logic._settle_hunt_damage(state)
 
     elif atype == 'card_option':
         _pco = getattr(state, 'pending_card_option', None)
+        if _pco is not None and _pco.get('card_casualty'):
+            _apply_card_casualty_choice(state, p)
+            return
+        if 'casualty_operation' in (p.get('choices') or {}):
+            raise ValueError('No card casualty allocation is pending')
+        if (_pco is not None and _pco.get('card_id') ==
+                'FREE_PEOPLES_Character_Dead_Men_of_Dunharrow'):
+            choice = p.get('choices')
+            if (p.get('card_id') not in (None, _pco['card_id'])
+                    or p.get('side') not in (None, 'fp')
+                    or not isinstance(choice, dict) or choice not in _pco['options']):
+                if isinstance(choice, dict) and choice.get('_dmd_recruit_only'):
+                    raise ValueError('Dead Men recruitment count is not available')
+                raise ValueError('Dead Men choice is not available')
+            if 'target_region' in choice and not choice.get('_dmd_recruit_only'):
+                from card_options import dead_men_options
+                if choice not in dead_men_options(state, Side.FREE_PEOPLES):
+                    raise ValueError('Dead Men companion group is no longer available')
+        if p.get('card_id') == '__gandalf_draw__' \
+                and not (_pco is not None and _pco.get('gandalf_draw')):
+            raise ValueError('No Gandalf draw is pending')
+        if _pco is not None and _pco.get('gandalf_draw'):
+            # Keep the pending intact across a deferred physical draw.
+            # apply_action retries on a clone; no original event/payment
+            # is replayed and a single successful grant settles the choice.
+            _choice = p.get('choices')
+            if (p.get('card_id') not in (None, '__gandalf_draw__')
+                    or p.get('side') not in (None, 'fp')
+                    or p.get('source_card_id') not in (None, _pco['source_card_id'])
+                    or p.get('deck') not in (None, _pco['deck'])
+                    or not isinstance(_choice, dict)
+                    or set(_choice) != {'gandalf_draw'}
+                    or type(_choice['gandalf_draw']) is not bool
+                    or _choice not in _pco['options']):
+                raise ValueError('Gandalf draw choice is not available')
+            if _choice['gandalf_draw']:
+                game_logic.grant_draw(state, Side.FREE_PEOPLES, _pco['deck'])
+            state.pending_card_option = None
+            return
+        if _pco is not None and _pco.get('card_id') == \
+                'FREE_PEOPLES_Character_House_of_the_Stewards':
+            from event_effects import _validate_stewards_recruit_choice
+            _stewards_choice = p.get('choices')
+            if (p.get('card_id') not in (None, _pco['card_id'])
+                    or p.get('side') not in (None, 'fp')
+                    or not isinstance(_stewards_choice, dict)
+                    or _stewards_choice not in _pco['options']):
+                raise ValueError("House of the Stewards choice is not available")
+            _validate_stewards_recruit_choice(state, _stewards_choice,
+                                              require_complete=True)
+        if _pco is not None and _pco.get('card_id') == \
+                'FREE_PEOPLES_Strategy_Guards_of_the_Citadel':
+            # Reject a malformed/stale Guards request before clearing its
+            # already-paid pending. No silent Elite fallback, partial
+            # Leader-only execution, or second payment on invalid input.
+            from card_options import guards_of_the_citadel_options
+            _guards_choice = p.get('choices')
+            if (p.get('card_id') not in (None, _pco['card_id'])
+                    or p.get('side') not in (None, 'fp')
+                    or not isinstance(_guards_choice, dict)
+                    or _guards_choice not in _pco['options']
+                    or _guards_choice not in guards_of_the_citadel_options(
+                        state, Side.FREE_PEOPLES)):
+                raise ValueError("Guards of the Citadel choice is not available")
+        if (_pco is not None
+                and _pco.get('card_id') == "FREE_PEOPLES_Strategy_Faramir's_Rangers"
+                and not _pco.get('card_casualty')):
+            from event_effects import _validate_faramir_choices
+            _far_choice = p.get('choices')
+            if (p.get('card_id') not in (None, _pco['card_id'])
+                    or p.get('side') not in (None, 'fp')
+                    or not isinstance(_far_choice, dict)
+                    or _far_choice not in _pco['options']):
+                raise ValueError("Faramir's Rangers choice is not available")
+            _validate_faramir_choices(
+                state, _far_choice,
+                recruitment_stage=bool(_pco.get('faramir_recruit')),
+                require_complete=True)
+        if _pco is not None and _pco.get('table_kill_payment'):
+            # EX-8: the Shadow's chosen payment pair; pay_table_card_kill
+            # refuses a bad pair BEFORE any mutation (the pending stays)
+            _chk9 = p.get('choices') or {}
+            pay_table_card_kill(state, _chk9.get('army_card'),
+                                _chk9.get('character_card'))
+            state.pending_card_option = None
+            return
         state.pending_card_option = None
         # P1 (USER ruling 1.112): Flocks of Crebain interpose for the
         # Nazgul Strike! HUNT option - the SHADOW first decides whether to
@@ -10586,27 +12104,6 @@ def _execute_action_inner(state: GameState, action: Action):
                                     _cho9, _crebain_resolved=True),
                                 '_restore_pco': _pco}}}
                     return
-        if _pco is not None and _pco.get('card_casualty'):
-            # USER 2026-07-27: card-inflicted casualties (Dreadful
-            # Spells / Spirit of Mordor) resolve through the SAME
-            # allocation machinery as combat — the chosen option
-            # carries k elite downgrades; _apply_allocation does the
-            # casualty-box-first accounting + FP tracking, then the
-            # shared aftermath handles orphans / wiped-garrison capture.
-            _kcc = int((p.get('choices') or {}).get('cas_downgrades', 0)
-                       or 0)
-            _apply_allocation(state, _pco['cas_region'],
-                              _pco['cas_side'], int(_pco['cas_hits']),
-                              _kcc)
-            import event_effects as _eecc
-            _rescc = {'effects': []}
-            # USER RULING 2026-08-15: the wipe exception is keyed on the
-            # CARD — the pending carries its name across the decision
-            # boundary (combat's published context cannot survive it).
-            _eecc._complete_card_casualty(
-                state, _pco['cas_region'], _pco['cas_side'], _rescc,
-                card_name=_pco.get('card_name'))
-            return
         if _pco is not None and _pco.get('bof_separation'):
             # USER 2026-07-27: Breaking of the Fellowship — WHICH
             # companion leaves is the FP player's chained learned pick
@@ -10627,7 +12124,7 @@ def _execute_action_inner(state: GameState, action: Action):
                 if _pcs is not None and _cid is not None:
                     # CARD CONSERVATION (2026-08-15): the spent Horn of
                     # Gondor / Axe and Bow is DISCARDED face-up, not
-                    # deleted (auto35 live game lost Horn of Gondor).
+                    # deleted.
                     from persistent_effects import (discard_table_card
                                                     as _dtc9)
                     _dtc9(state, _pcs.remove_card(_cid))
@@ -10664,7 +12161,7 @@ def _execute_action_inner(state: GameState, action: Action):
                 _g = state.fellowship.guide
                 _ab = getattr(_g, 'guide_ability', None)
                 if _ab == 'no_reveal_on_damage':
-                    state.fellowship.hidden = False        # Gollum reveals
+                    game_logic.reveal_fellowship_from_hunt(state)
                 else:                                       # hobbit separates
                     _f = state.fellowship
                     if _g in _f.companions:
@@ -10683,12 +12180,9 @@ def _execute_action_inner(state: GameState, action: Action):
                 _foul_confront(state, dict(_fres, victim=_fres.get('victim')),
                                max(0, _dmg - 1))            # re-check new guide
             else:
-                # decline -> straight to the forced casualty. Must NOT
-                # re-enter _foul_confront: the current reducing guide is
-                # unchanged (e.g. Gollum still hidden), so it would just
-                # re-open the same interpose forever (spec 1.208l control-
-                # flow fix; the spec's "decline -> pick" comment confirms
-                # the intent is the pick, not another offer).
+                # decline -> straight to the forced casualty; never
+                # re-enter _foul_confront (the unchanged reducing guide
+                # would re-open the same interpose forever; spec 1.208l).
                 _foul_apply_after_reduction(state, _fres, _dmg)
             state._pending_hunt_damage = 0
             return
@@ -10699,12 +12193,9 @@ def _execute_action_inner(state: GameState, action: Action):
             _chp = p.get('choices') or {}
             _deck = str(_chp.get('palantir_deck', 'character') or
                         'character')
-            # 2026-08-16 (live-play halt): WOTR has NO reshuffle — an
-            # exhausted deck simply means no draw.  This caller drew
-            # unguarded, so a late-game empty Shadow deck raised
-            # RuntimeError out of apply_action and HALTED the game
-            # (the comment below claimed self-play only; it fired on
-            # the live bridge path too).
+            # WOTR has NO reshuffle - an exhausted deck means no draw,
+            # never a raise out of apply_action (2026-08-16 live-play
+            # halt).
             try:
                 # engine-granted draw: grant_draw stamps the owed-draw
                 # debt when the client owns the physical draw
@@ -10716,9 +12207,8 @@ def _execute_action_inner(state: GameState, action: Action):
         if _pco is not None and _pco.get('card_name') == '__wwsat_discard__':
             # 1.211f: resolve the Shadow's learned Worn-with-Sorrow
             # SOURCE pick (kill the named table FP Character card, or
-            # discard a random FP hand Character card). 1.210g: MANDATORY
-            # - the option list never carries a decline. pco already
-            # cleared above.
+            # discard a random FP hand Character card, or decline).
+            # pco already cleared above.
             _chw = p.get('choices') or {}
             game_logic._wwsat_resolve(
                 state, source=_chw.get('wwsat_source'),
@@ -10780,10 +12270,28 @@ def _execute_action_inner(state: GameState, action: Action):
                     from event_effects import play_event_card
                     play_event_card(state, _side, _pco['card_id'],
                                     choices=_ch9)
+                    # BL-150 E1: the card has now left the hand - the
+                    # same-deck redraw (Gandalf / Palantir) is earned
+                    # HERE, never while the option was still open
+                    if _pco['card_id'] not in state.hands[_side].hand:
+                        _grant_event_play_draw(state, _side,
+                                               _pco['card_id'],
+                                               _pco.get('deck'),
+                                               _pco.get('die_face'))
                 except Exception:
+                    # EX-1: a raising handler must not annihilate the
+                    # card.  Self-play / live apply on a clone - the
+                    # raise REJECTS the action (card still in hand).
+                    # Only the teacher (log = truth, FINAL_HITS_HOOK
+                    # set) keeps the lenient path, and files the card
+                    # face-up rather than deleting it.
+                    import combat as _cmbeo9
+                    if _cmbeo9.FINAL_HITS_HOOK is None:
+                        raise
                     hand = state.hands.get(_side, PlayerInfo())
                     if _pco['card_id'] in hand.hand:
                         hand.hand.remove(_pco['card_id'])
+                        _discard_played_combat_card(state, _pco['card_id'])
             # P1 (Crebain): a decision interposed on another action
             # (fellowship_move) resumes that stashed action now
             _ra9 = _pco.get('resume_action')
@@ -10793,10 +12301,8 @@ def _execute_action_inner(state: GameState, action: Action):
                     action_type=_ra9['action_type'],
                     params=dict(_ra9['params'])))
             # 1.230: a card_option resolution may leave hunt-tile damage
-            # (Mithril redraw, There is Another Way's move) - it runs
-            # the SAME full settle as the fellowship_move tail (Gollum
-            # offer + Axe/Horn offer + sacrifice chains); the old inline
-            # sacrifice-or-apply copy diverged
+            # (Mithril redraw, There is Another Way's move) - it runs the
+            # SAME full settle as the fellowship_move tail.
             if getattr(state, '_pending_hunt_damage', 0) > 0 \
                     and state.pending_hunt is None:
                 if not game_logic._offer_hunt_reduction(state):
@@ -10812,6 +12318,10 @@ def _execute_action_inner(state: GameState, action: Action):
     elif atype == 'companion_move':
         from_san = sanitize(p['from'])
         to_san = sanitize(p['to'])
+        if from_san == to_san:
+            valid, reason = is_legal_companion_action(state, action)
+            if not valid:
+                raise RuntimeError(reason)
         _consume_die_for_face(state, Side.FREE_PEOPLES, die_idx,
                               (ActionDieFace.CHARACTER,
                                ActionDieFace.WILL_OF_WEST))
@@ -10827,20 +12337,21 @@ def _execute_action_inner(state: GameState, action: Action):
             comps = [c for c in comps if c.name in _wset9]
         if not comps:
             raise RuntimeError(f"companion_move: no companions at {p['from']}")
-        for c in comps:
-            src_army.leaders.remove(c)
-        if not src_army.units and not src_army.leaders:
-            del state.armies[src_key]
-        dst_key = next((k for k in state.armies if sanitize(k) == to_san), None)
-        if dst_key is None:
-            orig = board.regions.get(to_san, {}).get('orig', p['to'])
-            state.armies[orig] = Army(region=state.board.region(to_san))
-            dst_key = orig
-        state.armies[dst_key].leaders.extend(comps)
+        if from_san != to_san:
+            for c in comps:
+                src_army.leaders.remove(c)
+            if not src_army.units and not src_army.leaders:
+                del state.armies[src_key]
+            dst_key = next((k for k in state.armies if sanitize(k) == to_san), None)
+            if dst_key is None:
+                orig = board.regions.get(to_san, {}).get('orig', p['to'])
+                state.armies[orig] = Army(region=state.board.region(to_san))
+                dst_key = orig
+            state.armies[dst_key].leaders.extend(comps)
         # Companion ending movement in own nation's city/stronghold
         # activates that nation (rulebook p.34)
         game_logic._check_companion_activates_nation(
-            state, to_san, state.armies[dst_key])
+            state, to_san, comps)
         # USER (rulebook p.20 "Moving Companions"): the SAME Character
         # die may move ANY number of companion GROUPS from different
         # regions, each with its own allowance.  On the learned path
@@ -10869,6 +12380,8 @@ def _execute_action_inner(state: GameState, action: Action):
     elif atype == 'nazgul_move':
         from_san = sanitize(p['from'])
         to_san = sanitize(p['to'])
+        if not _nazgul_destination_allowed(state, to_san):
+            raise RuntimeError("Nazgul cannot fly into an unbesieged FP-controlled Stronghold")
         _consume_die_for_face(state, Side.SHADOW, die_idx,
                               (ActionDieFace.CHARACTER,))
         # Locate source army (keys may be orig names)
@@ -10907,7 +12420,20 @@ def _execute_action_inner(state: GameState, action: Action):
         import combat as _cmbn9
         if _cmbn9.FINAL_HITS_HOOK is None \
                 and getattr(state, 'pending_card_option', None) is None:
-            _arr9 = {to_san: len(nazgul), '__wk_ok__': 1}
+            # W4-028 (2026-09-02): the arrivals map counts PLAIN Nazgul
+            # only - _nazgul_chain_options compares it against the plain
+            # figures standing in the region; counting the Witch-king
+            # here froze one resident Nazgul at his destination (off by
+            # one; 7 logged legs lost, e.g. 2023-01-24 L585).
+            _arr9 = {to_san: sum(1 for _l9 in nazgul
+                                 if isinstance(_l9, Nazgul)),
+                     '__wk_ok__': 1,
+                     # W4-027 (1.262): the Mouth of Sauron may also move
+                     # (up to 3 regions, companion-style) on the SAME
+                     # Character die - die-seeded chains only; the card
+                     # seeds (_seed_card_nazgul_chain, The Black Captain
+                     # Commands) never carry this key
+                     '__mo_ok__': 1}
             if p.get('include_wk'):
                 _arr9['__wk__'] = 1  # the WK already flew this die
             from event_effects import _nazgul_chain_options
@@ -10973,20 +12499,20 @@ def _execute_action_inner(state: GameState, action: Action):
                 to_region, die_idx=die_idx)
 
     elif atype == 'fellowship_reveal_place':
-        # Learned reveal placement after hunt reveals fellowship
-        # (teacher-forced from logs since v-early; the LEARNED pick in
-        # self-play/live since USER RULING 2026-08-16).  "Revealed in"
-        # shadow stronghold tile already drawn (teacher: in
-        # fellowship_move; learned: open_reveal_placement's prep).
-        # _apply_reveal_placement is the ONE implementation:
-        # leaving/entering tiles + pawn move + progress 0.
-        _apply_reveal_placement(state, p['region'])
+        # Learned reveal placement (USER RULING 2026-08-16; teacher-
+        # forced from logs).  The 'revealed in' Shadow-stronghold tile
+        # is already drawn (teacher: in fellowship_move; learned:
+        # open_reveal_placement's prep).  _apply_reveal_placement is the
+        # ONE implementation.
+        _apply_reveal_placement(state, p['region'], p.get('path'))
         # Learned path only: a leaving/entering draw's damage settles
         # through the shared learned machinery.  TEACHER keeps its
         # certified behavior (logged records force damage separately).
         import combat as _cmbrp9
         if _cmbrp9.FINAL_HITS_HOOK is None \
-                and getattr(state, '_pending_hunt_damage', 0) > 0:
+                and getattr(state, '_pending_hunt_damage', 0) > 0 \
+                and state.pending_hunt is None \
+                and getattr(state, 'pending_card_option', None) is None:
             if not game_logic._offer_hunt_reduction(state):
                 game_logic._settle_hunt_damage(state)
 
@@ -11004,7 +12530,12 @@ def _execute_action_inner(state: GameState, action: Action):
             state, atype, forced_companion=p.get('forced_companion'))
 
     elif atype == 'choose_guide':
+        if p.get('side', 'fp') != 'fp':
+            raise ValueError('Only Free Peoples may choose the Fellowship guide')
         companion_name = p['companion']
+        pending = state.pending_guide_change
+        if pending is None or companion_name not in pending.get('candidates', ()):
+            raise ValueError('Guide choice is not among the pending legal candidates')
         game_logic.change_guide(state, chosen=companion_name)
         state.pending_guide_change = None
 
@@ -11019,14 +12550,19 @@ def _execute_action_inner(state: GameState, action: Action):
         state._eye_allocation_phase = False
 
     elif atype == 'elven_ring':
+        if p.get('face_unknown'):
+            raise RuntimeError('Elven Ring needs an explicit die and new face; resync or replay legacy waiver gestures')
         target_idx = p['target_die_idx']
         new_face_str = p['new_face']
         new_face = ActionDieFace(new_face_str)
         ring_side = Side.FREE_PEOPLES if p.get('side') == 'fp' else Side.SHADOW
         game_logic.use_elven_ring(state, ring_side, target_idx, new_face)
-        # a ring use is not an action: the ring user acts next
-        # (_next_acting_side); the marker dies with the next action
-        state._ring_free_side = ring_side
+        # Ring conversion keeps this player's action only while a usable
+        # die remains. A last-die conversion to Eye immediately exhausts
+        # that side; it must not create a compulsory action with no menu.
+        state._ring_free_side = (ring_side if any(
+            not die.used and die.current is not None
+            for die in state.dice.get(ring_side, ())) else None)
 
     elif atype == 'use_token':
         t_side = Side.FREE_PEOPLES if p.get('side', 'fp') == 'fp' \
@@ -11069,17 +12605,37 @@ def _consume_die(state: GameState, die_idx: int):
 
 
 def _consume_die_for_face(state: GameState, side: Side, die_idx: int,
-                          valid_faces: Tuple[ActionDieFace, ...]):
+                          valid_faces: Tuple[ActionDieFace, ...],
+                          waived: bool = False):
     """Mark a die as used for the given side with a compatible face.
 
     If the specified die_idx is already used, finds another unused die
     showing one of the valid faces.  Returns the index of the die
     actually consumed (None for die-less actions) so callers that
     relocate the die (hunt box) always move the CONSUMED die.
+
+    waived=True (LA-1): the action exists only through the Elven-Ring
+    waiver - the named die pays and the waiver is spent NOW, even when
+    its rolled face is natively in valid_faces (a Muster die ringed to
+    Army closing the Army die's pair); no live waiver -> loud.
     """
     if die_idx < 0:
         return None  # No-die action (e.g., fellowship_declare)
     dice = state.dice.get(side, [])
+    if waived:
+        import game_logic as _gl7w
+        if (die_idx < len(dice)
+                and set(valid_faces) != {ActionDieFace.WILL_OF_WEST}):
+            d = dice[die_idx]
+            if (not d.used and _gl7w.ring_waiver_active(state, side)
+                    and _gl7w.ring_waiver_permits(side, d.current)):
+                d.mark_used()
+                _gl7w.ring_waiver_spend(state, side)
+                _clear_ring_waiver_face(state, side)
+                return die_idx
+        raise RuntimeError(
+            f"die {die_idx} of {side.name}: waived action but no live "
+            f"Elven-Ring waiver permits it")
     # Try the specified die first
     if die_idx < len(dice):
         d = dice[die_idx]
@@ -11088,18 +12644,11 @@ def _consume_die_for_face(state: GameState, side: Side, die_idx: int,
             return die_idx
     # A7 (USER ruling 2026-08-19): an ELVEN RING paid for this action is
     # a LEGALITY EXPANSION - the STAGED die pays, keeping its face.
-    #
-    # THIS BRANCH MUST SIT ABOVE THE FALLBACK, and that ordering is the
-    # whole fix.  Below it, the fallback would quietly consume a
-    # DIFFERENT die than the one the human physically dragged into
-    # Current Action - and `fellowship_move` drops the CONSUMED die into
-    # the Hunt Box, so the wrong die leaves his pool while the staged
-    # one stays spendable.  That is the client-vs-engine desync behind
-    # USER live items C2/C4 ("shadow kept the elven ring I spent").
-    #
-    # The ring may never produce Will of the West (rulebook Ch.IV), so a
-    # Will-ONLY requirement - crown_aragorn's `payment='will'` - is not
-    # waivable.  A widened permit is not a conservative change either.
+    # THIS BRANCH MUST SIT ABOVE THE FALLBACK: consuming a DIFFERENT die
+    # than the one the human dragged is the client-vs-engine desync
+    # class (fellowship_move drops the CONSUMED die into the Hunt Box;
+    # USER live C2/C4).  The ring may never produce Will of the West
+    # (rulebook Ch.IV), so a Will-ONLY requirement is not waivable.
     if (die_idx < len(dice)
             and set(valid_faces) != {ActionDieFace.WILL_OF_WEST}):
         import game_logic as _gl7
@@ -11108,6 +12657,7 @@ def _consume_die_for_face(state: GameState, side: Side, die_idx: int,
                 and _gl7.ring_waiver_permits(side, d.current)):
             d.mark_used()
             _gl7.ring_waiver_spend(state, side)
+            _clear_ring_waiver_face(state, side)
             return die_idx
     # The named die cannot pay.  Consuming a DIFFERENT die silently is
     # the client-vs-engine desync class (the human dragged die X, the
@@ -11133,6 +12683,8 @@ def _consume_die_for_face(state: GameState, side: Side, die_idx: int,
 # Step 8a: MCTS (Monte Carlo Tree Search)
 # ===================================================================
 
+import weakref as _mcts_weakref
+
 class MCTSNode:
     """A node in the MCTS search tree.
 
@@ -11144,14 +12696,15 @@ class MCTSNode:
     event instead of freezing one sampled outcome ("the net should
     calculate expectation values in MCTS for anything affected by
     RNG")."""
-    __slots__ = ('state', 'side', 'parent', 'action', 'prior',
+    __slots__ = ('state', 'side', '_parent_ref', 'action', 'prior',
                  'children', 'visit_count', 'value_sum', 'value_sq',
                  'term_visits',
                  'is_terminal', 'terminal_value',
                  'is_chance', 'outcomes', 'out_sig', 'drops',
                  'proven', 'proven_value', 'kernel_cover',
                  'w3', 'ov_seen', 'ov_win', 'forced_visits',
-                 'conf_sum', 'phi_sum')
+                 'conf_sum', 'phi_sum', 'kernel_sets', 'kernel_key',
+                 'forced_policy_reason', 'round_sampling', '_opponent_edge_catalog', '__weakref__')
 
     def __init__(self, state, side, parent=None, action=None, prior=0.0):
         self.state = state           # GameState (cloned), None for lazy expansion
@@ -11160,6 +12713,9 @@ class MCTSNode:
         self.action = action         # Action that led here from parent
         self.prior = prior           # P(a) from policy network
         self.children = []           # List of MCTSNode
+        self._opponent_edge_catalog = None
+        self.forced_policy_reason = None
+        self.round_sampling = False
         self.visit_count = 0
         self.value_sum = 0.0         # Sum of values from this side's perspective
         self.value_sq = 0.0          # 1.226e: sum of squared backup values
@@ -11181,6 +12737,11 @@ class MCTSNode:
         self.kernel_cover = None     # kernel-exact chance node: kept
                                      # branch mass (1.0 = full support;
                                      # None = sampled node)
+        self.kernel_sets = None      # MC4: kernel node under a BLINDED
+                                     # root - {commit world key:
+                                     # (outcomes, cover, drops)}; None = one
+                                     # world (legacy path)
+        self.kernel_key = None       # MC4: world key `outcomes` serves
         self.w3 = None               # opponent combat-card window:
                                      # closed-form P(plays X) map over
                                      # the full unseen pool (design 3B)
@@ -11205,6 +12766,31 @@ class MCTSNode:
                                      # scaffold components (root-
                                      # currency) — per-arm phi mean
                                      # for shadow values
+
+    @property
+    def parent(self):
+        reference = self._parent_ref
+        return reference() if reference is not None else None
+
+    @parent.setter
+    def parent(self, value):
+        self._parent_ref = None if value is None else _mcts_weakref.ref(value)
+
+    def __getstate__(self):
+        # Serialize public graph links, never weakref objects. A rooted tree
+        # or envelope owns its ancestors while reconstruction reconnects them.
+        state = {name: getattr(self, name) for name in self.__slots__
+                 if name not in ('_parent_ref', '__weakref__')}
+        state['parent'] = self.parent
+        return state
+
+    def __setstate__(self, state):
+        # Accept the former default slotted-object pickle state as well.
+        if isinstance(state, tuple) and len(state) == 2:
+            ordinary, slots = state
+            state = dict(ordinary or {}, **(slots or {}))
+        for name, value in state.items():
+            setattr(self, name, value)
 
     @property
     def q_value(self):
@@ -11318,56 +12904,31 @@ _ATYPE_TO_CAT = {
 # today's binary rule).  Default 0.0 = rule unchanged.
 # ---------------------------------------------------------------------
 _CONF_LEAF = os.environ.get('WOTR_CONF_LEAF', '0') == '1'
-# LAW 1R (task 17, seeded re-adjudication comms\36): TRACK-ONLY mode.
-# The erebor class proved the honest theorem: on a deterministic
-# knife-edge (true margin 0.0025, interiors mid-confidence with
-# nonzero spread) ANY leaf-value transformation — absolute or
-# contrast-relative — reprices the order: the perturbation scale
-# (O(c*|v|) ~ 0.1-1.0) exceeds the margin ~100x, and making it
-# exactly zero on "trustworthy" states requires knowing which states
-# those are — the confidence question itself, circular.  Therefore
-# leaf shrinkage is RETIRED FROM THE PLAY PATH (WOTR_CONF_LEAF stays
-# off; code kept for TD-side use and for the record).  Consumption
-# moves to the ROOT DECISION: WOTR_CONF_TRACK=1 calls the provider
-# at every leaf eval and records confidence WITHOUT touching the
-# value — search, values, and RNG stream are BIT-IDENTICAL to
-# conf-OFF by construction — and select_root_action applies a
-# support-and-margin-gated override (cfg.conf_play) where margins
-# are explicit and auditable.
+# LAW 1R (task 17, comms\36): TRACK-ONLY mode.  Leaf shrinkage is
+# RETIRED FROM THE PLAY PATH (WOTR_CONF_LEAF stays off; code kept
+# for TD-side use): any leaf-value transformation reprices
+# deterministic knife-edge orderings.  WOTR_CONF_TRACK=1 records
+# confidence at every leaf eval WITHOUT touching the value (search,
+# values and RNG stream BIT-IDENTICAL to conf-OFF) and
+# select_root_action applies a support-and-margin-gated override
+# (cfg.conf_play).
 _CONF_TRACK = os.environ.get('WOTR_CONF_TRACK', '0') == '1'
 _CONF_FN = None
 _LAST_LEAF_CONF = 1.0     # set by _conf_shrink, read at backprop
 _LAST_LEAF_PHI = 0.0      # scaffold component of the last leaf
 
-# LAW 1B (task 16, R4 LEG-3b fix at source): CONFIDENCE REFERENCE
-# MODE.  R4 finding: at erebor_recapture the correct arm wins by a
-# 0.0025 Q-margin and the whole neighborhood reads NEAR-UNIFORM
-# mid-confidence (cf 0.38-0.42); absolute shrinkage (LAW 1 'abs')
-# compresses the entire Q table ~2.5x toward per-state scaffold
-# noise, destroying thin LEARNED margins and letting a 1-visit arm
-# win the cert judge's argmax-Q.  The epistemic truth: a UNIFORM
-# confidence level carries NO ordering information — only CONTRAST
-# does.  'root' mode consumes the differential component only:
-#     c_eff = min(1, c_leaf / max(c_root, eps))
-# (c_root = the provider's read of the ROOT state, once per search;
-# reference calls pass v_raw = 0.0 — basis-type providers ignore it
-# by contract).  Near-uniform subtrees -> c_eff ~ 1 -> orderings
-# preserved (erebor); genuinely less-supported lines than the root
-# -> shrinkage stands (mordor sit-lines 0.15/0.85 differential).
-# Never amplifies (clip at 1).  'mean' mode uses the search-running
-# mean as reference (measured alternative; nonstationary early).
-# Default 'abs' = R4 behavior until the battery adopts.
+# LAW 1B (task 16): CONFIDENCE REFERENCE MODE.  A UNIFORM confidence
+# level carries NO ordering information - only CONTRAST does.
+# 'root': c_eff = min(1, c_leaf / max(c_root, eps)) (c_root = the
+# provider's read of the ROOT state, once per search; reference
+# calls pass v_raw = 0.0).  Never amplifies (clip at 1).  'mean'
+# uses the search-running mean.  Default 'abs' = R4 behavior.
 _CONF_REF = os.environ.get('WOTR_CONF_REF', 'abs')
 _CONF_ROOT_C = None       # per-search root reference ('root' mode)
 _CONF_MEAN = [0.0, 0]     # running [sum, n] ('mean' mode)
-# Near-uniform DEADBAND ('root' mode): when c_leaf/c_root >=
-# 1 - deadband, c_eff snaps to EXACTLY 1 — the leaf value is
-# bit-untouched, so a near-uniform-confidence search is BIT-IDENTICAL
-# to conf-OFF (same values -> same descent -> same RNG stream).
-# This is what makes no-regression PROVABLE on fixtures whose
-# margins sit below value noise (erebor's 0.0025: ANY perturbation,
-# however small, is a coin flip there — measured: the R4 conf-OFF
-# pass itself flips under a different RNG stream).
+# Near-uniform DEADBAND ('root' mode): c_leaf/c_root >= 1 - deadband
+# snaps c_eff to EXACTLY 1 - the leaf value is bit-untouched, so a
+# near-uniform-confidence search is BIT-IDENTICAL to conf-OFF.
 _CONF_DEADBAND = float(os.environ.get('WOTR_CONF_DEADBAND', '0.25'))
 
 
@@ -11455,72 +13016,160 @@ def _conf_shrink(vec, side, v_raw):
 # (lattice key, die face, hobbit_place, enemy comps per dest) -> the
 # (N, ACTION_ENCODING_DIM) encoding matrix of a memoized separation
 # block; bounded, process-wide.  One lookup replaces N per-action
-# encodings at every FP expansion (profiled 2026-08-22: ~3,000 lattice
-# actions x ~200 expansions per 300-sim search).
+# encodings at every FP expansion (profiled 2026-08-22).
 _LATTICE_ENC_CACHE = {}
 
 
-def _encode_actions_batch(actions, state, side, comp_memo):
+def _encode_actions_batch_ordinary(actions, state, side, comp_memo):
+    if ACT_GEN == 'v52' and ACTION_ENCODING_DIM in (133, 157):
+        from search_action_encoding import encode_army_batch
+        import sys
+        return encode_army_batch(sys.modules[__name__], actions, state, side, comp_memo, _encode_actions_batch_base)
+    return _encode_actions_batch_base(actions, state, side, comp_memo)
+
+
+def _encode_actions_batch_base(actions, state, side, comp_memo):
     """Encodings + region indexes for a menu: memoized lattice
     separation actions come as ONE cached block matrix (the block's
     Action objects are shared across nodes; its encodings vary only
     with the die face, the hobbit_place subtype and the enemy
     composition at each destination); every other action goes through
     _encode_action_cached as before.  Returns (encs, region_idx)."""
-    n = len(actions)
-    lat = [i for i in range(n) if '_lattice' in actions[i].__dict__]
-    if len(lat) < 32:
-        encs = np.array([_encode_action_cached(a, state, side, comp_memo)
-                         for a in actions], dtype=np.float32)
+    _memo_installed = comp_memo is not None and len(actions) >= 32
+    if _memo_installed:
+        _previous_batch = comp_memo.get(ENCODING_BATCH_KEY, MISSING_BATCH)
+        comp_memo[ENCODING_BATCH_KEY] = EncodingBatch(state, sanitize)
+    try:
+        n = len(actions)
+        lat = [i for i in range(n) if '_lattice' in actions[i].__dict__]
+        if len(lat) < 32:
+            encs = np.array([_encode_action_cached(a, state, side, comp_memo)
+                             for a in actions], dtype=np.float32)
+            ridx = np.array([_region_index_cached(a) for a in actions],
+                            dtype=np.int64)
+            return encs, ridx
+        # the menu may carry SEVERAL blocks (one per Character die): the
+        # cache key names every block (in order) with its die's face
+        _dl = state.dice.get(side, [])
+        blocks = []
+        dests = set()
+        last_bk = None
+        for i in lat:
+            ad = actions[i].__dict__
+            bk = ad.get('_block_key')
+            if bk is not last_bk:
+                die_idx = actions[i].die_idx
+                _face = None
+                if 0 <= die_idx < len(_dl)                     and _dl[die_idx].current is not None:
+                    _face = _dl[die_idx].current.name
+                blocks.append((bk, die_idx, _face))
+                dests.update(ad.get('_block_dests') or ())
+                last_bk = bk
+        _phk9 = getattr(state, 'pending_hunt', None)
+        _hp = (isinstance(_phk9, dict) and _phk9.get('phase') == 'hobbit_place')
+        en_sig = []
+        for d in sorted(dests):
+            _ek9 = ('__enemy__', d)
+            _te = comp_memo.get(_ek9)
+            if _te is None:
+                _te = _enemy_comp_at(state, side, d)
+                comp_memo[_ek9] = _te
+            en_sig.append((d, _te))
+        ck = (tuple(blocks), len(lat), _hp, tuple(en_sig))
+        mat = _LATTICE_ENC_CACHE.get(ck)
+        if mat is None or mat.shape[0] != len(lat):
+            mat = np.array([_encode_action_cached(actions[i], state, side,
+                                                  comp_memo) for i in lat],
+                           dtype=np.float32)
+            if len(_LATTICE_ENC_CACHE) > 512:
+                _LATTICE_ENC_CACHE.clear()
+            _LATTICE_ENC_CACHE[ck] = mat
+        encs = np.empty((n, mat.shape[1]), dtype=np.float32)
+        encs[lat] = mat
+        rest = [i for i in range(n) if '_lattice' not in actions[i].__dict__]
+        if rest:
+            encs[rest] = np.array([_encode_action_cached(actions[i], state,
+                                                         side, comp_memo)
+                                   for i in rest], dtype=np.float32)
         ridx = np.array([_region_index_cached(a) for a in actions],
                         dtype=np.int64)
         return encs, ridx
-    # the menu may carry SEVERAL blocks (one per Character die): the
-    # cache key names every block (in order) with its die's face
-    _dl = state.dice.get(side, [])
-    blocks = []
-    dests = set()
-    last_bk = None
-    for i in lat:
-        ad = actions[i].__dict__
-        bk = ad.get('_block_key')
-        if bk is not last_bk:
-            die_idx = actions[i].die_idx
-            _face = None
-            if 0 <= die_idx < len(_dl)                     and _dl[die_idx].current is not None:
-                _face = _dl[die_idx].current.name
-            blocks.append((bk, die_idx, _face))
-            dests.update(ad.get('_block_dests') or ())
-            last_bk = bk
-    _phk9 = getattr(state, 'pending_hunt', None)
-    _hp = (isinstance(_phk9, dict) and _phk9.get('phase') == 'hobbit_place')
-    en_sig = []
-    for d in sorted(dests):
-        _ek9 = ('__enemy__', d)
-        _te = comp_memo.get(_ek9)
-        if _te is None:
-            _te = _enemy_comp_at(state, side, d)
-            comp_memo[_ek9] = _te
-        en_sig.append((d, _te))
-    ck = (tuple(blocks), len(lat), _hp, tuple(en_sig))
-    mat = _LATTICE_ENC_CACHE.get(ck)
-    if mat is None or mat.shape[0] != len(lat):
-        mat = np.array([_encode_action_cached(actions[i], state, side,
-                                              comp_memo) for i in lat],
-                       dtype=np.float32)
-        if len(_LATTICE_ENC_CACHE) > 512:
-            _LATTICE_ENC_CACHE.clear()
-        _LATTICE_ENC_CACHE[ck] = mat
-    encs = np.empty((n, mat.shape[1]), dtype=np.float32)
-    encs[lat] = mat
-    rest = [i for i in range(n) if '_lattice' not in actions[i].__dict__]
-    if rest:
-        encs[rest] = np.array([_encode_action_cached(actions[i], state,
-                                                     side, comp_memo)
-                               for i in rest], dtype=np.float32)
-    ridx = np.array([_region_index_cached(a) for a in actions],
-                    dtype=np.int64)
-    return encs, ridx
+    finally:
+        if _memo_installed:
+            if _previous_batch is MISSING_BATCH:
+                comp_memo.pop(ENCODING_BATCH_KEY, None)
+            else:
+                comp_memo[ENCODING_BATCH_KEY] = _previous_batch
+
+
+class _NonFiniteSearchValueError(ValueError):
+    """Invalid corrected-mode predictions must not become plausible fallbacks."""
+
+
+def _validate_search_value(value):
+    """Check raw corrected-mode predictions before any post-processing."""
+    from reward_contract import uses_predecision
+    if uses_predecision() and not math.isfinite(float(value)):
+        raise _NonFiniteSearchValueError(
+            'Non-finite search value in a predecision reward contract: %r' % value)
+    return value
+
+
+def _validate_search_priors(priors, action_count):
+    """Validate supplied policy weights before normalization or child creation.
+
+    Preserve the existing normalization for valid vectors and legacy behavior.
+    A corrected search cannot turn malformed model output into a smaller menu,
+    negative probabilities, or a plausible distribution from negative weights.
+    """
+    from reward_contract import uses_predecision
+    priors = np.asarray(priors, dtype=np.float32)
+    if uses_predecision():
+        if priors.shape != (action_count,):
+            raise ValueError('Invalid search policy shape %r; expected (%d,)'
+                             % (priors.shape, action_count))
+        if not np.isfinite(priors).all():
+            raise ValueError('Non-finite search policy weights')
+        if (priors < 0).any():
+            raise ValueError('Negative search policy weights')
+        with np.errstate(over='ignore'):
+            mass = priors.sum()
+        if not np.isfinite(mass) or mass <= 0:
+            raise ValueError('Invalid search policy mass: %r' % mass)
+        # Check the result of the existing normalization before a batch can
+        # publish any children. Tiny positive mass can be overwhelmed by its
+        # denominator epsilon; accepting it would leave an almost-zero policy.
+        normalized_mass = float((priors / (mass + 1e-10)).sum())
+        if not np.isclose(normalized_mass, 1.0, rtol=1e-5, atol=1e-7):
+            raise ValueError('Search policy normalized mass is not one: %r'
+                             % normalized_mass)
+    return priors
+
+
+def _validate_search_batch_count(values, expected, label):
+    """Corrected inference must answer every requested row exactly once."""
+    from reward_contract import uses_predecision
+    if uses_predecision():
+        try:
+            actual = len(values)
+        except TypeError as exc:
+            raise ValueError('%s is not a batch response' % label) from exc
+        if actual != expected:
+            raise ValueError('%s count %d; expected %d' % (label, actual, expected))
+
+
+def _bound_search_value(value):
+    """Corrected decision values cannot exceed their terminal [-1, 1] range.
+
+    Apply only at search boundaries, after confidence/shaping. Raw network
+    forwards remain differentiable and legacy profile values keep their
+    original scale, including when importing a scaled2 seed checkpoint.
+    """
+    from reward_contract import uses_predecision
+    if not uses_predecision():
+        return value
+    value = float(_validate_search_value(value))
+    return max(-1.0, min(1.0, value))
 
 
 def _get_priors_and_value(state: GameState, side: Side,
@@ -11532,9 +13181,19 @@ def _get_priors_and_value(state: GameState, side: Side,
 
     Priors come from the spatial action scorer (behavioral-cloning-trained,
     GNN region embeddings per action); value from the value head.
-    Falls back to uniform priors + heuristic value on any failure.
+    Legacy mode falls back to uniform priors + heuristic value on failure.
+    Corrected modes propagate supplied-model failures; net=None explicitly
+    requests uniform priors and a heuristic value.
     """
+    if _OWN_VALUE_CONTEXT is not None and (side != _OWN_VALUE_CONTEXT.side or net is not _OWN_VALUE_CONTEXT.net):
+        raise RuntimeError('Own-value search attempted a non-root policy request')
+    if _OWN_VALUE_CONTEXT is not None:
+        _OWN_VALUE_CONTEXT.stats['root_policy_requests'] += 1
+    from reward_contract import uses_predecision
     vec = features_vec if features_vec is not None else encode_state(state, side)
+    if net is None and uses_predecision():
+        priors = np.ones(len(actions), dtype=np.float32) / len(actions)
+        return priors.tolist(), _mcts_eval_state(state, side, None, None)
     # SCALE: remote batched-GPU inference path (per-net client wins —
     # lets one process arena nets served by DIFFERENT servers/archs)
     _icli = getattr(net, '_client', None) or INFER_CLIENT
@@ -11546,16 +13205,14 @@ def _get_priors_and_value(state: GameState, side: Side,
             priors, v = _icli.pv(
                 net.remote_key, np.asarray(vec, dtype=np.float32),
                 action_encs, region_idx)
-            priors = np.asarray(priors, dtype=np.float32)
+            v = _validate_search_value(v)
+            priors = _validate_search_priors(priors, len(actions))
             priors = priors / (priors.sum() + 1e-10)
             v = _conf_shrink(np.asarray(vec, dtype=np.float32),
                              side, float(v))     # LAW 1 (remote)
-            # gate widened + phi TRACKED (ultrareview bug_001/003):
-            # the remote branch applied shaping without recording
-            # _LAST_LEAF_PHI — same-side remote leaves backed up
-            # phi_sum 0.0, corrupting the ph payload LAW 1R and the
-            # delta trainer consume; and the profile-only gate
-            # dropped the rho ring term when profiles were unset
+            # phi TRACKED on the remote branch too (ultrareview
+            # bug_001/003): every leaf records _LAST_LEAF_PHI, and the
+            # rho ring term applies with profiles unset.
             if (_PHI_RINGS_RHO or PLAYER_PROFILES.get('fp')
                     or PLAYER_PROFILES.get('sh')):
                 _shp17 = (_profile_shaping(state)
@@ -11565,16 +13222,18 @@ def _get_priors_and_value(state: GameState, side: Side,
                     global _LAST_LEAF_PHI
                     _LAST_LEAF_PHI = _shp17
                 v = float(v) + _shp17
-            return priors.tolist(), float(v)
+            return priors.tolist(), _bound_search_value(float(v))
         except Exception:
-            pass
+            if uses_predecision():
+                raise
     net.eval()
 
     try:
         with torch.no_grad():
             x = torch.from_numpy(np.array([vec])).to(DEVICE)
             backbone_out, node_emb = net.forward_backbone(x)
-            v = net.value_head(backbone_out).squeeze(-1).item()
+            v = _validate_search_value(
+                net.value_head(backbone_out).squeeze(-1).item())
             _cm9 = {}   # per-expansion composition memo (profile fix)
             action_encs, region_idx = _encode_actions_batch(
                 actions, state, side, _cm9)
@@ -11583,8 +13242,7 @@ def _get_priors_and_value(state: GameState, side: Side,
             priors_t = net.score_actions_spatial(
                 backbone_out, node_emb, ae_t, ri_t)
             priors = priors_t.cpu().numpy().astype(np.float32)
-        # (skip/rearguard prior floor removed 2026-07-08 — those actions
-        # are no longer generated)
+        priors = _validate_search_priors(priors, len(actions))
         priors = priors / (priors.sum() + 1e-10)
         v = _conf_shrink(np.asarray(vec, dtype=np.float32),
                          side, float(v))         # LAW 1 (local)
@@ -11596,9 +13254,10 @@ def _get_priors_and_value(state: GameState, side: Side,
             if _CONF_LEAF or _CONF_TRACK:
                 _LAST_LEAF_PHI = _shp17   # global decl in remote block
             v = float(v) + _shp17
-        return priors.tolist(), float(v)
+        return priors.tolist(), _bound_search_value(float(v))
     except Exception:
-        pass
+        if uses_predecision():
+            raise
 
     # Fallback (heuristic leaf: net inference failed)
     v_fp = state_value_fp(state)
@@ -11618,7 +13277,7 @@ def _get_priors_and_value(state: GameState, side: Side,
             _LAST_LEAF_CONF = 1.0
         v += _shp17
     priors = np.ones(len(actions), dtype=np.float32) / len(actions)
-    return priors.tolist(), v
+    return priors.tolist(), _bound_search_value(v)
 
 
 # ---------------------------------------------------------------------
@@ -11637,32 +13296,28 @@ PLAYER_PROFILES = {'fp': None, 'sh': None}
 # functions route through it when the net object is a RemoteNet.
 INFER_CLIENT = None
 PROFILE_WEIGHT = 0.15
-# v2 (USER, session 29): 'balanced' profiles removed - four styles,
-# each trained against its own WIN AXIS (see the outcome-alignment
-# block in _run_single_episode).
-# 'mixed' (USER 2026-07-30): ALL outcomes valued equally — blended
-# convex currency (the reward split's else-branch), full +/-1 terminal
-# for ANY win (on-mission covers both victory types), no leaf shaping,
-# phi channels included (military currencies count in the blend).
+# Four styles, each trained against its own WIN AXIS (USER, session
+# 29; see the outcome-alignment block in _run_single_episode).
+# 'mixed' (USER 2026-07-30): ALL outcomes valued equally - blended
+# convex currency, full +/-1 terminal for ANY win, no leaf shaping.
 FP_PROFILES = ('ring', 'military', 'mixed')
 SH_PROFILES = ('corruption', 'military', 'mixed')
 
-# F2/V2a phi ring price (2026-08-04 A/B validated; VALUE rebase
-# amendment 2026-08-09).  Flag default OFF -> byte-identical
-# behavior.  Potential phi_rings = RHO * (fp_rings - sh_rings - 3):
-# REBASED to game-start zero — the raw (fp-sh) form carries +0.3 at
-# start, invisible to play (constant shifts never change in-tree
-# comparisons; the A/B evidence transfers exactly) but it displaces
-# the residual training currency (targets = G - phi): measured
-# saturation 27-38% raw vs 0.1-4.0% rebased at the S=2 head
-# (experiments\VALUE_rig RESULTS.md sec 7).  Spending a ring costs
-# RHO immediately; potential-based -> telescopes.
+# F2/V2a phi ring price (A/B validated 2026-08-04; VALUE rebase
+# 2026-08-09).  Flag default OFF = byte-identical.  phi_rings =
+# RHO * (fp_rings - sh_rings - 3), REBASED to game-start zero so the
+# residual training currency (targets = G - phi) is not displaced
+# (experiments\VALUE_rig RESULTS.md sec 7).  Potential-based ->
+# telescopes.
 _PHI_RINGS_RHO = float(os.environ.get('WOTR_PHI_RINGS_RHO', '0') or 0)
 
 
 def _profile_shaping(state: GameState) -> float:
     """FP-positive zero-sum shaping term from both sides' profiles.
     'balanced'/None contribute 0 (pure value)."""
+    from reward_contract import uses_predecision
+    if uses_predecision():
+        return 0.0
     _ring_phi9 = 0.0
     if _PHI_RINGS_RHO:
         _ring_phi9 = _PHI_RINGS_RHO * (
@@ -11707,9 +13362,16 @@ def _mcts_eval_state(state: GameState, side: Side,
                      sh_net: 'WOTRValueNet') -> float:
     """Evaluate a state from the given side's perspective.
 
-    Uses the side's trained value network; falls back to the heuristic
-    if no net is available.
+    Uses the side's trained value network. With no net, use the heuristic.
+    Supplied-model failures propagate in corrected reward modes.
     """
+    if _OWN_VALUE_CONTEXT is not None:
+        _own = fp_net if side == Side.FREE_PEOPLES else sh_net
+        if side != _OWN_VALUE_CONTEXT.side or _own is not _OWN_VALUE_CONTEXT.net:
+            raise RuntimeError('Own-value search attempted a non-root value request')
+    if _OWN_VALUE_CONTEXT is not None:
+        _OWN_VALUE_CONTEXT.stats['root_value_requests'] += 1
+    from reward_contract import uses_predecision
     _shp = _profile_shaping(state)
     _sgn = 1.0 if side == Side.FREE_PEOPLES else -1.0
     if _CONF_LEAF or _CONF_TRACK:
@@ -11724,26 +13386,51 @@ def _mcts_eval_state(state: GameState, side: Side,
     if _icli is not None and getattr(net, 'remote_key', None):
         try:
             vec = encode_state(state, side)
-            v = _icli.eval(
+            v = _validate_search_value(_icli.eval(
                 net.remote_key,
-                np.asarray([vec], dtype=np.float32))[0]
-            return _conf_shrink(np.asarray(vec, dtype=np.float32),
-                                side, float(v)) + _sgn * _shp
+                np.asarray([vec], dtype=np.float32))[0])
+            return _bound_search_value(_conf_shrink(
+                np.asarray(vec, dtype=np.float32), side, float(v)) + _sgn * _shp)
         except Exception:
-            pass
+            if uses_predecision():
+                raise
     if net is not None:
         try:
             vec = encode_state(state, side)
             net.eval()
             with torch.no_grad():
                 x = torch.from_numpy(np.array([vec])).to(DEVICE)
-                return _conf_shrink(
+                v = _validate_search_value(float(net(x).item()))
+                return _bound_search_value(_conf_shrink(
                     np.asarray(vec, dtype=np.float32), side,
-                    float(net(x).item())) + _sgn * _shp
+                    v) + _sgn * _shp)
         except Exception:
-            pass
+            if uses_predecision():
+                raise
     v_fp = state_value_fp(state)
-    return (v_fp if side == Side.FREE_PEOPLES else -v_fp) + _sgn * _shp
+    return _bound_search_value(
+        (v_fp if side == Side.FREE_PEOPLES else -v_fp) + _sgn * _shp)
+
+
+def _pending_option_owner(state: GameState):
+    """The Side that OWNS an open card option / followup, or None.
+    BL-150 (2026-08-28): a hand-limit discard yields to that side's
+    own action still resolving (the option belongs to the play in
+    flight; a discard surfaced first starved the option and let the
+    live matcher guess which card left the hand) - but ONLY same-side:
+    a coexisting other-side option keeps the v13 routing order
+    (test_pending_side_routing_consistency: FP discard outranks a
+    SHADOW option).  ONE helper for both answerers so they cannot
+    drift."""
+    for attr in ('pending_card_option', 'pending_card_followup'):
+        p = getattr(state, attr, None)
+        if p:
+            tag = str(p.get('side', '') or '').lower()
+            if tag == 'fp':
+                return Side.FREE_PEOPLES
+            if tag == 'sh':
+                return Side.SHADOW
+    return None
 
 
 def _pending_decision_kind_side(state: GameState,
@@ -11765,10 +13452,14 @@ def _pending_decision_kind_side(state: GameState,
     # hunt-reveal placement (USER RULING 2026-08-16: learned FP
     # decision) — branch position mirrors get_legal_actions EXACTLY
     if getattr(state, '_reveal_place_due', False) \
-            and not getattr(state, '_pending_hunt_damage', 0):
+            and not game_logic._reveal_hunt_pending(state):
         return ('reveal_place', Side.FREE_PEOPLES)
     _pd = getattr(state, 'pending_discard', None)
-    if _pd is not None:
+    # BL-150 (2026-08-28): the discard waits for ITS OWN side's card
+    # option / followup still resolving (see get_legal_actions' twin
+    # guard; _pending_option_owner is the one rule)
+    if _pd is not None \
+            and _pending_option_owner(state) is not _pd['side']:
         return ('discard', _pd['side'])
     if getattr(state, '_declare_phase', False):
         return ('declare', Side.FREE_PEOPLES)
@@ -11810,7 +13501,8 @@ def _pending_decision_side(state: GameState,
 
 
 def describe_pending(state: GameState,
-                     fallback_side: 'Optional[Side]' = None
+                     fallback_side: 'Optional[Side]' = None,
+                     for_side: 'Optional[Side]' = None
                      ) -> 'Optional[dict]':
     """THE packaging of "what decision is pending": a dict
     {'kind', 'side', 'actions'} for the highest-priority open pending,
@@ -11822,6 +13514,11 @@ def describe_pending(state: GameState,
     is the defect this replaces)."""
     kind, side = _pending_decision_kind_side(state, fallback_side)
     if kind is None or side is None:
+        return None
+    # W2-032 ownership (COORD #2 2026-09-03): asked FOR a side, a combat
+    # pending the OTHER side decides is not that side's pending - None.
+    if for_side is not None and kind.startswith('combat:') \
+            and side != for_side:
         return None
     return {'kind': kind, 'side': side,
             'actions': get_legal_actions(state, side)}
@@ -11847,12 +13544,9 @@ def _next_acting_side(state: GameState,
 
     Returns None if both sides have exhausted their dice.
     """
-    # Pending decision phases dictate the acting side directly — these
-    # override dice alternation. Without these checks, MCTS lookahead
-    # assigned hunt/combat decisions to the wrong side: wrong net
-    # evaluated the node and the value backup sign flipped for the
-    # whole subtree (the outer game loop always got this right; only
-    # in-tree search was affected).
+    # Pending decision phases dictate the acting side directly - they
+    # override dice alternation (in-tree search must evaluate the node
+    # with the right side's net and backup sign).
     _ps = _pending_decision_side(state, fallback=just_acted)
     if _ps is not None:
         return _ps
@@ -11863,7 +13557,9 @@ def _next_acting_side(state: GameState,
     # lands, so the live driver and in-tree routing agree with the
     # episode loop.
     _rfs = getattr(state, '_ring_free_side', None)
-    if _rfs is not None:
+    if _rfs is not None and any(
+            not die.used and die.current is not None
+            for die in state.dice.get(_rfs, ())):
         return _rfs
 
     # Multi-step actions keep the same side
@@ -11895,11 +13591,366 @@ def _next_acting_side(state: GameState,
     return None  # Both exhausted
 
 
-def _expand_node(node: MCTSNode,
-                 fp_net: 'WOTRValueNet',
-                 sh_net: 'WOTRValueNet',
-                 root_side: Side,
-                 max_children: int = None) -> float:
+def _segment_get_companion_separate_actions(state: GameState, die_idx: int) -> List[Action]:
+    """Generate companion separation actions (one companion at a time).
+
+    Costs a Character or Will die.  Movement = fellowship progress +
+    highest level of separating companion.  Cannot separate in Mordor.
+    """
+    actions = _segment_Menu(Action)
+    if state.fellowship.mordor_entered:
+        return actions
+    separable = [c for c in state.fellowship.companions if c.name not in ('Gollum',) and c.level > 0]
+    if not separable:
+        return actions
+    cur = game_logic.fellowship_region(state)
+    progress = state.fellowship.progress
+    _vc9 = {}
+    _ph_batch = getattr(state, 'pending_hunt', None)
+    _reuse_answers = not (isinstance(_ph_batch, dict) and _ph_batch.get('phase') == 'hobbit_place')
+    _reuse_answers = _reuse_answers and all((type(c.name) is str and type(c.level) is int for c in separable))
+    _reuse_answers = _reuse_answers and len({c.name for c in separable}) == len(separable)
+    _answer_batch = _companion_search_cache.answer_table(sys.modules[__name__], state, cur, progress, separable) if _reuse_answers else {}
+    _proposal_batch = {}
+
+    def _proposal_reachable(state, origin, allowance):
+        key = (origin, allowance)
+        if key not in _proposal_batch:
+            _proposal_batch[key] = _companion_reachable(state, origin, allowance)
+        return set(_proposal_batch[key])
+
+    def _legal_proposal(action, allowance, destination):
+        if not _reuse_answers:
+            return is_legal_companion_action(state, action, _vc9)[0]
+        key = (allowance, destination)
+        if key not in _answer_batch:
+            _answer_batch[key] = is_legal_companion_action(state, action, _vc9)[0]
+        return _answer_batch[key]
+
+    def _prop9(names, mv, dest):
+        if len(names) == 1:
+            a9 = Action(die_idx=die_idx, action_type='companion_separate', params={'companion': names[0], 'to_region': dest})
+        else:
+            a9 = Action(die_idx=die_idx, action_type='companion_separate', params={'companions': sorted(names), 'to_region': dest})
+        if _legal_proposal(a9, mv, dest):
+            actions.append(a9)
+    for comp in separable:
+        movement = progress + comp.level
+        if movement <= 0:
+            continue
+        reachable = _proposal_reachable(state, cur, movement)
+        reachable.add(cur)
+        for dest in sorted(reachable):
+            _prop9([comp.name], movement, dest)
+    if len(separable) > 1:
+        _gmv15 = progress + max((c.level for c in separable))
+        if _gmv15 > 0:
+            _grch15 = _proposal_reachable(state, cur, _gmv15)
+            _grch15.add(cur)
+            _gnames15 = [c.name for c in separable]
+            for dest in sorted(_grch15):
+                _prop9(_gnames15, _gmv15, dest)
+        if len(separable) >= 2:
+            from itertools import combinations
+            _legal_by_mv = {}
+
+            def _dests_for(mv, rep_names):
+                if mv not in _legal_by_mv:
+                    rch = _proposal_reachable(state, cur, mv)
+                    rch.add(cur)
+                    ok = []
+                    for dest in sorted(rch):
+                        a9 = Action(die_idx=die_idx, action_type='companion_separate', params={'companions': rep_names, 'to_region': dest})
+                        if _legal_proposal(a9, mv, dest):
+                            ok.append(dest)
+                    _legal_by_mv[mv] = ok
+                return _legal_by_mv[mv]
+            _mvs = sorted(set((progress + max((c.level for c in _sub)) for _r in range(2, len(separable)) for _sub in combinations(separable, _r))))
+            _dest_sig = tuple(((mv, tuple(_dests_for(mv, sorted((c.name for c in separable))))) for mv in _mvs if mv > 0))
+            _lkey = (die_idx, cur, progress, tuple(sorted((c.name for c in separable))), _dest_sig)
+            _block = _SEP_LATTICE_MEMO.get(_lkey)
+            if _block is None:
+                _block = []
+                for _r16 in range(2, len(separable)):
+                    for _sub16 in combinations(separable, _r16):
+                        _mv16 = progress + max((c.level for c in _sub16))
+                        if _mv16 <= 0:
+                            continue
+                        _nm16 = sorted((c.name for c in _sub16))
+                        for dest in _dests_for(_mv16, _nm16):
+                            _a16 = Action(die_idx=die_idx, action_type='companion_separate', params={'companions': list(_nm16), 'to_region': dest})
+                            _a16._lattice = True
+                            _block.append(_a16)
+                _bdests = sorted(set((a16.params['to_region'] for a16 in _block)))
+                for a16 in _block:
+                    a16._block_key = _lkey
+                    a16._block_dests = _bdests
+                if len(_SEP_LATTICE_MEMO) > 256:
+                    _SEP_LATTICE_MEMO.clear()
+                _SEP_LATTICE_MEMO[_lkey] = _block
+            actions.append(_segment_wrap_lattice(_block, _lkey, die_idx, getattr(_block[0], '_block_dests', ()) if _block else ()))
+    return actions
+
+def _segment_get_legal_actions(state: GameState, side: Side) -> List[Action]:
+    """Enumerate all legal atomic actions for the given side.
+
+    Handles multi-step die actions (Army die double-move, Muster die
+    double-recruit) via pending state on the GameState.
+
+    Returns a list of Action objects that can be passed to apply_action().
+    """
+    if state.pending_combat is not None:
+        _ds9 = state.pending_combat.get('deciding_side')
+        if _ds9 is not None and side is not None and (_ds9 != side):
+            return []
+        return _get_pending_combat_actions(state)
+    if state.pending_guide_change is not None:
+        if side != Side.FREE_PEOPLES:
+            return []
+        return [Action(die_idx=-1, action_type='choose_guide', params={'companion': name, 'side': 'fp'}) for name in state.pending_guide_change['candidates']]
+    if state.pending_hunt is not None:
+        return _get_pending_hunt_actions(state)
+    if getattr(state, '_reveal_place_due', False) and (not game_logic._reveal_hunt_pending(state)):
+        _rp_acts9 = _get_reveal_placement_actions(state)
+        if _rp_acts9:
+            return _rp_acts9
+    _pd = getattr(state, 'pending_discard', None)
+    if _pd is not None and side == _pd['side'] and (_pending_option_owner(state) is not _pd['side']):
+        _d_side = _pd['side']
+        _d_tag = 'fp' if _d_side == Side.FREE_PEOPLES else 'sh'
+        _seen = set()
+        _acts = []
+        for c in state.hands[_d_side].hand:
+            if c not in _seen:
+                _seen.add(c)
+                _acts.append(Action(die_idx=-1, action_type='discard_card', params={'card_id': c, 'side': _d_tag}))
+        if _acts:
+            return _acts
+        state.pending_discard = None
+    if getattr(state, '_declare_phase', False):
+        _decl = _get_declare_actions(state, allow_in_place=True)
+        _decl.append(Action(die_idx=-1, action_type='pass', params={}))
+        return _decl
+    if getattr(state, '_eye_allocation_phase', False):
+        n_companions = len(state.fellowship.companions)
+        unused = len([d for d in state.dice.get(Side.SHADOW, []) if not d.used])
+        max_eyes = min(max(n_companions, 1), unused)
+        min_eyes = 1 if getattr(state, '_fp_used_hunt_box_last_turn', False) else 0
+        min_eyes = min(min_eyes, max_eyes)
+        return [Action(die_idx=-1, action_type='eye_allocate', params={'count': n}) for n in range(min_eyes, max_eyes + 1)]
+    _pcf = getattr(state, 'pending_card_followup', None)
+    if _pcf is not None:
+        _f_side = Side.FREE_PEOPLES if _pcf['side'] == 'fp' else Side.SHADOW
+        if side != _f_side:
+            raise RuntimeError(f'pending_card_followup belongs to {_f_side.name}, but {side.name} was asked for legal actions')
+        acts_f = []
+        _needs_wk = _pcf['kind'] == 'wk_army'
+        from game_state import Nazgul as _NazF
+        for _k, _a in state.armies.items():
+            if not _a.units:
+                continue
+            if not any((_side_of_nation(u.nation) == _f_side for u in _a.units)):
+                continue
+            if _needs_wk and (not any((game_logic.is_nazgul_figure(l) and (not isinstance(l, _NazF)) for l in _a.leaders))):
+                continue
+            if not _needs_wk and (not any((game_logic.is_nazgul_figure(l) for l in _a.leaders))):
+                continue
+            if sanitize(_k) in _pcf.get('exclude', ()):
+                continue
+            for _mv in _get_army_move_actions(state, _f_side, -1):
+                if sanitize(str(_mv.params.get('from'))) == sanitize(_k):
+                    from army_move_participants import selected, card_followup_qualifies
+                    _border = _border_pred9(state, _a.units, _a.leaders, _f_side, _mv.params['to'])
+                    if not card_followup_qualifies(selected(_a, _f_side, _mv.params, _border), _pcf['kind']):
+                        continue
+                    _mv.params['card_followup'] = True
+                    acts_f.append(_mv)
+            if not _pcf.get('moved_any'):
+                for _at2 in _get_army_attack_actions(state, _f_side, -1):
+                    if sanitize(str(_at2.params.get('from'))) == sanitize(_k):
+                        _at2.params['card_followup'] = True
+                        _at2.params['followup_attack'] = True
+                        acts_f.append(_at2)
+        acts_f.append(Action(die_idx=-1, action_type='followup_done', params={}))
+        return acts_f
+    _pco = getattr(state, 'pending_card_option', None)
+    if _pco is not None:
+        _o_side = Side.FREE_PEOPLES if _pco.get('decider', _pco['side']) == 'fp' else Side.SHADOW
+        if side != _o_side:
+            raise RuntimeError(f"pending_card_option ({_pco.get('card_name')}) belongs to {_o_side.name}, but {side.name} was asked for legal actions")
+        _choice_options = _table_kill_payment_options(state) if _pco.get('table_kill_payment') else _pco['options']
+        return [Action(die_idx=-1, action_type='card_option', params={'idx': i, 'card_id': _pco['card_id'], 'card_name': _pco['card_name'], 'side': _pco['side'], 'choices': opt, **({'source_card_id': _pco['source_card_id'], 'deck': _pco['deck']} if _pco.get('gandalf_draw') else {})}) for i, opt in enumerate(_choice_options)]
+    if state.pending_army_move_die is not None and state.pending_army_move_side in (None, side):
+        actions = _get_army_move_actions(state, side, state.pending_army_move_die, exclude_from=state.pending_army_move_from)
+        actions.append(Action(die_idx=state.pending_army_move_die, action_type='pass', params={}))
+        return actions
+    if state.pending_muster_die is not None and getattr(state, 'pending_muster_side', None) in (None, side):
+        actions = _get_recruit_actions(state, side, state.pending_muster_die, allowed_types=['regular', 'leader'], exclude_region=state.pending_muster_region)
+        actions.append(Action(die_idx=state.pending_muster_die, action_type='pass', params={}))
+        return actions
+    actions = _segment_Menu(Action)
+    _move_templates = {}
+    _mouth_can_stamp = side == Side.SHADOW and state.mouth_of_sauron is not None and state.mouth_of_sauron.in_play and (not getattr(state, 'sh_mouth_muster_used_this_turn', False))
+
+    def _moves_for_die(state, side, die_idx, require_leader=False, exclude_from=None):
+        key = (side, require_leader, exclude_from)
+        if key in _move_templates:
+            templates = _move_templates[key]
+            return [Action(die_idx=die_idx, action_type=a.action_type, params=dict(a.params)) for a in templates]
+        actions = _get_army_move_actions(state, side, die_idx, require_leader=require_leader, exclude_from=exclude_from)
+        _move_templates[key] = [Action(a.die_idx, a.action_type, dict(a.params)) for a in actions] if _mouth_can_stamp else actions
+        return actions
+    unused_dice = _get_unused_dice(state, side)
+    faces_seen: Set[ActionDieFace] = set()
+    effect_memo: Dict = {}
+    import game_logic as _gl7m
+    _ring_waived = _gl7m.ring_waiver_active(state, side)
+    for die_idx, die in unused_dice:
+        face = die.current
+        if face in faces_seen and (not _ring_waived):
+            continue
+        faces_seen.add(face)
+        allowed = _die_faces_for_action(face)
+        if _ring_waived:
+            allowed = set(allowed) | _ring_waived_categories(state, side, face)
+        if 'army' in allowed:
+            actions.extend(_moves_for_die(state, side, die_idx))
+            actions.extend(_get_army_attack_actions(state, side, die_idx))
+            if 'event' not in allowed:
+                actions.extend(_get_play_event_for_die(state, side, die_idx, 'army', effect_memo))
+        if 'muster' in allowed:
+            actions.extend(_get_political_advance_actions(state, side, die_idx))
+            actions.extend(_get_recruit_actions(state, side, die_idx))
+            actions.extend(_get_muster_elite_actions(state, side, die_idx))
+            if side == Side.SHADOW:
+                actions.extend(_get_saruman_muster_actions(state, die_idx))
+                actions.extend(_get_muster_minion_actions(state, die_idx))
+            if 'event' not in allowed:
+                actions.extend(_get_play_event_for_die(state, side, die_idx, 'muster', effect_memo))
+            if side == Side.SHADOW and 'army' not in allowed and (state.mouth_of_sauron is not None) and state.mouth_of_sauron.in_play and (not getattr(state, 'sh_mouth_muster_used_this_turn', False)):
+                mouth_actions = _moves_for_die(state, side, die_idx) + _get_army_attack_actions(state, side, die_idx)
+                if 'event' not in allowed:
+                    mouth_actions.extend(_get_play_event_for_die(state, side, die_idx, 'army', effect_memo))
+                for a in mouth_actions:
+                    a.params['mouth_muster'] = True
+                actions.extend(mouth_actions)
+        actions.extend(_get_table_kill_actions(state, side, die_idx, face))
+        if side == Side.FREE_PEOPLES:
+            _cab9 = _get_companion_muster_advances(state, die_idx)
+            if _cab9 and 'muster' in allowed and (not _tp_on_table(state)):
+                _plain9 = {a.params.get('nation') for a in actions.dynamic() if a.die_idx == die_idx and a.action_type == 'advance_political' and (not a.params.get('companion_ability'))}
+                _cab9 = [a for a in _cab9 if a.params.get('nation') not in _plain9]
+            actions.extend(_cab9)
+        if 'character' in allowed:
+            if side == Side.FREE_PEOPLES:
+                actions.extend(_get_fellowship_actions(state, die_idx))
+                actions.extend(_segment_get_companion_separate_actions(state, die_idx))
+                actions.extend(_get_companion_move_actions(state, die_idx))
+            else:
+                actions.extend(_get_nazgul_move_actions(state, die_idx))
+                actions.extend(_get_mouth_move_actions(state, die_idx))
+            if 'army' not in allowed:
+                actions.extend(_moves_for_die(state, side, die_idx, require_leader=True))
+                actions.extend(_get_army_attack_actions(state, side, die_idx, require_leader=True))
+            if 'event' not in allowed:
+                actions.extend(_get_play_event_for_die(state, side, die_idx, 'character', effect_memo))
+        if 'event' in allowed:
+            actions.extend(_get_event_actions(state, side, die_idx, effect_memo))
+        if 'special' in allowed:
+            actions.extend(_get_special_actions(state, side, die_idx))
+    if side == Side.FREE_PEOPLES and (not state.fellowship.hidden) and (state.fellowship.guide is not None) and ('Strider' in getattr(state.fellowship.guide, 'name', '')):
+        seen_hide_faces = set()
+        for die_idx2, die2 in unused_dice:
+            if die2.current in (ActionDieFace.CHARACTER, ActionDieFace.WILL_OF_WEST):
+                continue
+            if die2.current in seen_hide_faces:
+                continue
+            seen_hide_faces.add(die2.current)
+            actions.append(Action(die_idx=die_idx2, action_type='fellowship_hide', params={'strider_ability': True}))
+    actions.extend(_get_elven_ring_actions(state, side))
+    actions.extend(_get_token_actions(state, side))
+    actions.extend(_get_dwarven_ring_actions(state, side))
+    # 1.272 (USER 2026-09-10, verbatim): "if the decks are empty, and the
+    # player only has palantirs and nothing playable, allow the option to
+    # kill the die for no benefit".  Rulebook 1678-1680 (discard a die
+    # without effect) restored in exactly this situation; ruling 1.67 (no
+    # voluntary die kill) stands everywhere else.  Conditions: every unused
+    # die of this side shows the Event face (a Will of the West die is
+    # usable -> no row); both of this side's decks are empty; the die has
+    # no event row (no playable card - a zero-effect play IS playable,
+    # 1.230 - and no deck to draw from).  ONE row for the first unused
+    # Event die (this menu's one-die-per-face dedupe); it re-appears for
+    # the next die once this one is spent.  Encoding: the existing 'skip'
+    # kind (category pass + SKIP flag + die face); executor: the named die
+    # is spent, nothing else.  selfplay F3: the empty Shadow menu behind
+    # 4,990 Free Peoples passes in one turn.
+    if unused_dice and all(_d9.current == ActionDieFace.EVENT
+                           for _, _d9 in unused_dice):
+        _kd9 = unused_dice[0][0]
+        _kdecks9 = (('fp_char_deck', 'fp_strat_deck')
+                    if side == Side.FREE_PEOPLES
+                    else ('sh_char_deck', 'sh_strat_deck'))
+        if (not any(getattr(state, _n9, None) for _n9 in _kdecks9)
+                and not _get_event_actions(state, side, _kd9, effect_memo)):
+            actions.append(Action(
+                die_idx=_kd9, action_type='skip',
+                params={'face': 'EVENT',
+                        'side': 'fp' if side == Side.FREE_PEOPLES
+                        else 'sh'}))
+    other_side = Side.SHADOW if side == Side.FREE_PEOPLES else Side.FREE_PEOPLES
+    my_unused = len(unused_dice)
+    other_unused = sum((1 for d in state.dice.get(other_side, []) if not d.used and d.current is not None))
+    # MC6: once the opponent has no legal action, this side plays its
+    # remaining actions consecutively. A pass cannot hand control back
+    # to an empty menu forever. Probe a clone because menu generation
+    # can normalize pending state. Recursion stops here: the opponent
+    # has MORE dice, so its inverse fewer-dice condition is false.
+    # (production repair turn_loop_repair_r1, ai.py fc049472 -> 4275899a;
+    # ported onto the pinned static_r4 text by python_sync, 2026-09-10)
+    if (my_unused > 0 and my_unused < other_unused
+            and get_legal_actions(clone_state(state), other_side)):
+        actions.append(Action(die_idx=-1, action_type='pass', params={}))
+    # Rulebook p21 permits discarding an action die without effect. Keep the
+    # AI's no-voluntary-discard policy: expose it only if the complete ordinary
+    # menu is empty, including after a Ring conversion. Pending choices return
+    # above, so missing casualty/card decisions cannot be hidden by this row.
+    if not actions:
+        for dead_idx, dead_die in unused_dice:
+            if dead_die.current != ActionDieFace.EYE:
+                actions.append(Action(dead_idx, 'skip', {
+                    'face': dead_die.current.name,
+                    'side': 'fp' if side == Side.FREE_PEOPLES else 'sh'}))
+                break
+    return actions
+
+
+def _segment_wrap_lattice(raw,key,die,destinations):
+    from ai_policies import action_policy_key
+    return _search_lattice.wrapper(action_policy_key)(raw,key,die,destinations)
+
+_segment_original_bindings=(get_ai_policy,get_legal_actions,_get_companion_separate_actions,_get_priors_and_value)
+
+def _segment_policy(node):
+    if get_ai_policy is not _segment_original_bindings[0] or get_legal_actions is not _segment_original_bindings[1] or _get_companion_separate_actions is not _segment_original_bindings[2] or _get_priors_and_value is not _segment_original_bindings[3] or not _search_lattice.allowed(sys.modules[__name__],node.state) or _PENDING_EVAL_BOX[0] is not None:
+        return get_ai_policy(node.state,node.side)
+    return _search_lattice.project(sys.modules[__name__],node.state,node.side,_segment_get_legal_actions(node.state,node.side))
+
+def _segment_action_keys(actions,function):
+    return actions.action_keys(function) if isinstance(actions,_segment_Menu) else _current_action_keys(actions,function)
+
+def _segment_observe(observer,node,actions,probabilities):
+    if isinstance(actions,_segment_Menu):
+        assert node.state.pending_combat is None
+        return
+    observer.card_policy(node,actions,probabilities)
+
+def _encode_actions_batch(actions,state,side,comp_memo):
+    return _search_lattice.encode(sys.modules[__name__],actions,state,side,comp_memo,_encode_actions_batch_ordinary)
+
+def _prune_candidates(actions,priors,max_children=40,free_guarantee=None):
+    return _search_lattice.prune(sys.modules[__name__],actions,priors,max_children,free_guarantee,_prune_candidates_original)
+
+def _expand_node(node: MCTSNode, fp_net: 'WOTRValueNet', sh_net: 'WOTRValueNet', root_side: Side, max_children: int=None, _sample_local=False) -> float:
     """Expand a node: create children using category-balanced pruning.
 
     Guarantees at least MIN_PER_CAT actions from each present action category
@@ -11909,63 +13960,73 @@ def _expand_node(node: MCTSNode,
     """
     net = fp_net if node.side == Side.FREE_PEOPLES else sh_net
     _ov35 = _SIM_OVERLAY
-    if _ov35 is not None and node.side == _ov35.opp_side \
-            and node.state is not None:
-        # 3A patch point: the opponent's menu is enumerated from
-        # their (sampled) hand — the overlay must be live here
+    if _ov35 is not None and node.side == _ov35.opp_side and (node.state is not None):
         try:
             _ov35.patch(node.state)
         except Exception:
             OVERLAY_STATS['patch_error'] += 1
-            if OVERLAY_ASSERT:
-                raise
-    actions = get_legal_actions(node.state, node.side)
-
+            raise
+    policy = _segment_policy(node)
+    actions = policy.actions if isinstance(policy.actions, _segment_Menu) else list(policy.actions)
+    if not actions and (not _sample_local) and (_OPPONENT_POLICY_MODE in ('learned_policy', 'own_value_reply_v0')) and (_ov35 is not None) and (node.side == _ov35.opp_side):
+        scratch = MCTSNode(copy.deepcopy(node.state), node.side)
+        return _expand_node(scratch, fp_net, sh_net, root_side, max_children, _sample_local=True)
+    if not actions:
+        _oth8 = Side.SHADOW if node.side == Side.FREE_PEOPLES else Side.FREE_PEOPLES
+        if _pending_decision_side(node.state) is None and any((not d.used and d.current is not None for d in node.state.dice.get(_oth8, []))):
+            if _ov35 is not None and _oth8 == _ov35.opp_side and (node.state is not None):
+                try:
+                    _ov35.patch(node.state)
+                except Exception:
+                    OVERLAY_STATS['patch_error'] += 1
+                    raise
+            _opolicy8 = get_ai_policy(node.state, _oth8)
+            _oacts8 = list(_opolicy8.actions)
+            if _oacts8:
+                node.side = _oth8
+                net = fp_net if _oth8 == Side.FREE_PEOPLES else sh_net
+                actions = _oacts8
+                policy = _opolicy8
     if not actions:
         return _mcts_eval_state(node.state, root_side, fp_net, sh_net)
-
-    priors, value = _get_priors_and_value(node.state, node.side, net, actions)
-    # ROOT-CURRENCY INVARIANT: priors are the node side's opponent
-    # model, but every value backed up by one search is the ROOT
-    # side's net from the ROOT side's perspective — one currency per
-    # tree.  Same-side expansions already got exactly that from
-    # _get_priors_and_value; opponent expansions re-evaluate.
+    if policy.forced_reason:
+        node.forced_policy_reason = policy.forced_reason
+        node.children.append(MCTSNode(state=None, side=node.side, parent=node, action=actions[0], prior=1.0))
+        return 0.0
+    if _OWN_VALUE_CONTEXT is not None and node.side != root_side:
+        # The complete sampled menu is discovered lazily at reply selection.
+        # Never prune it using the partner policy or root-private tree Q.
+        return _mcts_eval_state(node.state, root_side, fp_net, sh_net)
+    if _PENDING_EVAL_BOX[0] is not None:
+        return _defer_expand(node, actions, net, root_side, max_children)
+    _expansion_vec = encode_state(node.state, node.side)
+    priors, value = _get_priors_and_value(node.state, node.side, net, actions, features_vec=_expansion_vec)
+    if _OPPONENT_POLICY_MODE in ('learned_policy', 'own_value_reply_v0') and node.side != root_side:
+        _remember_opponent_policy(node.side, _expansion_vec, actions, priors)
     if node.side != root_side:
         value = _mcts_eval_state(node.state, root_side, fp_net, sh_net)
-        # OPPONENT combat-card window: the BC prior is replaced by the
-        # closed-form posterior x best-response model (own-side card
-        # windows keep net priors untouched)
         _pcw = getattr(node.state, 'pending_combat', None)
-        if isinstance(_pcw, dict) and _pcw.get('phase') in (
-                'attacker_combat_card', 'defender_combat_card') \
-                and _pcw.get('deciding_side') == node.side:
-            _pri35 = _opponent_card_priors(node.state, _pcw, actions,
-                                           node.side)
+        if (_OPPONENT_POLICY_MODE == 'legacy_puct' and isinstance(_pcw, dict)) and _pcw.get('phase') in ('attacker_combat_card', 'defender_combat_card') and (_pcw.get('deciding_side') == node.side):
+            _pri35 = _opponent_card_priors(node.state, _pcw, actions, node.side)
             if _pri35 is not None:
                 priors, node.w3 = _pri35
-
     if max_children is None:
-        max_children = MCTS_MAX_CHILDREN or (1 << 30)   # 0 = no cap
+        max_children = MCTS_MAX_CHILDREN or 1 << 30
     if len(actions) <= max_children:
         for a, p in zip(actions, priors):
-            child = MCTSNode(state=None, side=node.side,
-                             parent=node, action=a, prior=p)
+            child = MCTSNode(state=None, side=node.side, parent=node, action=a, prior=p)
             node.children.append(child)
     else:
-        selected_list = _prune_candidates(actions, priors,
-                                          max_children)
-        total_prior = sum(priors[i] for i in selected_list)
+        selected_list = _prune_candidates(actions, priors, max_children)
+        total_prior = sum((priors[i] for i in selected_list))
         for i in selected_list:
             p = priors[i] / total_prior if total_prior > 0 else 1.0 / len(selected_list)
-            child = MCTSNode(state=None, side=node.side,
-                             parent=node, action=actions[i], prior=p)
+            child = MCTSNode(state=None, side=node.side, parent=node, action=actions[i], prior=p)
             node.children.append(child)
-
     return value
 
 
-def _prune_candidates(actions, priors, max_children=40,
-                      free_guarantee=None):
+def _prune_candidates_original(actions, priors, max_children=40, free_guarantee=None):
     """Category-balanced candidate pruning (factored VERBATIM from
     _expand_node: min 3 per category, then fill by prior; returns
     sorted selected indices).
@@ -11983,40 +14044,26 @@ def _prune_candidates(actions, priors, max_children=40,
     if free_guarantee is None:
         free_guarantee = _FREE_CANDS
     MIN_PER_CAT = 3
-    cat_indices = {}  # cat_idx -> [(prior, action_idx)] sorted desc
-    for i, a in enumerate(actions):
+    cat_indices = {}
+    for i, a in enumerate(actions.category_rows() if isinstance(actions, _segment_Menu) else actions):
         canonical = _ATYPE_TO_CAT.get(a.action_type, 'other')
-        idx = _ACTION_TYPE_TO_IDX.get(canonical,
-                                      _ACTION_TYPE_TO_IDX['other'])
+        idx = _ACTION_TYPE_TO_IDX.get(canonical, _ACTION_TYPE_TO_IDX['other'])
         cat_indices.setdefault(idx, []).append((priors[i], i))
     for cat in cat_indices:
         cat_indices[cat].sort(reverse=True)
-
     selected = set()
-    # Phase 1: guarantee min slots per category
     for cat, items in cat_indices.items():
         for _, action_idx in items[:MIN_PER_CAT]:
             selected.add(action_idx)
-
-    # Phase 1b (FIX 1): guarantee top-prior free-action arms
     if free_guarantee:
-        free = sorted(
-            [(priors[i], i) for i, a in enumerate(actions)
-             if a.action_type in _FREE_ACTION_TYPES],
-            reverse=True)
+        free = sorted([(priors[i], i) for i, a in enumerate(actions.category_rows() if isinstance(actions, _segment_Menu) else actions) if a.action_type in _FREE_ACTION_TYPES], reverse=True)
         for _, action_idx in free[:_FREE_CANDS_N]:
             selected.add(action_idx)
-
-    # Phase 2: fill remaining slots with highest-prior unselected actions
-    remaining = sorted(
-        [(priors[i], i) for i in range(len(actions))
-         if i not in selected],
-        reverse=True)
+    remaining = sorted([(priors[i], i) for i in range(len(actions)) if i not in selected], reverse=True)
     for _, action_idx in remaining:
         if len(selected) >= max_children:
             break
         selected.add(action_idx)
-
     return sorted(selected)
 
 
@@ -12048,51 +14095,33 @@ _CHANCE_K_MAX = 24     # max distinct outcome branches per chance node
                        # 18-24% at 12 vs 1-3.5% at 24, measured)
 _CHANCE_DRAWS = 16     # RNG draws whose frequencies weight the branches
 
-# v30 (2026-07-26): CROSS-TURN SEARCH.  The old horizon ended every
-# simulation at the end of die-spending, so hunt/corruption bleed,
-# dice economics and the end-of-turn Military Victory check were
-# INVISIBLE to search (the value net had to carry all cross-turn
-# credit).  WOTR_TURN_HORIZON = number of turn boundaries a simulation
-# may cross (0 restores the old behavior).  The boundary is a CHANCE
-# edge (next-turn dice rolls + phase-1 draws consume RNG, so
-# _apply_action_detect_rng turns it into a chance node whose branches
-# sample independent next-turn rolls); the declare / eye-allocation /
-# hand-limit phases inside the transition are resolved GREEDILY by the
-# policy prior (mirroring the episode loop's noise-free phase picks) —
-# the searched decisions stay the die-spends.
+# v30 (2026-07-26): CROSS-TURN SEARCH.  WOTR_TURN_HORIZON = number
+# of turn boundaries a simulation may cross (0 = end at the die-
+# spends).  The boundary is a CHANCE edge (next-turn rolls +
+# phase-1 draws consume RNG); the declare / eye-allocation /
+# hand-limit phases inside the transition resolve GREEDILY by the
+# policy prior (mirroring the episode loop's noise-free phase picks).
 _TURN_HORIZON = int(os.environ.get('WOTR_TURN_HORIZON', '1') or 0)
 
-# F1 (LAB 2026-08-09, proposal P-D): root Dirichlet-noise exemption
-# for FREE actions (zero-die-cost same-side actions).  Mechanism: a
-# free action's subtree re-contains every root continuation plus the
-# converted die, so its Q is systematically inflated (+0.09 measured,
-# ring-usage memory) and noise-forced visits at ~1e-4-prior big-menu
-# ring arms hand it the visits PUCT would never give it.  Exempting
-# free arms from the noise mix removes the noise channel WITHOUT
-# touching their clean priors (thin-menu deliberate conversions keep
-# their honest BC prior mass).  Default OFF = current behavior.
+# F1 (LAB 2026-08-09, P-D): root Dirichlet-noise exemption for FREE
+# actions (zero-die-cost same-side actions): a free action's subtree
+# re-contains every root continuation, so noise-forced visits at
+# ~1e-4-prior arms inflate it.  Exempt arms keep their clean priors.
+# Default OFF.
 _FREE_ACTION_TYPES = frozenset(
     {'elven_ring', 'use_token', 'dwarven_ring'})
 _FREE_NOISE_EXEMPT = os.environ.get(
     'WOTR_FREE_NOISE_EXEMPT', '0') == '1'
 
-# RING-STARVATION FIXES (LAB task 14, 2026-08-09).  Post-launch
-# finding: F1 + visit_tf removed the pathologies that MANUFACTURED
-# ring usage (Dirichlet subsidy + option-value bias + temp sampling),
-# leaving the honest ~1e-4 BC prior as the only exploration source —
-# u-term at N=310 is ~0.02 (an order below typical Q-gaps), so free
-# arms get ZERO visits -> zero target mass -> zero delta pressure:
-# permanent starvation, the exact mirror of the old amplification.
-# FIX 1 _FREE_CANDS: candidate-set guarantee (see _prune_candidates).
-# FIX 2 _FREE_FORCE: KataGo-style ROOT forced-playout floor — the
-#   top-_FREE_CANDS_N-prior free arms each get >= _FREE_FORCE visits
-#   (honest MEAN estimates at fixed n, which per the F5 theorem
-#   REDUCE the max-over-noise bias; the option-value component is
-#   priced by F2's rho).  Budget <= _FREE_FORCE * _FREE_CANDS_N sims.
+# RING-STARVATION FIXES (LAB task 14, 2026-08-09): with the honest
+# ~1e-4 BC prior as the only exploration source, free arms get ZERO
+# visits -> zero target mass -> permanent starvation.
+# FIX 1 _FREE_CANDS: candidate-set guarantee (_prune_candidates).
+# FIX 2 _FREE_FORCE: KataGo-style ROOT forced-playout floor - the
+#   top-_FREE_CANDS_N-prior free arms each get >= _FREE_FORCE visits.
 # FIX 3 target discount: forced visits are SUBTRACTED from the
-#   visit_tf pi target (played arm keeps raw n), so the floor itself
-#   is never distilled — target mass must be EARNED beyond the floor
-#   (the F4 no-amplification guarantee survives).
+#   visit_tf pi target (played arm keeps raw n) - target mass must
+#   be EARNED beyond the floor.
 # All default OFF; adoption values: _FREE_CANDS=1, _FREE_FORCE=12.
 _FREE_CANDS = os.environ.get('WOTR_FREE_CANDS', '0') == '1'
 _FREE_CANDS_N = 3
@@ -12141,6 +14170,17 @@ def _apply_root_noise(children, rng_noise, frac=0.25,
 # nets for the transition's greedy phase picks; set by mcts_search
 # (single-threaded per worker process)
 _SEARCH_NETS = (None, None)
+_OWN_VALUE_CONTEXT = None
+# Optional evaluation-only collector. No hook calls when unset.
+_COMBAT_FORECAST_OBSERVER = None
+
+_OPPONENT_POLICY_MODE = os.environ.get('WOTR_OPPONENT_POLICY', 'legacy_puct')
+if _OPPONENT_POLICY_MODE not in ('legacy_puct', 'learned_policy'):
+    raise ValueError('Unknown WOTR_OPPONENT_POLICY mode')
+_OPPONENT_POLICY_EPSILON = float(os.environ.get('WOTR_OPPONENT_POLICY_EPSILON', '0.02'))
+if not math.isfinite(_OPPONENT_POLICY_EPSILON) or not 0.0 < _OPPONENT_POLICY_EPSILON <= 1.0:
+    raise ValueError('Opponent policy epsilon must be finite and in (0, 1]')
+_OPPONENT_POLICY_CACHE = {}  # bounded, search-scoped, keyed by opponent observation
 
 # Lever 1 (session 34 scale work): tree reuse across consecutive
 # decisions.  After a search picks action A, the chosen child's subtree
@@ -12152,8 +14192,378 @@ _SEARCH_NETS = (None, None)
 # a fresh tree).  Reused roots skip re-determinization and fresh root
 # noise (visit mass carried over dominates anyway).
 _TREE_REUSE = os.environ.get('WOTR_TREE_REUSE', '1') != '0'
+
+# S-003 (USER 2026-09-04 "implement leaf batching and scale sims with menu
+# size"): two env-gated search knobs, both OFF by default so the sequential
+# search (live head, harness fingerprints) is byte-identical when unset.
+#   WOTR_SIMS_MENU_SCALE=1  -> _sims_budget applies the per-child budget
+#       (WOTR_SIMS_PER_CHILD, default 60; floor WOTR_SIMS_FLOOR, default
+#       120) to EVERY root menu size, not only to menus of <= 6 children.
+#   WOTR_LEAF_BATCH=K (>1)  -> mcts_search runs K simulations per batch:
+#       each simulation selects + materializes its leaf under its own 3A
+#       overlay and ENCODES it then (state vector, candidate encodings),
+#       the K leaves are evaluated in ONE forward (local: one backbone
+#       pass; served: one 'pvm' message to the infer_server), a virtual
+#       loss holds the path meanwhile and the flush replaces it with the
+#       real backup.  Two simulations reaching the same pending leaf share
+#       its record (one backup per path).  SEARCH_STATS['leaf_batches'] /
+#       ['leaf_batched'] count the flushes / deferred leaves.
+_SIMS_MENU_SCALE = os.environ.get('WOTR_SIMS_MENU_SCALE', '0') == '1'
+_SIMS_PER_CHILD = max(1, int(os.environ.get('WOTR_SIMS_PER_CHILD', '60') or 60))
+_SIMS_FLOOR = max(1, int(os.environ.get('WOTR_SIMS_FLOOR', '120') or 120))
+_LEAF_BATCH = max(1, int(os.environ.get('WOTR_LEAF_BATCH', '1') or 1))
+_PENDING_EVAL_BOX = [None]      # active _PendingEvals collector or None
+_DEFERRED = float('nan')        # leaf-value sentinel: evaluation pending
+
+
+def _sims_budget(num_simulations, k):
+    """Root simulation budget for a menu of k children.  Legacy (env
+    unset): menus of <= 6 children are capped at max(120, 60 k) (visit
+    mass per arm, not exhaustive search); every larger menu keeps the
+    full budget.  WOTR_SIMS_MENU_SCALE=1 applies the same per-child
+    rule to every k - a 2-option decision costs 120 sims, a 10-option
+    one 600, and only menus of >= budget/60 children use the full
+    budget.  Never raises the budget above num_simulations."""
+    k = int(k)
+    if _SIMS_MENU_SCALE:
+        return min(num_simulations, max(_SIMS_FLOOR, _SIMS_PER_CHILD * k))
+    if k <= 6:
+        return min(num_simulations, max(120, 60 * k))
+    return num_simulations
+
+
+class _PendingEvals:
+    __slots__ = ('recs', 'by_node', 'last')
+
+    def __init__(self):
+        self.recs = []
+        self.by_node = {}
+        self.last = None
+
+
+def _defer_expand(node, actions, net, root_side, max_children):
+    """S-003 leaf batching, phase 1: everything of _expand_node that must
+    happen under THIS simulation's overlay (state / candidate encodings,
+    the root-side state vector for an opponent node, the closed-form
+    opponent card-window priors) is computed now and parked in the
+    collector; the forward and the child creation happen in
+    _flush_pending.  Returns the _DEFERRED sentinel."""
+    if _OWN_VALUE_CONTEXT is not None and (node.side != _OWN_VALUE_CONTEXT.side or net is not _OWN_VALUE_CONTEXT.net):
+        raise RuntimeError('Own-value search attempted non-root deferred inference')
+    coll = _PENDING_EVAL_BOX[0]
+    st = node.state
+    vec = np.asarray(encode_state(st, node.side), dtype=np.float32)
+    ae, ri = _encode_actions_batch(actions, st, node.side, {})
+    shp_node = None
+    if (_PHI_RINGS_RHO or PLAYER_PROFILES.get('fp')
+            or PLAYER_PROFILES.get('sh')):
+        shp_node = (_profile_shaping(st) if node.side == Side.FREE_PEOPLES
+                    else -_profile_shaping(st))
+    opp = node.side != root_side
+    root_vec = shp_root = pri35 = None
+    if opp:
+        root_vec = np.asarray(encode_state(st, root_side), dtype=np.float32)
+        shp_root = ((1.0 if root_side == Side.FREE_PEOPLES else -1.0)
+                    * _profile_shaping(st))
+        _pcw = getattr(st, 'pending_combat', None)
+        if (_OPPONENT_POLICY_MODE == 'legacy_puct'
+                and isinstance(_pcw, dict)) and _pcw.get('phase') in (
+                'attacker_combat_card', 'defender_combat_card') \
+                and _pcw.get('deciding_side') == node.side:
+            pri35 = _opponent_card_priors(st, _pcw, actions, node.side)
+    rec = {'node': node, 'actions': actions, 'net': net, 'vec': vec,
+           'ae': ae, 'ri': ri, 'opp': opp, 'root_vec': root_vec,
+           'shp_node': shp_node, 'shp_root': shp_root, 'pri35': pri35,
+           'max_children': max_children, 'paths': [],
+           'priors': None, 'v': None, 'v_root': None}
+    coll.recs.append(rec)
+    coll.by_node[id(node)] = rec
+    coll.last = rec
+    return _DEFERRED
+
+
+def _pv_forward_many(net, vecs, aes, ris):
+    """Batched priors + value for K leaves of ONE net. Local GPU batches
+    score candidate rows together, retaining per-leaf softmax boundaries.
+    CPU and custom nets retain the per-leaf scorer. Served: one 'pvm' message
+    (InferClient.pv_many) or, on an old client, K sequential pv calls.
+    Returns [(priors ndarray, value float), ...] (priors un-normalised
+    softmax outputs, exactly what the single path receives)."""
+    if _OWN_VALUE_CONTEXT is not None and net is not _OWN_VALUE_CONTEXT.net:
+        raise RuntimeError('Own-value search attempted non-root batched inference')
+    if _OWN_VALUE_CONTEXT is not None:
+        _OWN_VALUE_CONTEXT.stats['root_policy_batch_requests'] += 1
+    _validate_search_batch_count(aes, len(vecs), 'Policy action batches')
+    _validate_search_batch_count(ris, len(vecs), 'Policy region batches')
+    _icli = getattr(net, '_client', None) or INFER_CLIENT
+    if _icli is not None and getattr(net, 'remote_key', None):
+        items = [(np.asarray(v, dtype=np.float32), a, r)
+                 for v, a, r in zip(vecs, aes, ris)]
+        if hasattr(_icli, 'pv_many'):
+            out = _icli.pv_many(net.remote_key, items)
+        else:
+            out = [_icli.pv(net.remote_key, v, a, r) for v, a, r in items]
+        out = list(out)
+        _validate_search_batch_count(out, len(vecs), 'Policy/value replies')
+        return [(_validate_search_priors(p, len(aes[i]) if i < len(aes) else 0),
+                 float(_validate_search_value(v)))
+                for i, (p, v) in enumerate(out)]
+    net.eval()
+    if (len(vecs) > 1 and torch.device(DEVICE).type == 'cuda'
+            and type(net) is WOTRValueNet
+            and os.environ.get('WOTR_LOCAL_SCORER_BATCH', '1') != '0'):
+        from inference_batch import spatial_policy_value_batch
+        results = spatial_policy_value_batch(
+            net, vecs, aes, ris, DEVICE, _policy_delta_enabled())
+        _validate_search_batch_count(results, len(vecs), 'Local policy/value replies')
+        return [(_validate_search_priors(p, len(aes[i])),
+                 float(_validate_search_value(v)))
+                for i, (p, v) in enumerate(results)]
+    out = []
+    with torch.no_grad():
+        X = torch.from_numpy(np.stack([np.asarray(v, dtype=np.float32)
+                                       for v in vecs])).to(DEVICE)
+        bb, ne = net.forward_backbone(X)
+        vals = net.value_head(bb).squeeze(-1).detach().cpu().numpy().reshape(-1)
+        _validate_search_batch_count(vals, len(vecs), 'Local policy/value predictions')
+        for i in range(len(vecs)):
+            ae_t = torch.from_numpy(aes[i]).to(DEVICE)
+            ri_t = torch.from_numpy(ris[i]).to(DEVICE)
+            pr = net.score_actions_spatial(bb[i:i + 1], ne[i:i + 1], ae_t, ri_t)
+            out.append((_validate_search_priors(pr.detach().cpu().numpy(), len(aes[i])),
+                        float(_validate_search_value(vals[i]))))
+    return out
+
+
+def _eval_forward_many(net, vecs):
+    """Batched raw values (no shrink, no shaping) for K state vectors of
+    ONE net - the batched twin of _mcts_eval_state's net call."""
+    if _OWN_VALUE_CONTEXT is not None and net is not _OWN_VALUE_CONTEXT.net:
+        raise RuntimeError('Own-value search attempted non-root batched inference')
+    if _OWN_VALUE_CONTEXT is not None:
+        _OWN_VALUE_CONTEXT.stats['root_value_batch_requests'] += 1
+    X = np.stack([np.asarray(v, dtype=np.float32) for v in vecs])
+    _icli = getattr(net, '_client', None) or INFER_CLIENT
+    if _icli is not None and getattr(net, 'remote_key', None):
+        values = np.asarray(_icli.eval(net.remote_key, X)).reshape(-1)
+    else:
+        net.eval()
+        with torch.no_grad():
+            xt = torch.from_numpy(X).to(DEVICE)
+            values = net(xt).detach().cpu().numpy().reshape(-1)
+    _validate_search_batch_count(values, len(vecs), 'Value replies')
+    return [float(_validate_search_value(x)) for x in values]
+
+
+def _flush_pending(coll, fp_net, sh_net, root_side):
+    """S-003 leaf batching, phase 2/3: one batched forward per net for the
+    collector's leaves (+ one batched root-side value pass for opponent
+    nodes), then per leaf the post-processing of _get_priors_and_value /
+    _mcts_eval_state (conf shrink, profile shaping, card-window prior
+    override), the child creation of _expand_node, and the backup that
+    REPLACES the virtual loss along every path that reached the leaf.
+    Legacy batched-forward failures fall back to synchronous functions.
+    Corrected modes propagate supplied-model failures; an explicit missing
+    net uses the synchronous heuristic path."""
+    if _OWN_VALUE_CONTEXT is not None and (root_side != _OWN_VALUE_CONTEXT.side or any(r['net'] is not _OWN_VALUE_CONTEXT.net or r['node'].side != root_side for r in coll.recs)):
+        raise RuntimeError('Own-value search attempted non-root pending batch')
+    from reward_contract import uses_predecision
+    global _LAST_LEAF_CONF, _LAST_LEAF_PHI
+    recs = coll.recs
+    if not recs:
+        return
+    SEARCH_STATS['leaf_batches'] = SEARCH_STATS.get('leaf_batches', 0) + 1
+    SEARCH_STATS['leaf_batched'] = SEARCH_STATS.get('leaf_batched', 0) + len(recs)
+    groups = {}
+    for r in recs:
+        groups.setdefault(id(r['net']), (r['net'], []))[1].append(r)
+    for _, (net, rs) in groups.items():
+        try:
+            out = (None if net is None and uses_predecision()
+                   else _pv_forward_many(net, [r['vec'] for r in rs],
+                                         [r['ae'] for r in rs], [r['ri'] for r in rs]))
+        except Exception:
+            if uses_predecision():
+                raise
+            SEARCH_STATS['leaf_batch_fallback'] = SEARCH_STATS.get('leaf_batch_fallback', 0) + 1
+            out = None
+        if out is not None:
+            _validate_search_batch_count(out, len(rs), 'Deferred policy/value replies')
+            for r, (p, v) in zip(rs, out):
+                r['priors'] = _validate_search_priors(p, len(r['actions']))
+                r['v'] = _validate_search_value(v)
+    opp = [r for r in recs if r['opp']]
+    if opp:
+        rnet = fp_net if root_side == Side.FREE_PEOPLES else sh_net
+        try:
+            vals = (None if rnet is None and uses_predecision()
+                    else _eval_forward_many(rnet, [r['root_vec'] for r in opp]))
+        except Exception:
+            if uses_predecision():
+                raise
+            SEARCH_STATS['leaf_batch_fallback'] = SEARCH_STATS.get('leaf_batch_fallback', 0) + 1
+            vals = None
+        if vals is not None:
+            _validate_search_batch_count(vals, len(opp), 'Deferred root value replies')
+            for r, v in zip(opp, vals):
+                r['v_root'] = _validate_search_value(v)
+    for r in recs:
+        node = r['node']
+        actions = r['actions']
+        if r['priors'] is None:
+            priors, v = _get_priors_and_value(node.state, node.side, r['net'],
+                                              actions, features_vec=r['vec'])
+        else:
+            pr = np.asarray(r['priors'], dtype=np.float32)
+            priors = (pr / (pr.sum() + 1e-10)).tolist()
+            _LAST_LEAF_CONF = 1.0
+            _LAST_LEAF_PHI = 0.0
+            v = _conf_shrink(r['vec'], node.side, float(r['v']))
+            if r['shp_node'] is not None:
+                if _CONF_LEAF or _CONF_TRACK:
+                    _LAST_LEAF_PHI = r['shp_node']
+                v = float(v) + r['shp_node']
+        value = float(v)
+        if r['opp'] and _OPPONENT_POLICY_MODE in ('learned_policy', 'own_value_reply_v0'):
+            _remember_opponent_policy(node.side, r['vec'], actions, priors)
+        if r['opp']:
+            if r['v_root'] is None:
+                value = _mcts_eval_state(node.state, root_side, fp_net, sh_net)
+            else:
+                _LAST_LEAF_CONF = 1.0
+                if _CONF_LEAF or _CONF_TRACK:
+                    _LAST_LEAF_PHI = r['shp_root']
+                value = float(_conf_shrink(r['root_vec'], root_side,
+                                           float(r['v_root'])) + r['shp_root'])
+            if r['pri35'] is not None:
+                priors, node.w3 = r['pri35']
+        value = _bound_search_value(value)
+        conf, phi = _LAST_LEAF_CONF, _LAST_LEAF_PHI
+        max_children = r['max_children']
+        if max_children is None:
+            max_children = MCTS_MAX_CHILDREN or (1 << 30)
+        if len(actions) <= max_children:
+            for a, p in zip(actions, priors):
+                node.children.append(MCTSNode(state=None, side=node.side,
+                                              parent=node, action=a, prior=p))
+        else:
+            selected_list = _prune_candidates(actions, priors, max_children)
+            total_prior = sum(priors[i] for i in selected_list)
+            for i in selected_list:
+                p = priors[i] / total_prior if total_prior > 0 else 1.0 / len(selected_list)
+                node.children.append(MCTSNode(state=None, side=node.side,
+                                              parent=node, action=actions[i],
+                                              prior=p))
+        for path in r['paths']:
+            for n in path:
+                s_leaf = value if n.side == root_side else -value
+                s_virt = -1.0 if n.side == root_side else 1.0
+                n.value_sum += s_leaf - s_virt
+                n.value_sq += value * value
+                if _CONF_LEAF or _CONF_TRACK:
+                    n.conf_sum += conf
+                    n.phi_sum += phi
 _TREE_CACHE = {'child': None, 'sig': None, 'root_side': None,
                'hits': 0, 'misses': 0}
+
+
+def _sig_leader_id(l) -> str:
+    """MC7 leader identity for _state_sig: Companion / Minion NAME,
+    'N' for a Nazgul, 'L' for a plain Leader."""
+    if isinstance(l, Nazgul):
+        return 'N'
+    if isinstance(l, Companion) or type(l).__name__ == 'Minion':
+        return str(getattr(l, 'name', ''))
+    return 'L:' + str(getattr(getattr(l, 'nation', None), 'name', ''))
+
+
+_SEARCH_ORDINARY_CURSOR_FIELDS = (
+    'pending_army_move_die', 'pending_army_move_from',
+    'pending_army_move_side', 'pending_army_move_preexist',
+    'pending_muster_die', 'pending_muster_first_type',
+    'pending_muster_region', 'pending_muster_side',
+)
+_SEARCH_RETAINED_DECISION_FIELDS = (
+    'pending_combat', 'pending_hunt', 'pending_guide_change',
+    'pending_card_option', 'pending_discard',
+    '_pending_hunt_damage', '_hobbit_place_queue', '_wwsat_owed',
+    '_overstack_regions', '_palantir_draw_pending', '_owed_draws',
+    '_battle_resolved_attacker', '_crebain_hunt_bonus', '_ents_chain_n',
+    '_wizardstaff_stash', '_mithril_stash',
+)
+_SEARCH_PUBLIC_STATE_FIELDS = (
+    'enemy_controlled', 'besieged_strongholds', 'persistent_cards',
+    'witch_king', 'saruman', 'mouth_of_sauron',
+    'gandalf_the_white', 'aragorn_crowned',
+    'fp_dwarven_rings', 'sh_dwarven_rings',
+    'fp_political_token', 'fp_card_token', 'sh_action_tokens',
+    'fp_token_used_this_turn', 'sh_token_used_this_turn',
+    'sh_mouth_muster_used_this_turn', 'dice_rolled', 'eyes_allocated',
+    'fellowship_acted_in_mordor', '_fp_used_hunt_box_last_turn',
+    '_hunt_reveal_pending',
+    '_wormtongue_attack_pending',
+    'game_over', 'winner', '_search_endturn_victory',
+)
+
+
+def _search_public_context(state):
+    """Public rules state omitted by the compact army/dice census.
+
+    A resolved Guide choice, table card, captured settlement, or spent
+    once-per-turn ability changes future actions even with the same figures.
+    Hunt-bag composition is public by tile conservation; its shuffled order
+    and all unseen card identities stay outside this projection.
+    """
+    from combat_round_search import round_signature
+
+    def tile_key(tile):
+        return (tile.damage, bool(tile.is_eye), bool(tile.reveal),
+                bool(tile.is_special), str(tile.special_name or ''),
+                bool(tile.stops_movement), bool(tile.is_dice_roll),
+                bool(tile.is_fellowship_special))
+
+    return (
+        tuple(int(getattr(state, key, 0) or 0) if key in (
+                  '_hunt_reveal_pending', '_wormtongue_attack_pending')
+              else round_signature(getattr(state, key, None))
+              for key in _SEARCH_PUBLIC_STATE_FIELDS),
+        round_signature(state.fellowship.guide),
+        tuple(tuple(sorted(tile_key(tile) for tile in
+                           (getattr(state, key, None) or ())))
+              for key in ('hunt_pool', 'hunt_discard', 'hunt_removed')),
+        tuple(sorted((die.side.name,
+                      die.current.name if die.current else '-', bool(die.used))
+                     for die in state.hunt_box)),
+        tuple(len(getattr(state, key, None) or ())
+              for key in ('fp_char_deck', 'fp_strat_deck',
+                          'sh_char_deck', 'sh_strat_deck')),
+        tuple((sum(game_logic.card_deck_of(card) == 'character'
+                   for card in state.hands[side].hand),
+               len(state.hands[side].discarded_face_down))
+              for side in (Side.FREE_PEOPLES, Side.SHADOW)),
+        tuple(sorted((str(deck), tuple(sorted(map(str, cards))))
+                     for deck, cards in
+                     (getattr(state, 'discard_face_up', None) or {}).items())),
+    )
+
+
+def _search_decision_context(state, sort_dice=False):
+    """Keep continuation history even when its physical board is unchanged.
+
+    Army/muster cursors are public and distinguish chance outcomes too.
+    The retained-tree context includes complete pending graphs, whose choices
+    can depend on the acting player's private hand. Chance deduplication keeps
+    its existing root-relative projections instead of adding those menus.
+    Each field uses the existing alias/cycle-aware continuation signature.
+    """
+    from combat_round_search import round_signature
+    return (
+        tuple(round_signature(getattr(state, key, None))
+              for key in _SEARCH_ORDINARY_CURSOR_FIELDS),
+        None if sort_dice else tuple(
+            round_signature(getattr(state, key, None))
+            for key in _SEARCH_RETAINED_DECISION_FIELDS),
+    )
 
 
 def _state_sig(state, sort_dice=False):
@@ -12163,10 +14573,30 @@ def _state_sig(state, sort_dice=False):
     matters to game logic, but roll order splits identical multisets
     (chance-outcome dedup wants the multiset; tree reuse keeps order)."""
     try:
+        # A concealed combat commitment is sampled per search world. Such a
+        # root already disables reuse/stashing; fail closed here as well so
+        # no caller can compare its actual concealed identity via this key.
+        pc = getattr(state, 'pending_combat', None) or {}
+        if not sort_dice and (pc.get('atk_hidden_cc') or pc.get('def_hidden_cc')
+                             or (pc.get('phase') == 'defender_combat_card'
+                                 and pc.get('atk_combat_card'))):
+            return None
+        from collections import Counter as _Ctr7
+        from fellowship_action_timing import search_context as _hunt_timing_context
+        from fellowship_route_event_context import event_context as _route_event_context
+        from hunt_protection_context import breaking_remaining as _breaking_remaining
+        from combat_round_search import round_signature
+        # MC7: WHICH nation's unit / WHICH same-level companion stands
+        # in an army must never merge - per-army (nation, kind) census
+        # + leader identities (counts alone fused distinct outcomes)
         armies = tuple(sorted(
             (k, len(a.units),
              sum(1 for u in a.units if u.kind == UnitKind.ELITE),
-             len(a.leaders))
+             len(a.leaders),
+             tuple(sorted(_Ctr7(
+                 (str(getattr(u.nation, 'value', u.nation)), u.kind.name)
+                 for u in a.units).items())),
+             tuple(sorted(_sig_leader_id(l) for l in a.leaders)))
             for k, a in state.armies.items()))
         _per = [[(d.current.name if d.current else '-', d.used)
                  for d in state.dice.get(s9, [])]
@@ -12177,36 +14607,70 @@ def _state_sig(state, sort_dice=False):
         pol = tuple((n.value, state.political.boxes.get(n, 0),
                      bool(state.political.active.get(n)))
                     for n in Nation)
+        followup = getattr(state, 'pending_card_followup', None)
+        followup_sig = (round_signature(dict(
+            followup, exclude=tuple(sorted(followup.get('exclude') or ()))))
+            if followup is not None else None)
         return hash((
             state.turn, armies, dice,
+            _hunt_timing_context(state), _route_event_context(state), _breaking_remaining(state),
             sanitize(game_logic.fellowship_region(state)),
             f.progress, f.corruption, f.hidden, f.mordor_entered,
             f.mordor_step, len(f.companions),
+            # MC7: WHICH companions remain (same-count fellowships differ)
+            tuple(sorted(str(getattr(c, 'name', '')) for c in f.companions)),
             len(state.hands[Side.FREE_PEOPLES].hand),
             len(state.hands[Side.SHADOW].hand),
             len(getattr(state, 'hunt_box', ())), pol,
             state.pending_combat is not None,
+            round_signature((state.pending_combat or {}).get('_round_resume')),
+            round_signature((state.pending_combat or {}).get('_onslaught_payment')),
+            tuple((getattr(state, 'pending_card_option', None) or {}).get(k) for k in
+                  ('card_casualty', 'cas_region', 'cas_side', 'cas_hits')),
+            tuple((state.pending_combat or {}).get(k) for k in
+                  ('phase', 'alloc_stage', 'deciding_side', 'atk_hits', 'def_hits')),
+            tuple(sorted((n.name, tuple(sorted(counts.items())))
+                         for n, counts in (getattr(state, 'fp_casualties', None) or {}).items())),
+            (state.pending_combat or {}).get('attacker_rearguard'),
             state.pending_hunt is not None,
             getattr(state, 'pending_card_option', None) is not None,
             getattr(state, 'pending_discard', None) is not None,
-            # full-pass review 2026-07-27: the remaining two pendings
-            # _pending_decision_side routes on (defense-in-depth vs the
-            # same reuse-hijack class as the phase flags below)
+            # the remaining two pendings _pending_decision_side routes on
+            # (defense-in-depth vs the reuse-hijack class below)
             getattr(state, 'pending_guide_change', None) is not None,
-            getattr(state, 'pending_card_followup', None) is not None,
-            # USER bug 2026-07-27 (eye_allocs list short vs turns): the
-            # transient phase flags CHANGE the legal-action space — a
-            # subtree stashed from the just-drained SH hand-discard
-            # search sig-matched the eye-phase root (same state, same
-            # hands) and served the NORMAL menu, so MCTS returned
-            # 'pass' and the turn's eye allocation was silently
-            # SKIPPED (same class could skip declares).
+            followup_sig,
+            # the transient phase flags CHANGE the legal-action space - a
+            # subtree stashed under a different phase must never
+            # sig-match (USER bug 2026-07-27: a reused normal-menu
+            # subtree skipped the turn's eye allocation)
             bool(getattr(state, '_declare_phase', False)),
             bool(getattr(state, '_eye_allocation_phase', False)),
+            bool(getattr(state, '_fellowship_tail_phase', False)),
             # USER RULING 2026-08-16: an open reveal placement CHANGES
             # the legal-action space — same reuse-hijack class as the
             # phase flags above
-            bool(getattr(state, '_reveal_place_due', False))))
+            bool(getattr(state, '_reveal_place_due', False)),
+            # SPMC-7: elven-ring counts and a LIVE ring waiver change
+            # the legal surface - two states differing only here must
+            # never share a signature (reuse / chance-dedup guard)
+            int(state.fp_elven_rings), int(state.sh_elven_rings),
+            bool(state.fp_ring_used_this_turn),
+            bool(state.sh_ring_used_this_turn),
+            getattr(getattr(state, '_ring_free_side', None), 'name', None),
+            bool(getattr(state, 'fp_ring_waiver', False)),
+            bool(getattr(state, 'sh_ring_waiver', False)),
+            str(getattr(state, 'fp_ring_waiver_face', None)),
+            str(getattr(state, 'sh_ring_waiver_face', None)),
+            # A queued optional draw changes the first discard's future;
+            # source/deck and queued/open phase must survive tree reuse.
+            _gandalf_draw_context(state)[0],
+            tuple(sorted((getattr(state, '_gandalf_draw_pending', None)
+                          or {}).items())),
+            ((getattr(state, 'pending_card_option', None) or {}).get(
+                'source_card_id') if (getattr(state, 'pending_card_option', None)
+                                     or {}).get('gandalf_draw') else None),
+            _search_decision_context(state, sort_dice),
+            _search_public_context(state)))
     except Exception:
         return None
 
@@ -12219,6 +14683,7 @@ def _apply_action_detect_rng(parent_state: GameState, action: Action):
         _overlay_assert_state(parent_state)
     pre_rng = random.getstate()
     new_state = apply_action(parent_state, action)
+    _resume_preaction_for_search(parent_state, new_state, action)
     return new_state, random.getstate() != pre_rng
 
 
@@ -12265,7 +14730,13 @@ def _chance_sig(state):
                 for s9 in (Side.FREE_PEOPLES, Side.SHADOW))
     except Exception:
         hands = None
+    # Revealed card identity remains public after pending combat card keys
+    # are consumed. Different visible discards must not share a chance child.
+    public_discards = tuple(sorted(
+        (str(deck), tuple(sorted(map(str, cards))))
+        for deck, cards in (getattr(state, 'discard_face_up', None) or {}).items()))
     return (_state_sig(state, sort_dice=True),
+            public_discards,
             _prj(state.pending_combat),
             _prj(state.pending_hunt),
             _prj(getattr(state, 'pending_discard', None)),
@@ -12291,6 +14762,28 @@ def _select_outcome(chance: MCTSNode) -> 'Optional[MCTSNode]':
     draw-frequency share, so the node's Q is the probability-weighted
     expectation (uniform least-visited descent weighted a 5/8-likely
     outcome at 1/4 and sat on won games — mordor_push fixture)."""
+    if chance.round_sampling:
+        # Keep sampling the true phase transition on every visit. Freezing
+        # sixteen draws would permanently exclude other observed-roll choices.
+        _overlay_prepare_apply(chance.parent.state, chance.side, chance.action)
+        st, _ = _apply_action_detect_rng(chance.parent.state, chance.action)
+        sig = _chance_sig(st)
+        hit = next((b for b in chance.outcomes if b.out_sig == sig), None)
+        if hit is not None:
+            hit.prior += 1.0
+            return hit
+        branch = MCTSNode(state=st, side=chance.side, parent=chance,
+                          action=None, prior=1.0)
+        branch.out_sig = sig
+        if len(chance.outcomes) < _CHANCE_K_MAX:
+            chance.outcomes.append(branch)
+        # Over-cap outcomes are still evaluated and backed up; only their
+        # subtrees are transient. No probability mass is discarded.
+        return branch
+    if chance.kernel_sets is not None:
+        first = _kernel_serve_world(chance)
+        if first is not None:
+            return first
     outs = chance.outcomes
     drawn = sum(b.prior for b in outs) + chance.drops
     if chance.drops >= _CHANCE_DRAWS:
@@ -12302,8 +14795,9 @@ def _select_outcome(chance: MCTSNode) -> 'Optional[MCTSNode]':
         try:
             st, _ = _apply_action_detect_rng(chance.parent.state,
                                              chance.action)
-        except Exception:
-            pass
+        except Exception as _af8:
+            _search_apply_fail(chance.action, _af8)
+            raise
         if st is not None:
             sg = _chance_sig(st)
             ms = getattr(st, '_search_roll_ms', None) \
@@ -12332,9 +14826,86 @@ def _select_outcome(chance: MCTSNode) -> 'Optional[MCTSNode]':
         if not outs:
             return None
     tot = sum(b.prior for b in outs)
+    # MC4: a keyed node's visit_count spans every world; the ACTIVE
+    # set's own visit total keeps the descent share exact per world
+    # (legacy nodes keep the node count byte-for-byte)
+    n_vis = (sum(b.visit_count for b in outs)
+             if chance.kernel_sets is not None else chance.visit_count)
     return min(outs, key=lambda b: (b.visit_count
-                                    - chance.visit_count
-                                    * (b.prior / tot)))
+                                    - n_vis * (b.prior / tot)))
+
+
+def _blinded_commit_key(parent_state) -> 'Optional[str]':
+    """Key the sampled committed card by identity, including its public discard.
+
+    Cards with the same combat effect still have different revealed identities
+    and remove different cards from the remaining hidden pool.
+    """
+    ov = _SIM_OVERLAY
+    if ov is None:
+        return None
+    if ov.commit_cid is None:
+        if ov.commit_hidden:
+            raise RuntimeError('Hidden combat-card commitment has no sampled identity')
+        return None
+    pc = getattr(parent_state, 'pending_combat', None)
+    if not (isinstance(pc, dict) and pc.get('atk_combat_card')
+            and pc.get('_commit_nonce')
+            and pc.get('rounds_fought', 0) == ov.commit_bkey):
+        return None
+    return str(ov.commit_cid)
+
+
+def _kernel_register_world(node: 'MCTSNode') -> None:
+    """MC4: remember this world's kernel set on a blinded-root node so
+    _select_outcome can serve every simulation ITS sampled world.  A
+    None key (un-blinded edge) keeps the legacy single-set node."""
+    key = _blinded_commit_key(node.parent.state)
+    node.kernel_key = key
+    if key is None:
+        return
+    if node.kernel_sets is None:
+        node.kernel_sets = {}
+    node.kernel_sets[key] = (node.outcomes, node.kernel_cover, node.drops)
+
+
+def _kernel_serve_world(chance: 'MCTSNode') -> 'Optional[MCTSNode]':
+    """Serve this simulation's hidden world, with its own exact or sampled bank.
+
+    A newly sampled world returns its first real outcome so this visit does
+    not draw twice. Unsupported exact plans use ordinary sampling; apply
+    errors still propagate. Cached branch weights and visits stay world-local.
+    """
+    key = _blinded_commit_key(chance.parent.state)
+    if key is None or key == chance.kernel_key:
+        return None
+    # The active bank's mutable branches already live in the cache, but its
+    # overflow count is a scalar and must be saved before switching worlds.
+    chance.kernel_sets[chance.kernel_key] = (
+        chance.outcomes, chance.kernel_cover, chance.drops)
+    ent = chance.kernel_sets.get(key)
+    if ent is not None:
+        chance.outcomes, chance.kernel_cover, chance.drops = ent
+        chance.kernel_key = key
+        return None
+    _overlay_prepare_apply(chance.parent.state, chance.side, chance.action)
+    try:
+        probe, _used_rng = _apply_action_detect_rng(chance.parent.state, chance.action)
+    except Exception as error:
+        _kstat_fallback('blind_world_apply', {
+            'key': key, 'err': '%s: %s' % (type(error).__name__, str(error)[:200])})
+        raise
+    if _kernel_expand_combat(chance, probe):
+        return None
+    _kstat_fallback('blind_world_expand', {'key': key})
+    branch = MCTSNode(state=probe, side=chance.side, parent=chance,
+                      action=None, prior=1.0)
+    branch.out_sig = _chance_sig(probe)
+    chance.outcomes = [branch]
+    chance.kernel_cover = None
+    chance.drops = 0
+    _kernel_register_world(chance)
+    return branch
 
 
 def _greedy_prior_action(state: GameState, side: Side, net,
@@ -12347,38 +14918,78 @@ def _greedy_prior_action(state: GameState, side: Side, net,
     the priors here come from _get_priors_and_value, whose total
     logits already include the residual policy delta, so this pick
     inherits the corrected priors as the delta trains."""
+    from ai_policies import project_ai_actions
+    policy = project_ai_actions(state, side, actions)
+    actions = list(policy.actions)
+    if policy.forced_reason:
+        return actions[0]
     if not actions:
         return None
+    if _OWN_VALUE_CONTEXT is not None and side != _OWN_VALUE_CONTEXT.side:
+        return _OWN_VALUE_CONTEXT.turn_action(state, side, actions)
     try:
         priors, _v = _get_priors_and_value(state, side, net, actions)
         return actions[int(np.argmax(priors))]
     except Exception:
+        from reward_contract import uses_predecision
+        if uses_predecision():
+            raise
         return None
+
+
+def _roll_current_turn_for_search(state: GameState):
+    """Sample this turn's action dice, with no recovery, draws or turn increment."""
+    if state.dice_rolled:
+        raise RuntimeError('Current turn action dice were already rolled')
+    if state.pending_guide_change is not None or getattr(state, '_fellowship_tail_phase', False):
+        raise RuntimeError('Fellowship effects and Guide choice must finish before action rolls')
+    state._eye_allocation_phase = False
+    hb0 = len(getattr(state, 'hunt_box', ()) or ())
+    game_logic.roll_action_dice(state, pool=Side.FREE_PEOPLES)
+    game_logic.roll_action_dice(state, pool=Side.SHADOW)
+    hb1 = len(getattr(state, 'hunt_box', ()) or ())
+    state._search_roll_ms = (
+        tuple(sorted(d.current.name for d in state.dice.get(Side.FREE_PEOPLES, [])
+                     if d.current is not None)),
+        tuple(sorted(d.current.name for d in state.dice.get(Side.SHADOW, [])
+                     if d.current is not None)), max(0, hb1 - hb0))
+
+
+def _resume_preaction_for_search(before: GameState, state: GameState, action: Action):
+    """Continue a played preaction choice within the current search turn."""
+    if (getattr(before, '_declare_phase', False)
+            and action.action_type in ('fellowship_declare', 'pass', 'declare_decline')):
+        game_logic.begin_fellowship_tail(state)
+    elif getattr(before, '_fellowship_tail_phase', False):
+        game_logic.resume_fellowship_tail(state)
+    elif (getattr(before, '_eye_allocation_phase', False)
+          and action.action_type == 'eye_allocate'):
+        _roll_current_turn_for_search(state)
+    # No Shadow dice means there is no allocation decision, but guide ties
+    # still resolve before the FP pool is rolled.
+    if (getattr(state, '_eye_allocation_phase', False)
+            and state.pending_guide_change is None
+            and not any(not d.used for d in state.dice.get(Side.SHADOW, []))):
+        _roll_current_turn_for_search(state)
 
 
 def _advance_turn_for_search(state: GameState) -> None:
     """In-tree turn transition (WOTR_TURN_HORIZON, v30).
 
-    Order mirrors the episode loop exactly: end-of-turn Victory Check
-    (Military included — previously invisible to search) -> phase 1
+    Order mirrors the episode loop exactly: Mordor inactivity, Victory Check
+    (Military included) -> phase 1
     via _safe_next_turn (recover, draws, hand-limit pending) ->
-    hand-limit greedy resolve -> Mordor-entry pre-step + Balrog ->
-    auto/greedy declare -> greedy eye allocation -> both action rolls.
+    hand-limit greedy resolve -> auto/greedy declare -> declaration/Hunt
+    effects -> Mordor entry/refill -> Guide -> eyes -> both action rolls.
     Draws + rolls consume RNG, so the caller's edge becomes a chance
     node sampling independent next-turn rolls.  On an end-of-turn
     victory the state is flagged and NOT advanced."""
-    res = game_logic.check_all_victory_conditions(state)
-    if game_logic.should_game_end(res, end_of_turn=True):
-        state._search_endturn_victory = dict(res)
+    from reward_contract import uses_predecision
+    fpn, shn = _SEARCH_NETS
+    if _safe_next_turn(state):
         return
     state._search_turn_crossings = getattr(
         state, '_search_turn_crossings', 0) + 1
-    fpn, shn = _SEARCH_NETS
-    if _safe_next_turn(state):
-        # P0 2026-08-15: rollover ring victory — flag, don't play on
-        state._search_endturn_victory = dict(
-            game_logic.check_all_victory_conditions(state))
-        return
     # hand-limit discards opened by the turn-start draws: resolve
     # greedily here (the episode loop searches them; in-tree they are
     # part of the chance transition)
@@ -12387,31 +14998,26 @@ def _advance_turn_for_search(state: GameState) -> None:
         if _pd9 is None:
             break
         _dside9 = _pd9['side']
-        _dacts9 = get_legal_actions(state, _dside9)
+        _dacts9 = get_ai_actions(state, _dside9)
         _pick9 = _greedy_prior_action(
             state, _dside9,
             fpn if _dside9 == Side.FREE_PEOPLES else shn, _dacts9)
         if _pick9 is None and _dacts9:
             _pick9 = _dacts9[0]
         if _pick9 is None:
+            if uses_predecision():
+                raise RuntimeError('Required discard has no legal choice during search turn transition')
             state.pending_discard = None
             break
         try:
             _execute_action_inner(state, _pick9)
         except Exception:
+            if uses_predecision():
+                raise
             state.pending_discard = None
             break
-    # Phase 2 pre-steps (twin of the episode loop).
-    # FINAL RULING (USER 2026-08-16): Mordor entry is TURN-START ONLY
-    # and POSITIONAL, and the DECLARATION OPPORTUNITY COMES FIRST -
-    # the entry check runs AFTER the Fellowship phase below.  The old
-    # order (entry check before the declaration) was the day-one bug:
-    # a fellowship declared onto a gate waited a full turn to enter.
-    # Balrog stationary trigger stays BEFORE the declaration (almanac
-    # C17: 'remaining stationary at turn start' - a declaration away
-    # must not have happened yet).
-    if not state.fellowship.mordor_entered:
-        _balrog_stationary_turn_start(state)
+    # Complete declaration before the single stationary Balrog opportunity
+    # in begin_fellowship_tail (Almanac C17).
     _auto9 = False
     if not state.fellowship.mordor_entered:
         _auto9 = _auto_enter_mordor(state)
@@ -12421,56 +15027,63 @@ def _advance_turn_for_search(state: GameState) -> None:
         if _get_declare_actions(state, allow_in_place=True):
             state._declare_phase = True
             try:
-                _dacts = get_legal_actions(state, Side.FREE_PEOPLES)
+                _dacts = get_ai_actions(state, Side.FREE_PEOPLES)
                 _pick = _greedy_prior_action(
                     state, Side.FREE_PEOPLES, fpn, _dacts)
             finally:
                 state._declare_phase = False
+            if _pick is None or _pick.action_type not in ('fellowship_declare', 'pass', 'declare_decline'):
+                raise RuntimeError('Required Fellowship declaration selection is missing')
             if _pick is not None and \
                     _pick.action_type == 'fellowship_declare':
                 try:
                     _execute_action_inner(state, _pick)
                 except Exception:
+                    if uses_predecision():
+                        raise
                     pass
-    # Mordor entry check - AFTER the declaration opportunity, same
-    # turn start (USER FINAL 2026-08-16): a gate position reached by a
-    # fresh declaration, standing from an earlier one, or by a REVEAL
-    # enters NOW.  _check_mordor_entry is positional and idempotent -
-    # the single answerer for all three triggers.
-    if not state.fellowship.mordor_entered:
-        game_logic._check_mordor_entry(state)
+    game_logic.begin_fellowship_tail(state)
+    for _tail_step in range(128):
+        if not getattr(state, '_fellowship_tail_phase', False):
+            break
+        tail_side = _pending_decision_side(state)
+        if tail_side is None:
+            raise RuntimeError('Unresolved Fellowship tail has no decision owner')
+        tail_actions = get_ai_actions(state, tail_side)
+        tail_pick = _greedy_prior_action(state, tail_side,
+            fpn if tail_side == Side.FREE_PEOPLES else shn, tail_actions)
+        if tail_pick is None or tail_pick not in tail_actions:
+            raise RuntimeError('Required Fellowship tail selection is missing')
+        # Tail decisions may finish a Balrog/stronghold route event. Run the
+        # normal executor cleanup before asking whether the phase can resume.
+        _execute_action(state, tail_pick)
+        game_logic.resume_fellowship_tail(state)
+    if getattr(state, '_fellowship_tail_phase', False):
+        raise RuntimeError('Fellowship tail exceeded 128 decisions')
+    if game_logic.should_game_end(game_logic.check_all_victory_conditions(state), end_of_turn=False):
+        return
+    if state.pending_guide_change is not None:
+        guide_actions = get_ai_actions(state, Side.FREE_PEOPLES)
+        guide_pick = _greedy_prior_action(state, Side.FREE_PEOPLES, fpn, guide_actions)
+        if guide_pick is None or guide_pick.action_type != 'choose_guide':
+            raise RuntimeError('Required Fellowship guide selection is missing')
+        _execute_action_inner(state, guide_pick)
+        if state.pending_guide_change is not None:
+            raise RuntimeError('Fellowship guide selection did not resolve')
     # Hunt allocation: greedy eye count
     _shu = [d for d in state.dice.get(Side.SHADOW, []) if not d.used]
     if _shu:
         state._eye_allocation_phase = True
         try:
-            _eacts = get_legal_actions(state, Side.SHADOW)
+            _eacts = get_ai_actions(state, Side.SHADOW)
             _epick = _greedy_prior_action(state, Side.SHADOW, shn, _eacts)
         finally:
             state._eye_allocation_phase = False
-        _ne = (int(_epick.params.get('count', 0) or 0)
-               if _epick is not None else 1)
-        if _ne > 0:
-            _idx = [i for i, d in enumerate(state.dice[Side.SHADOW])
-                    if not d.used][:_ne]
-            try:
-                game_logic.allocate_eyes(state, _ne, indices=_idx)
-            except Exception:
-                pass
-    _hb0 = len(getattr(state, 'hunt_box', ()) or ())
-    game_logic.roll_action_dice(state, pool=Side.FREE_PEOPLES)
-    game_logic.roll_action_dice(state, pool=Side.SHADOW)
-    _hb1 = len(getattr(state, 'hunt_box', ()) or ())
-    # rolled multiset stash: rolled Eyes migrate to the hunt box, so
-    # the post-roll pool alone under-counts the SH roll
-    state._search_roll_ms = (
-        tuple(sorted(d.current.name for d in
-                     state.dice.get(Side.FREE_PEOPLES, [])
-                     if d.current is not None)),
-        tuple(sorted(d.current.name for d in
-                     state.dice.get(Side.SHADOW, [])
-                     if d.current is not None)),
-        max(0, _hb1 - _hb0))
+        if _epick is None or _epick.action_type != 'eye_allocate':
+            raise RuntimeError('Required Shadow Hunt allocation selection is missing')
+        _execute_action_inner(state, _epick)
+    _roll_current_turn_for_search(state)
+
 
 
 def _roll_ms_prob(ms) -> float:
@@ -12525,7 +15138,7 @@ _SEARCH_ROOT_SIDE = None  # root side of the running search (feeds the
 
 _OV_DECKS = ('char', 'strat')
 _OV_LAZY_PRIOR = 0.02     # floor prior for 3A lazily-added children
-_OV_LAZY_MIN_VISITS = 16  # event-window additions need a dry-run
+_OV_LAZY_MIN_VISITS = 16  # defer sampled event-menu enumeration
                           # (~ms) per candidate: only nodes with real
                           # visit mass pay it — the mask itself stays
                           # universal, so no sim ever descends an
@@ -12611,13 +15224,10 @@ def combat_card_pool(state: GameState, pc: dict, is_attacker: bool,
             continue
         if c in rej9:
             continue
-        try:
-            if _combat_card_playable(state, get_card(c), tmp9,
-                                     is_attacker):
-                mix9[c] = 1
-            else:
-                rej9.add(c)
-        except Exception:
+        if _combat_card_playable(state, get_card(c), tmp9,
+                                 is_attacker):
+            mix9[c] = 1
+        else:
             rej9.add(c)
     return sorted(mix9.items())
 
@@ -12671,14 +15281,12 @@ class _SimOverlay:
         self.own_tag = 'sh' if self.opp_tag == 'fp' else 'fp'
         # ROOT/SEARCH BLINDING (USER RULING 2026-08-16, verbatim: "NO
         # YOU CANNOT SEE THE CARD THAT IS COMMITTED").  When the ROOT
-        # player is the DEFENDER and the attacker's combat card lies
-        # committed face-down, its IDENTITY is hidden information -
-        # sample one of the committed TYPE from the D3 mixture
-        # (_atk_commit_mixture, the same one answerer the opponent
-        # model uses) BEFORE the zone build, so the zones below can be
-        # built from the identity-invariant PRE-COMMIT pool minus the
-        # sample.  TYPE stays visible, commitment fact stays visible;
-        # root=attacker never blinds (their own commit is known).
+        # player is the DEFENDER and the attacker's card lies committed
+        # face-down, sample one of the committed TYPE from the D3
+        # mixture (_atk_commit_mixture) BEFORE the zone build; the zones
+        # are built from the identity-invariant PRE-COMMIT pool minus
+        # the sample.  TYPE and the commitment fact stay visible;
+        # root=attacker never blinds.
         self.commit_cid = None
         self.commit_true = None
         self.commit_bkey = None
@@ -12686,9 +15294,16 @@ class _SimOverlay:
         self.commit_slot = getattr(root_state, '_commit_slot', None)
         _commit_true9 = None
         _pcb9 = getattr(root_state, 'pending_combat', None)
-        if (_pcb9 and _pcb9.get('atk_combat_card')
-                and _pcb9.get('attacker_side') == self.opp_side):
+        # MC2: blind only while the commit is UNREVEALED (the ONE
+        # predicate shared with mcts_search's root blinding and the
+        # encoding's card-status plane)
+        if _hidden_commit_card(root_state, root_side) is not None:
             _mixb9 = _atk_commit_mixture(root_state, _pcb9)
+            if not _mixb9:
+                raise RuntimeError("Hidden combat-card commitment has no representable candidate")
+            if _COMBAT_FORECAST_OBSERVER is not None:
+                _COMBAT_FORECAST_OBSERVER.hidden_commit(
+                    root_state, root_side, _mixb9)
             # K1: a hidden (human) commit is the same type-only world;
             # the sampled identity stands in for the unrevealed card so
             # the in-tree round can resolve.  Nothing is restored to the
@@ -12696,6 +15311,11 @@ class _SimOverlay:
             self.commit_hidden = bool(_pcb9.get('atk_hidden_cc'))
             if self.commit_hidden:
                 self.commit_bkey = _pcb9.get('rounds_fought', 0)
+                # The live protocol has not removed the unrevealed card yet.
+                # Reserve its search-only discard slot so later rounds retain
+                # the identity represented by each cached sampled world.
+                deck_key = self.opp_tag + '_' + _pcb9['atk_hidden_cc']['deck']
+                self.commit_slot = (deck_key, len(root_state.discard_face_up[deck_key]))
             if _mixb9:
                 self.commit_cid = random.choices(
                     [c for c, _w in _mixb9],
@@ -12748,9 +15368,13 @@ class _SimOverlay:
             # of a sorted list is a uniform shuffle)
             pool.sort()
             random.shuffle(pool)
-            self.hand[d] = pool[:len(hd)]
-            self.deck[d] = pool[len(hd):len(hd) + len(dl)]
-            self.fdown[d] = pool[len(hd) + len(dl):]
+            hand_count = len(hd) - int(self.commit_hidden
+                and self.commit_cid is not None and _ov_deck_of(self.commit_cid) == d)
+            if hand_count < 0:
+                raise RuntimeError('Hidden combat-card commitment has no hand card to spend')
+            self.hand[d] = pool[:hand_count]
+            self.deck[d] = pool[hand_count:hand_count + len(dl)]
+            self.fdown[d] = pool[hand_count + len(dl):]
         self.own_deck = {}
         for d in _OV_DECKS:
             dl = [c for c in (getattr(root_state,
@@ -12836,6 +15460,48 @@ class _SimOverlay:
         patched state equals the true-state one exactly."""
         from collections import Counter
         OVERLAY_STATS['patches'] += 1
+        pc = getattr(state, 'pending_combat', None)
+        if (self.commit_hidden and pc and pc.get('atk_hidden_cc')
+                and pc.get('rounds_fought', 0) == self.commit_bkey):
+            # Complete the protocol's deferred commit only in the search clone.
+            # Condition on the already sampled card without changing the unseen
+            # pool: if necessary exchange it with a same-deck hand card, then
+            # use the real commit bookkeeping (hand, discard and Sorcerer debt).
+            cid = self.commit_cid
+            hand = state.hands[self.opp_side].hand
+            if cid not in hand:
+                victim = next((c for c in hand if _ov_ok(c)
+                               and _ov_deck_of(c) == _ov_deck_of(cid)), None)
+                zones = (state.hands[self.opp_side].discarded_face_down,
+                         getattr(state, _ov_deck_attr(self.opp_tag, _ov_deck_of(cid))))
+                source = next((zone for zone in zones if cid in zone), None)
+                if victim is None or source is None:
+                    raise RuntimeError('Hidden combat-card commitment cannot conserve its hand payment')
+                source[source.index(cid)] = victim
+                hand[hand.index(victim)] = cid
+            _commit_combat_card(state, pc, 'atk', cid)
+            pc.pop('atk_hidden_cc')
+            state._commit_slot = self.commit_slot
+        # A cached node may represent a DIFFERENT sampled commitment from
+        # the root that created this overlay. Exchange that node's public
+        # commitment with this simulation's card, preserving the whole pool.
+        represented_commit = self.commit_true
+        if self.commit_slot is not None:
+            deck_key, slot_index = self.commit_slot
+            public = (getattr(state, 'discard_face_up', None) or {}).get(deck_key, ())
+            if slot_index < len(public):
+                recorded = public[slot_index]
+                if recorded != '_committed_face_down_':
+                    represented_commit = recorded
+        if (self.commit_slot is not None and self.commit_cid is not None
+                and represented_commit != self.commit_cid):
+            # A sample already revealed elsewhere cannot replace this slot.
+            # Refuse before changing either world; never resurrect a discard.
+            for deck_key, public in (getattr(state, 'discard_face_up', None) or {}).items():
+                for slot_index, recorded in enumerate(public):
+                    if ((deck_key, slot_index) != self.commit_slot
+                            and recorded == self.commit_cid):
+                        raise RuntimeError('Sampled commitment conflicts with public card history')
         info = state.hands.get(self.opp_side)
         if info is not None:
             for d in _OV_DECKS:
@@ -12847,27 +15513,25 @@ class _SimOverlay:
                           if _ov_ok(c) and _ov_deck_of(c) == d]
                 s_fd = [c for c in info.discarded_face_down
                         if _ov_ok(c) and _ov_deck_of(c) == d]
-                # ROOT BLINDING (USER 2026-08-16): the recon target is
-                # the BLINDED world's multiset (state + true committed
-                # - sampled committed).  Without this the reconciler
-                # forced the TRUE identity back into the zones and the
-                # state re-leaked it from the second simulation on
-                # (probe: sim-1 overlay divergence).
+                # ROOT BLINDING (USER 2026-08-16): the recon target is the
+                # BLINDED world's multiset (state + represented committed -
+                # sampled committed), or the reconciler would force the
+                # previous sampled identity back into the zones.
                 s_deck_l = sdeck
                 if (self.commit_cid is not None
-                        and self.commit_true is not None
-                        and self.commit_cid != self.commit_true
-                        and _ov_deck_of(self.commit_true) == d):
+                        and represented_commit is not None
+                        and self.commit_cid != represented_commit
+                        and _ov_deck_of(represented_commit) == d):
                     for _sl9 in (s_hand, s_fd):
                         if self.commit_cid in _sl9:
                             _sl9[_sl9.index(self.commit_cid)] = \
-                                self.commit_true
+                                represented_commit
                             break
                     else:
                         if self.commit_cid in sdeck:
                             s_deck_l = list(sdeck)
                             s_deck_l[s_deck_l.index(
-                                self.commit_cid)] = self.commit_true
+                                self.commit_cid)] = represented_commit
                 self._recon(d, s_hand, s_deck_l, s_fd)
                 sdeck[:] = list(reversed(self.deck[d]))
             info.hand[:] = (
@@ -12956,15 +15620,17 @@ def _overlay_prepare_apply(parent_state, actor_side, action) -> None:
                     and not (action.params or {}).get('from_table')):
             cid = (action.params or {}).get('card_id')
             if cid and _ov_ok(cid) and not ov.has(cid):
+                if _OPPONENT_POLICY_MODE in ('learned_policy', 'own_value_reply_v0'):
+                    raise RuntimeError('Selected card is absent from consistent sampled hand')
                 if ov.require(cid):
                     OVERLAY_STATS['cond_swaps'] += 1
                     ov.patch(parent_state)
                 else:
                     OVERLAY_STATS['require_fail'] += 1
+                    raise RuntimeError('Hidden sample cannot supply selected card: %s' % cid)
     except Exception:
         OVERLAY_STATS['patch_error'] += 1
-        if OVERLAY_ASSERT:
-            raise
+        raise
 
 
 def _overlay_assert_state(state) -> None:
@@ -13002,6 +15668,10 @@ def _ov_window_kind(node) -> str:
     overlay must mask/extend."""
     k = node.ov_win
     if k is None:
+        pending = getattr(node.state, 'pending_card_option', None)
+        if isinstance(pending, dict) and pending.get('table_kill_payment'):
+            node.ov_win = 'table_payment'
+            return node.ov_win
         k = 'none'
         for c in node.children:
             at = (c.action.action_type if c.action is not None else '')
@@ -13011,10 +15681,34 @@ def _ov_window_kind(node) -> str:
             if at in ('combat_card_play', 'combat_card_none'):
                 k = 'combat'
                 break
-            if at == 'play_event':
+            if (at == 'play_event'
+                    or (at == 'discard_table_card'
+                        and _is_hidden_hand_card_edge(c.action))):
+                # A removal edge needs an Army+Character hand payment even
+                # when this stored menu contains no ordinary event play.
+                # It must be masked before the lazy-add visit threshold.
                 k = 'event'
         node.ov_win = k
     return k
+
+
+def _is_hidden_hand_card_edge(action) -> bool:
+    """An edge whose legality depends on sampled hidden hand contents.
+
+    Includes event/combat plays, discards and the hand payment required
+    to remove an opponent's table card. Such an edge is not a proof
+    valid across all possible hands.
+    """
+    if action is None:
+        return False
+    at = action.action_type
+    p = action.params or {}
+    return (at in ('play_event', 'discard_card')
+            or (at == 'discard_table_card' and str(p.get('card_id', '')).startswith('FREE'))
+            or (at == 'card_option' and 'army_card' in (p.get('choices') or {})
+                and 'character_card' in (p.get('choices') or {}))
+            or (at == 'combat_card_play'
+                and not (action.params or {}).get('from_table')))
 
 
 def _ov_child_ok(child, node, ov) -> bool:
@@ -13027,12 +15721,15 @@ def _ov_child_ok(child, node, ov) -> bool:
     the lazy-add mass source (overlay-invariant, and never branch
     WEIGHTS, so no membership probability is double-counted)."""
     a = child.action
-    if a is None:
-        return True
-    at = a.action_type
-    if at in ('play_event', 'discard_card') \
-            or (at == 'combat_card_play'
-                and not (a.params or {}).get('from_table')):
+    if a is not None and a.action_type == 'discard_table_card' \
+            and str((a.params or {}).get('card_id', '')).startswith('FREE'):
+        army, chars = _table_kill_payment_cards(node.state)
+        return bool(army and chars)
+    if a is not None and a.action_type == 'card_option':
+        choices = (a.params or {}).get('choices') or {}
+        if 'army_card' in choices and 'character_card' in choices:
+            return ov.has(choices['army_card']) and ov.has(choices['character_card'])
+    if _is_hidden_hand_card_edge(a):
         cid = (a.params or {}).get('card_id')
         return (not cid) or (not _ov_ok(cid)) or ov.has(cid)
     return True
@@ -13044,16 +15741,26 @@ def _overlay_lazy_children(node, ov) -> str:
     DIFFERENT simulation's sample) get children so no determinization
     is silently card-starved.  Bounded by hand size; per-node memo.
     Combat windows draw their mass from the node's W3 map (the decline
-    arm gives that mass back); event windows dry-run playability and
-    reuse a same-deck template child's die binding."""
+    arm gives that mass back); event windows enumerate the sampled hand through
+    the shared legal AI menu, including funding and play requirements."""
     kind = _ov_window_kind(node)
-    if kind == 'none':
-        return kind
     ov.patch(node.state)
     if node.ov_seen is None:
         node.ov_seen = set()
     hand_cards = ov.hand['char'] + ov.hand['strat']
-    if kind == 'discard':
+    if kind == 'table_payment':
+        have = {tuple(sorted((c.action.params.get('choices') or {}).items()))
+                for c in node.children if c.action is not None
+                and c.action.action_type == 'card_option'}
+        for action in get_ai_actions(node.state, node.side):
+            if action.action_type != 'card_option':
+                continue
+            key = tuple(sorted((action.params.get('choices') or {}).items()))
+            if key not in have:
+                have.add(key)
+                node.children.append(MCTSNode(state=None, side=node.side,
+                    parent=node, action=action, prior=_OV_LAZY_PRIOR))
+    elif kind == 'discard':
         have = {(c.action.params or {}).get('card_id')
                 for c in node.children if c.action is not None
                 and c.action.action_type == 'discard_card'}
@@ -13069,9 +15776,12 @@ def _overlay_lazy_children(node, ov) -> str:
                 prior=_OV_LAZY_PRIOR))
             OVERLAY_STATS['lazy_discard'] += 1
     elif kind == 'combat':
-        w3 = node.w3
-        if w3 is None:
-            return kind
+        w3 = node.w3 or {}
+        # The opponent model supplies exploration weights, not legality.
+        # A zero-weight legal card remains a possible response in this hand.
+        legal_cards = {(a.params or {}).get('card_id')
+                       for a in get_ai_actions(node.state, node.side)
+                       if a.action_type == 'combat_card_play'}
         have = {(c.action.params or {}).get('card_id')
                 for c in node.children if c.action is not None
                 and c.action.action_type == 'combat_card_play'}
@@ -13082,9 +15792,9 @@ def _overlay_lazy_children(node, ov) -> str:
             if cid in have or cid in node.ov_seen:
                 continue
             node.ov_seen.add(cid)
-            pm = float(w3.get(cid, 0.0))
-            if pm <= 0.0:
+            if cid not in legal_cards:
                 continue
+            pm = float(w3.get(cid, 0.0))
             node.children.append(MCTSNode(
                 state=None, side=node.side, parent=node,
                 action=Action(die_idx=-1,
@@ -13096,40 +15806,34 @@ def _overlay_lazy_children(node, ov) -> str:
                 decline.prior = max(decline.prior - pm, 1e-3)
             OVERLAY_STATS['lazy_combat'] += 1
     else:
-        if node.visit_count < _OV_LAZY_MIN_VISITS:
+        # Deferral is safe only while this sample has a selectable edge.
+        # A different hand can invalidate every stored card/payment choice.
+        if (node.visit_count < _OV_LAZY_MIN_VISITS
+                and any(_ov_child_ok(child, node, ov)
+                        for child in node.children)):
             return kind
-        tmpl = {}
-        have = set()
-        for c in node.children:
-            if c.action is not None \
-                    and c.action.action_type == 'play_event':
-                cid0 = (c.action.params or {}).get('card_id')
-                have.add(cid0)
-                if cid0 and _ov_ok(cid0):
-                    tmpl.setdefault(_ov_deck_of(cid0), c)
-        for cid in hand_cards:
-            if cid in have or cid in node.ov_seen:
+        unseen = set(hand_cards) - node.ov_seen
+        if not unseen:
+            return kind
+        # Use the public AI menu for payment, printed requirements,
+        # pending timing, Rings and Mouth of Sauron. Deck membership
+        # does not determine which die can pay for a card.
+        legal_events = [a for a in get_ai_actions(node.state, node.side)
+                        if a.action_type in ('play_event', 'discard_table_card')]
+        node.ov_seen.update(hand_cards)
+        if legal_events:
+            kind = node.ov_win = 'event'
+        have = {(c.action.action_type, c.action.die_idx, tuple(sorted(c.action.params.items())))
+                for c in node.children if c.action is not None
+                and c.action.action_type in ('play_event', 'discard_table_card')}
+        for action in legal_events:
+            key = (action.action_type, action.die_idx, tuple(sorted(action.params.items())))
+            if key in have:
                 continue
-            node.ov_seen.add(cid)
-            t = tmpl.get(_ov_deck_of(cid))
-            if t is None:
-                OVERLAY_STATS['lazy_no_template'] += 1
-                continue
-            try:
-                ok = _event_card_has_effect(node.state, node.side, cid)
-            except Exception:
-                ok = False
-            if not ok:
-                OVERLAY_STATS['lazy_rejected'] += 1
-                continue
+            have.add(key)
             node.children.append(MCTSNode(
                 state=None, side=node.side, parent=node,
-                action=Action(die_idx=t.action.die_idx,
-                              action_type='play_event',
-                              params={'card_id': cid,
-                                      'side': (t.action.params or {})
-                                      .get('side', ov.opp_tag)}),
-                prior=_OV_LAZY_PRIOR))
+                action=action, prior=_OV_LAZY_PRIOR))
             OVERLAY_STATS['lazy_event'] += 1
     return kind
 
@@ -13172,6 +15876,32 @@ def _kstat_highdrop(entry):
         del lst[20:]
 
 
+KERNEL_ERROR_FIRST = None   # first 'error'-class kernel fallback text this
+                            # process - the meters / smoke gate assert None
+
+
+SEARCH_STATS = {'apply_fail': 0}
+SEARCH_APPLY_FAIL_FIRST = None  # first in-tree apply failure text
+
+
+def _search_apply_fail(action, exc) -> None:
+    """SPMC-5: an in-tree apply_action failure is COUNTED and the
+    first occurrence per process keeps the exception text - such
+    failures used to become silent fake -1 terminals. The caller
+    always re-raises; engine failures cannot supply a search value."""
+    global SEARCH_APPLY_FAIL_FIRST
+    SEARCH_STATS['apply_fail'] += 1
+    if SEARCH_APPLY_FAIL_FIRST is None:
+        SEARCH_APPLY_FAIL_FIRST = '%s: %s: %s' % (
+            getattr(action, 'action_type', '?'),
+            type(exc).__name__, str(exc)[:300])
+        import logging
+        logging.getLogger('wotr.search').warning(
+            '[SEARCH] in-tree apply_action failed (counted in '
+            'SEARCH_STATS[apply_fail]): %s',
+            SEARCH_APPLY_FAIL_FIRST.encode('ascii', 'replace').decode())
+
+
 def _kstat_fallback(reason, detail=None):
     KERNEL_STATS['fallback'][reason] = \
         KERNEL_STATS['fallback'].get(reason, 0) + 1
@@ -13179,6 +15909,22 @@ def _kstat_fallback(reason, detail=None):
         lst = KERNEL_STATS.setdefault('fallback_detail', [])
         if len(lst) < 20000:
             lst.append((reason, detail))
+    if reason in ('error', 'hunt_error'):
+        # LOUD (CB-1 + SPEP-6, 2026-08-29): an error-class fallback of
+        # EITHER kernel (combat 'error', hunt 'hunt_error') is counted
+        # AND the FIRST occurrence per process is logged at WARNING
+        # with the exception text, exposed via KERNEL_ERROR_FIRST /
+        # kernel_stats_summary()['error_first'].
+        global KERNEL_ERROR_FIRST
+        if KERNEL_ERROR_FIRST is None:
+            KERNEL_ERROR_FIRST = str(
+                (detail or {}).get('err', detail))[:300]
+            import logging
+            logging.getLogger('wotr.kernel').warning(
+                '[KERNEL] exact %s kernel failed '
+                '(error class, counted in KERNEL_STATS): %s',
+                'hunt' if reason == 'hunt_error' else 'combat',
+                KERNEL_ERROR_FIRST.encode('ascii', 'replace').decode())
 
 
 def kernel_stats_summary() -> dict:
@@ -13197,6 +15943,7 @@ def kernel_stats_summary() -> dict:
     return {'combat_chance_nodes': KERNEL_STATS['combat_chance_nodes'],
             'kernel_nodes': KERNEL_STATS['kernel_nodes'],
             'fallback': dict(KERNEL_STATS['fallback']),
+            'error_first': KERNEL_ERROR_FIRST,
             'dropped_mass_mean': dm['mean'],
             'dropped_mass_p50': dm['p50'],
             'dropped_mass_p90': dm['p90'],
@@ -13222,13 +15969,13 @@ def kernel_stats_summary() -> dict:
                 key=lambda e: -e.get('dropped', 0.0))}
 
 
-def _kernel_army_spec(state: GameState, region, side: Side):
+def _kernel_army_spec(state: GameState, region, side: Side, pc=None):
     """ArmySpec of `side`'s portion at `region` (Isengard elites split
     out — their nation is math-bearing under Saruman's leadership
     rule; everything else folds to one nation per side)."""
     from combat_dist import ArmySpec, LeaderSpec
     from combat import _combat_leader_side
-    army = _armies_lookup(state, region)
+    army = _battle_army(state, region, side, pc)
     r = e_o = e_i = 0
     specs = []
     if army is not None:
@@ -13274,8 +16021,10 @@ def _kernel_ctx(state: GameState, info: dict, atk_card_id, def_card_id,
     from cards import get_card
     atk_side = info['atk_side']
     def_side = info['def_side']
-    atk = _kernel_army_spec(state, info['atk_region'], atk_side)
-    dfn = _kernel_army_spec(state, info['def_region'], def_side)
+    _pc = ({'attacker_rearguard': info['attacker_rearguard']}
+           if info.get('attacker_rearguard') is not None else None)
+    atk = _kernel_army_spec(state, info['atk_region'], atk_side, _pc)
+    dfn = _kernel_army_spec(state, info['def_region'], def_side, _pc)
     if atk.regulars + atk.elites + atk.elites2 == 0 \
             or dfn.regulars + dfn.elites + dfn.elites2 == 0:
         raise ValueError('empty battle side')
@@ -13296,7 +16045,9 @@ def _kernel_ctx(state: GameState, info: dict, atk_card_id, def_card_id,
     ch = {}
     src = dict(info.get('choices') or {})
     for k in ('atk_casualty_policy', 'def_casualty_policy',
-              'atk_effect_count', 'def_effect_count'):
+              'atk_effect_count', 'def_effect_count',
+              # 1.254: the kernel mirrors the WHICH-figure picks
+              'atk_effect_target', 'def_effect_target'):
         v = src.get(k)
         if v is not None:
             ch[k] = v
@@ -13328,11 +16079,16 @@ def _kernel_dist(ctx, want_witness: bool = False):
     if ent is not None and (not want_witness
                             or ent.witness is not None):
         return ent
-    _rs = random.getstate()
-    try:
-        d = cd.exact_distribution(ctx, want_witness=want_witness)
-    finally:
-        random.setstate(_rs)
+    # Optional persistent second level; full distributions and witnesses.
+    # Workers only read; uncatalogued/incompatible contexts compute exactly.
+    import combat_lookup
+    d = combat_lookup.lookup(ctx, want_witness=want_witness)
+    if d is None:
+        _rs = random.getstate()
+        try:
+            d = cd.exact_distribution(ctx, want_witness=want_witness)
+        finally:
+            random.setstate(_rs)
     if len(_KERNEL_MEMO) >= _KERNEL_MEMO_MAX:
         _KERNEL_MEMO.clear()
     _KERNEL_MEMO[ctx] = d
@@ -13349,12 +16105,17 @@ def _kernel_expand_combat(node: 'MCTSNode', probe_state) -> bool:
     if OVERLAY_ASSERT:
         _overlay_assert_state(node.parent.state)
     KERNEL_STATS['combat_chance_nodes'] += 1
+    from combat_round_search import requires_phase_sampling
+    if requires_phase_sampling(node.parent.state, probe_state):
+        node.round_sampling = True
+        _kstat_fallback('observed_round_phase')
+        return False
     info = getattr(probe_state, '_last_round_call', None)
     if not isinstance(info, dict):
         _pcd = getattr(node.parent.state, 'pending_combat', None) or {}
         _ecd = _pcd.get('effect_choice') or {}
         if (node.action.action_type == 'combat_effect_choice'
-                and _ecd.get('stage') == 'post'):
+                and _ecd.get('stage') in ('post', 'onslaught_payment')):
             # deferred-Onslaught magnitude resume: the only RNG is
             # apply_onslaught_choice's k-dice 4+ batch — exact
             # binomial branches, engine-built states
@@ -13371,6 +16132,8 @@ def _kernel_expand_combat(node: 'MCTSNode', probe_state) -> bool:
         ctx = _kernel_ctx(node.parent.state, info, info.get('atk_card'),
                           info.get('def_card'), defer=True)
         dist = _kernel_dist(ctx, want_witness=True)
+        if _COMBAT_FORECAST_OBSERVER is not None:
+            _COMBAT_FORECAST_OBSERVER.exact_round(node, ctx, dist)
         # OUTCOME-CLASS COARSENING (user-approved): merge outcomes by
         # the state-faithful projection obs[8:19] (rosters, destroyed,
         # fx, deferred stash) BEFORE the top-N cut — the diagnostic
@@ -13462,12 +16225,29 @@ def _kernel_expand_combat(node: 'MCTSNode', probe_state) -> bool:
                             plan + (_h9,), conf,
                             lambda: apply_action(node.parent.state,
                                                  node.action))
-                        _en_pred = cd._apply_hits(
-                            _en_post[0], _en_post[1], _h9,
-                            'preserve_elites')
+                        # USER RULING 1.254: the WCtK hits are the ENEMY
+                        # owner's learned allocation - with a real
+                        # choice the apply PAUSES on it (enemy roster
+                        # untouched, {enemy}_hits == h); otherwise the
+                        # k=0 auto-apply (= preserve_elites)
+                        _pcb9k = getattr(st_b, 'pending_combat', None) or {}
+                        _enr9 = ('def' if wctk_side == 'attacker'
+                                 else 'atk')
+                        _paused9 = (
+                            _pcb9k.get('phase') == 'casualty_allocation'
+                            and _pcb9k.get('alloc_stage') == (
+                                'defender' if _enr9 == 'def'
+                                else 'attacker')
+                            and int(_pcb9k.get('%s_hits' % _enr9, 0)
+                                    or 0) == _h9)
+                        _en_pred = (_en_post if _paused9
+                                    else cd._apply_hits(
+                                        _en_post[0], _en_post[1], _h9,
+                                        'preserve_elites'))
 
                         def _re_cnt(stx, reg, sid):
-                            _us = _alloc_side_units(stx, reg, sid)
+                            _us = _alloc_side_units(stx, reg, sid, pc={
+                                'attacker_rearguard': info.get('attacker_rearguard')})
                             return (sum(1 for u in _us
                                         if u.kind == UnitKind.REGULAR),
                                     sum(1 for u in _us
@@ -13488,15 +16268,30 @@ def _kernel_expand_combat(node: 'MCTSNode', probe_state) -> bool:
             pcb = getattr(st_b, 'pending_combat', None)
             if isinstance(pcb, dict) \
                     and pcb.get('phase') == 'casualty_allocation':
-                # engine-vs-kernel invariant: the stashed hits of the
-                # forced apply must equal the outcome's
-                if (int(pcb.get('def_hits', 0) or 0) != obs[17]
-                        or int(pcb.get('atk_hits', 0) or 0) != obs[18]):
+                if pcb.get('_p9_done'):
+                    # SPMC-4 / USER RULING 1.254: the round's deferred
+                    # hits auto-applied in the SAME apply and phase 9
+                    # paused on the ENEMY owner's allocation of the
+                    # deterministic Great Host hit - verify against
+                    # the GH expectation, not the round's obs hits
+                    _ghd9, _gha9 = _gh_alloc_expected(ctx, obs)
+                    _vok9 = (int(pcb.get('def_hits', 0) or 0) == _ghd9
+                             and int(pcb.get('atk_hits', 0) or 0)
+                             == _gha9)
+                else:
+                    # engine-vs-kernel invariant: the stashed hits of
+                    # the forced apply must equal the outcome's
+                    _vok9 = (int(pcb.get('def_hits', 0) or 0) == obs[17]
+                             and int(pcb.get('atk_hits', 0) or 0)
+                             == (obs[18] if pcb.get('alloc_stage') == 'attacker'
+                                 else 0))
+                if not _vok9:
                     _kstat_fallback('branch_verify', {
                         'a': node.action.action_type,
                         'cards': (ctx.attacker_card,
                                   ctx.defender_card),
-                        'obs': obs[8:19]})
+                        'obs': obs[8:19],
+                        'p9': bool(pcb.get('_p9_done'))})
                     return False
             branches.append((st_b, mass))
     except cd.PlanMismatch as _pm:
@@ -13531,7 +16326,7 @@ def _kernel_expand_combat(node: 'MCTSNode', probe_state) -> bool:
                      ('atk_region', 'def_region', 'atk_side',
                       'def_side', 'atk_card', 'def_card',
                       'is_siege')}})
-        return False
+        raise
     merged = {}
     for st_b, mass in branches:
         sg = _chance_sig(st_b)
@@ -13548,6 +16343,7 @@ def _kernel_expand_combat(node: 'MCTSNode', probe_state) -> bool:
         node.outcomes.append(br)
     node.drops = _CHANCE_DRAWS     # bank full: weights are exact
     node.kernel_cover = float(cover)
+    _kernel_register_world(node)   # MC4
     KERNEL_STATS['kernel_nodes'] += 1
     if len(KERNEL_STATS['dropped_mass']) < 500000:
         KERNEL_STATS['dropped_mass'].append(max(0.0, 1.0 - cover))
@@ -13577,7 +16373,13 @@ def _kernel_expand_onslaught_post(node: 'MCTSNode') -> bool:
     import combat_dist as cd
     if OVERLAY_ASSERT:
         _overlay_assert_state(node.parent.state)
-    k = int((node.action.params or {}).get('count', 0) or 0)
+    payment = (node.parent.state.pending_combat or {}).get('_onslaught_payment')
+    if payment:
+        choice = node.action.params or {}
+        cost = 2 if choice.get('kind') == 'elite' and choice.get('operation') == 'remove' else 1
+        k = int(payment['paid']) + cost
+    else:
+        k = int((node.action.params or {}).get('count', 0) or 0)
     if k <= 0:
         # count 0 rolls nothing; RNG here means an unmodeled consumer
         _kstat_fallback('onslaught_post_k0',
@@ -13600,7 +16402,7 @@ def _kernel_expand_onslaught_post(node: 'MCTSNode') -> bool:
         _kstat_fallback('error', {
             'a': node.action.action_type,
             'err': '%s: %s' % (type(_ex).__name__, str(_ex)[:200])})
-        return False
+        raise
     merged = {}
     for st_b, mass in branches:
         sg = _chance_sig(st_b)
@@ -13617,6 +16419,7 @@ def _kernel_expand_onslaught_post(node: 'MCTSNode') -> bool:
         node.outcomes.append(br)
     node.drops = _CHANCE_DRAWS
     node.kernel_cover = 1.0
+    _kernel_register_world(node)   # MC4 (post-round edge: key None)
     KERNEL_STATS['kernel_nodes'] += 1
     if len(KERNEL_STATS['dropped_mass']) < 500000:
         KERNEL_STATS['dropped_mass'].append(0.0)
@@ -13626,34 +16429,58 @@ def _kernel_expand_onslaught_post(node: 'MCTSNode') -> bool:
     return True
 
 
+def _gh_alloc_expected(ctx, obs) -> tuple:
+    """SPMC-4 / USER RULING 1.254: expected (def_hits, atk_hits) at the
+    phase-9 enemy-allocation pause reached in the SAME apply (the
+    round's deferred hits auto-applied first).  Great Host is the only
+    DETERMINISTIC phase-9 enemy-hit source (WCtK rolls dice and takes
+    the binomial-split path), so the pause carries exactly its
+    automatic hit: 1 on the enemy when the owner's post-allocation
+    army has at least twice the enemy's units (combat.py phase 9;
+    defer-mode obs rosters are pre-allocation, auto-apply policy is
+    preserve_elites)."""
+    import combat_dist as cd
+    _ra, _ea = cd._apply_hits(obs[8], obs[9], int(obs[18] or 0),
+                              'preserve_elites')
+    _rd, _ed = cd._apply_hits(obs[10], obs[11], int(obs[17] or 0),
+                              'preserve_elites')
+    atk_n, def_n = _ra + _ea, _rd + _ed
+    hd = ha = 0
+    if atk_n > 0 and def_n > 0:
+        if ('great host' in (ctx.attacker_card or '').lower()
+                and atk_n >= 2 * def_n):
+            hd = 1
+        if ('great host' in (ctx.defender_card or '').lower()
+                and def_n >= 2 * atk_n):
+            ha = 1
+    return hd, ha
+
+
 def _predict_alloc_pause(state: GameState, info: dict,
                          obs: tuple) -> bool:
     """Mirror of _alloc_choice_exists over a kernel defer outcome's
-    post-round rosters (defender stage then attacker) — predicts
+    post-round rosters (attacker stage then defender) — predicts
     whether the apply pauses at a casualty_allocation pending.  A
     wrong prediction can only cost a counted plan-mismatch fallback,
     never a wrong branch."""
-    from combat import _cas_box_regulars
     for region, side, r, e, hits in (
-            (info['def_region'], info['def_side'],
-             obs[10], obs[11], obs[17]),
-            (info['atk_region'], info['atk_side'],
-             obs[8], obs[9], obs[18])):
+            (info['atk_region'], info['atk_side'], obs[8], obs[9], obs[18]),
+            (info['def_region'], info['def_side'], obs[10], obs[11], obs[17])):
         hits = int(hits or 0)
-        if hits <= 0:
+        if hits <= 0 or r + e <= 0:
             continue
-        if hits >= 2 * e + r:
+        if hits >= 2 * e + r and (side == Side.SHADOW or e == 0):
             continue
-        if not e:
-            continue
-        if r:
+        if e and (r or hits >= 2):
             return True
-        if hits < 2 or e < 2:
-            continue
-        if any(_cas_box_regulars(state, u.nation) > 0
-               or _can_recruit(state, u.nation, 'regular')
-               for u in _alloc_side_units(state, region, side,
-                                          UnitKind.ELITE)):
+        # Count-only kernels cannot resolve mixed-nation choices. Be
+        # conservative when pre-effect identities may have been removed;
+        # the real apply and branch verification remain authoritative.
+        kinds = {u.nation for u in _alloc_side_units(
+            state, region, side,
+            UnitKind.ELITE if e else UnitKind.REGULAR,
+            pc={'attacker_rearguard': info.get('attacker_rearguard')})}
+        if len(kinds) > 1:
             return True
     return False
 
@@ -13665,6 +16492,9 @@ def _kernel_chance_proof(n: 'MCTSNode') -> bool:
     Sampled chance nodes still block proofs."""
     cover = getattr(n, 'kernel_cover', None)
     if not n.is_chance or cover is None or cover < 1.0 - 1e-9:
+        return False
+    if n.kernel_sets is not None:
+        # MC4: one sampled world's set never proves the commit mixture
         return False
     outs = n.outcomes or []
     if not outs or any(b.proven is None for b in outs):
@@ -13713,7 +16543,8 @@ def _hunt_action_gate(node: 'MCTSNode') -> bool:
         return True
     for o in (pco.get('options') or []):
         if isinstance(o, dict) and ('mithril_redraw' in o
-                                    or 'wizardstaff_prevent' in o):
+                                    or 'wizardstaff_prevent' in o
+                                    or 'balrog_declare_draw' in o):
             return True
     return False
 
@@ -13773,7 +16604,8 @@ def _hunt_rng_culprit(parent, action, plan, src) -> str:
     random.choice = _mk_walk_choice(_wrap('choice'))
     try:
         try:
-            apply_action(parent, action)
+            diagnostic_state = apply_action(parent, action)
+            _resume_preaction_for_search(parent, diagnostic_state, action)
         except BaseException:
             pass
     finally:
@@ -13820,6 +16652,7 @@ def _hunt_expand_try(node: 'MCTSNode'):
             random.choice = _walk_choice
             try:
                 st_b = apply_action(parent, node.action)
+                _resume_preaction_for_search(parent, st_b, node.action)
             except hd.HuntFork:
                 forked = True
                 if random.getstate() != rng0:
@@ -13852,6 +16685,8 @@ def _hunt_expand_try(node: 'MCTSNode'):
             _kstat_fallback('hunt_error', {
                 'a': node.action.action_type,
                 'err': '%s: %s' % (type(e).__name__, str(e)[:200])})
+            # Unexpected engine errors cannot supply sampled outcomes.
+            raise
         return None, None
     KERNEL_STATS['hunt_walks'] = \
         KERNEL_STATS.get('hunt_walks', 0) + walks
@@ -13987,7 +16822,8 @@ def _opponent_card_priors(state: GameState, pc: dict, actions,
     takes the residual (plus the mass of candidates the sampled hand
     cannot represent).  Returns (priors aligned with `actions`,
     {card_id: P(plays)} over the FULL pool — the 3A lazy-add mass
-    source), or None (counted fallback -> BC priors).
+    source), or None for an explicit kernel PlanMismatch (counted
+    fallback -> BC priors). Unexpected errors propagate unchanged.
     OVERLAY-INVARIANT: the pool below is the per-deck union
     deck + hand + face-down, which 3A patching permutes but never
     changes as a multiset — this posterior is identical on true and
@@ -14071,36 +16907,22 @@ def _opponent_card_priors(state: GameState, pc: dict, actions,
                         pc.get('def_dice_reduction', 0),
                     'disable_city_defense':
                         pc.get('rounds_fought', 0) > 0}}
-        # D3 BLINDING (rules-audit discrepancy 3, USER-ruled
-        # 2026-08-16): combat cards are committed SECRETLY - at the
-        # defender's decision the attacker's card lies face-down, so
-        # only its TYPE (char/strat card back) and the fact of
-        # commitment are public; the IDENTITY is not.  The old code
-        # ranked defender candidates in a context built from
-        # pc['atk_combat_card'] - the exact committed card - an
-        # information leak into the opponent model.  USER: "it can see
-        # the type of card (character/ strategy) just not the
-        # identity."  So the defender ranking now marginalizes over
-        # the attacker's PLAYABLE cards of the COMMITTED TYPE from the
-        # attacker's unseen pool (deck + hand + face-down,
-        # copy-weighted, the same _ov machinery as the opponent pool
-        # above).  Type visible, identity dissolved.  The attacker
+        # D3 BLINDING (USER 2026-08-16: "it can see the type of card
+        # (character/ strategy) just not the identity"): combat cards
+        # are committed SECRETLY - the defender ranking marginalizes
+        # over the attacker's PLAYABLE cards of the COMMITTED TYPE from
+        # the attacker's unseen pool (copy-weighted).  The attacker
         # model is unchanged (the defender has not committed at
-        # attacker-decision time - nothing to blind).
+        # attacker-decision time).
         atk_mix = [(None, 1)]
         if not is_attacker and pc.get('atk_combat_card'):
             # _atk_commit_mixture is the ONE answerer (shared with the
             # root/search blinding in _SimOverlay, USER 2026-08-16):
             # playable same-type candidates from the attacker's
             # PRE-COMMIT unseen pool, copy-weighted, sorted.
-            try:
-                _amix9 = _atk_commit_mixture(state, pc)
-                if _amix9:
-                    atk_mix = _amix9
-                # else: no representable candidate of the committed
-                # type - identity-free None context
-            except Exception:
-                atk_mix = [(None, 1)]
+            atk_mix = _atk_commit_mixture(state, pc)
+            if not atk_mix:
+                raise RuntimeError("Hidden combat-card commitment has no representable candidate")
 
         def _v(cand_cid):
             if is_attacker:
@@ -14127,10 +16949,7 @@ def _opponent_card_priors(state: GameState, pc: dict, actions,
         v_none = _v(None)
         cands = {}
         for (cid, d), copies in cand_copies.items():
-            try:
-                cands[cid] = (d, copies, _v(cid))
-            except Exception:
-                cands[cid] = (d, copies, v_none)   # unrankable: as none
+            cands[cid] = (d, copies, _v(cid))
         p_play, _p_none = cd.card_play_posterior(
             pool_sizes, n_hand, cands, v_none)
         priors = []
@@ -14150,15 +16969,15 @@ def _opponent_card_priors(state: GameState, pc: dict, actions,
         s = sum(priors)
         return [x / s for x in priors], \
             {k: float(v) for k, v in p_play.items()}
-    except Exception:
+    except cd.PlanMismatch:
         KERNEL_STATS['opp_card_fallback'] += 1
         return None
 
 
 # ------------------------------------------------------------------
 # Root-action selection: visit-argmax with evidence-gated overrides.
-# ONE implementation for every consumer — the search's final pick and
-# the trainer's policy-delta targets (run_td_v33loop).
+# Search computes the live target here. Corrected training retains that
+# target and its resolved settings; lossy diagnostics are not replay inputs.
 # ------------------------------------------------------------------
 
 @dataclass
@@ -14170,21 +16989,19 @@ class SearchSelectConfig:
     c_visit: float = 50.0       # pi sharpness: sigma=(c_visit+max_n)*c_scale
     c_scale: float = 1.0
     completed_q_min_n: int = 3  # below this, an arm's Q = pooled mean
-    # pi_target mode (LAB 2026-08-09, proposal P-A):
-    #   'sigma'    — run-7 baseline: p*exp(sigma*q_hat) over eligible
-    #                arms.  PROVEN KILLER: sigma = 50+max_n (~238-2386
-    #                at 1000 sims) one-hots 71.9% of targets on Q
-    #                noise / free-action bias; one delta update crushed
-    #                fellowship_move prior 0.149 -> 0.0006 (250x).
-    #   'visit_tf' — P3: visit distribution over alive arms
-    #                (AlphaZero-style; target-side amplification of
-    #                any arm == 1.0x its visit share, unit-tested) +
-    #                w_tf-weighted one-hot blend ONLY when the
-    #                1.230 terminal-grounded override fired (play !=
-    #                visit argmax).  Proof-forced pv rows unchanged.
-    #   Play pick is IDENTICAL under both modes (targets change,
-    #   play semantics never do).
-    pi_mode: str = 'sigma'
+    # pi_target mode (LAB 2026-08-09, P-A):
+    #   'sigma'    - run-7 baseline: p*exp(sigma*q_hat) over eligible
+    #                arms (sigma = 50+max_n one-hots targets on Q noise;
+    #                see the run-7 collapse record).
+    #   'visit_tf' - P3: visit distribution over alive arms (AlphaZero-
+    #                style; target-side amplification == 1.0x visit
+    #                share, unit-tested) + w_tf one-hot blend ONLY when
+    #                the 1.230 terminal-grounded override fired.
+    #   Play pick is IDENTICAL under both modes.
+    # SPB addendum 2026-08-29: DEFAULT is the adopted safe operator -
+    # the 'sigma' default was the proven run-7 collapse operator,
+    # reachable now only by an explicit WOTR_SELECT_CFG=pi_mode=sigma.
+    pi_mode: str = 'visit_tf'
     w_tf: float = 0.5           # override-arm blend weight (visit_tf)
     # task-15 LAW 3 (quantified 1.230): 0.0 = binary tf rule only
     # (unchanged).  > 0 adds the graded path: an arm may override on
@@ -14208,16 +17025,12 @@ class SearchSelectConfig:
     s_low: float = 0.30
     s_high: float = 0.60
     conf_play_margin: float = 0.10
-    # task-20 (v37 smoke-refusal supply fix): the earned-visit
-    # discount (FIX 3) protected the TRAINING target from forced-
-    # floor visits but the play-time TEMPERATURE SAMPLER drew on raw
-    # n — measured on the refused smoke: 20/24 ring plays were
-    # temp-sampled from ~4% visit shares that were PURE floor
-    # (ring-arm visits p50 exactly 36 = 12x3, earned p50 = 0).
-    # temp_earned=True subtracts forced visits from the sampling
-    # weights too (mirror of FIX 3; argmax play and pi targets
-    # unaffected; all-forced fallback keeps raw n).  Default off.
-    temp_earned: bool = False
+    # task-20 (v37 smoke-refusal supply fix): temp_earned=True subtracts
+    # forced visits from the play-time temperature SAMPLING weights too
+    # (mirror of FIX 3; argmax play and pi targets unaffected; all-
+    # forced fallback keeps raw n).  Default ON (SPB addendum
+    # 2026-08-29 - lab-adopted regime is the default, not env-gated).
+    temp_earned: bool = True
 
 
 def _select_cfg_from_env() -> 'SearchSelectConfig':
@@ -14242,6 +17055,11 @@ def _select_cfg_from_env() -> 'SearchSelectConfig':
 
 
 SELECT_CFG = _select_cfg_from_env()
+# SPB addendum 2026-08-29: one loud line naming what the collapsed-
+# regime defaults resolved to (env overrides included)
+print('[SELECT] resolved: pi_mode=%s temp_earned=%s head_act=%s'
+      % (SELECT_CFG.pi_mode, SELECT_CFG.temp_earned,
+         os.environ.get('WOTR_VALUE_HEAD_ACT', 'scaled2')), flush=True)
 
 
 def select_root_action(children_stats, temperature, cfg=None):
@@ -14259,13 +17077,14 @@ def select_root_action(children_stats, temperature, cfg=None):
        does not shrink with visits, so no gap between two head
        opinions is ever significant (an 0.15 "lead" from a tf=0 arm
        sat won games out at the Crack of Doom — mordor_push fixture).
-    3. TEMPERATURE: pi_target weights arms with n >= cfg.min_visits by
-       prior * exp(sigma * completed-Q), sigma=(c_visit+max_n)*c_scale.
-       temp 0 plays the default/override pick; temp > 0 samples
-       pi_target^(1/T).
+    3. TARGET: visit_tf uses visit evidence with a terminal-override blend;
+       sigma uses prior * exp(sigma * completed-Q) over eligible arms.
+       Temperature zero plays the selected arm; positive temperature samples
+       separately and may discount forced visits. Sampling does not change
+       the retained policy-training target.
 
-    pi_target is the delta-head training target; ineligible arms hold
-    exactly 0 (the trainer masks its CE to the eligible set).
+    pi_target and the original eligibility are retained for delta training.
+    Visit-target support and sigma eligibility have separate training gates.
     Diagnostics: q_hat float64[K], sigma float, elig bool[K], regret
     float (best eligible completed-Q minus the pick's)."""
     if cfg is None:
@@ -14287,6 +17106,19 @@ def select_root_action(children_stats, temperature, cfg=None):
     # closest to victory, never resign)
     if pv is not None and len(n):
         pv_arr = np.asarray(pv, dtype=np.int8)
+        from reward_contract import current_contract, PROFILE
+        if current_contract() == PROFILE:
+            # A board win can pay only 0 or .2 for this profile. Only
+            # exact utility bounds (+1/-1) dominate all alternatives.
+            # Missing exact values cannot establish that stronger claim.
+            exact = children_stats.get('pvv')
+            if exact is None or len(exact) != len(n):
+                pv_arr = np.zeros(len(n), dtype=np.int8)
+            else:
+                pv_arr = np.asarray([
+                    {'W': 1, 'L': -1}.get(_objective_proof_mark(
+                        {1: 'W', -1: 'L'}.get(int(mark)), value), 0)
+                    for mark, value in zip(pv_arr, exact)], dtype=np.int8)
         if (pv_arr == 1).any():
             play = int(np.argmax(np.where(pv_arr == 1, q_hat, -np.inf)))
             pi = (pv_arr == 1).astype(np.float64)
@@ -14474,11 +17306,40 @@ def _search_terminal(result: dict, root_side: 'Side',
     return v
 
 
-def _proof_mark(result: dict, root_side: 'Side') -> str:
-    """'W'/'L' from the root side's view for a resolved terminal."""
+def _objective_proof_mark(mark, value):
+    """Keep only objective-bound proofs under the corrected profile contract.
+
+    An off-target board win is resolved but does not prove the best possible
+    utility. Leaving its mark unset keeps alternative lines searchable.
+    Legacy and pure win/loss proof behavior stays unchanged.
+    """
+    if mark is None:
+        return None
+    from reward_contract import current_contract, PROFILE
+    if current_contract() != PROFILE:
+        return mark
+    bound = {'W': 1.0, 'L': -1.0}.get(mark)
+    if bound is None or value is None:
+        return None
+    try:
+        exact = float(value)
+    except (TypeError, ValueError):
+        return None
+    return mark if math.isfinite(exact) and abs(exact - bound) <= 1e-9 else None
+
+
+def _proof_mark(result: dict, root_side: 'Side') -> 'Optional[str]':
+    """Return an objective-dominating terminal mark from the root side's view."""
     fp_won = (result.get('victory') == 'free_peoples')
     won = Side.FREE_PEOPLES if fp_won else Side.SHADOW
-    return 'W' if won == root_side else 'L'
+    mark = 'W' if won == root_side else 'L'
+    from reward_contract import current_contract, PROFILE, profile_terminal
+    if current_contract() == PROFILE:
+        tag = 'fp' if root_side == Side.FREE_PEOPLES else 'sh'
+        value = profile_terminal(tag, PLAYER_PROFILES.get(tag),
+                                 result.get('victory_type'), won == root_side)
+        return _objective_proof_mark(mark, value)
+    return mark
 
 
 def _propagate_proofs(path, root_side: 'Side') -> None:
@@ -14490,7 +17351,11 @@ def _propagate_proofs(path, root_side: 'Side') -> None:
     full-cover combat nodes (_kernel_chance_proof); 'all children'
     means all TRACKED children (the prune's commitment).  Grading of
     short-circuit proofs uses the known-proven children only."""
+    if _OPPONENT_POLICY_MODE in ('learned_policy', 'own_value_reply_v0'):
+        return  # Keep exact terminal values; do not promote minimax proofs.
     for n in reversed(path):
+        if n.proven is not None:
+            n.proven = _objective_proof_mark(n.proven, n.proven_value)
         if n.is_chance or n.proven is not None or not n.children:
             if n.proven is None and not n.is_terminal:
                 # kernel-exact full-cover chance nodes may prove
@@ -14501,19 +17366,56 @@ def _propagate_proofs(path, root_side: 'Side') -> None:
             continue
         mover_root = (n.side == root_side)
         want = 'W' if mover_root else 'L'
-        got = [c.proven for c in n.children]
-        vals = [c.proven_value for c in n.children
-                if c.proven is not None]
+        # MC5: at an OPPONENT node a hidden-hand card edge was
+        # enumerated under ONE determinization sample - the opponent
+        # may not hold the card, so the edge is UNKNOWN for proofs (it
+        # can neither supply the opponent's proof nor complete an
+        # all-children proof), exactly like a sampled chance node.
+        _pv9 = [((None if (not mover_root
+                           and _is_hidden_hand_card_edge(c.action))
+                  else _objective_proof_mark(c.proven, c.proven_value)), c.proven_value)
+                for c in n.children]
+        got = [g for g, _v in _pv9]
+        vals = [v for g, v in _pv9 if g is not None]
         if want in got:
             n.proven = want
-            pick = [c.proven_value for c in n.children
-                    if c.proven == want]
+            pick = [v for g, v in _pv9 if g == want]
             n.proven_value = (max(pick) if mover_root else min(pick))
         elif all(g is not None for g in got):
+            if not mover_root and n.state is not None:
+                hand = n.state.hands.get(n.side)
+                kind = _ov_window_kind(n)
+                hidden_menu = (kind in ('combat', 'event', 'discard', 'table_payment')
+                               or (kind == 'none'
+                                   and _pending_decision_side(n.state) is None))
+                if hand is not None and hand.hand and hidden_menu:
+                    # Tracked responses came from sampled hands. A later hand
+                    # may add another legal response, so exhausting this menu
+                    # cannot prove a win against every opponent hand. A known
+                    # non-card refutation above remains safe and still proves.
+                    return
             n.proven = 'L' if mover_root else 'W'
             n.proven_value = (max(vals) if mover_root else min(vals))
         else:
             return
+
+
+def _turn_start_side(state: GameState) -> 'Optional[Side]':
+    """First actor of a freshly rolled turn: the Free Peoples (rulebook
+    1406-1407 "Starting with the Free Peoples player, the two players
+    alternate actions"), unless a turn-start pending routes elsewhere
+    (_pending_decision_side, the one cascade); the Shadow when the
+    Free Peoples hold no die; None when neither side does.  The
+    episode loop hard-sets FP after the rolls; this is the in-tree
+    twin (EX-2)."""
+    _ps = _pending_decision_side(state, fallback=Side.FREE_PEOPLES)
+    if _ps is not None:
+        return _ps
+    for s in (Side.FREE_PEOPLES, Side.SHADOW):
+        if any(not d.used and d.current is not None
+               for d in state.dice.get(s, [])):
+            return s
+    return None
 
 
 def _settle_new_node(node: MCTSNode, pre_side: Side,
@@ -14541,8 +17443,25 @@ def _settle_new_node(node: MCTSNode, pre_side: Side,
         node.proven_value = node.terminal_value
         node.side = pre_side
         return node.terminal_value
-    next_side = _next_acting_side(node.state, pre_side)
+    # EX-2 (rulebook 1406-1407): after an in-tree end_turn crossing the
+    # new turn's first actor is the Free Peoples - never alternation
+    # from the old turn's last actor or a stale battle marker.
+    # SPMC-2: a chance BRANCH carries action=None - the edge action
+    # lives on its chance parent (the REAL crossing always consumes
+    # RNG and materializes as a branch, so testing node.action alone
+    # left EX-2 dead on the live path)
+    _ea9 = node.action if node.action is not None \
+        else (node.parent.action if node.parent is not None else None)
+    if _ea9 is not None and _ea9.action_type == 'end_turn':
+        next_side = _turn_start_side(node.state)
+    else:
+        next_side = _next_acting_side(node.state, pre_side)
     if next_side is None:
+        if not node.state.dice_rolled and (
+                getattr(node.state, '_declare_phase', False)
+                or getattr(node.state, '_eye_allocation_phase', False)
+                or getattr(node.state, '_fellowship_tail_phase', False)):
+            raise RuntimeError('Unfinished preaction phase cannot become end_turn')
         node.side = pre_side
         _v9 = _mcts_eval_state(node.state, root_side, fp_net, sh_net)
         if (_TURN_HORIZON > 0
@@ -14558,7 +17477,95 @@ def _settle_new_node(node: MCTSNode, pre_side: Side,
     return _expand_node(node, fp_net, sh_net, root_side)
 
 
-def _select_child(node: MCTSNode, c_puct: float) -> MCTSNode:
+def _opponent_policy_key(side, vec, actions, action_keys=None):
+    if action_keys is None and isinstance(actions, _segment_Menu):
+        from ai_policies import action_policy_key
+        action_keys = actions.action_keys(action_policy_key)
+    from ai_policies import action_policy_key
+    if action_keys is None:
+        action_keys = tuple((action_policy_key(a) for a in actions))
+    return (side, np.asarray(vec, dtype=np.float32).tobytes(), action_keys)
+
+
+def _remember_opponent_policy(side, vec, actions, priors, policy_key=None):
+    probabilities = np.asarray(
+        _validate_search_priors(priors, len(actions)), dtype=np.float64)
+    probabilities = probabilities / probabilities.sum()
+    probabilities = ((1.0 - _OPPONENT_POLICY_EPSILON) * probabilities
+                     + _OPPONENT_POLICY_EPSILON / len(actions))
+    key = (_opponent_policy_key(side, vec, actions)
+           if policy_key is None else policy_key)
+    if len(_OPPONENT_POLICY_CACHE) >= 256:
+        _OPPONENT_POLICY_CACHE.clear()
+    result = tuple(probabilities.tolist())
+    _OPPONENT_POLICY_CACHE[key] = result
+    return result if type(_OPPONENT_POLICY_CACHE) is dict else _OPPONENT_POLICY_CACHE[key]
+
+
+def _current_action_keys(actions, function):
+    """One-call identity memo; mutable Actions are never keyed across calls."""
+    identity_keys = {}
+    keys = []
+    for action in actions:
+        ident = id(action)
+        entry = identity_keys.get(ident)
+        if entry is None:
+            entry = (action, function(action))
+            identity_keys[ident] = entry
+        keys.append(entry[1])
+    return tuple(keys)
+
+
+def _learned_opponent_child(node, ov):
+    """Sample pi(a|opponent observation, sampled hand) over the full AI menu.
+
+    Hand probability is already represented by the simulation's joint draw.
+    Neither root-private Q values nor a second holding probability enters
+    this choice. A legal decline is scored just like any other action.
+    """
+    if _OWN_VALUE_CONTEXT is not None:
+        raise RuntimeError('Own-value search cannot enter learned opponent policy')
+    from ai_policies import action_policy_key
+    global _LAST_LEAF_CONF, _LAST_LEAF_PHI
+    ov.patch(node.state)
+    policy = _segment_policy(node)
+    actions = policy.actions if isinstance(policy.actions, _segment_Menu) else list(policy.actions)
+    if not actions:
+        if _pending_decision_side(node.state) is not None or getattr(node.state, '_ring_free_side', None) is not None or node.state.pending_army_move_die is not None or (node.state.pending_muster_die is not None):
+            raise RuntimeError('Empty sampled menu during required decision')
+        other = Side.SHADOW if node.side == Side.FREE_PEOPLES else Side.FREE_PEOPLES
+        end_turn = next((c for c in node.children if c.action is not None and c.action.action_type == 'end_turn'), None)
+        if end_turn is not None and (not get_ai_actions(node.state, other)):
+            return end_turn
+        OVERLAY_STATS['no_action_samples'] = OVERLAY_STATS.get('no_action_samples', 0) + 1
+        return None
+    action_keys = _segment_action_keys(actions, action_policy_key)
+    if policy.forced_reason:
+        if len(actions) != 1:
+            raise RuntimeError('Fixed AI policy must expose exactly one transition')
+        probabilities = (1.0,)
+    else:
+        net = _SEARCH_NETS[0 if node.side == Side.FREE_PEOPLES else 1]
+        if net is None:
+            raise RuntimeError('Learned opponent policy requires its checkpoint')
+        vec = encode_state(node.state, node.side)
+        key = _opponent_policy_key(node.side, vec, actions, action_keys)
+        probabilities = _OPPONENT_POLICY_CACHE.get(key)
+        if probabilities is None:
+            saved = (_LAST_LEAF_CONF, _LAST_LEAF_PHI)
+            try:
+                priors, _ = _get_priors_and_value(node.state, node.side, net, actions, features_vec=vec)
+            finally:
+                _LAST_LEAF_CONF, _LAST_LEAF_PHI = saved
+            probabilities = _remember_opponent_policy(node.side, vec, actions, priors, key)
+        OVERLAY_STATS['learned_policy_draws'] = OVERLAY_STATS.get('learned_policy_draws', 0) + 1
+    if _COMBAT_FORECAST_OBSERVER is not None:
+        _segment_observe(_COMBAT_FORECAST_OBSERVER, node, actions, probabilities)
+    from search_edge_catalog import choose
+    return choose(node, actions, probabilities, action_keys, policy.forced_reason, Action, MCTSNode)
+
+
+def _select_child(node: MCTSNode, c_puct: float) -> 'Optional[MCTSNode]':
     """Select the child with highest PUCT score.
 
     Proven children are excluded — their value is exact, so visits
@@ -14569,16 +17576,23 @@ def _select_child(node: MCTSNode, c_puct: float) -> MCTSNode:
     child addition for overlay-legal actions the stored enumeration
     lacks."""
     ov = _SIM_OVERLAY
+    if _OWN_VALUE_CONTEXT is not None and node.side != _OWN_VALUE_CONTEXT.side:
+        return _OWN_VALUE_CONTEXT.child(node, ov)
     masked = (ov is not None and node.side == ov.opp_side
               and node.state is not None)
+    if not (masked and _OPPONENT_POLICY_MODE in ('learned_policy', 'own_value_reply_v0')):
+        from search_edge_catalog import flush
+        flush(node, Action, MCTSNode)
+    if masked and _OPPONENT_POLICY_MODE in ('learned_policy', 'own_value_reply_v0'):
+        return _learned_opponent_child(node, ov)
     if masked:
         try:
             masked = _overlay_lazy_children(node, ov) != 'none'
         except Exception:
             OVERLAY_STATS['mask_error'] += 1
-            if OVERLAY_ASSERT:
-                raise
-            masked = False
+            # Failed legality reconciliation cannot authorize an unmasked
+            # card edge from a different hidden-hand sample.
+            raise
     pscale = 1.0
     if masked:
         cand = [c for c in node.children
@@ -14587,11 +17601,20 @@ def _select_child(node: MCTSNode, c_puct: float) -> MCTSNode:
             cand = [c for c in node.children
                     if _ov_child_ok(c, node, ov)]
         if not cand:
-            # every child incompatible with this sample: fall back
-            # unmasked (the opponent must still act) — counted
+            # An incompatible sample cannot authorize an absent card/payment.
+            if (node.ov_win == 'event'
+                    and _pending_decision_side(node.state) is None
+                    and getattr(node.state, '_ring_free_side', None) is None
+                    and node.state.pending_army_move_die is None
+                    and node.state.pending_muster_die is None
+                    and not get_ai_actions(node.state, node.side)):
+                # This hand can legitimately have no playable action. It
+                # does not authorize a stored card from another sample.
+                OVERLAY_STATS['no_action_samples'] = (
+                    OVERLAY_STATS.get('no_action_samples', 0) + 1)
+                return None
             OVERLAY_STATS['mask_empty'] += 1
-            cand = [c for c in node.children if c.proven is None] \
-                or node.children
+            raise RuntimeError('No compatible action for the sampled opponent hand')
         else:
             pmass = sum(c.prior for c in cand)
             if pmass > 1e-9:
@@ -14683,16 +17706,136 @@ def _action_in_regions(action: Action, hot_regions: set) -> bool:
     return False
 
 
-# R10 counter-knob (LAB 2026-08-09): the honest recalibrated value
-# currency widens/lowers in-tree Q levels; at fixed c_puct the PUCT
-# exploration term weakens RELATIVELY and prior-disfavored survival
-# lines starve (erebor_recapture adjudication probe: seeds lift the
-# iron-hills muster to top-Q at 400 sims, recal nets never give it
-# the visits).  Env-pinned, default 4.0 = byte-identical; adoption
-# value comes from fixture-validated A/B only.
+# R10 counter-knob (LAB 2026-08-09): the recalibrated value currency
+# lowers in-tree Q levels, so at fixed c_puct the PUCT exploration
+# term weakens RELATIVELY.  Env-pinned, default 4.0 = byte-
+# identical; adoption value from fixture-validated A/B only.
 _C_PUCT = float(os.environ.get('WOTR_C_PUCT', '4.0') or 4.0)
 
 
+_SEARCH_FAILURE_DIAGNOSTIC = None
+
+
+def _capture_search_failure(error, args, kwargs, entry_rng):
+    """One bounded failure-only packet; never retain a tree or traceback frames."""
+    from game_trace import snapshot_state
+    packet = {'schema': 'search_failure_diagnostic_v1',
+              'error': '%s: %s' % (type(error).__name__, error),
+              'search_entry_rng': entry_rng,
+              'root_side': args[1] if len(args) > 1 else kwargs.get('side'),
+              'requested_simulations': args[4] if len(args) > 4 else kwargs.get('num_simulations', 100),
+              'search_options': {key: kwargs[key] for key in
+                  ('temperature', 'add_noise', 'c_puct', 'bonus_sims', 'determinize') if key in kwargs},
+              'capture_errors': []}
+    try:
+        import hashlib
+        with open(__file__, 'rb') as source:
+            packet['ai_source_sha256'] = hashlib.sha256(source.read()).hexdigest()
+    except OSError as exc:
+        packet['capture_errors'].append('source hash: %s' % exc)
+    root_state = args[0] if args else kwargs.get('state')
+    states = {'root_state': root_state}
+    node = None
+    action = None
+    actor = None
+    frame_summary = []
+    tb = error.__traceback__
+    for _ in range(64):
+        if tb is None:
+            break
+        local = tb.tb_frame.f_locals
+        frame_summary.append({'function': tb.tb_frame.f_code.co_name, 'line': tb.tb_lineno})
+        candidate = local.get('node')
+        if isinstance(candidate, MCTSNode):
+            node = candidate
+        if local.get('parent_state') is not None:
+            states['parent_state'] = local['parent_state']
+            action, actor = local.get('action'), local.get('actor_side')
+        tb = tb.tb_next
+    packet['frames'] = frame_summary
+    if node is not None:
+        states['node_state'] = node.state
+        if node.parent is not None:
+            states.setdefault('parent_state', node.parent.state)
+        packet['node'] = {'side': node.side, 'visit_count': node.visit_count,
+                          'is_chance': node.is_chance, 'is_terminal': node.is_terminal}
+        if action is None:
+            action, actor = node.action, node.side
+    packet['actor_side'] = actor
+    packet['action'] = (None if action is None else
+                        {'action_type': action.action_type, 'die_idx': action.die_idx,
+                         'params': copy.deepcopy(action.params)})
+    ov = _SIM_OVERLAY
+    if ov is not None:
+        packet['overlay'] = {name: copy.deepcopy(getattr(ov, name)) for name in
+            ('root_side', 'opp_side', 'opp_tag', 'own_tag', 'hand', 'deck', 'fdown',
+             'own_deck', 'pool', 'commit_cid', 'commit_true', 'commit_bkey',
+             'commit_slot', 'commit_hidden') if hasattr(ov, name)}
+    for name, state in states.items():
+        if state is not None:
+            try:
+                packet[name] = snapshot_state(state)
+            except Exception as exc:
+                packet['capture_errors'].append('%s: %s: %s' % (name, type(exc).__name__, exc))
+    return packet
+
+
+def _search_failure_scope(search):
+    """A failed search cannot leave hidden samples or reusable partial visits."""
+    from functools import wraps
+
+    @wraps(search)
+    def scoped(*args, **kwargs):
+        global _SIM_OVERLAY, _SEARCH_NETS, _SEARCH_ROOT_SIDE, _SEARCH_FAILURE_DIAGNOSTIC
+        _SIM_OVERLAY = None
+        _SEARCH_FAILURE_DIAGNOSTIC = None
+        _OPPONENT_POLICY_CACHE.clear()
+        observer = _COMBAT_FORECAST_OBSERVER
+        entry_rng = None
+        try:
+            from rng_streams import search_scope
+            with search_scope():
+                # Copy RNG state, never draw/reseed. Snapshot game states only
+                # if this search fails; healthy searches publish nothing.
+                entry_rng = {'python': random.getstate(), 'numpy': np.random.get_state()}
+                if observer is not None:
+                    observer.begin_search(
+                        args[0] if args else kwargs['state'],
+                        args[1] if len(args) > 1 else kwargs['side'])
+                result = search(*args, **kwargs)
+                if observer is not None:
+                    summary = observer.finish_search(
+                        result[0] if result else None,
+                        result[1] if result is not None and isinstance(result[1], dict) else None)
+                    if (summary is not None and result is not None
+                            and isinstance(result[1], dict)):
+                        result[1]['combat_forecast_eval'] = summary
+                return result
+        except BaseException as error:
+            try:
+                _SEARCH_FAILURE_DIAGNOSTIC = _capture_search_failure(error, args, kwargs, entry_rng)
+            except Exception as capture_error:
+                _SEARCH_FAILURE_DIAGNOSTIC = {
+                    'schema': 'search_failure_diagnostic_v1', 'search_entry_rng': entry_rng,
+                    'capture_errors': ['%s: %s' % (type(capture_error).__name__, capture_error)]}
+            for key in ('child', 'sig', 'root_side', 'policy_version'):
+                _TREE_CACHE[key] = None
+            raise
+        finally:
+            _SIM_OVERLAY = None
+            _SEARCH_NETS = (None, None)
+            _SEARCH_ROOT_SIDE = None
+            _OPPONENT_POLICY_CACHE.clear()
+    return scoped
+
+
+from search_collection import search_collection_scope
+
+
+@search_collection_scope
+@_companion_search_cache.search_scope
+@_search_lattice.search_scope
+@_search_failure_scope
 def mcts_search(state: GameState, side: Side,
                 fp_net: 'WOTRValueNet', sh_net: 'WOTRValueNet',
                 num_simulations: int = 100, c_puct: float = _C_PUCT,
@@ -14722,6 +17865,26 @@ def mcts_search(state: GameState, side: Side,
     Returns:
         (selected Action, visit_info dict), or None if no legal actions.
     """
+    if _OWN_VALUE_CONTEXT is not None:
+        if side != _OWN_VALUE_CONTEXT.side or _LEAF_BATCH != 1 or _TREE_REUSE or not determinize:
+            raise ValueError('Own-value v0 requires its root side, sequential leaves, fresh tree and hidden sampling')
+        _own_pair = (_OWN_VALUE_CONTEXT.net, None) if side == Side.FREE_PEOPLES else (None, _OWN_VALUE_CONTEXT.net)
+        if fp_net is not _own_pair[0] or sh_net is not _own_pair[1]:
+            raise ValueError('Own-value search accepts only its root model')
+    _edge_cached_root = _TREE_CACHE.get('child')
+    if _edge_cached_root is not None:
+        from search_edge_catalog import flush
+        flush(_edge_cached_root, Action, MCTSNode)
+    # The cache/root owns any reusable node; do not retain a rejected tree locally.
+    del _edge_cached_root
+    if _OPPONENT_POLICY_MODE in ('learned_policy', 'own_value_reply_v0') and not determinize:
+        raise ValueError('Learned opponent policy requires joint hidden-hand sampling')
+    from ai_policies import POLICY_VERSION
+    policy = get_ai_policy(state, side)
+    if policy.forced_reason:
+        # No manufactured visits, regret, value estimate or training target.
+        _TREE_CACHE['child'] = None
+        return policy.actions[0], None
     if not HAS_TORCH:
         return None
 
@@ -14732,17 +17895,14 @@ def mcts_search(state: GameState, side: Side,
     _SEARCH_ROOT_SIDE = side
 
     # ROOT/SEARCH BLINDING trigger (USER RULING 2026-08-16, verbatim:
-    # "NO YOU CANNOT SEE THE CARD THAT IS COMMITTED"): the root player
-    # is the DEFENDER while the attacker's combat card lies committed
-    # face-down.  Tree reuse and stashing are disabled for these
-    # (rare) roots — a stashed subtree carries sample-specific
-    # committed-card worlds and the blinded root clone's blanked
-    # discard slot must never leak back as a "real" state.
-    _blind9 = False
+    # "NO YOU CANNOT SEE THE CARD THAT IS COMMITTED"): the root is the
+    # DEFENDER while the attacker's card lies committed face-down.
+    # Tree reuse and stashing are disabled for these roots (stashed
+    # subtrees carry sample-specific worlds).  MC2: only while the
+    # commit is UNREVEALED (_hidden_commit_card, the one predicate
+    # shared with the overlay and the encoding).
     _pcr9 = getattr(state, 'pending_combat', None)
-    if (_pcr9 and _pcr9.get('atk_combat_card')
-            and _pcr9.get('attacker_side') != side):
-        _blind9 = True
+    _blind9 = _hidden_commit_card(state, side) is not None
 
     # Lever 1: try to reuse the previous search's chosen subtree
     root = None
@@ -14759,16 +17919,15 @@ def mcts_search(state: GameState, side: Side,
                 # reuse only when that currency is this root's
                 and _TREE_CACHE.get('root_side') == side):
             _sig_now = _state_sig(state)
-            # PHANTOM-PLAY FIX (USER trace w5_g2 T8 Morgul Wound,
-            # 2026-07-20): _state_sig fingerprints hands by COUNT only,
-            # so a cached child whose state carries the PREVIOUS
-            # search's DETERMINIZED (imaginary) hand for `side` could
-            # be reused as this side's root — get_legal_actions then
-            # offered play_event for cards not really held (10/23 card
-            # plays in one game were phantoms, each burning a die on a
-            # no-op). The mover's OWN hand is perfect information: it
-            # must match reality EXACTLY or the tree is stale.
-            if (_sig_now is not None
+            # _state_sig fingerprints hands by COUNT only; the mover's OWN
+            # hand is perfect information and must match reality EXACTLY
+            # or the tree is stale (a reused determinized hand offered
+            # phantom card plays; USER trace w5_g2 T8, 2026-07-20).
+            if (_TREE_CACHE.get('policy_version') == POLICY_VERSION
+                    and _TREE_CACHE.get('opponent_policy_mode', 'legacy_puct') == _OPPONENT_POLICY_MODE
+                    and (_OPPONENT_POLICY_MODE == 'legacy_puct'
+                         or _TREE_CACHE.get('opponent_policy_epsilon') == _OPPONENT_POLICY_EPSILON)
+                    and _sig_now is not None
                     and _sig_now == _TREE_CACHE.get('sig')
                     and sorted(map(str, _cand9.state.hands[side].hand))
                     == sorted(map(str, state.hands[side].hand))):
@@ -14778,6 +17937,7 @@ def mcts_search(state: GameState, side: Side,
                 _TREE_CACHE['hits'] += 1
         if not _reused:
             _TREE_CACHE['misses'] += 1
+        del _cand9
 
     if root is None:
         # 3A: NO root-once hand swap — the root clone keeps the true
@@ -14861,10 +18021,10 @@ def mcts_search(state: GameState, side: Side,
         _force_idx = [i for _p9, i in _fr9[:_FREE_CANDS_N]]
 
     # small menus need visit mass per arm, not exhaustive search:
-    # cap the budget at 60 sims/child (floor 120)
-    if len(root.children) <= 6:
-        num_simulations = min(num_simulations,
-                              max(120, 60 * len(root.children)))
+    # cap the budget at 60 sims/child (floor 120); S-003: with
+    # WOTR_SIMS_MENU_SCALE=1 the per-child budget applies to EVERY menu
+    # size (see _sims_budget) - default env keeps the <= 6 rule exactly
+    num_simulations = _sims_budget(num_simulations, len(root.children))
 
     def _simulate_from(node, path):
         """One simulation starting at `node` (already appended to
@@ -14888,8 +18048,7 @@ def mcts_search(state: GameState, side: Side,
             except Exception:
                 _SIM_OVERLAY = None
                 OVERLAY_STATS['sample_error'] += 1
-                if OVERLAY_ASSERT:
-                    raise
+                raise
         else:
             _SIM_OVERLAY = None
         leaf_term = False
@@ -14906,14 +18065,7 @@ def mcts_search(state: GameState, side: Side,
             if node.is_chance:
                 branch = _select_outcome(node)
                 if branch is None:
-                    # every sampling attempt failed — loss for the
-                    # acting side, signed into root perspective
-                    node.is_terminal = True
-                    node.terminal_value = (-1.0 if node.side == side
-                                           else 1.0)
-                    leaf_value = node.terminal_value
-                    leaf_term = True
-                    break
+                    raise RuntimeError('Chance search produced no valid outcome')
                 path.append(branch)
                 node = branch
                 if (not node.is_terminal and not node.children
@@ -14922,9 +18074,13 @@ def mcts_search(state: GameState, side: Side,
                     leaf_value = _settle_new_node(
                         node, node.parent.side, fp_net, sh_net, side)
                     leaf_term = node.is_terminal
+                    if node.forced_policy_reason and not leaf_term:
+                        continue
                     break
                 continue
-            if node.children:
+            if (node.children or (_OPPONENT_POLICY_MODE in ('learned_policy', 'own_value_reply_v0')
+                    and _SIM_OVERLAY is not None and node.state is not None
+                    and node.side == _SIM_OVERLAY.opp_side)):
                 if node is root and _force_idx:
                     # FIX 2: serve the forced floor before PUCT
                     _fp9 = None
@@ -14942,7 +18098,17 @@ def mcts_search(state: GameState, side: Side,
                         node = root.children[_fp9]
                         path.append(node)
                         continue
-                node = _select_child(node, c_puct)
+                selected = _select_child(node, c_puct)
+                if selected is None:
+                    # Reuse fresh-node no-action routing in this sampled
+                    # world, without changing the shared actor or menu.
+                    sample_leaf = MCTSNode(copy.deepcopy(node.state), node.side)
+                    leaf_value = _expand_node(
+                        sample_leaf, fp_net, sh_net, side, _sample_local=True)
+                    if sample_leaf.forced_policy_reason:
+                        raise RuntimeError('Unexpected pending policy in empty ordinary menu')
+                    break
+                node = selected
                 path.append(node)
                 continue
             if node.state is None:
@@ -14966,6 +18132,9 @@ def mcts_search(state: GameState, side: Side,
                         leaf_value = _settle_new_node(
                             branch, node.side, fp_net, sh_net, side)
                         leaf_term = branch.is_terminal
+                        if branch.forced_policy_reason and not leaf_term:
+                            node = branch
+                            continue
                         break
                     if _hkind == 'det':
                         node.state = _hst
@@ -14973,6 +18142,8 @@ def mcts_search(state: GameState, side: Side,
                             node, node.parent.side, fp_net, sh_net,
                             side)
                         leaf_term = node.is_terminal
+                        if node.forced_policy_reason and not leaf_term:
+                            continue
                         break
                 # Lazy materialization + RNG detection
                 _pl35 = (_hidden_zone_lens(node.parent.state)
@@ -14980,15 +18151,9 @@ def mcts_search(state: GameState, side: Side,
                 try:
                     new_state, used_rng = _apply_action_detect_rng(
                         node.parent.state, node.action)
-                except Exception:
-                    # Action failed — loss for the acting side,
-                    # signed into root perspective
-                    node.is_terminal = True
-                    node.terminal_value = (-1.0 if node.side == side
-                                           else 1.0)
-                    leaf_value = node.terminal_value
-                    leaf_term = True
-                    break
+                except Exception as _af9:
+                    _search_apply_fail(node.action, _af9)
+                    raise
                 if (not used_rng and _pl35 is not None
                         and _hidden_zone_lens(new_state) != _pl35):
                     # RNG-free draw/pop of a hidden-ORDER zone: a
@@ -14996,7 +18161,9 @@ def mcts_search(state: GameState, side: Side,
                     # must not fuse this simulation's sampled order
                     used_rng = True
                     OVERLAY_STATS['det_draw_chance'] += 1
-                if used_rng:
+                if (used_rng or _blinded_commit_key(node.parent.state) is not None):
+                    # A hidden commit can change a deterministic pre-roll choice.
+                    # Its first materialization must stay world-keyed too.
                     node.is_chance = True
                     node.outcomes = []
                     if (node.action is not None
@@ -15010,6 +18177,9 @@ def mcts_search(state: GameState, side: Side,
                         leaf_value = _settle_new_node(
                             branch, node.side, fp_net, sh_net, side)
                         leaf_term = branch.is_terminal
+                        if branch.forced_policy_reason and not leaf_term:
+                            node = branch
+                            continue
                         break
                     _ms0 = getattr(new_state, '_search_roll_ms', None) \
                         if node.action is not None \
@@ -15024,21 +18194,45 @@ def mcts_search(state: GameState, side: Side,
                         node.drops += 1
                     branch.out_sig = _chance_sig(new_state)
                     node.outcomes.append(branch)
+                    _kernel_register_world(node)
                     path.append(branch)
                     leaf_value = _settle_new_node(
                         branch, node.side, fp_net, sh_net, side)
                     leaf_term = branch.is_terminal
+                    if branch.forced_policy_reason and not leaf_term:
+                        node = branch
+                        continue
                     break
                 node.state = new_state
                 leaf_value = _settle_new_node(
                     node, node.parent.side, fp_net, sh_net, side)
                 leaf_term = node.is_terminal
+                if node.forced_policy_reason and not leaf_term:
+                    continue
+                break
+            if (_PENDING_EVAL_BOX[0] is not None
+                    and id(node) in _PENDING_EVAL_BOX[0].by_node):
+                # S-003: this leaf already awaits its batched
+                # evaluation - share its record (virtual loss along
+                # this path too; one real backup per path at flush)
+                _PENDING_EVAL_BOX[0].last = _PENDING_EVAL_BOX[0].by_node[id(node)]
+                leaf_value = _DEFERRED
                 break
             # Already expanded node with no children (no legal actions)
             leaf_value = _mcts_eval_state(
                 node.state, side, fp_net, sh_net)
             break
 
+        if leaf_value != leaf_value:          # _DEFERRED (NaN sentinel)
+            # S-003: the leaf's evaluation is pending in the batch - hold
+            # a virtual loss (root-side loss) on every node of the path;
+            # _flush_pending swaps it for the real value
+            _rec9 = _PENDING_EVAL_BOX[0].last
+            _rec9['paths'].append(list(path))
+            for n in path:
+                n.visit_count += 1
+                n.value_sum += (-1.0 if n.side == side else 1.0)
+            return
         # BACKPROP: leaf_value is in root perspective, so a node's sum
         # gains +value iff the node acts for the root side (per-node
         # sums stay in the node side's perspective, one currency)
@@ -15062,10 +18256,28 @@ def mcts_search(state: GameState, side: Side,
         if leaf_term:
             _propagate_proofs(path, side)
 
-    for _sim in range(num_simulations):
-        if root.proven is not None:
-            break
-        _simulate_from(root, [root])
+    if _LEAF_BATCH > 1:
+        # S-003 leaf batching: K simulations select + materialize + encode
+        # (each under its own overlay), then ONE batched forward per net
+        _done9 = 0
+        while _done9 < num_simulations and root.proven is None:
+            _k9 = min(_LEAF_BATCH, num_simulations - _done9)
+            _coll9 = _PendingEvals()
+            _PENDING_EVAL_BOX[0] = _coll9
+            try:
+                for _i9 in range(_k9):
+                    if root.proven is not None:
+                        break
+                    _simulate_from(root, [root])
+                    _done9 += 1
+            finally:
+                _PENDING_EVAL_BOX[0] = None
+            _flush_pending(_coll9, fp_net, sh_net, side)
+    else:
+        for _sim in range(num_simulations):
+            if root.proven is not None:
+                break
+            _simulate_from(root, [root])
 
     # --- Bonus simulations for hot-zone focused search ---
     if hot_regions and bonus_sims > 0 and root.children:
@@ -15100,6 +18312,9 @@ def mcts_search(state: GameState, side: Side,
         [c.term_visits / c.visit_count if c.visit_count > 0 else 0.0
          for c in root.children], dtype=np.float32)
     visit_info = {
+        # Lossless identities for combining independent searches. Encodings
+        # alone can alias distinct legal moves and are not action identifiers.
+        'root_actions': tuple(c.action for c in root.children),
         'action_encs': np.array([encode_action(c.action, state, side)
                                  for c in root.children], dtype=np.float32),
         'region_indices': np.array([_get_action_region_index(c.action)
@@ -15142,20 +18357,34 @@ def mcts_search(state: GameState, side: Side,
         # committed-card worlds + the blanked discard slot)
         if _TREE_REUSE and not _blind9 and child is not None \
                 and child.state is not None and not child.is_chance:
+            # Search/selection has finished. Retain descendants, not the old
+            # root and all sibling subtrees through this upward link. A reused
+            # node already becomes a parentless root at the next search.
+            child.parent = None
             _TREE_CACHE['child'] = child
             _TREE_CACHE['sig'] = _state_sig(child.state)
             _TREE_CACHE['root_side'] = side
+            _TREE_CACHE['policy_version'] = POLICY_VERSION
+            _TREE_CACHE['opponent_policy_mode'] = _OPPONENT_POLICY_MODE
+            _TREE_CACHE['opponent_policy_epsilon'] = _OPPONENT_POLICY_EPSILON
 
     # final pick: visit-argmax with evidence-gated overrides (see
     # select_root_action; regret ~ 0 marks deliberate picks)
+    # Retain the exact resolved selector and live target. Diagnostic Q and
+    # terminal fractions are rounded later and cannot reproduce thresholds.
+    from selector_contract import make_evidence
+    from reward_contract import current_contract
+    selector_cfg = dataclasses.replace(SELECT_CFG)
     idx, pi_sel, sel_diag = select_root_action(
         {'p': priors_clean, 'q': q_values, 'n': child_visits_raw,
          'tf': term_frac, 'pv': visit_info['proven'],
          'pvv': visit_info['proven_value'],
          'fn': visit_info['forced'], 'cf': visit_info['conf'],
          'ph': visit_info['phi']},
-        temperature)
-    visit_info['pi_sel'] = pi_sel.astype(np.float32)
+        temperature, cfg=selector_cfg)
+    visit_info.update(make_evidence(
+        selector_cfg, temperature, pi_sel, eligible=sel_diag['elig'],
+        reward_contract=current_contract()))
     visit_info['q_hat'] = sel_diag['q_hat'].astype(np.float32)
     visit_info['sigma'] = sel_diag['sigma']
     visit_info['played'] = idx
@@ -15213,29 +18442,49 @@ def mcts_action_with_policy(state: GameState, side: Side,
 # Step 9: Phase 2 TD(λ) Self-Play
 # ===================================================================
 
+def _turn_end_blockers(state: GameState):
+    """Read-only boundary check; legal-menu probes run only on isolated clones."""
+    pending = [name for name in (
+        'pending_combat', 'pending_hunt', 'pending_guide_change',
+        '_wormtongue_attack_pending',
+        'pending_card_option', 'pending_card_followup', 'pending_discard',
+        'pending_army_move_die', 'pending_muster_die', '_fellowship_move_die_pending')
+        if getattr(state, name, None) is not None]
+    pending.extend(name for name in (
+        '_pending_hunt_damage', '_hunt_reveal_pending', '_reveal_place_due', '_pending_reveal_strongholds', '_fellowship_route_event', '_hobbit_place_queue',
+        '_mithril_stash', '_pending_reveal_strongholds', '_fellowship_route_event', '_wwsat_owed', '_palantir_draw_pending', '_gandalf_draw_pending', '_owed_draws',
+        '_declare_phase', '_eye_allocation_phase', '_fellowship_tail_phase')
+        if getattr(state, name, None))
+    # An unresolved obligation already forbids rollover; do not normalize it
+    # away by enumerating a stale pending menu, even on the probe clone.
+    if pending:
+        return pending
+    for side in (Side.FREE_PEOPLES, Side.SHADOW):
+        unused = sum(not d.used and d.current is not None
+                     for d in state.dice.get(side, []))
+        if unused and get_ai_policy(clone_state(state), side).actions:
+            pending.append('unused_action_dice:%s=%d' % (side.name, unused))
+    return pending
+
+
 def _safe_next_turn(state: GameState):
     """Advance to next turn, handling empty decks gracefully.
 
-    Returns True if the ROLLOVER itself decided the game (ring
-    victory at corruption 12 via the Mordor inactivity penalty —
-    P0 2026-08-15: the engine used to play ON past a won game; ring
-    victories are IMMEDIATE, rulebook p.17, wherever corruption
-    increments).  Callers must stop the game when this returns True.
+    Resolve Mordor inactivity before the Victory Check. Returns True for
+    any terminal outcome without resetting the turn, dice, or decks.
+    Callers must stop the game when this returns True.
     """
-    # Mordor inactivity penalty: +1 corruption if Fellowship didn't move/hide
-    if (state.fellowship.mordor_entered
-            and not getattr(state, 'fellowship_acted_in_mordor', False)
-            and state.fellowship.corruption < 12):
-        state.fellowship.corruption = min(12, state.fellowship.corruption + 1)
-        if state.fellowship.corruption >= 12:
-            return True
+    blockers = _turn_end_blockers(state)
+    if blockers:
+        raise RuntimeError('unfinished_turn: refusing rollover with ' + ', '.join(blockers))
+    if game_logic._settle_end_of_turn(state):
+        return True
 
     state.turn += 1
     state.eyes_allocated = 0
     # USER AUDIT 2026-07-08: the eye-allocation MINIMUM (1 if the FP
-    # player retrieved a die from the Hunt Box = moved the Fellowship)
-    # depends on this flag — the self-play turn path cleared the box
-    # WITHOUT setting it, so the mandatory minimum never applied.
+    # player retrieved a die from the Hunt Box) depends on this flag -
+    # it is set on the self-play turn path too.
     state._fp_used_hunt_box_last_turn = any(
         d.side is Side.FREE_PEOPLES for d in state.hunt_box)
     for d in state.hunt_box:
@@ -15247,11 +18496,18 @@ def _safe_next_turn(state: GameState):
     state.fp_ring_used_this_turn = False
     state.sh_ring_used_this_turn = False
     # A7: an unspent Elven-Ring legality waiver never crosses a turn
-    # boundary (mirrors game_logic.begin_turn_reset - this is the
-    # FOURTH turn implementation and AUTO is the caller that runs it).
+    # boundary (mirrors game_logic.begin_turn_reset member for member;
+    # EX-13: this is a parallel turn implementation).
     state.fp_ring_waiver = False
     state.sh_ring_waiver = False
+    state.fp_ring_waiver_face = None
+    state.sh_ring_waiver_face = None
     state._ring_free_side = None
+    # EX-5: the battle-attacker routing marker is per-action state and
+    # never crosses a turn - the new turn's first actor is the Free
+    # Peoples (rulebook 1406-1407; the in-tree crossing, EX-2, relies
+    # on this reset)
+    state._battle_resolved_attacker = None
     state.sh_mouth_muster_used_this_turn = False
     state.fp_token_used_this_turn = False
     state.sh_token_used_this_turn = False
@@ -15261,25 +18517,16 @@ def _safe_next_turn(state: GameState):
     # NOTE (2026-07-24): the stay-heal (rulebook p.34) requires RE-
     # DECLARING in place - a decision, offered via the declare phase;
     # never an auto-heal here (see game_logic.next_turn note).
-    # Minions mustered mid-game grant bonus action dice — the closed
-    # loop's turn path never recalculated them (2023-11-03 ketchuptime
-    # T9: the Mouth's T8 muster left the SH pool at 8 while the humans
-    # rolled 9; the Foul Thing play starved and its Eye's +5 corruption
-    # never applied — outcome flipped to ring-destroyed).  Recalculated
-    # ONCE below, after pendings are cleared (nothing in between reads
-    # the dice pools).
-    # Clear pending multi-phase states (restore rearguard if combat was pending)
-    if state.pending_combat is not None:
-        _restore_rearguard(state, state.pending_combat)
+    # Minions mustered mid-game grant bonus action dice - recalculated
+    # ONCE below, after pendings are cleared (2023-11-03 ketchuptime
+    # T9).
+    # Clear pending multi-phase states
     state.pending_combat = None
     state.pending_hunt = None
     state.pending_guide_change = None
     # F-2 (USER 2026-07-19): the Army-die double-move / Muster
-    # double-recruit chains MUST die with the turn — a dangling chain
-    # used to survive into the next turn, where get_legal_actions
-    # handed the leftover second half to whichever side acted first
-    # (the OPPONENT: fuzz seeds 9101/9140, FP played free moves on
-    # Shadow's stale die).
+    # double-recruit chains die with the turn - a dangling chain must
+    # never hand the leftover second half to next turn's first actor.
     state.pending_army_move_die = None
     state.pending_army_move_from = None
     state.pending_army_move_side = None
@@ -15288,30 +18535,51 @@ def _safe_next_turn(state: GameState):
     state.pending_muster_first_type = None
     state.pending_muster_region = None
     state.pending_muster_side = None
-    # OVERSIGHT #4 (2026-07-20): the card/discard pendings also die
-    # with the turn — probe-proven to survive before this (stale
-    # owner's menu leaked into the next turn via the decision-cap
-    # valve or empty-menu fallthrough).
+    # OVERSIGHT #4 (2026-07-20): the card/discard pendings die with the
+    # turn too.
     state.pending_card_option = None
     if hasattr(state, 'pending_card_followup'):
         state.pending_card_followup = None
     if hasattr(state, 'pending_discard'):
         state.pending_discard = None
+    # EX-6: owed obligations die with the turn too (logged above)
+    state._pending_hunt_damage = 0
+    state._reveal_place_due = False
+    state._hobbit_place_queue = []
+    state._wwsat_owed = []
+    state._palantir_draw_pending = False
+    state._gandalf_draw_pending = None
+    state._wormtongue_attack_pending = None
     # F-3: a battle abandoned by the per-turn decision cap may have
     # left a wiped garrison unconquered — settle control/siege state
     # now that the pendings are cleared (stable point).
     try:
         game_logic.cleanup_sieges(state)
-    except Exception:
-        pass
+    except Exception as exc:
+        import state_invariants
+        state_invariants.VIOLATIONS.append({
+            'code': 'turn_cleanup_failed',
+            'ctx': 'T%s cleanup_sieges' % state.turn,
+            'detail': '%s: %s' % (type(exc).__name__, exc)})
+        raise
     game_logic.calculate_bonus_dice(state)
-    # Draw cards, silently skipping empty decks
+    # Exhausted decks are legal. Check before drawing so a handler that
+    # removes its last card and then fails still records a real failure.
     for s in (Side.FREE_PEOPLES, Side.SHADOW):
         for deck in ("character", "strategy"):
+            deck_attr = ('fp_' if s is Side.FREE_PEOPLES else 'sh_') + (
+                'char_deck' if deck == 'character' else 'strat_deck')
+            if not getattr(state, deck_attr, []):
+                continue
             try:
                 game_logic.draw_event_card(state, s, deck)
-            except RuntimeError:
-                pass
+            except RuntimeError as exc:
+                import state_invariants
+                state_invariants.VIOLATIONS.append({
+                    'code': 'turn_draw_failed',
+                    'ctx': 'T%s %s %s' % (state.turn, s.name, deck),
+                    'detail': '%s: %s' % (type(exc).__name__, exc)})
+                raise
     # Hand limit is 6 (rulebook): discarding down is a LEARNED decision —
     # open a pending phase instead of discarding randomly. The self-play
     # loop resolves it via MCTS before the turn's other phases.
@@ -15466,7 +18734,18 @@ def _ring_progress_metric(state: 'GameState') -> float:
         d = d0 = None
     if d is None or d0 is None:
         return float(state.fellowship.progress)
-    adv = d0 if state.fellowship.mordor_entered else d0 - d
+    # SPEP-4 / 1.143b ("Mordor entry is seamless and the Mordor track
+    # continues the same scale") + 1.225 ("1 step from destroying the
+    # ring is better than 10 steps"): inside Mordor the pawn term is
+    # the full gate distance PLUS the track step - entry (progress 0
+    # at a gate) is continuous at d0, and step 5 reaches
+    # d0 + _RING_TRACK_TAIL = the full ring track.  The metric was
+    # flat at d0 for all five steps: zero step reward and
+    # closeness(step 4) == closeness(step 0).
+    if state.fellowship.mordor_entered:
+        adv = d0 + int(state.fellowship.mordor_step)
+    else:
+        adv = d0 - d
     return float(state.fellowship.progress + adv)
 
 
@@ -15526,7 +18805,8 @@ def _win_frac_phi(x, total) -> float:
 
 
 def _compute_step_reward_split(pre: dict, state: 'GameState',
-                               acting_side: 'Side') -> tuple:
+                               acting_side: 'Side', *,
+                               include_decision_cost: bool = True) -> tuple:
     """(axis_reward, military_reward) for one step, INTERVAL semantics.
 
     1.224 (USER 2026-07-29): rewards are CONVEX WIN-FRACTION deltas —
@@ -15535,7 +18815,12 @@ def _compute_step_reward_split(pre: dict, state: 'GameState',
     early, and opponent-axis terms are SYMMETRIC (blocking Shadow's
     9th VP is automatically worth 0.19 — the old hand-tuned -0.30
     defense coefficient is superseded by the currency's convexity).
-    Still potential-based (deltas telescope) -> policy-invariant.
+    The delta terms telescope, but nonzero terminal potentials,
+    profile-specific terminals, and decision costs change the objective.
+    This is not a policy-invariant transformation of pure win/loss.
+
+    include_decision_cost=False settles changes after a side's last
+    decision without charging that side for a decision it never made.
 
     1.143 (USER): military terms are returned SEPARATELY so the
     episode loop can BANK them and pay them only on the side's next
@@ -15543,6 +18828,9 @@ def _compute_step_reward_split(pre: dict, state: 'GameState',
     credited for stronghold events.  Axis terms land on every step.
     1.140 profile-purity and 1.146 effective corruption carry over.
     """
+    from reward_contract import uses_predecision
+    if uses_predecision():
+        return 0.0, 0.0
     axis = 0.0
     mil = 0.0
     vp = game_logic.calculate_victory_points(state)
@@ -15589,13 +18877,9 @@ def _compute_step_reward_split(pre: dict, state: 'GameState',
             axis += _PHI_RINGS_RHO * (int(state.sh_elven_rings)
                                       - int(pre['sh_rings']))
     # 1.224b (USER 2026-07-30): threat-phi and dice-phi are MILITARY
-    # currencies — paying them profile-blind was the residual leakage
-    # channel that had fp_ring nets capturing strongholds (a capture
-    # drops Shadow threat potential -> banked mil credit -> paid on
-    # the military action; batch-6 exemplar: fp_ring won MILITARY in
-    # 6 turns, fellowship never past mdist 8).  Non-military profiles
-    # get NO phi terms; their only military-bucket term is the
-    # symmetric opponent-VP delta (defense, capture-neutral).
+    # currencies - non-military profiles get NO phi terms; their only
+    # military-bucket term is the symmetric opponent-VP delta (defense,
+    # capture-neutral).
     if acting_side == Side.FREE_PEOPLES:
         if fp_prof in (None, 'military', 'mixed'):
             if d_phi is not None:
@@ -15619,26 +18903,24 @@ def _compute_step_reward_split(pre: dict, state: 'GameState',
                 mil += 0.20 * d_dice
         if sh_prof == 'corruption':
             axis += d_corr - d_ring
-            axis -= 0.005
+            if include_decision_cost:
+                axis -= 0.005
         elif sh_prof == 'military':
             mil += d_shvp - d_fpvp
-            axis -= 0.01
+            if include_decision_cost:
+                axis -= 0.01
         else:
             mil += d_shvp - d_fpvp
             axis += d_corr - d_ring
-            axis -= 0.005
+            if include_decision_cost:
+                axis -= 0.005
     return axis, mil
 
 
-
-
 # 1.145 (USER 2026-07-19): a profile net's terminal is conditioned on
-# HOW the game was won.  On-mission victory keeps the full +/-1;
-# an OFF-mission win pays 0.2 (w10_ep00023: the fp-ring net parked the
-# fellowship at Hollin for 20 turns and militarized because the
-# profile-blind terminal paid +1.0 for the military win — the 1.140
-# profile-pure SHAPING was being out-voted 5-10x by the terminal).
-# Losses stay -1 in full (losing off-mission is still losing).
+# HOW the game was won.  On-mission victory keeps the full +/-1; an
+# OFF-mission win pays the _OFFMISSION_* fraction; losses stay -1 in
+# full.
 _PROFILE_ON_MISSION = {
     ('fp', 'ring'): ('ring_destroyed',),
     ('fp', 'military'): ('military',),
@@ -15651,11 +18933,7 @@ _PROFILE_ON_MISSION = {
 
 
 # 1.225b (USER 2026-08-03 "zero off mission for fp but keep it for
-# shadow"): under the focus run, fp_ring was chasing military wins in
-# 21% of games — the off-mission +0.2 was the only jackpot INSIDE the
-# search horizon while the ring win sits far outside it.  FP now gets
-# ZERO for off-mission wins; Shadow keeps 0.2 (a corruption-profile
-# Shadow stumbling into a military win still denied FP the game).
+# shadow"): FP gets ZERO for off-mission wins; Shadow keeps 0.2.
 _OFFMISSION_FP = float(os.environ.get('WOTR_OFFMISSION_FP', '0.0')
                        or 0.0)
 _OFFMISSION_SH = float(os.environ.get('WOTR_OFFMISSION_SH', '0.2')
@@ -15737,6 +19015,11 @@ def _terminal_for(side_tag: str, profile, victory_type, won: bool,
             default 0.7 -> best-case loss -0.30, USER 2026-08-02);
             final_state None (state unavailable at the call site)
             degrades to the old flat -1.0."""
+    from reward_contract import uses_winloss, current_contract, PROFILE, profile_terminal
+    if current_contract() == PROFILE:
+        return profile_terminal(side_tag, profile, victory_type, won)
+    if uses_winloss():
+        return 1.0 if won else -1.0
     if won:
         return float(_profile_terminal(1.0, side_tag, profile,
                                        victory_type))
@@ -15744,12 +19027,6 @@ def _terminal_for(side_tag: str, profile, victory_type, won: bool,
         return -1.0
     return -1.0 + _TERM_CLOSENESS * _closeness_to_victory(
         side_tag, profile, final_state)
-
-
-
-
-
-
 
 
 def _auto_enter_mordor(state) -> bool:
@@ -15803,15 +19080,12 @@ def _auto_enter_mordor(state) -> bool:
         if dist is None or dist > f.progress:
             continue
         try:
-            # DECLARE only — the fellowship sits at the gateway
-            # declared; the driver runs _check_mordor_entry AFTER the
-            # declaration opportunity IN THE SAME turn start (USER
-            # FINAL 2026-08-16 — never inside this action, never a
-            # full-turn wait).
-            game_logic.declare_fellowship(state, region=gw)
-            # 2026-07-20c: trace-visible (the w5_g2 T9 declare was a
-            # silent unrecorded state jump attributed to the next
-            # recorded action — the auditor and the user must SEE it)
+            # DECLARE only - the driver runs _check_mordor_entry AFTER the
+            # declaration opportunity IN THE SAME turn start (USER FINAL
+            # 2026-08-16).
+            _execute_action_inner(state, Action(-1, 'fellowship_declare', {'region': gw}))
+            # Trace-visible (2026-07-20c): the auditor and the user must
+            # SEE the auto-declare.
             try:
                 from game_trace import emit_annotation
                 emit_annotation(state, 'auto_declare_gateway',
@@ -15822,8 +19096,6 @@ def _auto_enter_mordor(state) -> bool:
         except Exception:
             return False
     return False
-
-
 
 
 # ===================================================================
@@ -15869,6 +19141,12 @@ def _game_stats_finalize(state, ep_meta) -> dict:
         return sorted(out)
     return {
         'profiles': dict(PLAYER_PROFILES),
+        'reward_contract': ep_meta.get('reward_contract'),
+        'ai_policy_contract': ep_meta.get('ai_policy_contract'),
+        'observation_contract': ep_meta.get('observation_contract'),
+        'action_encoding_contract': ep_meta.get('action_encoding_contract'),
+        'forced_transitions': dict(ep_meta.get('forced_transitions') or {}),
+        'checkpoint_ids': dict(ep_meta.get('checkpoint_ids') or {}),
         'turns': ep_meta.get('turns', 0),
         'winner': ep_meta.get('winner'),
         'victory_type': ep_meta.get('victory_type'),
@@ -15884,6 +19162,8 @@ def _game_stats_finalize(state, ep_meta) -> dict:
         'separations': list(ep_meta.get('separations', [])),
         'eye_allocs': list(ep_meta.get('eye_allocs', [])),
         'trace_path': ep_meta.get('trace_path'),
+        # 1.259: 'fp'/'sh' when a frozen opponent played that side
+        'frozen_side': ep_meta.get('frozen_side'),
     }
 
 
@@ -15908,14 +19188,10 @@ def _apply_axis_outcomes(state, winner, vtype, outcome_fp, outcome_sh,
             if PLAYER_PROFILES.get('sh') == 'military':
                 outcome_sh = 2.0 * min(
                     _vp_ax.get('shadow', 0) / 10.0, 1.0) - 1.0
-        # 1.145: ring/corruption profiles — a WON off-mission terminal
-        # is scaled to 0.2*base ('ring assaults Mordor' VP-grab leak,
-        # w10_ep00023) without flipping to a loss (the run-15 -1.0
-        # override is superseded).  Review P1 (2026-07-27): the W10 B1
-        # comment claimed _profile_terminal "already" did this, but it
-        # had ZERO call sites — the scaling must be applied HERE.
-        # Winner-gated: timeout targets are bootstrapped (possibly
-        # positive) truncation values, never "wins" to scale.
+        # 1.145: ring/corruption profiles - a WON off-mission terminal is
+        # scaled via _profile_terminal (review P1 2026-07-27).  Winner-
+        # gated: timeout targets are bootstrapped truncation values,
+        # never "wins" to scale.
         if winner == 'fp' and outcome_fp is not None \
                 and PLAYER_PROFILES.get('fp') not in (None, 'military'):
             outcome_fp = _profile_terminal(
@@ -15979,14 +19255,17 @@ def _search_stats_payload(visit_info):
         if 'term_frac' in visit_info:
             ss['tf'] = np.asarray(visit_info['term_frac'],
                                   dtype=np.float16)
-        # solver proof marks (LAB 2026-08-09, P-A extension): stored
-        # so TRAINING targets can reproduce the proof-forced pi the
-        # play side used — proven-win one-hots are the exact,
-        # terminal-grounded sharpening 1.230 sanctions, and they were
-        # previously invisible to the trainer (payload lacked pv)
+        # solver proof marks (LAB 2026-08-09, P-A extension): stored so
+        # TRAINING targets reproduce the proof-forced pi the play side
+        # used (proven-win one-hots are the 1.230-sanctioned sharpening).
         if 'proven' in visit_info:
             ss['pv'] = np.asarray(visit_info['proven'],
                                   dtype=np.int8)
+        # Profile proofs require the exact utility, not only board W/L.
+        # Carry the same values the live selector received into replay.
+        if 'proven_value' in visit_info:
+            ss['pvv'] = np.asarray(visit_info['proven_value'],
+                                   dtype=np.float32)
         # forced-playout counts (task 14 FIX 3): stored so the
         # trainer's visit_tf target applies the SAME earned-visits
         # discount the play side used
@@ -16004,12 +19283,173 @@ def _search_stats_payload(visit_info):
             if 'phi' in visit_info:
                 ss['ph'] = np.asarray(visit_info['phi'],
                                       dtype=np.float16)
+        from selector_contract import copy_evidence
+        from reward_contract import uses_predecision
+        if uses_predecision() or 'selector_contract' in visit_info:
+            ss.update(copy_evidence(visit_info))
         return ss, float(visit_info['regret'])
     except Exception:
+        from reward_contract import uses_predecision
+        if uses_predecision():
+            raise
         return None, None
 
 
+def _trace_state_row(tracer, state, ctx):
+    """SPEP-3: side-less snapshot row.  The turn-start engine steps
+    (Balrog pending / declare / Mordor entry / action rolls) mutate
+    the state BETWEEN decision rows, so the trace-side collectors
+    paired the turn's first decisions with a stale snapshot: the
+    pre-roll menu is empty, so the OPS_V2 collector skew-dropped the
+    turn's first FP decision EVERY turn, and entry-turn eye samples
+    paired with a pre-entry state.  A 'turn_state' row re-anchors the
+    pre-state; side None so neither training stream samples it."""
+    if tracer is None:
+        return
+    from types import SimpleNamespace
+    tracer.record_action(state, None, SimpleNamespace(
+        action_type='turn_state', params={'ctx': str(ctx)}, die_idx=-1))
+
+
+def _phase_row_reward(state, side, action, last_post, mil_bank,
+                      pre_stats) -> float:
+    """SPEP-7 one-implementation: phase rows (hand-limit discard /
+    declare / eye allocation) earn the SAME per-row interval reward
+    the trained stream (run_td_v33loop._replay_reward_stream) charges
+    them - the episode stream recorded literal 0.0, so the two 'twin'
+    streams summed differently (the per-call SH urgency constants
+    scaled with row count only on the trained side).  Same contract
+    as the main loop's step: split, bank military, pay the bank only
+    on a military-class action, advance the side's interval anchor."""
+    axis9, mil9 = _compute_step_reward_split(pre_stats, state, side)
+    mil_bank[side] = mil_bank.get(side, 0.0) + mil9
+    reward = axis9
+    if _is_military_action(action.action_type, action.params, None) \
+            and abs(mil_bank[side]) > 1e-9:
+        reward += mil_bank[side]
+        mil_bank[side] = 0.0
+    last_post[side] = _reward_stats(state)
+    return reward
+
+
+def _decision_context(state, side, tracer=None, phase=None, net=None):
+    """Capture what search could see, before execution changes the state.
+
+    The saved state also permits policy-menu reconstruction without guessing
+    from the previous trace row. Phase flags must match the search input.
+    """
+    from reward_contract import current_contract
+    old = getattr(state, phase, False) if phase else None
+    try:
+        if phase:
+            setattr(state, phase, True)
+        context = {'contract': current_contract(),
+                   'encoding': encode_state(state, side).copy(),
+                   'reward_stats': _reward_stats(state),
+                   'potential': (1 if side == Side.FREE_PEOPLES else -1)
+                                * _profile_shaping(state)}
+        if tracer is not None and net is not None:
+            # Save the behavior net's prediction now. A future dashboard
+            # must not call today's newest checkpoint historical credit.
+            raw_value = (_eval_forward_many(net, [context['encoding']])[0]
+                         + context['potential'])
+            from reward_contract import uses_predecision
+            context['raw_value'] = raw_value
+            context['value'] = (float(np.clip(raw_value, -1.0, 1.0))
+                                if uses_predecision() else raw_value)
+            if not np.isfinite(raw_value):
+                raise ValueError('Nonfinite pre-decision value prediction')
+        if tracer is not None:
+            from game_trace import snapshot_state
+            context['state'] = snapshot_state(state)
+        return context
+    finally:
+        if phase:
+            setattr(state, phase, old)
+
+
+def _save_failed_episode(capture, config, error):
+    """Retain committed rows and diagnostic failure state, never a fake action."""
+    tracer = capture.get('tracer')
+    if tracer is None:
+        return
+    import traceback
+    from game_trace import snapshot_state
+    from reward_contract import current_contract
+    detail = '%s: %s' % (type(error).__name__, error)
+    tracer.meta['source_errors'].append({
+        'code': 'episode_exception', 'step': len(tracer.steps), 'detail': detail})
+    if _SEARCH_FAILURE_DIAGNOSTIC is not None:
+        # Diagnostic metadata is never an executed action or training row.
+        try:
+            tracer.meta['search_failure'] = copy.deepcopy(_SEARCH_FAILURE_DIAGNOSTIC)
+        except Exception as diagnostic_error:
+            tracer.meta['source_errors'].append({
+                'code': 'search_failure_capture_copy_failed', 'step': len(tracer.steps),
+                'detail': '%s: %s' % (type(diagnostic_error).__name__, diagnostic_error)})
+    # save() abandons the uncommitted action buffer. Keep actual chance
+    # observations separately as diagnostics, never as committed rows.
+    try:
+        tracer.meta['failure_annotations'] = copy.deepcopy(
+            getattr(tracer, '_ann_buffer', []))
+    except Exception as annotation_error:
+        tracer.meta['source_errors'].append({
+            'code': 'failure_annotations_failed', 'step': len(tracer.steps),
+            'detail': '%s: %s' % (type(annotation_error).__name__, annotation_error)})
+    state = capture.get('state')
+    if state is not None:
+        try:
+            # This is diagnostic metadata, not an executed decision or a
+            # trustworthy post-action training row. Preserve partial mutation.
+            tracer.meta['failure_state_attributes'] = sorted(vars(state))
+            tracer.meta['failure_state'] = snapshot_state(state)
+        except Exception as snapshot_error:
+            tracer.meta['source_errors'].append({
+                'code': 'failure_snapshot_failed', 'step': len(tracer.steps),
+                'detail': '%s: %s' % (type(snapshot_error).__name__, snapshot_error)})
+    try:
+        tracer.save(status='error', error=detail,
+                    error_traceback=''.join(traceback.format_exception(error)),
+                    winner=None, victory_type=None, outcome_fp=None,
+                    reward_contract=current_contract(), profiles=dict(PLAYER_PROFILES),
+                    checkpoint_ids=dict(config.get('checkpoint_ids') or {}),
+                    **({'frozen_side': config['frozen_side']}
+                       if config.get('frozen_side') in ('fp', 'sh') else {}))
+    except Exception as save_error:
+        # Preserve the original execution/search exception and expose the
+        # secondary I/O error. A failed save must never become a played game.
+        error.add_note('Failed to preserve episode trace %s: %s: %s' % (
+            tracer.path, type(save_error).__name__, save_error))
+
+
 def _run_single_episode(fp_net, sh_net, config: dict) -> dict:
+    """Run one episode, retaining failures and restoring temporary globals."""
+    global _SEARCH_FAILURE_DIAGNOSTIC
+    _SEARCH_FAILURE_DIAGNOSTIC = None
+    import game_trace
+    previous_vp = game_logic.SHADOW_VP_VICTORY
+    previous_tracer = game_trace.ACTIVE_TRACER
+    capture = {}
+    try:
+        from rng_streams import start_episode, episode_metadata
+        rng_metadata = start_episode(config)
+        result = _run_single_episode_impl(fp_net, sh_net, config, _failure_capture=capture)
+        if rng_metadata is not None:
+            result['rng_contract'] = rng_metadata['contract']
+            result['rng_episode'] = episode_metadata()
+            if isinstance(result.get('game_stats'), dict):
+                result['game_stats']['rng_contract'] = rng_metadata['contract']
+                result['game_stats']['rng_episode'] = episode_metadata()
+        return result
+    except Exception as error:
+        _save_failed_episode(capture, config, error)
+        raise
+    finally:
+        game_logic.SHADOW_VP_VICTORY = previous_vp
+        game_trace.ACTIVE_TRACER = previous_tracer
+
+
+def _run_single_episode_impl(fp_net, sh_net, config: dict, *, _failure_capture=None) -> dict:
     """Run a single self-play episode and return trajectory data.
 
     Args:
@@ -16020,12 +19460,15 @@ def _run_single_episode(fp_net, sh_net, config: dict) -> dict:
         states, sides, rewards, visit_dists, action_encs,
         outcome_fp, turns, winner, victory_type
     """
+    from reward_contract import current_contract, PROFILE, validate_net_profile
+    if current_contract() == PROFILE:
+        for tag, net in (('fp', fp_net), ('sh', sh_net)):
+            validate_net_profile(net, tag, PLAYER_PROFILES.get(tag))
     _ep_stats = {'eye_allocs': [], 'separations': []}
-    # leak hygiene (USER 2026-07-30 hunt): the single-shot tree-reuse
-    # cache must NEVER survive an episode boundary — a stale subtree
-    # carries the PREVIOUS game's profile-valued Q estimates (the sig
-    # guard makes a cross-game hit near-impossible, but the class is
-    # removed outright here)
+    _forced_counts = {}
+    # leak hygiene (USER 2026-07-30): the single-shot tree-reuse cache
+    # never survives an episode boundary (a stale subtree carries the
+    # PREVIOUS game's profile-valued Q estimates).
     _TREE_CACHE['child'] = None
     _TREE_CACHE['sig'] = None
     # 1.142: per-side interval anchors - each side's step reward
@@ -16042,24 +19485,70 @@ def _run_single_episode(fp_net, sh_net, config: dict) -> dict:
     # Turn 1 draw phase: each player draws 1 Character + 1 Strategy card
     # (next_turn handles turns 2+; without this, turn 1 was played
     # cardless — human logs show both players drawing at turn 1 start)
+    _initial_source_errors = []
+    _initial_draw_error = None
     for _side in (Side.FREE_PEOPLES, Side.SHADOW):
+        if _initial_draw_error is not None:
+            break
         for _deck in ('character', 'strategy'):
             try:
                 game_logic.draw_event_card(state, _side, _deck)
-            except Exception:
-                pass
+            except Exception as exc:
+                # The recorder is created below. Retain this failure now
+                # so its initial snapshot cannot conceal a missing draw.
+                error = {
+                    'code': 'initial_draw_failed', 'step': 0,
+                    'detail': '%s %s: %s: %s' % (
+                        _side.name, _deck, type(exc).__name__, exc)}
+                _initial_source_errors.append(error)
+                _initial_draw_error = exc
+                import state_invariants
+                state_invariants.VIOLATIONS.append(error)
+                break
 
     max_turns = config.get('max_turns', 100)
+    max_turn_decisions = config.get('max_turn_decisions', 10000)
+    if type(max_turn_decisions) is not int or max_turn_decisions < 1:
+        raise ValueError('max_turn_decisions must be a positive integer')
     mcts_sims = config.get('mcts_sims', 400)
     shadow_vp = config.get('shadow_vp', 10)
     bonus_sims = config.get('bonus_sims', 0)
+    # 1.259 frozen-opponent anchor: the side played by the FROZEN net
+    # pair ('fp'/'sh'); its rows are stamped and never trained on
+    _frozen9 = config.get('frozen_side')
+    if _frozen9 not in ('fp', 'sh'):
+        _frozen9 = None
 
     # Optional game trace recording (replayable in the GUI)
     tracer = None
     if config.get('trace_path'):
         from game_trace import TraceRecorder
         tracer = TraceRecorder(config['trace_path'])
+        if _failure_capture is not None:
+            _failure_capture.update(tracer=tracer, state=state)
+        from ai_policies import POLICY_VERSION
+        tracer.meta['ai_policy_contract'] = POLICY_VERSION
+        if _OPPONENT_POLICY_MODE != 'legacy_puct':
+            tracer.meta['search_opponent_policy'] = _OPPONENT_POLICY_MODE
+            tracer.meta['search_opponent_policy_epsilon'] = _OPPONENT_POLICY_EPSILON
+        from rng_streams import episode_metadata
+        rng_metadata = episode_metadata()
+        if rng_metadata is not None:
+            tracer.meta['rng_contract'] = rng_metadata['contract']
+            tracer.meta['rng_episode'] = rng_metadata
+        tracer.meta['source_errors'].extend(_initial_source_errors)
         tracer.record_initial(state)
+
+    if _initial_draw_error is not None:
+        # Retain the partial initialization, then stop before any further
+        # draw, search or action can conceal the failed deal.
+        raise _initial_draw_error
+
+    def fail_episode(code, detail):
+        if tracer is not None:
+            tracer.meta['source_errors'].append(
+                {'code': code, 'detail': detail, 'step': len(tracer.steps)})
+        raise RuntimeError('%s: %s' % (code, detail))
 
     # Override shadow VP threshold
     _orig_vp = game_logic.SHADOW_VP_VICTORY
@@ -16131,55 +19620,38 @@ def _run_single_episode(fp_net, sh_net, config: dict) -> dict:
                 num_simulations=max(20, mcts_sims // 4),
                 temperature=d_temp, add_noise=_use_noise)
             if d_action is None or d_action.action_type != 'discard_card':
-                # Safety valve — never stall the game on a stuck phase.
-                # DETERMINISTIC and conserving (2026-08-15): this used
-                # to `random.choice` the card and drop it into NO pile,
-                # which both annihilated it and made the episode depend
-                # on the global RNG stream. It fires only when MCTS
-                # failed to return a discard at all, so it is never the
-                # decision path — but it must still be a legal discard.
-                _h = state.hands[d_side].hand
-                if len(_h) > game_logic.HAND_LIMIT:
-                    game_logic.discard_hand_card(state, d_side, _h[-1])
-                else:
-                    state.pending_discard = None
-                continue
-            vec_d = encode_state(state, d_side)
+                fail_episode('invalid_discard_selection',
+                             'hand-limit decision did not select a discard')
+            context_d = _decision_context(state, d_side, tracer,
+                net=fp_net if d_side == Side.FREE_PEOPLES else sh_net)
+            vec_d = context_d['encoding']
             enc_d = encode_action(d_action, state, d_side)
+            # SPEP-7: phase rows earn the shared interval term (twin
+            # of _replay_reward_stream's per-row charge)
+            _pre9d = _last_post.get(d_side) or _reward_stats(state)
             try:
                 _traced_execute(state, d_action, tracer)
-            except Exception:
-                state.pending_discard = None
-                break
-            trajectory.append((vec_d, d_side, 0.0, d_visit, enc_d))
+            except Exception as discard_error:
+                fail_episode('discard_action_failed',
+                             '%s: %s' % (type(discard_error).__name__, discard_error))
+            _rw9d = _phase_row_reward(state, d_side, d_action,
+                                      _last_post, _mil_bank, _pre9d)
+            trajectory.append((vec_d, d_side, _rw9d, d_visit, enc_d))
             if tracer:
                 _ss9d, _rg9d = _search_stats_payload(d_visit)
                 tracer.record_action(state, d_side, d_action,
-                                     search_stats=_ss9d, regret=_rg9d)
+                                     search_stats=_ss9d, regret=_rg9d,
+                                     decision_context=context_d)
 
-        # Phase 2 pre-step.  FINAL RULING (USER 2026-08-16): Mordor
-        # entry is TURN-START ONLY and POSITIONAL, and the DECLARATION
-        # OPPORTUNITY COMES FIRST - the entry check now runs AFTER the
-        # Fellowship phase below (the old order, entry check first,
-        # was the day-one bug: a fellowship declared onto a gate
-        # waited a full turn to enter).
-        if not state.fellowship.mordor_entered:
-            # Balrog of Moria STATIONARY trigger (almanac C17, second
-            # bullet): the Fellowship remaining stationary IN Moria at
-            # the start of a turn also lets the Shadow discard the
-            # table card to draw a Hunt tile.  Same pending shape and
-            # 'balrog_declare_draw' handler branch as the declaration
-            # trigger; it resolves in the main action loop below, i.e.
-            # AFTER the FP Fellowship phase (declaration first, per the
-            # almanac).  LEARNED PATH ONLY (the helper self-gates on
-            # combat.FINAL_HITS_HOOK is None) so the certified teacher
-            # never stalls on a fresh interactive pending.  The trigger
-            # check itself stays BEFORE the declaration (stationary
-            # means no declaration away has happened yet).
-            _balrog_stationary_turn_start(state)
-        # USER RULING 2026-07-20c: declarations are TURN-START ONLY —
-        # the gateway auto-declare fires HERE (Fellowship phase), never
-        # mid-turn (w5_g2 T9 silent declare removed).
+        if getattr(state, 'pending_discard', None) is not None:
+            fail_episode('discard_decision_limit',
+                         'opening hand-limit decision exceeded 12 discards')
+
+        # The declaration resolves before Balrog; begin_fellowship_tail
+        # handles the stationary case after this phase (Almanac C17).
+        # USER RULING 2026-07-20c: declarations are TURN-START ONLY - the
+        # gateway auto-declare fires HERE (Fellowship phase), never
+        # mid-turn.
         _auto_declared9 = False
         if not state.fellowship.mordor_entered:
             _auto_declared9 = _auto_enter_mordor(state)
@@ -16189,51 +19661,150 @@ def _run_single_episode(fp_net, sh_net, config: dict) -> dict:
             if declare_actions:
                 state._declare_phase = True
                 try:
-                    # USER 2026-07-18 (Ithilien/Dunland declare
-                    # ping-pong): NO root noise on the declare pick —
-                    # declare roots are value-flat (every child ~= same
-                    # eval), so Dirichlet spikes + early-turn
-                    # temperature sampled 1-step back-and-forth
-                    # declares instead of the gateway push the prior
-                    # already encodes (v22: minas morgul 0.49 /
-                    # morannon 0.26 from north ithilien).
-                    # 1.142c (USER 2026-08-02 'declaring at rivendell
-                    # and resetting progress for no reason'): NOISE-
-                    # FREE means temperature too.  add_noise=False
-                    # killed the Dirichlet spikes but fp_temp (0.6
-                    # turns 1-3) kept SAMPLING the value-flat declare
-                    # children — 3.61 declares/game vs human 1.9, 192
-                    # progress-burning rivendell declares in 8 batches,
-                    # all at t2-t3, reward-negative every one.  Argmax.
+                    # USER 2026-07-18 + 1.142c (USER 2026-08-02): the
+                    # declare pick is NOISE-FREE - no root noise AND
+                    # temperature 0 (declare roots are value-flat;
+                    # Dirichlet spikes and early-turn temperature sampled
+                    # progress-burning back-and-forth declares).  Argmax.
                     dec_action, dec_visit = mcts_action_with_policy(
                         state, Side.FREE_PEOPLES, fp_net, sh_net,
                         num_simulations=max(30, mcts_sims // 3),
                         temperature=0.0, add_noise=False)
                 finally:
                     state._declare_phase = False
+                if dec_action is None or dec_action.action_type not in (
+                        'fellowship_declare', 'pass', 'declare_decline'):
+                    fail_episode('invalid_declaration_selection', 'Fellowship declaration choice is required')
                 if dec_action and dec_action.action_type == 'fellowship_declare':
-                    vec = encode_state(state, Side.FREE_PEOPLES)
+                    context_dec = _decision_context(
+                        state, Side.FREE_PEOPLES, tracer, '_declare_phase', fp_net)
+                    vec = context_dec['encoding']
                     enc = encode_action(dec_action, state, Side.FREE_PEOPLES)
+                    _pre9e = _last_post.get(Side.FREE_PEOPLES) \
+                        or _reward_stats(state)
                     try:
                         _traced_execute(state, dec_action, tracer)
-                    except Exception:
-                        pass
-                    trajectory.append((vec, Side.FREE_PEOPLES, 0.0, dec_visit, enc))
+                    except Exception as declaration_error:
+                        fail_episode('declaration_action_failed', str(declaration_error))
+                    _rw9e = _phase_row_reward(
+                        state, Side.FREE_PEOPLES, dec_action,
+                        _last_post, _mil_bank, _pre9e)
+                    trajectory.append((vec, Side.FREE_PEOPLES, _rw9e,
+                                       dec_visit, enc))
                     if tracer:
                         _ss9e, _rg9e = _search_stats_payload(dec_visit)
                         tracer.record_action(state, Side.FREE_PEOPLES,
                                              dec_action,
                                              search_stats=_ss9e,
-                                             regret=_rg9e)
+                                             regret=_rg9e,
+                                             decision_context=context_dec)
+                elif dec_action is not None and dec_visit is not None:
+                    # SPEP-8 (session-34 absence doctrine; 1.230
+                    # offers the declare EVERY turn start): the
+                    # DECLINE is the decision - record the searched
+                    # pick as a declare-family row with its search
+                    # stats; nothing executes.
+                    context_dec = _decision_context(
+                        state, Side.FREE_PEOPLES, tracer, '_declare_phase', fp_net)
+                    vec = context_dec['encoding']
+                    enc = encode_action(dec_action, state,
+                                        Side.FREE_PEOPLES)
+                    _pre9e = _last_post.get(Side.FREE_PEOPLES) \
+                        or _reward_stats(state)
+                    _rw9e = _phase_row_reward(
+                        state, Side.FREE_PEOPLES, dec_action,
+                        _last_post, _mil_bank, _pre9e)
+                    trajectory.append((vec, Side.FREE_PEOPLES, _rw9e,
+                                       dec_visit, enc))
+                    if tracer:
+                        _ss9e, _rg9e = _search_stats_payload(dec_visit)
+                        tracer.record_action(
+                            state, Side.FREE_PEOPLES,
+                            Action(die_idx=-1,
+                                   action_type='declare_decline',
+                                   params={}),
+                             search_stats=_ss9e, regret=_rg9e,
+                             decision_context=context_dec)
 
-        # Mordor entry check - AFTER the declaration opportunity, same
-        # turn start (USER FINAL 2026-08-16): a gate position reached
-        # by a fresh declaration (auto or learned), standing from an
-        # earlier one, or by a REVEAL enters NOW.  _check_mordor_entry
-        # is positional and idempotent - the single answerer for all
-        # three triggers.
-        if not state.fellowship.mordor_entered:
-            game_logic._check_mordor_entry(state)
+        game_logic.begin_fellowship_tail(state)
+        if (getattr(state, 'pending_card_option', None) or {}).get('card_name') == 'Balrog of Moria':
+            _trace_state_row(tracer, state, 'balrog_pending')
+        _trace_state_row(tracer, state, 'fellowship_tail')
+        for _tail_step in range(128):
+            if not getattr(state, '_fellowship_tail_phase', False):
+                break
+            tail_side = _pending_decision_side(state)
+            if tail_side is None:
+                fail_episode('unfinished_fellowship_tail', 'Pending Fellowship effects have no decision owner')
+            tail_net = fp_net if tail_side == Side.FREE_PEOPLES else sh_net
+            tail_policy = get_ai_policy(state, tail_side)
+            tail_forced = tail_policy.forced_reason
+            tail_context = _decision_context(state, tail_side, tracer,
+                                            net=None if tail_forced else tail_net)
+            tail_visit = None
+            if tail_forced:
+                tail_action = tail_policy.actions[0]
+                _forced_counts[tail_forced] = _forced_counts.get(tail_forced, 0) + 1
+            else:
+                tail_action, tail_visit = mcts_action_with_policy(
+                    state, tail_side, fp_net, sh_net,
+                    num_simulations=max(30, mcts_sims // 3),
+                    temperature=fp_temp if tail_side == Side.FREE_PEOPLES else sh_temp,
+                    add_noise=_use_noise)
+            if tail_action is None or tail_action not in get_ai_actions(clone_state(state), tail_side):
+                fail_episode('invalid_fellowship_tail_selection', 'A legal Fellowship effect choice is required')
+            pre_tail = _last_post.get(tail_side) or _reward_stats(state)
+            tail_enc = encode_action(tail_action, state, tail_side)
+            try:
+                _traced_execute(state, tail_action, tracer)
+            except Exception as tail_error:
+                fail_episode('fellowship_tail_action_failed', str(tail_error))
+            if not tail_forced:
+                tail_reward = _phase_row_reward(state, tail_side, tail_action,
+                                                _last_post, _mil_bank, pre_tail)
+                trajectory.append((tail_context['encoding'], tail_side, tail_reward,
+                                   tail_visit, tail_enc))
+            if tracer:
+                tail_stats, tail_regret = _search_stats_payload(tail_visit)
+                tracer.record_action(state, tail_side, tail_action,
+                                     search_stats=tail_stats, regret=tail_regret,
+                                     decision_context=tail_context, forced_policy=tail_forced)
+            game_logic.resume_fellowship_tail(state)
+            _trace_state_row(tracer, state, 'fellowship_tail_resume')
+        if getattr(state, '_fellowship_tail_phase', False):
+            fail_episode('unfinished_fellowship_tail', 'Fellowship effects exceeded 128 decisions')
+        if game_logic.should_game_end(game_logic.check_all_victory_conditions(state), end_of_turn=False):
+            game_over = True
+            break
+        if state.pending_guide_change is not None:
+            context_guide = _decision_context(state, Side.FREE_PEOPLES, tracer, net=fp_net)
+            guide_action, guide_visit = mcts_action_with_policy(
+                state, Side.FREE_PEOPLES, fp_net, sh_net,
+                num_simulations=max(30, mcts_sims // 3),
+                temperature=fp_temp, add_noise=_use_noise)
+            if guide_action is None or guide_action.action_type != 'choose_guide':
+                fail_episode('invalid_guide_selection', 'Fellowship guide choice is required')
+            pre_guide = _last_post.get(Side.FREE_PEOPLES) or _reward_stats(state)
+            guide_enc = encode_action(guide_action, state, Side.FREE_PEOPLES)
+            try:
+                _traced_execute(state, guide_action, tracer)
+            except Exception as guide_error:
+                fail_episode('guide_action_failed', str(guide_error))
+            if state.pending_guide_change is not None:
+                fail_episode('unfinished_guide_selection', 'Guide obligation remained after selection')
+            guide_reward = _phase_row_reward(state, Side.FREE_PEOPLES, guide_action,
+                                            _last_post, _mil_bank, pre_guide)
+            trajectory.append((context_guide['encoding'], Side.FREE_PEOPLES,
+                               guide_reward, guide_visit, guide_enc))
+            if tracer:
+                guide_stats, guide_regret = _search_stats_payload(guide_visit)
+                tracer.record_action(state, Side.FREE_PEOPLES, guide_action,
+                                     search_stats=guide_stats, regret=guide_regret,
+                                     decision_context=context_guide)
+        # SPEP-3: the eye decision below must pair with the
+        # POST-declare/POST-entry state (entry-turn eye samples used
+        # to pair 8 dims stale)
+        _trace_state_row(tracer, state, 'post_entry')
 
         # Shadow eye allocation via MCTS (before dice roll per WOTR rules)
         shadow_unused = [d for d in state.dice.get(Side.SHADOW, [])
@@ -16241,67 +19812,60 @@ def _run_single_episode(fp_net, sh_net, config: dict) -> dict:
         if len(shadow_unused) > 0:
             state._eye_allocation_phase = True
             try:
-                # 1.142 REVISED (USER 2026-07-18, baseline_w9_g3 4-eyes
-                # T1): NO root noise on the eye-allocation decision AT
-                # ALL — the old split (noisy pick, clean re-searched
-                # target) still EXECUTED noise-spiked counts.  One clean
-                # search now serves both the played action and the
+                # 1.142 REVISED (USER 2026-07-18) + 1.142c: NO root noise
+                # and temperature 0 on the eye-allocation decision - one
+                # clean search serves both the played action and the
                 # policy target.
-                # 1.142c: temperature=0 — same fix as the declare
-                # pick above; sh_temp sampling was the residual noise
-                # channel 1.142's add_noise=False left open
                 eye_action, eye_visit = mcts_action_with_policy(
                     state, Side.SHADOW, fp_net, sh_net,
                     num_simulations=mcts_sims,
                     temperature=0.0, add_noise=False)
             finally:
                 state._eye_allocation_phase = False
-            if eye_action is not None \
-                    and eye_action.action_type != 'eye_allocate':
-                # never silent (2026-07-27): a non-eye result here was
-                # the tree-reuse phase-flag hijack — sig now separates
-                # phase states, so any recurrence is a regression
-                try:
-                    import state_invariants as _si9e
-                    _si9e.VIOLATIONS.append({
-                        'code': 'eye_phase_hijacked',
-                        'ctx': 'T%s' % getattr(state, 'turn', '?'),
-                        'detail': 'eye-phase search returned %s'
-                                  % eye_action.action_type})
-                except Exception:
-                    pass
+            if eye_action is None or eye_action.action_type != 'eye_allocate':
+                fail_episode('invalid_eye_selection', 'Shadow Hunt allocation choice is required')
             if eye_action and eye_action.action_type == 'eye_allocate':
                 n_eyes = eye_action.params.get('count', 0)
                 _ep_stats['eye_allocs'].append(int(n_eyes))
-                state_vec = encode_state(state, Side.SHADOW)
+                context_eye = _decision_context(
+                    state, Side.SHADOW, tracer, '_eye_allocation_phase', sh_net)
+                state_vec = context_eye['encoding']
                 action_enc = encode_action(eye_action, state, Side.SHADOW)
-                if n_eyes > 0:
-                    indices = [i for i, d in enumerate(state.dice[Side.SHADOW])
-                               if not d.used][:n_eyes]
-                    game_logic.allocate_eyes(state, n_eyes, indices=indices)
-                trajectory.append((state_vec, Side.SHADOW, 0.0,
+                _pre9f = _last_post.get(Side.SHADOW) \
+                    or _reward_stats(state)
+                try:
+                    _traced_execute(state, eye_action, tracer)
+                except Exception as eye_error:
+                    fail_episode('eye_action_failed', str(eye_error))
+                _rw9f = _phase_row_reward(state, Side.SHADOW,
+                                          eye_action, _last_post,
+                                          _mil_bank, _pre9f)
+                trajectory.append((state_vec, Side.SHADOW, _rw9f,
                                    eye_visit, action_enc))
                 if tracer:
                     _ss9f, _rg9f = _search_stats_payload(eye_visit)
                     tracer.record_action(state, Side.SHADOW, eye_action,
                                          search_stats=_ss9f,
-                                         regret=_rg9f)
+                                         regret=_rg9f,
+                                         decision_context=context_eye)
 
+        state._eye_allocation_phase = False
         game_logic.roll_action_dice(state, pool=Side.FREE_PEOPLES)
         game_logic.roll_action_dice(state, pool=Side.SHADOW)
+        # SPEP-3: the turn's first action decision must pair with the
+        # ROLLED state (the pre-roll snapshot has an empty menu, so
+        # the delta collector skew-dropped the first FP row per turn)
+        _trace_state_row(tracer, state, 'dice_rolled')
 
         def _unused(side):
             return sum(1 for d in state.dice.get(side, [])
                        if not d.used and d.current is not None)
 
         active = Side.FREE_PEOPLES
-        # F-3 (USER 2026-07-19): 40 was a per-turn DECISION cap, but
-        # battle sub-decisions (cards, allocations, retreats) burn
-        # iterations too — a long siege turn hit the cap mid-battle
-        # and _safe_next_turn abandoned the fight AFTER the garrison
-        # died but BEFORE capture ran (fuzz seed 9133, Lorien). 200
-        # keeps the runaway-loop valve far above any legal turn.
-        for _ in range(200):
+        _empty9 = set()   # MC6: sides whose menu came back empty in a row
+        # Combat can legally last arbitrarily many rounds. A resource guard
+        # is an explicit episode failure, never a substitute for turn completion.
+        for _ in range(max_turn_decisions):
             # Check for pending multi-phase states first
             has_pending = (state.pending_combat is not None or
                            state.pending_hunt is not None or
@@ -16336,19 +19900,36 @@ def _run_single_episode(fp_net, sh_net, config: dict) -> dict:
             _ps0 = _pending_decision_side(state)
             if _ps0 is not None:
                 active = _ps0
-            # USER RULING 2026-07-20c: declarations are TURN-START ONLY
-            # — mid-turn _auto_enter_mordor removed (w5_g2 T9); it now
-            # fires in the Phase-2 Fellowship pre-step.
-            actions = get_legal_actions(state, active)
+            # USER RULING 2026-07-20c: declarations are TURN-START ONLY -
+            # the auto-declare fires in the Phase-2 Fellowship pre-step.
+            _policy_main = get_ai_policy(state, active)
+            actions = list(_policy_main.actions)
             if not actions:
+                # MC6 (rulebook 1681-1683): a side with no legal action
+                # left hands the rest of the round to its opponent, who
+                # executes its remaining actions one after the other;
+                # the round ends only when NEITHER side can act
+                _oth9 = (Side.SHADOW if active == Side.FREE_PEOPLES
+                         else Side.FREE_PEOPLES)
+                _empty9.add(active)
+                if (not has_pending and _oth9 not in _empty9
+                        and _unused(_oth9) > 0):
+                    active = _oth9
+                    continue
                 break
+            _empty9.clear()
 
             temp = fp_temp if active == Side.FREE_PEOPLES else sh_temp
             visit_dist = None
-            action, visit_dist = mcts_action_with_policy(
-                state, active, fp_net, sh_net,
-                num_simulations=mcts_sims, temperature=temp, add_noise=_use_noise,
-                hot_regions=hot_regions, bonus_sims=bonus_sims)
+            _forced_main = _policy_main.forced_reason
+            if _forced_main:
+                action = actions[0]
+                _forced_counts[_forced_main] = _forced_counts.get(_forced_main, 0) + 1
+            else:
+                action, visit_dist = mcts_action_with_policy(
+                    state, active, fp_net, sh_net,
+                    num_simulations=mcts_sims, temperature=temp, add_noise=_use_noise,
+                    hot_regions=hot_regions, bonus_sims=bonus_sims)
             if action is None:
                 break
 
@@ -16370,57 +19951,55 @@ def _run_single_episode(fp_net, sh_net, config: dict) -> dict:
             _mil9 = _is_military_action(action.action_type,
                                         action.params, _die_face9)
 
-            state_vec = encode_state(state, active)
+            context_main = _decision_context(state, active, tracer,
+                net=(None if _forced_main else
+                     fp_net if active == Side.FREE_PEOPLES else sh_net))
+            state_vec = context_main['encoding']
             action_enc = encode_action(action, state, active)
-            # review P2 (2026-07-27): capture the hunt-place phase
-            # BEFORE execution — the hobbit_place executor clears
-            # pending_hunt, so a post-execute read missed the common
-            # single-hobbit case and mislabeled it a chosen separation
+            # capture the hunt-place phase BEFORE execution - the
+            # hobbit_place executor clears pending_hunt (review P2
+            # 2026-07-27)
             _hunt_place9 = bool(
                 state.pending_hunt is not None
                 and (state.pending_hunt or {}).get('phase')
                 == 'hobbit_place')
-            _exec_failed9 = False
             try:
                 _traced_execute(state, action, tracer)
             except Exception as _exec_err:
-                # Rare enumeration/execution mismatch (e.g. stacking after
-                # mid-combat army changes). Recover by consuming the die /
-                # clearing the stuck phase rather than killing the episode
-                # — a raise here used to discard the whole game's data.
-                # Never silent: every recovery is a HARD invariant flag.
+                # Execution can mutate before raising. Neither a fixed nor a
+                # searched failure is a legal pass or safe continuation point.
                 _record_exec_failure(state, action, _exec_err)
-                _recover_from_failed_action(state, action, active)
-                action = Action(die_idx=action.die_idx,
-                                action_type='pass', params={})
-                action_enc = encode_action(action, state, active)
-                # the substituted pass no longer matches the search's
-                # 'played' index — drop the stats for this row
-                _exec_failed9 = True
+                if tracer is not None:
+                    attempted = tracer.meta.setdefault('failure_action', {
+                        'action_type': action.action_type, 'die_idx': action.die_idx,
+                        'params': copy.deepcopy(action.params)})
+                    attempted.update(side=active.name, forced_policy=_forced_main)
+                    tracer.meta['source_errors'].append({
+                        'code': 'forced_action_failed' if _forced_main else 'action_execution_failed',
+                        'step': len(tracer.steps), 'detail': '%s: %s' % (
+                            type(_exec_err).__name__, _exec_err)})
+                raise
 
             # Update hot zone for next MCTS call
             if bonus_sims > 0:
                 hot_regions = _get_hot_regions(action, state)
 
-            _axis9, _milr9 = _compute_step_reward_split(pre, state,
-                                                        active)
-            # 1.143 (USER): military deltas are banked and paid only on
-            # this side's next military-class action.  1.143b flush:
-            # residue at game end is NO LONGER dropped — it lands on
-            # the side's LAST sample after the game loop (a stronghold
-            # captured after the side's last military action used to
-            # leave the -VP nowhere).
-            _mil_bank[active] = _mil_bank.get(active, 0.0) + _milr9
-            step_reward = _axis9
-            if _mil9:
-                step_reward += _mil_bank[active]
-                _mil_bank[active] = 0.0
-            _last_post[active] = _reward_stats(state)
-            trajectory.append((state_vec, active, step_reward, visit_dist, action_enc))
+            if not _forced_main:
+                _axis9, _milr9 = _compute_step_reward_split(pre, state, active)
+                # Fixed transitions leave the learned decision's reward
+                # interval open; their consequences belong to surrounding
+                # learned actions (or the existing terminal tail settlement).
+                _mil_bank[active] = _mil_bank.get(active, 0.0) + _milr9
+                step_reward = _axis9
+                if _mil9:
+                    step_reward += _mil_bank[active]
+                    _mil_bank[active] = 0.0
+                _last_post[active] = _reward_stats(state)
+                trajectory.append((state_vec, active, step_reward, visit_dist, action_enc))
             if action.action_type in ('companion_separate',
                                       'hunt_guide_separate'):
                 # stats fix (USER 2026-07-26): label the three distinct
-                # mechanics — a hunt-casualty hobbit PLACEMENT is not a
+                # mechanics - a hunt-casualty hobbit PLACEMENT is not a
                 # chosen separation, and group separations list all names
                 _grp9s = action.params.get('companions')
                 if _grp9s:
@@ -16431,10 +20010,8 @@ def _run_single_episode(fp_net, sh_net, config: dict) -> dict:
                         _nm9 += ' (hunt-placed)'
                     _ep_stats['separations'].append(_nm9)
             elif action.action_type in ('play_event', 'card_option'):
-                # card-driven separations were invisible in the report
-                # (I Will Go Alone / Breaking of the Fellowship) —
-                # USER caught a crowned-Aragorn game showing no Strider
-                # separation because the card did it
+                # card-driven separations (I Will Go Alone / Breaking of
+                # the Fellowship) are reported too
                 _cn9 = str(action.params.get('card_name', '') or '')
                 _ch9 = (action.params.get('choices') or {})
                 if 'I Will Go Alone' in _cn9 or 'Breaking' in _cn9:
@@ -16442,10 +20019,12 @@ def _run_single_episode(fp_net, sh_net, config: dict) -> dict:
                         _ep_stats['separations'].append(
                             '%s (card: %s)' % (_c9, _cn9 or 'separation'))
             if tracer:
-                _ss9m, _rg9m = ((None, None) if _exec_failed9
+                _ss9m, _rg9m = ((None, None) if _forced_main
                                 else _search_stats_payload(visit_dist))
                 tracer.record_action(state, active, action,
-                                     search_stats=_ss9m, regret=_rg9m)
+                                     search_stats=_ss9m, regret=_rg9m,
+                                     decision_context=context_main,
+                                     forced_policy=_forced_main)
 
             vc = game_logic.check_all_victory_conditions(state)
             # Ring victories end the game immediately; military victory is
@@ -16466,22 +20045,42 @@ def _run_single_episode(fp_net, sh_net, config: dict) -> dict:
                 active = (_ps9 if _ps9 is not None
                           else _post_action_active(state, active, other))
 
+        else:
+            blockers = _turn_end_blockers(state)
+            if blockers:
+                fail_episode('turn_decision_limit',
+                             '%d decisions reached with %s' % (
+                                 max_turn_decisions, ', '.join(blockers)))
+
         if game_over:
             break
-        # Victory Check phase: military victory at end of turn only
-        _end_vc = game_logic.check_all_victory_conditions(state)
-        if game_logic.should_game_end(_end_vc, end_of_turn=True):
-            game_over = True
-            break
+        blockers = _turn_end_blockers(state)
+        if blockers:
+            fail_episode('unfinished_turn', ', '.join(blockers))
         if _safe_next_turn(state):
-            # P0 2026-08-15: rollover corruption hit 12 — immediate
-            # ring victory; never play into a won game
+            # Inactivity precedes the military Victory Check.
             game_over = True
             if tracer:
                 tracer.record_new_turn(state)
             break
         if tracer:
             tracer.record_new_turn(state)
+
+    # Settle the interval after each side's LAST decision.  Opponent
+    # actions and turn-end effects may change VP/corruption before the
+    # game ends; those changes have never reached _mil_bank.  No extra
+    # decision cost is due for this unobserved tail.
+    for _tail_side, _tail_pre in _last_post.items():
+        _tail_axis, _tail_mil = _compute_step_reward_split(
+            _tail_pre, state, _tail_side, include_decision_cost=False)
+        _mil_bank[_tail_side] = _mil_bank.get(_tail_side, 0.0) + _tail_mil
+        for _tail_i in range(len(trajectory) - 1, -1, -1):
+            if trajectory[_tail_i][1] == _tail_side:
+                _tail_row = trajectory[_tail_i]
+                trajectory[_tail_i] = (_tail_row[0], _tail_row[1],
+                                      _tail_row[2] + _tail_axis,
+                                      _tail_row[3], _tail_row[4])
+                break
 
     # 1.143b TERMINAL FLUSH: residual military bank lands on the
     # side's LAST emitted sample (mirrors run_td_v33loop's
@@ -16513,11 +20112,11 @@ def _run_single_episode(fp_net, sh_net, config: dict) -> dict:
                                    vtype, winner == 'fp', state)
         outcome_sh = _terminal_for('sh', PLAYER_PROFILES.get('sh'),
                                    vtype, winner == 'sh', state)
-        # 1.140 (USER): Shadow win-fast decay kept — positive SH
-        # outcomes only (was inside _apply_axis_outcomes, which now
-        # serves the timeout path alone)
+        # 1.140 (USER): Shadow win-fast decay - positive SH outcomes only
+        # (_apply_axis_outcomes serves the timeout path alone)
         try:
-            if PLAYER_PROFILES.get('sh') in ('corruption', 'military') \
+            from reward_contract import uses_predecision
+            if not uses_predecision() and PLAYER_PROFILES.get('sh') in ('corruption', 'military') \
                     and outcome_sh > 0:
                 outcome_sh *= max(0.4, 1.0 - 0.04
                                   * max(0, turn_count - 8))
@@ -16536,32 +20135,45 @@ def _run_single_episode(fp_net, sh_net, config: dict) -> dict:
         vtype = 'timeout'
         outcome_fp = 0.0
         try:
-            with torch.no_grad():
-                xf = torch.from_numpy(np.asarray(
-                    [encode_state(state, Side.FREE_PEOPLES)],
-                    dtype=np.float32)).to(DEVICE)
-                xs = torch.from_numpy(np.asarray(
-                    [encode_state(state, Side.SHADOW)],
-                    dtype=np.float32)).to(DEVICE)
-                outcome_fp = float(np.clip(fp_net(xf).item(), -0.9, 0.9))
-                outcome_sh = float(np.clip(sh_net(xs).item(), -0.9, 0.9))
+            # An explicit absent net retains the untrained timeout control.
+            # A supplied model's failure must never acquire that placeholder.
+            outcome_fp = (0.0 if fp_net is None else float(np.clip(_eval_forward_many(
+                fp_net, [encode_state(state, Side.FREE_PEOPLES)])[0], -0.9, 0.9)))
+            outcome_sh = (0.0 if sh_net is None else float(np.clip(_eval_forward_many(
+                sh_net, [encode_state(state, Side.SHADOW)])[0], -0.9, 0.9)))
         except Exception:
+            from reward_contract import uses_predecision
+            if uses_predecision():
+                raise
             outcome_fp, outcome_sh = 0.0, 0.0
 
     game_logic.SHADOW_VP_VICTORY = _orig_vp
 
     if tracer:
         try:
+            # 1.259: stamp every frozen-side row so EVERY collector
+            # drops it (the trace meta carries the episode-level twin)
+            if _frozen9:
+                _ftag9 = 'FP' if _frozen9 == 'fp' else 'SH'
+                for _st9 in tracer.steps:
+                    if _st9.get('side') == _ftag9:
+                        _st9['frozen_side'] = _frozen9
             # Make the outcome visible in the filename: ep00042.trace.gz
             # -> ep00042_sh_military.trace.gz
             base = tracer.path
             if base.endswith('.trace.gz'):
                 tracer.path = base[:-len('.trace.gz')] + f'_{winner}_{vtype}.trace.gz'
+            from reward_contract import current_contract
             tracer.save(winner=winner, victory_type=vtype, turns=turn_count,
+                        reward_contract=current_contract(),
+                        checkpoint_ids=dict(config.get('checkpoint_ids') or {}),
+                        profiles=dict(PLAYER_PROFILES),
                         mcts_sims=mcts_sims, max_turns=max_turns,
-                        outcome_fp=outcome_fp)
+                        outcome_fp=outcome_fp,
+                        **({'frozen_side': _frozen9} if _frozen9
+                           else {}))
         except Exception as e:
-            print(f"[trace] failed to save {tracer.path}: {e}")
+            raise
         finally:
             import game_trace as _gt
             _gt.ACTIVE_TRACER = None
@@ -16583,52 +20195,58 @@ def _run_single_episode(fp_net, sh_net, config: dict) -> dict:
 
     # --- WIN-AXIS reward alignment (USER, session 29 profiles v2) ---
     # military profiles train on VICTORY POINTS only: outcome =
-    # 2*clip(vp/target) - 1 (an off-axis win - e.g. SH corruption
-    # victory under SH-military - earns whatever its VP say, i.e. a
-    # loss-grade target at low VP).  ring/corruption profiles keep the
-    # standard +/-1 outcome.  Search shaping (_profile_shaping) is
-    # unchanged; this only changes the TRAINING target.
-    #
-    # v3.1 BUG FIX (runs 5-7, user-diagnosed): outcomes must be
-    # DECOUPLED before any axis override.  The trainer derived
-    # outcome_sh = -outcome_fp when unset; the FP-military override
-    # (-1.0 for a 0-VP ring win) handed the SHADOW net +1.0 FOR A GAME
-    # IT LOST - and those are exactly the hunt races, so hunt-heavy
-    # states trained as wins for EVERY SH net (29%/23% of
-    # sh_corruption/sh_military games in run 7).  outcome_sh is now
-    # always explicit from the RAW result; overrides apply per side.
+    # 2*clip(vp/target) - 1; ring/corruption profiles keep +/-1.  Search
+    # shaping is unchanged; only the TRAINING target changes.
+    # v3.1: outcomes are DECOUPLED before any axis override - outcome_sh
+    # is always explicit from the RAW result, never -outcome_fp after an
+    # FP override (a 0-VP ring win must not hand the SHADOW net +1.0 for
+    # a game it lost).
     if outcome_sh is None:
         outcome_sh = -outcome_fp
     # 1.225: decided games are fully labeled by _terminal_for above;
     # _apply_axis_outcomes now serves TRUNCATIONS only (military-axis
     # VP measure over the bootstrap + SH decay on the censored tail)
-    if winner == 'timeout':
+    from reward_contract import uses_predecision, current_contract
+    if winner == 'timeout' and not uses_predecision():
         outcome_fp, outcome_sh = _apply_axis_outcomes(
             state, winner, vtype, outcome_fp, outcome_sh, turn_count)
 
     return {
         'states': states_arr,
+        'ai_policy_contract': __import__('ai_policies').POLICY_VERSION,
+        'observation_contract': OBSERVATION_CONTRACT,
+        'action_encoding_contract': __import__('trace_decisions').ACTION_ENCODING_CONTRACT,
+        'forced_transitions': dict(_forced_counts),
+        'reward_contract': current_contract(),
         'sides': sides_arr,
         'rewards': rewards_arr,
         'visit_dists': visit_dists,
         'action_encs': action_encs,
         'outcome_fp': outcome_fp,
-        # Shadow terminal target: None for decided games (use -outcome_fp);
-        # own-net bootstrap for truncated games
+        # Explicit own-side terminal or bootstrap, under the stated contract.
         'outcome_sh': outcome_sh,
         'turns': turn_count,
         'winner': winner,
         'victory_type': vtype,
+        # 1.259: mirror of the retired parallel learner's
+        # traj['frozen_side'] contract - the frozen side is never
+        # trained on
+        'frozen_side': _frozen9,
         'game_stats': _game_stats_finalize(state, {
+            'reward_contract': current_contract(),
+            'ai_policy_contract': __import__('ai_policies').POLICY_VERSION,
+            'observation_contract': OBSERVATION_CONTRACT,
+        'action_encoding_contract': __import__('trace_decisions').ACTION_ENCODING_CONTRACT,
+            'forced_transitions': dict(_forced_counts),
+            'checkpoint_ids': dict(config.get('checkpoint_ids') or {}),
             'turns': turn_count, 'winner': winner,
             'victory_type': vtype,
             'separations': _ep_stats['separations'],
             'eye_allocs': _ep_stats['eye_allocs'],
-            'trace_path': config.get('trace_path'),
+            'trace_path': tracer.path if tracer is not None else None,
+            'frozen_side': _frozen9,
         }),
     }
-
-
 
 
 def resolve_trace_path(tp):
@@ -16641,8 +20259,7 @@ def resolve_trace_path(tp):
     if os.path.exists(tp):
         return tp
     # newest match, NOT alphabetical: stale traces from earlier runs
-    # shared the same w{N}_ep{M} base and hits[0] linked episode stats
-    # to another run's game (USER report 2026-07-15, run 17 ep 7)
+    # share the same w{N}_ep{M} base (USER report 2026-07-15)
     hits = _glob.glob(tp.replace('.trace.gz', '') + '*.trace.gz')
     return max(hits, key=os.path.getmtime) if hits else None
 
@@ -16771,12 +20388,6 @@ def write_td_window_report(window_stats, label, report_path,
     return saved
 
 
-
-
-
-
-
-
 # ===================================================================
 # CLI Interface
 # ===================================================================
@@ -16796,9 +20407,6 @@ def main():
     sub.add_parser('test-legal', help='Test legal action enumeration')
     sub.add_parser('watch',
                    help='Watch AI vs AI game in GUI (step with Space)')
-
-    # ('selfplay' subcommand deleted 2026-07-27 with the
-    #  td_self_play twin — production runs use run_td_v33sp.py)
 
     args = parser.parse_args()
 
@@ -16914,55 +20522,6 @@ def _test_legal_actions():
     print()
 
 
-def _balrog_moria_on_declare_path(state, from_key, to_key, steps):
-    """True if 'moria' lies on at least one legal fellowship-declaration
-    path of length <= *steps* from *from_key* to *to_key*.
-
-    Declaration reachability (game_logic.declare_fellowship) is a plain
-    BFS over board adjacency: the pawn may be placed in any region at a
-    distance up to the progress counter.  Moria lies on such a path iff
-    dist(from,moria) + dist(moria,to) <= steps (the shortest path through
-    a node; valid because board adjacency is undirected).  FROM / INTO
-    Moria are the dist==0 endpoints and short-circuit to True.
-
-    APPROXIMATION (documented, amendment): the model is board adjacency
-    ONLY - fellowship declaration has no per-region legality beyond
-    distance (the exact model declare_fellowship itself uses to validate
-    the target), so within the declaration rules this test is exact.  It
-    deliberately does NOT reconstruct the SECRET step-by-step route the
-    Ring-bearers actually took (hidden information); the almanac trigger
-    is 'moves through Moria while being declared', i.e. it is enough that
-    a legal declaration path through Moria EXISTS.
-    """
-    moria = 'moria'
-    if from_key == moria or to_key == moria:
-        return True
-    # A pure through-path needs dist(from,moria) >= 1 and
-    # dist(moria,to) >= 1, so steps < 2 can never pass through.
-    if steps is None or steps < 2:
-        return False
-
-    def _dists(src):
-        seen = {src: 0}
-        frontier = [src]
-        for hop in range(1, steps + 1):
-            nxt = []
-            for r in frontier:
-                for adj in state.board.adjacent(r):
-                    a = sanitize(adj)
-                    if a not in seen:
-                        seen[a] = hop
-                        nxt.append(a)
-            frontier = nxt
-            if not frontier:
-                break
-        return seen
-
-    d_from = _dists(from_key).get(moria)
-    if d_from is None:
-        return False
-    d_to = _dists(to_key).get(moria)
-    return d_to is not None and (d_from + d_to) <= steps
 
 
 def _balrog_stationary_turn_start(state) -> bool:
@@ -16975,8 +20534,7 @@ def _balrog_stationary_turn_start(state) -> bool:
     LEARNED PATH ONLY: the certified closed-loop teacher replays logged
     choices and must never stall on a fresh interactive pending, so this
     is gated on combat.FINAL_HITS_HOOK is None (== self-play / learned
-    mode; the teacher sets the hook).  No campaign log plays Balrog, so
-    the canary is unaffected, but the gate is the mandatory pattern.
+    mode; the teacher sets the hook).
 
     Returns True iff a pending was opened.
     """
@@ -16992,9 +20550,9 @@ def _balrog_stationary_turn_start(state) -> bool:
             return False
     except Exception:
         return False
-    # adversarial repair 2026-07-11 (MAJOR): 'remains STATIONARY' -
-    # progress > 0 means the Fellowship has hidden-moved off the
-    # marker; only a genuinely unmoved Fellowship triggers
+    # 'remains STATIONARY' (2026-07-11): progress > 0 means the
+    # Fellowship has hidden-moved off the marker; only a genuinely
+    # unmoved Fellowship triggers
     if state.fellowship.progress != 0:
         return False
     from game_state import PersistentCardType as _PCT_bal
@@ -17003,32 +20561,42 @@ def _balrog_stationary_turn_start(state) -> bool:
                if _pcb_bal else None)
     if _cb_bal is None:
         return False
-    state.pending_card_option = {
-        'card_id': getattr(_cb_bal, 'card_id', '__balrog__'),
-        'card_name': 'Balrog of Moria',
-        'side': 'sh', 'decider': 'sh', 'direct': True,
-        'options': [{'balrog_declare_draw': True},
-                    {'balrog_declare_draw': False}]}
+    from fellowship_reveal_route import declared
+    declared(state, ('moria',))
     return True
 
 
 # ---------------------------------------------------------------------------
-# WOTR_NATIVE=1 (PERF 2026-08-09; re-wired 2026-08-11 after the F10
-# clobber - the task-15 confidence patch, generated against a base
-# without this block, deleted it on apply; see lab comms 44_PERF).
-# PURE performance swap, byte-identical outputs (parity-certified;
-# perf/native in the lab tree; re-verified against THIS ai.py, whose
-# post-8/9 changes touch no ported function).  Rebinding module
-# globals here (the last statements executed at import) retargets
-# every call site: internal callers resolve these names through
-# module globals at call time, and external `from ai import X` /
-# `ai.X` reads happen only after import completes.  Default OFF:
-# without the env flag this block is inert and the module behaves
-# byte-identically to production.  ACTIVATION IS GATED: run
+# WOTR_NATIVE=1 (PERF 2026-08-09): PURE performance swap, byte-
+# identical outputs (parity-certified; perf/native in the lab tree).
+# Rebinding module globals here (the last statements at import)
+# retargets every call site: internal callers resolve these names
+# through module globals at call time; external `from ai import X`
+# reads happen after import completes.  Default OFF (the block is
+# inert without the env flag).  ACTIVATION IS GATED: run
 # src/test_native_activation.py (exit 4 = flag requested but the
-# native path is not actually taken - the exact F10 failure mode).
-# NOTE for patch generators: diff against a base that CONTAINS this
-# block, or your patch will delete it again (the F10 root cause).
+# native path is not taken).  NOTE for patch generators: diff against
+# a base that CONTAINS this block (F10 root cause: a patch generated
+# against an older base deleted it).
+NATIVE_BOUND = False           # wotr_native mirrors actually bound
+NATIVE_REFUSED_REASON = None   # why a requested native bind was refused
+
+
+def _native_mirror_fingerprint() -> str:
+    """sha1 over the CURRENT Python sources of the five mirrored
+    functions - the contract a native build must match.  SPMC-1/
+    SPEP-1/SPLP-1 (2026-08-29): a stale pyd silently reverted whole
+    fix waves ONLY under the loop's WOTR_NATIVE=1 env while every pin
+    suite ran python-side and stayed green."""
+    import hashlib
+    import inspect
+    h = hashlib.sha1()
+    for _f9 in (clone_state, encode_state, _state_sig, encode_action,
+                _action_cache_key):
+        h.update(inspect.getsource(_f9).encode('utf-8', 'replace'))
+    return h.hexdigest()
+
+
 if os.environ.get('WOTR_NATIVE') == '1':
     try:
         import wotr_native as _wotr_native
@@ -17036,20 +20604,50 @@ if os.environ.get('WOTR_NATIVE') == '1':
         raise ImportError(
             'WOTR_NATIVE=1 but the wotr_native extension is not '
             'built/importable: %r' % (_e,))
-    _wotr_native.init_ai(sys.modules[__name__])
-    _wotr_native.init_state_encoder(sys.modules[__name__])
-    _wotr_native.init_clone(sys.modules[__name__])
-    _side_of_nation = _wotr_native.side_of_nation
-    _armies_lookup = _wotr_native.armies_lookup
-    encode_state = _wotr_native.encode_state
-    clone_state = _wotr_native.clone_state
-    _state_sig = _wotr_native.state_sig
-    if HAS_TORCH:
-        encode_action = _wotr_native.encode_action
-        _action_cache_key = _wotr_native.action_cache_key
-        _encode_action_cached = _wotr_native.encode_action_cached
-        _region_index_cached = _wotr_native.region_index_cached
-        _get_action_region_index = _wotr_native.get_action_region_index
+    # MIRROR FINGERPRINT guard: the build must carry
+    # MIRROR_FINGERPRINT == sha1 of the current Python mirror sources
+    # (stamped at build time by build_wotr_native.py).  Absent or
+    # stale -> the mirrors are NOT bound: the Python implementations
+    # stay live, one loud line says so, and the decision is exposed
+    # via NATIVE_BOUND / NATIVE_REFUSED_REASON.
+    _nfp_want = _native_mirror_fingerprint()
+    _nfp_have = getattr(_wotr_native, 'MIRROR_FINGERPRINT', None)
+    if _nfp_have != _nfp_want:
+        NATIVE_REFUSED_REASON = (
+            'wotr_native MIRROR_FINGERPRINT=%s does not match the '
+            'current python mirrors (%s) - rebuild wotr_native; '
+            'python implementations stay bound' % (_nfp_have,
+                                                   _nfp_want))
+        print('[NATIVE-REFUSED] %s' % NATIVE_REFUSED_REASON,
+              flush=True)
+        # a build may DECLARE mirror-independent pure accelerators;
+        # only those bind on refusal (pre-fingerprint builds declare
+        # none)
+        _accs9 = tuple(getattr(_wotr_native, 'PURE_ACCELERATORS', ())
+                       or ())
+        if _accs9:
+            _wotr_native.init_ai(sys.modules[__name__])
+            for _nm9a in _accs9:
+                _fn9a = getattr(_wotr_native, str(_nm9a), None)
+                if _fn9a is not None:
+                    globals()[str(_nm9a)] = _fn9a
+    else:
+        _wotr_native.init_ai(sys.modules[__name__])
+        _wotr_native.init_state_encoder(sys.modules[__name__])
+        _wotr_native.init_clone(sys.modules[__name__])
+        _side_of_nation = _wotr_native.side_of_nation
+        _armies_lookup = _wotr_native.armies_lookup
+        encode_state = _wotr_native.encode_state
+        clone_state = _wotr_native.clone_state
+        _state_sig = _wotr_native.state_sig
+        if HAS_TORCH:
+            encode_action = _wotr_native.encode_action
+            _action_cache_key = _wotr_native.action_cache_key
+            _encode_action_cached = _wotr_native.encode_action_cached
+            _region_index_cached = _wotr_native.region_index_cached
+            _get_action_region_index = \
+                _wotr_native.get_action_region_index
+        NATIVE_BOUND = True
 
 
 if __name__ == '__main__':

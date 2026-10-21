@@ -9,6 +9,24 @@ from typing import Dict, List, Optional, Tuple
 from game_state import Side, CombatCard
 
 
+_HOBBIT_IDENTITIES = frozenset({
+    'meriadoc', 'meriadoc brandybuck', 'peregrin', 'peregrin took',
+    'frodo', 'frodo baggins', 'sam', 'samwise', 'sam gamgee', 'samwise gamgee',
+})
+
+
+def is_hobbit_identity(companion_or_name) -> bool:
+    """Recognize explicit Hobbit names without substring matching.
+
+    Accept either a name or a figure-like object. Participation remains the
+    caller's responsibility: a Hobbit hidden in the Fellowship is not an army
+    participant merely because its identity matches.
+    """
+    name = (companion_or_name if isinstance(companion_or_name, str)
+            else getattr(companion_or_name, 'name', None))
+    return isinstance(name, str) and name.strip().casefold() in _HOBBIT_IDENTITIES
+
+
 # ---------------------------------------------------------------------------
 # Full Card Definition (event + combat)
 # ---------------------------------------------------------------------------
@@ -91,20 +109,17 @@ def _parse_combat_requirements(req_text: str, card: Card) -> None:
 
     req_lower = req_text.lower()
 
-    # Named-character requirements ('Gandalf is in the battle',
-    # 'Strider/Aragorn is in the battle') — previously parsed to NO
-    # flag at all (USER audit: Athelas played without Aragorn).
+    # Named-character requirements ("Gandalf is in the battle",
+    # "Strider/Aragorn is in the battle")
     if "gandalf is in the battle" in req_lower:
         card.requires_character_in_battle = ["gandalf"]
     elif "strider/aragorn is in the battle" in req_lower or \
             "strider or aragorn" in req_lower:
         card.requires_character_in_battle = ["strider", "aragorn"]
 
-    # Companion requirements. "a Leader or a Companion" is an OR
-    # requirement — covered by the leader check, which already accepts
-    # companions as leaders. A strict companion flag wrongly blocked e.g.
-    # Sudden Strike (verified: game0 humans played Paths of the Woses /
-    # Dead Men of Dunharrow with plain Leaders and no Companion).
+    # "a Leader or a Companion" is an OR requirement covered by the leader
+    # check (which accepts companions as leaders); a strict companion flag
+    # would wrongly block Sudden Strike / Paths of the Woses.
     if "companion" in req_lower:
         if not re.search(r"leader or (a )?companion", req_lower):
             card.requires_companion = True
@@ -316,13 +331,9 @@ def load_cards(csv_path: str) -> Dict[str, Card]:
         # Anything else (Roll, Heal, Move, Recruit, Change, etc.) is an EFFECT
         # ---------------------------------------------------------------------------
 
-        # First, combine event_req and event_effect so we can re-parse
-        # properly. CARD-FLEET HIGH-2 fix (2026-07-20): the join MUST
-        # guarantee a sentence boundary — a req lacking its trailing
-        # period made the non-greedy `(.+?\.)` split at the FIRST
-        # period of the EFFECT text instead, swallowing everything
-        # into the requirement and leaving effect='' (Swords in
-        # Eriador's Advantageous Position was a total no-op).
+        # Combine event_req and event_effect, then re-parse.  The join MUST
+        # guarantee a sentence boundary (HIGH-2): a req missing its period
+        # made the non-greedy split swallow the effect text.
         def _dot(s):
             s = s.strip()
             return s if (not s or s.endswith(('.', '!', '?'))) \
@@ -358,8 +369,7 @@ def load_cards(csv_path: str) -> Dict[str, Card]:
                     event_req = ""
                     event_effect = full_event_text
 
-        # COMBAT: Same logic - combine and re-parse (same HIGH-2
-        # sentence-boundary guarantee on the join)
+        # COMBAT: same join (same sentence-boundary guarantee)
         full_combat_text = ""
         if combat_req and combat_effect:
             full_combat_text = _dot(combat_req) + " " + combat_effect
@@ -536,9 +546,7 @@ def can_play_combat_card(card: Card, combat_state: "CombatState",
                          state: "GameState" = None) -> Tuple[bool, str]:
     """Check if a card can legally be played in the current combat state.
     `state` (the full GameState) enables the fellowship-region / FP-nation
-    / region-restriction requirements (USER audit 2026-07-08: Phial of
-    Galadriel was played as a combat card away from the Fellowship —
-    these three printed requirements were parsed but NEVER enforced)."""
+    / region-restriction requirements (USER audit 2026-07-08)."""
     # Get the relevant army and state info
     if is_attacker:
         army = combat_state.attacker_army
@@ -551,6 +559,11 @@ def can_play_combat_card(card: Card, combat_state: "CombatState",
     if card.side != side:
         return False, "Card belongs to opponent"
 
+    # Almanac p41: Scouts follows defender retreat rules in a field battle.
+    if (card.combat_name or '').strip().lower() == 'scouts' and (
+            is_attacker or combat_state.is_siege):
+        return False, "Scouts requires defending in a field battle"
+
     # Check companion requirement
     if card.requires_companion:
         if not combat_state.companions_in_battle:
@@ -558,8 +571,7 @@ def can_play_combat_card(card: Card, combat_state: "CombatState",
 
     # Check Hobbit requirement
     if card.requires_hobbit:
-        hobbit_names = {"Meriadoc", "Peregrin", "Frodo", "Sam"}
-        if not any(c.name in hobbit_names for c in combat_state.companions_in_battle):
+        if not any(is_hobbit_identity(c) for c in combat_state.companions_in_battle):
             return False, "No Hobbit in battle"
 
     # Check Nazgul requirement
@@ -624,16 +636,21 @@ def can_play_combat_card(card: Card, combat_state: "CombatState",
         if not any(u.nation == Nation.ISENGARD for u in army.units):
             return False, "No Isengard unit in battle"
 
-    # Check stronghold requirement
+    # "Defending Army is in a Stronghold" means inside a besieged
+    # stronghold, not a field battle or sortie in a stronghold region.
     if card.requires_stronghold:
-        if not combat_state.stronghold_defense and not combat_state.is_siege:
-            return False, "Not fighting at a Stronghold"
+        if not combat_state.is_siege:
+            return False, "Defending army is not inside a besieged Stronghold"
 
     # Fellowship-region requirement ("the defending Army is in the same
     # region as the Fellowship") — Phial/Elven Cloaks/It is a Gift class
     if getattr(card, 'requires_fellowship_region', False) and state is not None:
         from board import sanitize as _s
         import game_logic as _gl
+        # Rulebook p43: the Mordor Track is not part of any map region.
+        # region retains the last gateway for bookkeeping after entry.
+        if state.fellowship.mordor_entered:
+            return False, "The Fellowship is on the Mordor Track, not in a map region"
         if _s(str(combat_state.defender_region)) != \
                 _s(str(_gl.fellowship_region(state))):
             return False, "Defender not in the Fellowship's region"

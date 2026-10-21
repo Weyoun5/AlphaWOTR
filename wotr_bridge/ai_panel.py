@@ -12,13 +12,14 @@ Small always-on-top window beside the VASSAL client:
     applied by the live server from its NEXT decision (the server log
     stamps 'sims=N' per decision so the effect is provable)
 
-Talks to ai_move_server via two small json files in the client dir:
+Talks to the live server (live/live_server.py via live/transport.py)
+through two small json files in the client dir:
   ai_bridge_status.json   (server -> panel)
   ai_panel_control.json   (panel -> server)
 
 Single-instance: writes ai_panel.pid; a second launch exits quietly if
-that pid is alive (the server auto-spawns a panel for AI-vs-AI games,
-and the Play-vs-AI java path spawns one too — only one survives).
+that pid is a live panel (the java client spawns the panel via
+-Dai.python).
 
 Usage: python ai_panel.py [client_dir]
 """
@@ -136,15 +137,17 @@ def _write_control(**kw):
     cur = {}
     try:
         if os.path.exists(CONTROL):
-            cur = json.load(open(CONTROL, encoding='utf-8'))
+            with open(CONTROL, encoding='utf-8') as stream:
+                cur = json.load(stream)
     except (ValueError, OSError):
         cur = {}
     cur.update(kw)
     try:
         with open(CONTROL, 'w', encoding='utf-8') as f:
             json.dump(cur, f)
+        return True
     except OSError:
-        pass
+        return False
 
 
 def clear_control_keys(*keys):
@@ -154,7 +157,8 @@ def clear_control_keys(*keys):
     cur = {}
     try:
         if os.path.exists(CONTROL):
-            cur = json.load(open(CONTROL, encoding='utf-8'))
+            with open(CONTROL, encoding='utf-8') as stream:
+                cur = json.load(stream)
     except (ValueError, OSError):
         cur = {}
     hit = False
@@ -223,7 +227,7 @@ def turn_text(st):
     return 'Turn %s - %s to act' % (turn, acting)
 
 
-def note_text(st, last_status_note, local_note):
+def note_text(st, last_status_note, local_note, recovery_requested_at=0):
     """The note line: a status note that CHANGED since the last poll
     wins; otherwise a note the panel set itself (button feedback)
     stays; the server's panel notes (status 'notes' tail) are shown
@@ -231,6 +235,10 @@ def note_text(st, last_status_note, local_note):
     cur = str(st.get('note') or '')
     if cur and cur != (last_status_note or ''):
         return cur
+    recovery = st.get('recovery') or {}
+    if (recovery.get('epoch', 0) >= recovery_requested_at and recovery.get('summary')
+            and (recovery_requested_at or not local_note)):
+        return str(recovery['summary'])
     if local_note:
         return local_note
     if cur:
@@ -283,9 +291,7 @@ class Panel:
         self.root = tk.Tk()
         self.root.title('WOTR AI')
         # position only: the HEIGHT is fitted to the content once the
-        # widgets exist (USER 2026-08-22: 'the panel is too small, the
-        # MCTS bar gets cut off' - a fixed 320x380 had no room for the
-        # enforce checkbox + the two-line reset button)
+        # widgets exist (USER 2026-08-22)
         self.root.geometry('+40+40')
         self.root.attributes('-topmost', True)
         self.root.resizable(False, True)
@@ -318,13 +324,6 @@ class Panel:
                               font=('Segoe UI', 14, 'bold'))
         self.think.pack(pady=6, fill=tk.X)
 
-        # START GAME REMOVED (USER 2026-08-20: "we should remove the
-        # now-defunct start game button").  It dates from the 2026-08-16
-        # flow where the panel triggered setup; the live stack starts
-        # itself from the client's own 'Play vs AI...' -> Start Game
-        # and drives its draws/eyes/roll off the feed, so the button
-        # sent a control key nothing consumed.
-
         # ---- WHOSE TURN (USER 2026-08-20): manual alternation
         # override.  The engine owns the turn rule; these only correct
         # the driver's 'who last acted' bookkeeping when the two have
@@ -344,9 +343,7 @@ class Panel:
                                padx=(4, 0))
 
         # ---- CLEAR ERROR (USER 2026-08-20): the server's error state
-        # is STICKY on purpose (a halt used to be repainted 'idle' by
-        # the next heartbeat and vanish).  Sticky needs a dismiss, or
-        # a one-off error follows the session forever.
+        # is STICKY on purpose; sticky needs a dismiss
         crow = tk.Frame(self.root)
         crow.pack(fill=tk.X, padx=10, pady=(0, 2))
         self.clearerr_btn = tk.Button(crow, text='CLEAR ERROR + RESET',
@@ -364,26 +361,19 @@ class Panel:
         self.skip_btn.pack(side=tk.LEFT, fill=tk.X, expand=True,
                            padx=(4, 0))
 
-        # ---- RESET + RESYNC (USER 2026-08-20): the one button that
-        # gets a stuck game moving again - decline what can be
-        # declined, clear every remaining pending, adopt the client
-        # board, hand the turn to the AI.  Prominent because it is the
-        # thing to reach for when play has stopped; it CAN erase a
-        # decision mid-battle, so everything it does is reported in the
-        # note line and the server console.
+        # Recover the visible board while preserving unfinished decisions
+        # and the side that owns the next action.
         rr = tk.Frame(self.root)
         rr.pack(fill=tk.X, padx=10, pady=(0, 4))
-        self.reset_btn = tk.Button(rr, text='RESET AI  (resync board, '
-                                             'clear pending decisions, '
-                                             'AI continues)',
+        self.reset_btn = tk.Button(rr, text='RESYNC BOARD  (retain turn '
+                                             'and unfinished decisions)',
                                    font=('Segoe UI', 10, 'bold'),
                                    fg='white', bg='#a4560a',
                                    wraplength=300,
                                    command=self.full_reset)
         self.reset_btn.pack(fill=tk.X)
 
-        # ---- resync check (P5, USER 2026-08-16): on-demand board
-        # comparison, report-only; result lands in the note line
+        # The compact resync button requests the same board recovery.
         rrow = tk.Frame(self.root)
         rrow.pack(fill=tk.X, padx=10, pady=(0, 2))
         self.resync_btn = tk.Button(rrow, text='RESYNC (reset AI)',
@@ -395,6 +385,18 @@ class Panel:
                                     command=self.open_mirror)
         self.mirror_btn.pack(side=tk.LEFT, fill=tk.X, expand=True,
                              padx=(4, 0))
+
+        rewind_row = tk.Frame(self.root)
+        rewind_row.pack(fill=tk.X, padx=10, pady=(0, 4))
+        self.rewind_turn_btn = tk.Button(rewind_row, text='Rewind turn',
+            font=('Segoe UI', 9, 'bold'), command=self.rewind_turn, state=tk.DISABLED)
+        self.rewind_turn_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.rewind_manual_btn = tk.Button(rewind_row, text='Rewind (manual)',
+            font=('Segoe UI', 9, 'bold'), command=self.open_timeline, state=tk.DISABLED)
+        self.rewind_manual_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        self._timeline_window = None
+        self._timeline_poll_at = 0
+        self._last_rewind_epoch = 0
 
         # ---- MANUAL EDIT (USER ruling 2026-08-16): the one sanctioned
         # bypass of the legality gate.  Toggle ON = gating suspended,
@@ -450,9 +452,7 @@ class Panel:
         self.srv_lbl = tk.Label(row, text='(server: ?)', fg='#888',
                                 font=('Segoe UI', 8))
         self.srv_lbl.pack(side=tk.RIGHT, padx=(0, 6))
-        # from_=10 (was 30): the server honors any value >= 1 since the
-        # 2026-08-15 silent-clamp fix — the slider must not re-impose a
-        # floor the server no longer has.
+        # from_=10: the server honors any value >= 1
         self.slider = tk.Scale(self.root, from_=10, to=1000,
                                orient=tk.HORIZONTAL, resolution=10,
                                showvalue=False,
@@ -465,8 +465,8 @@ class Panel:
                  fg='#888', font=('Segoe UI', 8)).pack(pady=(0, 2))
 
         # ---- SEARCH WIDTH (USER 2026-08-22: 'cut those caps but add
-        # extra sliders with those set as default').  Two settings the
-        # engine used to hard-code: how many children an MCTS node
+        # extra sliders with those set as default').  Two search
+        # settings: how many children an MCTS node
         # expands (by prior) and how many distinct outcomes a chance
         # node tracks.  The right end of each slider = NO CAP (written
         # as 0).  Boot value: the control file's, else the default.
@@ -478,13 +478,7 @@ class Panel:
             'chance outcomes / node', 4, 100, 4, 24,
             ctl0.get('chance_k'), self.apply_chance)
 
-        # fit the window to its content (width fixed, height = what
-        # the widgets ask for) so nothing at the bottom is ever cut off
-        self.root.update_idletasks()
-        self.root.geometry('%dx%d+40+40' % (
-            max(320, self.root.winfo_reqwidth()),
-            self.root.winfo_reqheight()))
-        self.root.minsize(320, self.root.winfo_reqheight())
+        self._fit_to_content(initial=True)
 
         self._connected_seen = False
         self._blink = False
@@ -495,6 +489,23 @@ class Panel:
         # to a game that is over.
         self._boot_ts = time.time()
         self.root.after(300, self.poll)
+
+    def _fit_to_content(self, initial=False):
+        """Keep the bottom controls visible when status text gains wrapped lines."""
+        self.root.update_idletasks()
+        requested = self.root.winfo_reqheight()
+        # Leave room for window decoration and the desktop taskbar. The
+        # initial spare space accommodates ordinary multi-line waiting text.
+        top = 40 if initial else max(0, self.root.winfo_y())
+        available = max(1, self.root.winfo_screenheight() - top - 80)
+        if initial:
+            self._panel_width = max(320, self.root.winfo_reqwidth())
+        current = 0 if initial else self.root.winfo_height()
+        height = min(available, max(current, requested + 48))
+        self.root.minsize(320, min(requested, available))
+        if initial or height != current:
+            self.root.geometry('%dx%d%s' % (
+                self._panel_width, height, '+40+40' if initial else ''))
 
     def _style_manual_btn(self):
         if self.manual_edit:
@@ -519,6 +530,12 @@ class Panel:
             self._say('manual edit finished - forced resync requested')
 
     def toggle_pause(self):
+        if getattr(self, '_rewind_review', False):
+            _write_control(paused=False, resume_rewind=time.time())
+            self._rewind_review = False
+            self.paused = False
+            self.pause_btn.config(text='PAUSE')
+            return
         self.paused = not self.paused
         _write_control(paused=self.paused)
         self.pause_btn.config(text='RESUME' if self.paused else 'PAUSE')
@@ -528,10 +545,13 @@ class Panel:
         changes (poll() never clobbers it with an unchanged note)."""
         self._local_note = text
         self.note.config(text=text, fg='#c60', font=('Segoe UI', 9))
+        self._fit_to_content()
 
     def _one_shot(self, text, **kw):
         """Write a one-shot lever, show the feedback until the status
         note changes, and expire the lever from the control file."""
+        if 'reset_resync' not in kw:
+            self._recovery_requested_at = 0
         _write_control(**kw)
         self._say(text)
         keys = tuple(k for k in kw if k in ONE_SHOT_KEYS)
@@ -549,19 +569,74 @@ class Panel:
         self._one_shot("turn override sent: the AI's turn",
                        whose_turn='ai', whose_turn_epoch=time.time())
 
-    def clear_error(self):
-        self._one_shot('clear-error sent...', clear_error=time.time())
-
     def full_reset(self):
-        """THE recovery lever (USER 2026-08-22: 'if something breaks
-        people can easily reset it and continue their game'): one
-        press clears the sticky error, declines/clears every pending
-        decision, drops the AI's open step, adopts the client board
-        into the engine and hands the turn to the AI."""
+        """Request recovery; the server verifies the board before clearing errors."""
         now = time.time()
-        self._one_shot('RESET sent - clearing the error and every '
-                       'pending decision, adopting the board, AI to '
-                       'act...', reset_resync=now, clear_error=now)
+        self._recovery_requested_at = now
+        self._one_shot('RESYNC requested - checking the client board; '
+                       'turn order, unfinished decisions and known rolls will be retained.',
+                       reset_resync=now)
+
+    def _load_timeline(self):
+        from panel_timeline import load_timeline, read_json
+        return load_timeline(CLIENT_DIR, read_json(STATUS), boot_ts=self._boot_ts)
+
+    def _request_rewind(self, checkpoint, session):
+        from panel_timeline import TimelineUnavailable
+        model = self._load_timeline()
+        epoch = max(time.time(), self._last_rewind_epoch + 0.000001)
+        request = model.request(checkpoint, session, epoch)
+        if not _write_control(**request):
+            raise TimelineUnavailable('Could not write the rewind request. Check the client folder and try again.')
+        self._last_rewind_epoch = epoch
+        self._recovery_requested_at = 0
+        target = model.turn_start if checkpoint is None else checkpoint
+        self._say('Rewind requested: %s. Waiting for the client and AI to confirm.' %
+                  model.checkpoint_label(target, detailed=True))
+        # Keep this session-bound request while a long AI search completes.
+        # The backend consumes its epoch once; a newer click replaces it.
+
+    def rewind_turn(self):
+        from panel_timeline import TimelineUnavailable
+        try:
+            model = self._load_timeline()
+            # Explicit null clears a prior manual target in the merge-written
+            # control file; the backend resolves this session's turn start.
+            self._request_rewind(None, model.session)
+        except (TimelineUnavailable, OSError) as error:
+            self._say(str(error))
+
+    def open_timeline(self):
+        from panel_timeline import TimelineWindow
+        if self._timeline_window is not None and self._timeline_window.exists():
+            self._timeline_window.show()
+        else:
+            self._timeline_window = TimelineWindow(self.root, self._load_timeline, self._request_rewind)
+
+    def _refresh_rewind_controls(self, status, fresh):
+        state = status.get('turn_rewind') or {}
+        if not isinstance(state, dict):
+            state = {}
+        supported = bool(fresh and state.get('supported') and state.get('session'))
+        self._rewind_review = bool(supported and state.get('review'))
+        receipt = (state.get('session'), state.get('request_epoch'), state.get('restored_checkpoint_id'))
+        if self._rewind_review and receipt != getattr(self, '_rewind_receipt', None):
+            self._rewind_receipt = receipt
+            self._rewind_review_note = state.get('note') or 'Rewind complete. Press RESUME when ready.'
+            self._say(self._rewind_review_note)
+        elif (supported and not self._rewind_review
+              and getattr(self, '_rewind_review_note', None) == self._local_note):
+            # Chat Resume/Skip can end review without touching panel controls.
+            # Retire only this panel's paused-rewind notice, not newer feedback.
+            self._rewind_review_note = None
+            self._say('Play has resumed from the restored position.')
+        self.pause_btn.configure(text='RESUME' if self._rewind_review or self.paused else 'PAUSE')
+        self.rewind_manual_btn.configure(state=tk.NORMAL if supported else tk.DISABLED)
+        self.rewind_turn_btn.configure(state=tk.NORMAL if supported and state.get('turn_available') else tk.DISABLED)
+        if (self._timeline_window is not None and self._timeline_window.exists()
+                and time.time() - self._timeline_poll_at >= 1):
+            self._timeline_poll_at = time.time()
+            self._timeline_window.refresh()
 
     def toggle_enforce(self):
         on = bool(self.enforce_var.get())
@@ -572,16 +647,9 @@ class Panel:
                      'OFF - your moves are taken as given'))
 
     def skip_decision(self):
-        self._one_shot('skip-decision sent - declining the open '
-                       'decision...', skip_pending=time.time())
-
-    def reset_resync(self):
-        self._one_shot('RESET + RESYNC sent - clearing pending '
-                       'decisions, adopting the board, AI to act...',
-                       reset_resync=time.time())
-
-    def resync(self):
-        self._one_shot('resync check requested...', resync=time.time())
+        self._one_shot('skip requested - decline if possible, otherwise abandon '
+                       'the blocked interaction and use the visible board.',
+                       skip_pending=time.time())
 
     def open_mirror(self):
         """ENGINE MIRROR (USER 2026-08-16): read-only WotrGUI on the
@@ -666,25 +734,17 @@ class Panel:
         except (ValueError, OSError):
             st = {}
         # A PREVIOUS SESSION'S STATUS IS NOT OUR STATUS (A1, USER
-        # 2026-08-18: "opening the AI loads the last thing it was on
-        # rather than starting from fresh each time.  it says 'turn 2'
-        # rather than turn 1 for example").  ai_bridge_status.json
-        # outlives the session and the java client launches this panel
-        # BEFORE it spawns the server, so every field below used to be
-        # read straight off the dead game: the turn line ("Turn 5 - ?
-        # to act" with nothing running), the green connection light,
-        # the note/waiting text, and 'started': True.  (That last one
-        # used to trip a one-way latch that hid the START GAME button
-        # for the whole new session; the button is gone as of
-        # 2026-08-20, but the staleness rule it motivated stands.)
-        # One rule covers all of them: a status stamped before this
-        # panel booted is not ours.  A panel restarted mid-game loses
-        # nothing - the live server's next heartbeat (<=2s) is stamped
-        # after our boot and is adopted in full.
+        # 2026-08-18): ai_bridge_status.json outlives the session and
+        # the java client launches this panel BEFORE it spawns the
+        # server, so a status stamped before this panel booted is not
+        # ours.  A panel restarted mid-game loses nothing - the live
+        # server's next heartbeat (<=2s) is stamped after our boot and
+        # is adopted in full.
         if st and float(st.get('ts', 0) or 0) < self._boot_ts:
             st = {}
         # server heartbeats every ~2s now; 12s of silence = really gone
         fresh = st and (time.time() - float(st.get('ts', 0))) < 12
+        self._refresh_rewind_controls(st, fresh)
         if st.get('connected') and not self._connected_seen:
             self._connected_seen = True
             self.conn.config(text='AI connected', fg='#2a2')
@@ -699,13 +759,10 @@ class Panel:
         # death reason instead of an eternal gray 'waiting...' — the
         # numpy import death and the stale-lock refusal both become
         # readable on screen (throttled to ~2s).
-        # NOT DURING THE BOOT WINDOW (A1): before the first heartbeat,
-        # the newest error in ai_server.log is the PREVIOUS run's, and
-        # announcing "AI SERVER DOWN" at 2 seconds old — while the
-        # server this panel is waiting for is still loading — is the
-        # same stale-session lie in a different label.  Only claim a
-        # death once we have actually seen this session's server, or
-        # once the whole boot budget has passed with no heartbeat.
+        # NOT DURING THE BOOT WINDOW (A1): before the first heartbeat
+        # the newest error in the log is the PREVIOUS run's - claim a
+        # death only once this session's server was seen, or once the
+        # whole boot budget passed with no heartbeat
         _booting = (not self._connected_seen
                     and (time.time() - self._boot_ts) < 45)
         if not fresh and not _booting:
@@ -748,7 +805,12 @@ class Panel:
         # illegal human moves are refused with the reason) - the
         # bridge's refusal notes start with 'illegal:'
         _cur = str(st.get('note') or '')
-        _note = note_text(st, self._last_status_note, self._local_note)
+        _requested = getattr(self, '_recovery_requested_at', 0)
+        _note = note_text(st, self._last_status_note, self._local_note, _requested)
+        _recovery = st.get('recovery') or {}
+        if (_requested and _recovery.get('summary')
+                and _recovery.get('epoch', 0) >= _requested):
+            self._local_note = ''
         if _cur and _cur != self._last_status_note:
             self._local_note = ''        # the server spoke: feedback done
         self._last_status_note = _cur
@@ -758,15 +820,15 @@ class Panel:
         else:
             self.note.config(text=_note, fg='#c60',
                              font=('Segoe UI', 9))
-        # (the START GAME hide-latch died with the button, USER
-        # 2026-08-20 - the live stack starts itself from the client)
         if fresh:
             w = st.get('waiting_on')
             if state == 'thinking':
                 w = 'thinking (%s sims)' % (sims or '?')
             if w:
-                self.waiting.config(text='waiting on: %s' % w,
+                self.waiting.config(text=(w if str(w).lower().startswith('waiting on')
+                                          else 'waiting on: %s' % w),
                                     fg='#579')
+        self._fit_to_content()
         self.root.after(300, self.poll)
 
     def run(self):

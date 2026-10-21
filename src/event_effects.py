@@ -101,6 +101,51 @@ def _besieged_garrison_source(state, frm, side):
     return frm in bs and garrison_side_for(state, frm) == side
 
 
+def _unit_may_enter_nation(state, unit, to_san):
+    """Amendment 1.222(b) (standing ruling 2026-08-25), per UNIT: a
+    non-belligerent unit may never enter ANOTHER nation's borders; its
+    own nation's regions and free regions are unrestricted, and an
+    At-War unit moves anywhere.  ONE predicate for every voluntary
+    card move (Through a Day and a Night, Paths of the Woses) - the
+    same test the die-driven army move applies inline in
+    ai._get_army_move_actions (not a callable helper there)."""
+    from ai import _region_nation
+    dest_nation = _region_nation(sanitize(to_san))
+    if dest_nation is None:
+        return True
+    return (state.political.is_at_war(unit.nation)
+            or unit.nation == dest_nation)
+
+
+def _card_tile_damage(tile):
+    """Damage of a card-drawn hunt tile: a Die icon (Shelob's Lair)
+    rolls a d6 through the funnel (rulebook: 'considered to be a
+    numbered tile for all Event card effects'); every other tile reads
+    its printed number.  ONE body for Isildur's Bane and Foul Thing
+    from the Deep."""
+    if getattr(tile, 'is_dice_roll', False):
+        return _d6_batch(1, 'shelob d6 damage')[0]
+    return int(getattr(tile, 'damage', 0) or 0)
+
+
+def _is_shadow_army_with_nazgul(army) -> bool:
+    """'A Shadow Army containing a Nazgul' (USER 2026-07-16 item 5): the
+    entry must hold Shadow Army UNITS - a lone Nazgul figure is not an
+    Army.  ONE predicate for the Dreadful Spells gate, spec and handler."""
+    return (army is not None and _army_contains_nazgul(army)
+            and any(u.nation in SHADOW_NATIONS for u in army.units))
+
+
+def _card_by_name(name):
+    """The card object whose card_name == name (None when unknown) - for
+    handlers re-entered from a pending that carries only the name."""
+    from cards import get_cards
+    for c in get_cards().values():
+        if getattr(c, 'card_name', None) == name:
+            return c
+    return None
+
+
 def _default_unit_type(state, nation, choices, key="unit_type"):
     """USER RULE (2026-07-07, amendment 1.45): mustering event cards that
     offer 'Recruit ... (Regular or Elite)' place the ELITE whenever the
@@ -157,12 +202,8 @@ def recruit_unit(state: "GameState", region: str, nation: Nation,
     Returns None when the stacking limit blocks the placement (per rules,
     excess units stay in/return to reinforcements).
     """
-    # Respect the reinforcement pool (physical piece limits).
-    # QUEUE round (RT pre-attack intel, 2026-08-17): the old blanket
-    # `except Exception: pass` was the SWALLOW class - a RAISING pool
-    # check silently disabled the cap (the W9 F2 over-pool minting
-    # re-opened).  Only the circular-import window may fall through;
-    # a real failure stays loud.
+    # Reinforcement-pool guard (physical piece limits).  Only the circular-
+    # import window may fall through; a real failure stays LOUD.
     try:
         from ai import _can_recruit
     except ImportError:
@@ -225,14 +266,10 @@ def recruit_unit(state: "GameState", region: str, nation: Nation,
     if my_count >= cap:
         if not CARD_RECRUIT_OVERSTACK:
             return None
-        # almanac ('Points common'): recruitment CARDS may over-stack,
-        # resolved immediately after the effect.  P1 (USER ruling
-        # 1.112.7): WHICH excess units return to reinforcements is the
-        # owner's decision - record the region; resolve_overstacks()
-        # runs after the card effect completes (learned pending on the
-        # pending path, regulars-first heuristic for teacher/fx/GUI
-        # bookkeeping - canary Adobim T4: Half-orcs' Isengard elite
-        # must land in the full Woodland Realm besieger stack).
+        # Recruitment CARDS may over-stack (almanac); WHICH excess returns is
+        # the owner's decision (1.112.7) - record the region; resolve_overstacks
+        # runs after the effect (learned pending on the pending path,
+        # regulars-first heuristic for teacher/GUI bookkeeping).
         unit = Unit(nation, unit_kind)
         army.units.append(unit)
         _ovr = getattr(state, '_overstack_regions', None)
@@ -251,11 +288,8 @@ def _stack_cap(state: "GameState", rsan: str, my_side) -> int:
     besieged stronghold, 10 otherwise (mirrors recruit_unit)."""
     import game_logic as _gl
     from game_state import Side as _S
-    # QA 2026-07-11 Half-orcs C6: army keys reach here display-cased
-    # (_find_army_key / _overstack_regions), but besieged_strongholds is
-    # sanitized - the case-sensitive membership check missed the siege
-    # cap (garrison cap 5 read as 10) so the besieged over-stack never
-    # trimmed.  Sanitize so every region test below is case-robust.
+    # sanitize: besieged_strongholds holds sanitized keys, callers pass
+    # display-cased ones (QA C6)
     rsan = sanitize(rsan)
     if rsan not in getattr(state, 'besieged_strongholds', set()):
         return 10
@@ -320,11 +354,8 @@ def resolve_overstacks(state: "GameState", learned: bool = True) -> None:
                 for u in removable[:excess]:
                     army.units.remove(u)
                 continue
-            # QA 2026-07-11 Half-orcs C6: offer REGULAR removals before
-            # ELITE ones (default keeps the stronger/just-recruited elite,
-            # matching the certified learned=False regulars-first heuristic
-            # and the Adobim T4 canary - the recruited Isengard elite stays,
-            # a garrison regular returns to reinforcements).
+            # offer REGULAR removals before ELITE ones (matches the
+            # learned=False regulars-first heuristic)
             kinds = sorted({(u.nation.value,
                              'elite' if u.kind == UnitKind.ELITE
                              else 'regular') for u in mine},
@@ -385,8 +416,7 @@ def _nazgul_chain_options(state, arrivals: dict) -> list:
         if pp.get('count') is not None:
             continue
         if pp.get('include_wk'):
-            # adversarial repair 2026-07-11 (BCC MAJOR): the WK is a
-            # Nazgul for all rules - offer his flight when the chain
+            # the WK is a Nazgul for all rules: offer his flight when the chain
             # permits ('__wk_ok__') and he has not flown this die
             if not _wk_ok9:
                 continue
@@ -413,6 +443,21 @@ def _nazgul_chain_options(state, arrivals: dict) -> list:
         opts.append({'from_region': sanitize(frm),
                      'to_region': sanitize(dst), 'count': 1,
                      '_naz_arr': dict(arrivals)})
+    # W4-027 (USER ruling 1.262, 2026-09-02): on a DIE-seeded chain
+    # ('__mo_ok__', set only by the nazgul_move executor - never by the
+    # card seeds: The Black Captain Commands / Ringwraiths Are Abroad
+    # move Nazgul only) the Mouth of Sauron may fly once, up to 3
+    # regions companion-style (ai._mouth_reachable).  The option carries
+    # the Mouth's identity for the action encoder's EXISTING companion
+    # slot ('companions', slot 12) - no new dims.
+    if arrivals.get('__mo_ok__') and not arrivals.get('__mo__'):
+        _mo_src = _ai9._mouth_region(state)
+        if _mo_src is not None:
+            for _mo_dst in sorted(_ai9._mouth_reachable(state, _mo_src)):
+                opts.append({'from_region': _mo_src, 'to_region': _mo_dst,
+                             'include_mouth': True,
+                             'companions': ['Mouth of Sauron'],
+                             '_naz_arr': dict(arrivals)})
     return opts
 
 
@@ -455,8 +500,10 @@ def _nazgul_search_reveal_check(state, result):
     Shadow-stronghold tile draws along the traced path)."""
     from game_logic import fellowship_region
     fsp_region = sanitize(fellowship_region(state))
+    _found_n7 = False
     for region_key, army in state.armies.items():
         if sanitize(region_key) == fsp_region and _army_contains_nazgul(army):
+            _found_n7 = True
             state.fellowship.hidden = False
             result["effects"].append(
                 "Nazgûl in Fellowship region - Fellowship revealed!")
@@ -474,6 +521,11 @@ def _nazgul_search_reveal_check(state, result):
             except Exception:
                 pass
             break
+    if not _found_n7:
+        # N7: state the negative verdict (no-silent-ignore doctrine)
+        result["effects"].append(
+            "Nazgul Search: no Nazgul with the Fellowship - "
+            "nothing found")
 
 
 def _nazgul_card_post(state, card, key, result):
@@ -490,6 +542,10 @@ def _nazgul_card_post(state, card, key, result):
         fsp = sanitize(_fr131(state))
         army = state.armies.get(_find_army_key(state, fsp))
         if army is None or not _army_contains_nazgul(army):
+            # N7 no-silent-ignore: the skipped either/or is STATED
+            result["effects"].append(
+                "Nazgul Strike: no Nazgul with the Ring-bearers - no "
+                "Hunt roll / table-card discard option")
             return
         opts = [{'action': 'hunt'}]
         try:
@@ -517,12 +573,9 @@ def _effect_nazgul_chain(state: "GameState", card, choices: dict) -> dict:
     (pseudo-handler '__nazgul_moves__', USER 2026-07-11)."""
     from game_state import Nazgul as _NazN, Army as _ArmyN
     result = {"effects": []}
-    # BCC (amendment 1.128 wiring): a chain started by 'The Black Captain
-    # Commands' carries a deferred follow-up spec so the printed 'Then,
-    # you may move or attack with an Army containing the Witch-king' half
-    # fires AFTER every Nazgul flight resolves (the follow-up outranks a
-    # coexisting pending, so it must NOT be granted until the chain ends).
-    # The plain nazgul_move chain never sets this key -> unchanged.
+    # BCC (1.128): a chain started by The Black Captain Commands carries the
+    # deferred 'Then, move or attack with the Witch-king's Army' follow-up,
+    # granted only when the chain ends (it outranks a coexisting pending).
     _fu = choices.get('_then_followup')
     _post131 = choices.get('_naz_post')
     if choices.get('_naz_done'):
@@ -538,11 +591,29 @@ def _effect_nazgul_chain(state: "GameState", card, choices: dict) -> dict:
         return result
     frm = sanitize(str(choices.get('from_region', '')))
     dst = sanitize(str(choices.get('to_region', '')))
+    if not choices.get('include_mouth'):
+        from ai import _nazgul_destination_allowed
+        if not _nazgul_destination_allowed(state, dst):
+            raise RuntimeError("Nazgul cannot fly into an unbesieged FP-controlled Stronghold")
     arr = {str(k): int(v) for k, v in
            (choices.get('_naz_arr') or {}).items()}
     src_key = _find_army_key(state, frm)
     src = state.armies.get(src_key) if src_key else None
-    if src is not None and choices.get('include_wk'):
+    if src is not None and choices.get('include_mouth'):
+        # W4-027 (1.262): the Mouth of Sauron's own leg of the die chain
+        # (armies only via game_logic.get_or_create_army)
+        import game_logic as _gl_mo
+        for l in list(src.leaders):
+            if type(l).__name__ == 'Minion' and                     'mouth' in str(getattr(l, 'name', '')).lower():
+                src.leaders.remove(l)
+                if not src.units and not src.leaders:
+                    state.armies.pop(src_key, None)
+                _gl_mo.get_or_create_army(state, dst).leaders.append(l)
+                arr['__mo__'] = 1
+                result["effects"].append(
+                    f"The Mouth of Sauron moves {frm} -> {dst}")
+                break
+    elif src is not None and choices.get('include_wk'):
         # WK flight (adversarial repair: BCC MAJOR)
         import re as _re_wk
         for l in list(src.leaders):
@@ -846,13 +917,7 @@ def draw_cards(state: "GameState", side: Side, deck: str, count: int = 1) -> Lis
 
 def _handle_persistent_card(state: "GameState", side: Side, card,
                             result: dict) -> None:
-    """Handle cards that stay on the table with ongoing effects.
-
-    RESTORED 2026-07-20: the W6 excision deleted a CONTIGUOUS range that
-    swept up this LIVE helper (15 callers) alongside the genuinely-dead
-    functions interleaved with it. Lesson re-learned (the _VP_TABLES
-    class): delete each named function by ITS OWN boundaries, never a
-    bulk range."""
+    """Handle cards that stay on the table with ongoing effects."""
     from persistent_effects import create_persistent_card
     from game_state import PersistentCardState
 
@@ -956,14 +1021,9 @@ def play_event_card(state: "GameState", side: Side, card_id: str,
         if handler:
             global CARD_RECRUIT_OVERSTACK
             CARD_RECRUIT_OVERSTACK = True
-            # CONSERVATION FIX (2026-07-20, seed 12111 Dreadful Spells):
-            # card handlers that call combat.apply_casualties (Dreadful
-            # Spells / Foul Thing / etc.) do so OUTSIDE battle(), where
-            # combat._ACTIVE_STATE is None -> _downgrade_allowed returned
-            # True unconditionally and MINTED a Regular (bypassing the
-            # pool check). Publish the state around the WHOLE handler so
-            # any casualty application inside it is supply-checked. One
-            # choke point covers every current and future card handler.
+            # Publish the state around the WHOLE handler so any casualty
+            # application inside it is supply-checked (card handlers run
+            # outside battle()).
             from combat import set_active_state as _sas_c
             _prev_as_c = _sas_c(state)   # save/restore (nesting-safe)
             try:
@@ -974,17 +1034,42 @@ def play_event_card(state: "GameState", side: Side, card_id: str,
             result["effects"].extend(handler_result.get("effects", []))
             if handler_result.get("message"):
                 result["message"] = handler_result["message"]
-            # CARD-FLEET LOW-6/LOW-8 (2026-07-21): a handler that
-            # no-ops (illegal/absent companion choice) sets
-            # result['refund'].  Honor it here: keep the card in hand,
-            # do NOT discard, do NOT resolve overstacks, report failure.
+            # LOW-6/LOW-8: a handler that no-ops sets result['refund'] - keep
+            # the card in hand, no discard, no overstack resolve.
             if handler_result.get("refund"):
-                result["refund"] = True
-                result["success"] = False
-                if not result["message"]:
-                    result["message"] = (
-                        f"{card.card_name}: no legal effect - not played")
-                return result
+                # USER RULING 1.230 (2026-08-28, verbatim: "zero effect plays
+                # are allowed, always. even in self play"): a handler that
+                # could apply NOTHING is a completed zero-effect play (card
+                # discarded, die spent).  The refund survives ONLY when legal
+                # choices EXISTED and the action carried a bad or absent one
+                # (an invalid action, not a zero-effect play).
+                _bad_choice = False
+                try:
+                    from card_options import get_card_options as _gco_r
+                    _opts_r = _gco_r(state, side, card.card_name) or []
+                    if _opts_r:
+                        def _nv(v):
+                            return sanitize(str(v)) if isinstance(
+                                v, str) else v
+                        _bad_choice = not any(
+                            all(_nv((choices or {}).get(k)) == _nv(v)
+                                for k, v in o.items()
+                                if not str(k).startswith('_'))
+                            for o in _opts_r)
+                except Exception:
+                    _bad_choice = False
+                if _bad_choice:
+                    result["refund"] = True
+                    result["success"] = False
+                    if not result["message"]:
+                        result["message"] = (
+                            f"{card.card_name}: no legal effect - not "
+                            f"played")
+                    return result
+                result["zero_effect"] = True
+                result["effects"].append(
+                    f"{card.card_name}: no effect (zero-effect play, "
+                    f"ruling 1.230)")
         else:
             # Fall back to generic effect parsing
             _apply_generic_effects(state, card, choices, result)
@@ -1017,9 +1102,11 @@ def play_event_card(state: "GameState", side: Side, card_id: str,
             result["message"] = f"Played {card.card_name}"
 
     except Exception as e:
-        result["message"] = f"Error applying effect: {str(e)}"
-        import traceback
-        traceback.print_exc()
+        # LOUD (audit EE1-09): a handler that raises after mutating must never
+        # be reported as a quiet failure; the ai.py executor owns the
+        # conservation branch for a raising handler.
+        print(f"[play_event_card] handler raised for {card_id}: {e!r}")
+        raise
 
     return result
 
@@ -1156,16 +1243,124 @@ def _handle_draw(state: "GameState", side: Side, effect_text: str,
         result["effects"].append(f"Drew {len(drawn)} Character cards")
 
 
+def _dead_men_recruit(state, target_region, choices, result):
+    """Dead Men's final optional recruitment, after the attack and movement.
+
+    Card C22 says "may then recruit up to three"; the almanac pp15-16
+    confirms recruitment happens after the Shadow's forced retreat and that
+    moving companions alone does not recapture an enemy-held settlement.
+    """
+    from ai import figures_available
+    import combat
+    target_key = sanitize(target_region)
+    available = min(3, figures_available(state, Nation.GONDOR, 'regular'))
+    count = choices.get('recruit_count')
+    if (count is None and choices.get('_from_pending')
+            and combat.FINAL_HITS_HOOK is None and available > 0):
+        state.pending_card_option = {
+            'card_id': 'FREE_PEOPLES_Character_Dead_Men_of_Dunharrow',
+            'card_name': 'Dead Men of Dunharrow',
+            'side': 'fp', 'decider': 'fp', 'direct': True,
+            'options': [
+                {'target_region': target_key, '_dmd_recruit_only': True,
+                 'recruit_count': n}
+                for n in range(available + 1)]}
+        result['effects'].append('Free Peoples chooses how many Gondor regulars to recruit')
+        return result
+    count = 3 if count is None else int(count)
+    if choices.get('_dmd_recruit_only') and not 0 <= count <= available:
+        raise ValueError('Dead Men recruitment count is not available')
+    # Explicit replay choices retain their historical physical-pool cap.
+    count = max(0, min(3, count))
+    placed = sum(recruit_unit(state, target_region, Nation.GONDOR,
+                             UnitKind.REGULAR, ignore_captured=True) is not None
+                 for _ in range(count))
+    result['effects'].append(f'Recruited {placed} Gondor regular(s) in {target_region}')
+    if target_key in state.enemy_controlled.get(Side.SHADOW, set()):
+        army = state.armies.get(_find_army_key(state, target_key))
+        from combat import side_of_nation
+        if (army and any(side_of_nation(u.nation) == Side.FREE_PEOPLES
+                         for u in army.units)
+                and not any(side_of_nation(u.nation) == Side.SHADOW
+                            for u in army.units)):
+            state.enemy_controlled[Side.SHADOW].discard(target_key)
+            result['effects'].append(f'Regained control of {target_region}')
+    return result
+
+
+def dead_men_arrival_before_roll(state: "GameState", target_region: str,
+                                 aragorn_companions, result=None) -> bool:
+    """Apply only the printed arrival and attack politics before any dice.
+
+    The live bridge uses this same phase on a clone to render the selected
+    Companions before requesting the client roll. No hit, retreat or recruit
+    decision is resolved here.
+    """
+    from game_state import Companion as _Comp
+    import game_logic as _gl9
+    from combat import side_of_nation as _son
+    target_key = sanitize(target_region)
+    if target_key not in {"erech", "lamedon", "pelargir"}:
+        raise ValueError('Invalid Dead Men destination')
+    result = result if result is not None else {"effects": []}
+    # Printed sequence: move the selected group FIRST, then roll Shadow hits.
+    # Shared-region casualty and destruction helpers filter by the dying side,
+    # so arriving Companions cannot become casualties of the Shadow army.
+    _lead_names9 = ("Strider", "Aragorn", "Aragorn - Heir to Isildur")
+    _src9, _group9 = None, []
+    for rk, a in list(state.armies.items()):
+        if sanitize(rk) == target_key:
+            continue
+        comps_here = [l for l in a.leaders if isinstance(l, _Comp)]
+        if not any(l.name in _lead_names9 for l in comps_here):
+            continue
+        if aragorn_companions is not None:
+            if (not isinstance(aragorn_companions, (list, tuple))
+                    or len(set(aragorn_companions)) != len(aragorn_companions)
+                    or not set(aragorn_companions).issubset({l.name for l in comps_here})
+                    or not any(name in aragorn_companions for name in _lead_names9)):
+                raise ValueError('Dead Men companion group is not available')
+            _keep9 = set(aragorn_companions)
+            _group9 = [l for l in comps_here if l.name in _keep9]
+        else:
+            _group9 = comps_here   # take all co-located companions
+        _src9 = rk
+        break
+
+    if _src9 is not None:
+        source = state.armies[_src9]
+        for companion in _group9:
+            source.leaders.remove(companion)
+            _gl9.place_separated_companion(state, companion, target_key)
+        if not source.units and not source.leaders:
+            state.armies.pop(_src9, None)
+        result['effects'].append('Moved ' + ', '.join(c.name for c in _group9)
+                                 + f' to {target_region}')
+
+    shadow_army = state.armies.get(_find_army_key(state, target_key))
+    attacked = bool(shadow_army and any(_son(u.nation) == Side.SHADOW
+                                       for u in shadow_army.units))
+    if attacked:
+        _gl9.advance_defenders_political(
+            state, target_key, attacker_side=Side.FREE_PEOPLES)
+    return attacked
+
+
 def effect_dead_men_of_dunharrow(state: "GameState", target_region: str,
                                  aragorn_companions: List[str] = None,
-                                 choices: dict = None) -> dict:
-    """Dead Men of Dunharrow: Move Aragorn, roll against Shadow army."""
+                                 choices: dict = None, card=None) -> dict:
+    """Dead Men of Dunharrow: Move Aragorn, roll against Shadow army.
+
+    USER RULING 1.254: the hits are the Shadow OWNER's learned
+    allocation (_route_card_casualties); when that opens a pending the
+    card's remaining legs (forced retreat and recruitment) resume
+    through _complete_card_casualty with choices['_dmd_cas_resumed']."""
     choices = choices or {}
     # Chained retreat stage (learned path, amendment 1.129): the Shadow
     # player already picked WHICH legal region the forced-retreat army
     # withdraws to.  The attack (political advance, roll, hits) resolved
-    # in the prior stage; this option embeds the Strider target + movers
-    # so the remainder of the card (move, recruit, control) runs here.
+    # in the prior stage, after the selected Companions arrived. This
+    # option retains their target for recruitment and control handling.
     _dmd_dest = choices.get('destination')
     if _dmd_dest is not None:
         target_region = choices.get('_dmd_target', target_region)
@@ -1177,36 +1372,16 @@ def effect_dead_men_of_dunharrow(state: "GameState", target_region: str,
         return {"success": False, "message": f"Invalid target: {target_region}"}
 
     result = {"success": True, "effects": []}
+    if choices.get('_dmd_recruit_only'):
+        return _dead_men_recruit(state, target_key, choices, result)
 
     from game_state import Companion as _Comp
     import game_logic as _gl9
     from combat import side_of_nation as _son
 
-    # locate the mover group (Strider/Aragorn + named companions) but
-    # do NOT move yet - the attack resolves FIRST (QA 2026-07-11 Dead
-    # Men CASES 10/11: moving first merged Strider into the enemy
-    # entry, and he retreated or died along with it)
-    # USER 2026-07-16 (item 1): Dead Men moves "Strider/Aragorn (and any
-    # number of Companions in the same region)".  Bring EVERY companion
-    # co-located with Strider/Aragorn in the source region along - a group
-    # move (the old code moved only Strider/Aragorn, stranding the others).
-    # An explicit companion subset (choices['companions']) still narrows
-    # the group when a chained retreat stage supplies one.
-    _lead_names9 = ("Strider", "Aragorn", "Aragorn - Heir to Isildur")
-    _src9, _group9 = None, []
-    for rk, a in list(state.armies.items()):
-        if sanitize(rk) == target_key:
-            continue
-        comps_here = [l for l in a.leaders if isinstance(l, _Comp)]
-        if not any(l.name in _lead_names9 for l in comps_here):
-            continue
-        if aragorn_companions:
-            _keep9 = set(aragorn_companions) | set(_lead_names9)
-            _group9 = [l for l in comps_here if l.name in _keep9]
-        else:
-            _group9 = comps_here   # take all co-located companions
-        _src9 = rk
-        break
+    if _dmd_dest is None and not choices.get('_dmd_cas_resumed'):
+        dead_men_arrival_before_roll(state, target_key,
+                                    aragorn_companions, result)
 
     # Attack a Shadow army in the target: political advance, hits on
     # the SHADOW portion, then FORCE RETREAT (destroy if impossible,
@@ -1215,32 +1390,37 @@ def effect_dead_men_of_dunharrow(state: "GameState", target_region: str,
     from combat import reconcile_destroyed_army as _rda9
     if shadow_army and any(_son(u.nation) == Side.SHADOW
                            for u in shadow_army.units):
-        if _dmd_dest is None:
-            # almanac: 'this card is an attack and so affects the
-            # Political Track'
-            _gl9.advance_defenders_political(
-                state, target_key, attacker_side=Side.FREE_PEOPLES)
+        if _dmd_dest is None and not choices.get('_dmd_cas_resumed'):
             roll = _d6_batch(1)[0]
             _ann_rng(state, 'card effect roll', faces=[roll])
-            casualties = _apply_card_hits_to_shadow(state, shadow_army, roll)
-            result["effects"].append(
-                f"Rolled {roll}, {len(casualties)} Shadow casualties")
-        _sh_units9 = [u for u in shadow_army.units
+            import combat as _cmb_dmd
+            if _cmb_dmd.FINAL_HITS_HOOK is None:
+                # USER RULING 1.254: owner-allocated (learned pending);
+                # the teacher keeps its certified logged-composition
+                # path below.
+                result["effects"].append(f"Rolled {roll}")
+                if not _route_card_casualties(
+                        state, target_key, Side.SHADOW, roll,
+                        card or _card_by_name('Dead Men of Dunharrow'),
+                        choices, result):
+                    return result
+                shadow_army = state.armies.get(
+                    _find_army_key(state, target_key))
+            else:
+                casualties = _apply_card_hits_to_shadow(
+                    state, shadow_army, roll)
+                result["effects"].append(
+                    f"Rolled {roll}, {len(casualties)} Shadow casualties")
+        _sh_units9 = [u for u in (shadow_army.units if shadow_army else [])
                       if _son(u.nation) == Side.SHADOW]
-        _sh_ldrs9 = [l for l in shadow_army.leaders
+        _sh_ldrs9 = [l for l in (shadow_army.leaders if shadow_army else [])
                      if _gl9._leader_side(l) == Side.SHADOW]
         if _sh_units9:
-            # retreat destination per normal rules: no FP units, not an
-            # FP-controlled settlement.  Per the almanac the DESTINATION
-            # is the SHADOW player's choice (amendment 1.129): on the
-            # learned path with >1 legal region we open a cross-side
-            # pending (side fp / decider sh / direct chained stage); the
-            # teacher/GUI keep the deterministic first-legal pick.
-            # USER 2026-07-16 (item 4): the Shadow army cannot retreat into
-            # an FP-CONTROLLED settlement (native OR captured), even when it
-            # holds no units.  enemy_controlled[FP] lists only FP-CAPTURED
-            # settlements, so native FP towns/cities/strongholds slipped
-            # through - use the settlement controller instead.
+            # Retreat destination = the SHADOW player's choice (1.129): a
+            # learned cross-side pending when >1 legal region; teacher/GUI
+            # keep the first legal pick.  USER 2026-07-16 item 4: never into
+            # an FP-CONTROLLED settlement (native or captured) - use the
+            # settlement controller.
             from ai import _settlement_controller as _sc9
             _dests9 = []
             for adj in state.board.adjacent(target_key):
@@ -1263,12 +1443,10 @@ def effect_dead_men_of_dunharrow(state: "GameState", target_region: str,
                     'side': 'fp', 'decider': 'sh', 'direct': True,
                     'options': [{'destination': _d9,
                                  '_dmd_target': target_key,
-                                 'companions': [l.name for l in _group9],
-                                 # LOW-5: thread the FP-chosen recruit
-                                 # count through the Shadow-retreat
-                                 # pending (Stage 2 recruits it)
-                                 'recruit_count':
-                                     choices.get('recruit_count', 3)}
+                                 # Recorded counts can be carried through;
+                                 # normal play chooses only AFTER retreat.
+                                 **({'recruit_count': choices['recruit_count']}
+                                    if 'recruit_count' in choices else {})}
                                 for _d9 in _dests9]}
                 result["effects"].append(
                     "Shadow army must retreat - the Shadow player picks "
@@ -1284,9 +1462,8 @@ def effect_dead_men_of_dunharrow(state: "GameState", target_region: str,
                 for l in _sh_ldrs9:
                     shadow_army.leaders.remove(l)
                     _dst9.leaders.append(l)
-                # adversarial repair 2026-07-11: an occupied retreat
-                # destination can exceed the cap - record it for the
-                # P1 learned-overstack resolution (runs post-handler)
+                # an occupied retreat destination can exceed the cap - record
+                # it for the learned overstack resolution (1.112.7)
                 _own_d9 = sum(1 for u in _dst9.units
                               if _son(u.nation) == Side.SHADOW)
                 if _own_d9 > _stack_cap(state, sanitize(dest),
@@ -1305,9 +1482,7 @@ def effect_dead_men_of_dunharrow(state: "GameState", target_region: str,
                 for u in _sh_units9:
                     shadow_army.units.remove(u)
                 # USER RULING 2026-08-15: the ONE reconciler books the
-                # eliminated figures (named Minions flip out of play,
-                # Saruman's table cards discard) — the inline sweep left
-                # a phantom Witch-king/Mouth/Saruman action die behind
+                # eliminated figures
                 _rda9(state, target_key, Side.SHADOW,
                       card_name='Dead Men of Dunharrow')
                 result["effects"].append(
@@ -1320,51 +1495,7 @@ def effect_dead_men_of_dunharrow(state: "GameState", target_region: str,
             result["effects"].append(
                 "Shadow army destroyed (with Nazgûl and Minions)")
 
-    # NOW move Strider/Aragorn (+ companions) into the cleared region
-    if _src9 is not None:
-        _sa9 = state.armies[_src9]
-        _tgt9 = _army_entry_for(state, target_key)
-        for l in _group9:
-            _sa9.leaders.remove(l)
-            _tgt9.leaders.append(l)
-        if not _sa9.units and not _sa9.leaders:
-            state.armies.pop(_src9, None)
-        result["effects"].append(
-            "Moved " + ', '.join(l.name for l in _group9)
-            + f" to {target_region}")
-
-    # Recruit up to 3 Gondor regulars (pool-capped). CARD-FLEET LOW-5
-    # (2026-07-20): the COUNT is a learned decision (card text: "you
-    # MAY recruit UP TO three") routed through card_options as
-    # recruit_count; default 3 keeps the teacher path and any direct
-    # caller at the historical always-max behavior.
-    _rc9 = choices.get('recruit_count')
-    _rc9 = 3 if _rc9 is None else max(0, min(3, int(_rc9)))
-    _placed9 = 0
-    for _ in range(_rc9):
-        if recruit_unit(state, target_region, Nation.GONDOR,
-                        UnitKind.REGULAR,
-                        ignore_captured=True) is not None:
-            _placed9 += 1
-    result["effects"].append(
-        f"Recruited {_placed9} Gondor regular(s) in {target_region}")
-
-    # Dead Men is the ONE card that REGAINS control of the settlement -
-    # but only when a unit could actually be placed (almanac CASE 14:
-    # an empty Gondor pool moves Strider and rolls the attack, yet the
-    # FP player does NOT take control)
-    _ec = getattr(state, 'enemy_controlled', None)
-    if _ec is not None and target_key in _ec.get(Side.SHADOW, set()):
-        _sa = state.armies.get(_find_army_key(state, target_key))
-        _has_fp_units9 = bool(_sa and any(
-            _son(u.nation) == Side.FREE_PEOPLES for u in _sa.units))
-        _has_sh_units9 = bool(_sa and any(
-            _son(u.nation) == Side.SHADOW for u in _sa.units))
-        if _has_fp_units9 and not _has_sh_units9:
-            _ec[Side.SHADOW].discard(target_key)
-            result["effects"].append(f"Regained control of {target_region}")
-
-    return result
+    return _dead_men_recruit(state, target_key, choices, result)
 
 
 # ---------------------------------------------------------------------------
@@ -1427,6 +1558,8 @@ def _effect_mithril_coat(state: "GameState", card, choices: dict) -> dict:
         import game_logic as _gl9
         result = {"effects": []}
         stash = getattr(state, '_mithril_stash', None)
+        if stash and stash.get('return_pending'):
+            raise ValueError('Mithril redraw already resolved; original tile awaits action end')
         state._mithril_stash = None
         if stash is None:
             return result
@@ -1437,10 +1570,13 @@ def _effect_mithril_coat(state: "GameState", card, choices: dict) -> dict:
             # its own 'apply_kind'; the apply-continuation re-enters the
             # card handler with the (kept or redrawn) tile forced.
             _ak9 = stash.get('apply_kind')
-            if _ak9 in ('orc_patrol', 'foul_thing', 'isildur'):
+            if _ak9 == 'stronghold':
+                return _gl9._apply_shadow_stronghold_tile(state, tile9)
+            if _ak9 in ('orc_patrol', 'foul_thing', 'isildur', 'breaking'):
                 _hmap9 = {'orc_patrol': _effect_orc_patrol,
                           'foul_thing': _effect_foul_thing,
-                          'isildur': _effect_isildurs_bane}
+                          'isildur': _effect_isildurs_bane,
+                          'breaking': _effect_breaking_of_fellowship}
                 _ch9 = dict(stash.get('choices') or {})
                 _ch9['_forced_tile'] = tile9
                 _r9 = _hmap9[_ak9](state, None, _ch9)
@@ -1470,7 +1606,8 @@ def _effect_mithril_coat(state: "GameState", card, choices: dict) -> dict:
                 return {}
             return _gl9._apply_hunt_tile(state, tile9,
                                          stash['successes'],
-                                         mordor=stash['mordor'])
+                                         mordor=stash['mordor'],
+                                         eye_no_effect=stash.get('eye_no_effect', False))
 
         if not choices['mithril_redraw']:
             _apply9(stash['tile'])
@@ -1488,12 +1625,13 @@ def _effect_mithril_coat(state: "GameState", card, choices: dict) -> dict:
         result["effects"].append(
             "Mithril Coat and Sting discarded - Shadow redraws")
         # rebuild only if the pool is EMPTY and a tile is required
-        # (almanac; the original tile returns during this action)
-        if not state.hunt_pool and state.hunt_discard:
-            state.hunt_pool.extend(state.hunt_discard)
-            state.hunt_discard.clear()
-            random.shuffle(state.hunt_pool)
+        # (almanac; the original tile returns during this action).
+        # 1.136: the ONE recycler - pre-Mordor special tiles stay out.
+        if not state.hunt_pool and _gl9._recycle_hunt_pool(state):
             result["effects"].append("Hunt Pool rebuilt for the redraw")
+        # Preserve the publicly known tile across asynchronous damage/reveal
+        # choices, including additional draws within the same action.
+        state._mithril_stash = dict(stash, return_pending=True)
         if state.hunt_pool:
             t2 = _tile_pop(state)
             try:
@@ -1504,9 +1642,7 @@ def _effect_mithril_coat(state: "GameState", card, choices: dict) -> dict:
             except Exception:
                 pass
             _apply9(t2)
-        # the ORIGINAL tile returns to the Hunt Pool at action end
-        state.hunt_pool.append(stash['tile'])
-        random.shuffle(state.hunt_pool)
+        _gl9.return_mithril_tile_if_settled(state)
         return result
     result = {"effects": []}
     _handle_persistent_card(state, Side.FREE_PEOPLES, card, result)
@@ -1566,9 +1702,16 @@ def _effect_wizards_staff(state: "GameState", card, choices: dict) -> dict:
         # _resolve_hunt_tile (mirrors _effect_mithril_coat's apply_kind
         # routing).
         _ak9 = stash.get('apply_kind')
-        if _ak9 in ('foul_thing', 'isildur'):
-            _hmap9 = {'foul_thing': _effect_foul_thing,
-                      'isildur': _effect_isildurs_bane}
+        if _ak9 == 'stronghold':
+            _gl9._draw_shadow_stronghold_tile(
+                state, stash['region'], stash['reason'], _skip_wizard=True, _resume=True)
+            result['effects'].append("Wizard's Staff kept - stronghold Hunt draw resumes")
+            return result
+        if _ak9 in ('orc_patrol', 'foul_thing', 'isildur', 'breaking'):
+            _hmap9 = {'orc_patrol': _effect_orc_patrol,
+                      'foul_thing': _effect_foul_thing,
+                      'isildur': _effect_isildurs_bane,
+                      'breaking': _effect_breaking_of_fellowship}
             _ch9 = dict(stash.get('choices') or {})
             _ch9['_skip_wizard'] = True
             _r9 = _hmap9[_ak9](state, None, _ch9)
@@ -1650,6 +1793,18 @@ def _effect_there_is_another_way(state: "GameState", card, choices: dict) -> dic
         result["effects"].append(
             "Fellowship moved (Gollum guide, no die to the Hunt "
             "Box): " + str(_mv9.get('message', '')))
+    elif gollum and _act9 == 'hide':
+        # USER RULING 2026-08-25 (verbatim: "move or hide depending
+        # on whether fellowship is revealed") - the revealed
+        # fellowship may HIDE with the card instead
+        if state.fellowship.hidden:
+            result["effects"].append(
+                "Gollum hide skipped: already hidden (heal kept)")
+            return result
+        state.fellowship.hidden = True
+        state.fellowship_acted_in_mordor = True
+        result["effects"].append(
+            "Fellowship hidden (Gollum guide, There is Another Way)")
     return result
 
 
@@ -1664,14 +1819,9 @@ def _effect_i_will_go_alone(state: "GameState", card, choices: dict) -> dict:
     companions_to_separate = choices.get("companions", [])
     destination = choices.get("destination", "")
 
-    # CARD-FLEET LOW-8 (2026-07-21): "Separate one Companion ..." is
-    # imperative; the trailing "heal one Corruption" is the
-    # CONTINUATION of a completed separation. With no companion/
-    # destination chosen the separation cannot happen, so neither does
-    # the heal: refund (do not silently heal + burn card/die) — but
-    # only when a legal separation target exists; a Gollum-only
-    # Fellowship has no separable target, so fall through to the
-    # historical heal-only there.
+    # LOW-8: with no companion/destination and a separable target the
+    # separation cannot happen, so neither does its trailing heal - refund; a
+    # Gollum-only Fellowship has nothing to separate and heals only.
     if (
             not companions_to_separate or not destination):
         if any(c.name != "Gollum" and c.level > 0
@@ -1717,13 +1867,12 @@ def _effect_i_will_go_alone(state: "GameState", card, choices: dict) -> dict:
         if separated_names:
             result["effects"].append(f"Separated {', '.join(separated_names)} to {destination}")
 
-            # Update guide if needed
+            # a separated Guide re-picks by HIGHEST Level; a Level tie
+            # is the learned pending_guide_change (CL-219) - never a
+            # swallowed RuntimeError leaving a stale guide
             from game_logic import change_guide
-            if state.fellowship.guide and state.fellowship.guide.name in separated_names:
-                try:
-                    change_guide(state)
-                except:
-                    pass
+            change_guide(state, allow_pending=True)
+            _gl.check_companion_persistent_discards(state)
 
     # Heal 1 corruption
     state.fellowship.corruption = max(0, state.fellowship.corruption - 1)
@@ -1748,11 +1897,8 @@ def _effect_mirror_of_galadriel(state: "GameState", card, choices: dict) -> dict
     result = {"effects": []}
     from game_logic import fellowship_region
     from game_state import ActionDieFace
-    # iter 39: perform the die change HERE (the old "handled externally"
-    # comment was aspirational — nothing external did it in self-play).
-    # SELF-PLAY ONLY: the teacher's schedule applies the humans' logged
-    # die_change records itself (doing both double-changed a die and
-    # regressed the AngryBird canary within one cycle).
+    # Perform the die change HERE.  SELF-PLAY ONLY: the teacher's schedule
+    # applies the logged die_change records itself.
     _changed = False
     for _d in state.dice.get(Side.FREE_PEOPLES, []):
         if not _d.used and _d.current == ActionDieFace.CHARACTER:
@@ -1783,17 +1929,14 @@ def _effect_mirror_of_galadriel(state: "GameState", card, choices: dict) -> dict
 def _effect_challenge_of_king(state: "GameState", card, choices: dict) -> dict:
     """Draw 3 hunt tiles - eliminate Strider if all Eyes, else remove Eye tiles."""
     result = {"effects": []}
-    # Draw 3 DISTINCT tiles (actually remove them from the pool).
-    # almanac (QA 2026-07-11 CASE 15): if the pool empties mid-draw and
-    # a required tile cannot be drawn, rebuild it from the discard.
+    # Draw 3 DISTINCT tiles; an emptied pool is refilled by the ONE recycler
+    # (1.136; pre-Mordor special tiles stay parked in the used pile).
+    import game_logic as _glc9
     tiles = []
     for _ in range(3):
-        if not state.hunt_pool and state.hunt_discard:
-            state.hunt_pool.extend(state.hunt_discard)
-            state.hunt_discard.clear()
-            random.shuffle(state.hunt_pool)
+        if not state.hunt_pool and _glc9._recycle_hunt_pool(state):
             result["effects"].append(
-                "Hunt Pool rebuilt from the discard mid-draw")
+                "Hunt Pool rebuilt from the used pile mid-draw")
         if state.hunt_pool:
             tile = _tile_choice(state)
             state.hunt_pool.remove(tile)
@@ -1802,22 +1945,21 @@ def _effect_challenge_of_king(state: "GameState", card, choices: dict) -> dict:
     eye_count = sum(1 for t in tiles if getattr(t, 'is_eye', False))
 
     if eye_count == 3:
-        # All Eyes: put the tiles BACK in the pool and eliminate
-        # Strider/Aragorn.  QA 2026-07-11 CASE 11: the play requirement
-        # forces him SEPARATED - search the BOARD as well as the
-        # Fellowship (the old code only checked the Fellowship).
+        # All Eyes: the tiles return to the pool and Strider/Aragorn is
+        # eliminated - he is SEPARATED by the play requirement, so search the
+        # BOARD as well as the Fellowship - through
+        # combat.book_eliminated_characters (companion-casualty hooks),
+        # never a bare leaders.remove.
         result["effects"].append("All 3 tiles show Eyes - Strider/Aragorn eliminated!")
-        _found9 = False
+        from combat import book_eliminated_characters as _bec9
+        _dead9 = None
         for c in state.fellowship.companions[:]:
             if "Strider" in c.name or "Aragorn" in c.name:
                 state.fellowship.companions.remove(c)
-                if state.fellowship.guide is c:
-                    state.fellowship.guide = (
-                        state.fellowship.companions[0]
-                        if state.fellowship.companions else None)
-                _found9 = True
+                _dead9 = c
+                _glc9.change_guide(state, allow_pending=True)
                 break
-        if not _found9:
+        if _dead9 is None:
             from game_state import Companion as _CompC
             for _rk9, _a9 in list(state.armies.items()):
                 for l in list(_a9.leaders):
@@ -1826,17 +1968,17 @@ def _effect_challenge_of_king(state: "GameState", card, choices: dict) -> dict:
                         _a9.leaders.remove(l)
                         if not _a9.units and not _a9.leaders:
                             state.armies.pop(_rk9, None)
-                        _found9 = True
+                        _dead9 = l
                         break
-                if _found9:
+                if _dead9 is not None:
                     break
-            import game_logic as _glc9
             _glc9.remove_orphaned_leaders(state)
+        if _dead9 is not None:
+            _bec9(state, [_dead9])
         state.hunt_pool.extend(tiles)
     else:
-        # USER RULE 2026-07-08: Challenge is the ONE card that removes
-        # Eyes PERMANENTLY (hunt_removed, so they do NOT return on
-        # Mordor entry).  Non-Eye tiles go back to the pool.
+        # USER RULE 2026-07-08: Challenge is the ONE card that removes Eyes
+        # PERMANENTLY (hunt_removed); non-Eye tiles return to the pool.
         discarded = 0
         for t in tiles:
             if getattr(t, 'is_eye', False):
@@ -1883,13 +2025,8 @@ def _group_separate(state, names, dest_san, rng, result,
     if sep_names:
         result["effects"].append(
             f"Separated {', '.join(sep_names)} to {dest_san} (group)")
-        if state.fellowship.guide is not None \
-                and state.fellowship.guide not in \
-                state.fellowship.companions:
-            try:
-                _gl.change_guide(state, allow_pending=True)
-            except Exception:
-                pass
+        _gl.change_guide(state, allow_pending=True)
+        _gl.check_companion_persistent_discards(state)
     return result
 
 
@@ -1903,11 +2040,9 @@ def _effect_gwaihir(state: "GameState", card, choices: dict) -> dict:
     action = choices.get("companion_action", "")
     destination = choices.get("destination", "")
 
-    # TEACHER pure-mode vocabulary (fx-derived, TaBA-class keys): a bare
-    # companions+destination choice set IS the logged group separation
-    # (GAME19 T2 Polijuna: Strider+Boromir -> Minas Tirith; the missing
-    # companion_action made the play a no-op and stranded both).  Self-
-    # play always supplies companion_action via its option specs.
+    # TEACHER vocabulary: a bare companions+destination choice set IS the
+    # logged group separation (GAME19 T2); self-play always supplies
+    # companion_action.
     if not action and destination and choices.get('companions'):
         action = 'group'
 
@@ -1917,8 +2052,10 @@ def _effect_gwaihir(state: "GameState", card, choices: dict) -> dict:
 
     if destination == '__remove_from_play__' \
             and state.fellowship.mordor_entered \
-            and action.startswith('sep_'):
-        _remove_companions_from_play(state, [action[4:]], result)
+            and (action == 'group' or action.startswith('sep_')):
+        names = (choices.get('companions') or []
+                 if action == 'group' else [action[4:]])
+        _remove_companions_from_play(state, names, result)
         return result
 
     dest_san = sanitize(destination)
@@ -1935,21 +2072,15 @@ def _effect_gwaihir(state: "GameState", card, choices: dict) -> dict:
                                    allow_besieged=True):
             result["message"] = f"{destination} out of range (Level 4)"
             return _selfplay_refund(result)   # LOW-6
-    elif action.startswith('move_'):
+    elif action == 'move_group' or action.startswith('move_'):
         # QA 2026-07-11 (Gwaihir CASE 8): a previously separated
-        # companion moves up to 4 regions FROM ITS OWN REGION
-        from game_state import Companion as _CompG
-        _cn9 = action[5:]
-        _cur9 = None
-        for _rk9, _a9 in state.armies.items():
-            if any(isinstance(l, _CompG) and l.name == _cn9
-                   for l in _a9.leaders):
-                _cur9 = sanitize(_rk9)
-                break
-        if _cur9 is None or not _dest_ok_from(state, _cur9, dest_san, 4,
-                                              allow_besieged=True):
-            result["message"] = f"{destination} out of range (Level 4)"
-            return _selfplay_refund(result)   # LOW-6
+        # companion (or a co-located GROUP - card: "one Companion or one
+        # group of Companions") moves up to 4 regions FROM ITS OWN
+        # REGION; ONE body for the single and the group arm.
+        _names9 = (list(choices.get('companions') or [])
+                   if action == 'move_group' else [action[5:]])
+        return _card_move_board_group(state, _names9, dest_san, 4, result,
+                                      '(as Level 4)')
 
     if action.startswith("sep_"):
         # Separating from fellowship
@@ -1962,26 +2093,49 @@ def _effect_gwaihir(state: "GameState", card, choices: dict) -> dict:
                 place_separated_companion(state, comp, dest_san)
                 result["effects"].append(f"Separated {comp_name} to {destination} (as Level 4)")
 
-                # Update guide if needed
+                # a separated Guide re-picks by HIGHEST Level; a Level
+                # tie is the learned pending_guide_change (CL-219)
                 from game_logic import change_guide
-                if state.fellowship.guide and state.fellowship.guide.name == comp_name:
-                    try:
-                        change_guide(state)
-                    except:
-                        pass
+                change_guide(state, allow_pending=True)
+                from game_logic import check_companion_persistent_discards
+                check_companion_persistent_discards(state)
                 break
 
-    elif action.startswith("move_"):
-        # Moving already separated companion
-        comp_name = action[5:]  # Remove "move_"
-        for region_key, army in list(state.armies.items()):
-            for leader in list(army.leaders):
-                if isinstance(leader, Companion) and leader.name == comp_name:
-                    army.leaders.remove(leader)
-                    place_separated_companion(state, leader, dest_san)
-                    result["effects"].append(f"Moved {comp_name} to {destination} (as Level 4)")
-                    break
+    return result
 
+
+def _card_move_board_group(state, names, dest_san, rng, result, label):
+    """Card-granted board move of one or more CO-LOCATED separated
+    companions (Gwaihir / We Prove Swifter 'move' arm): validated with
+    _dest_ok_from from the group's own region (besieged end allowed),
+    placed via place_separated_companion, and the emptied source entry
+    is dropped (never an empty Army entry left behind)."""
+    from game_state import Companion as _CompG
+    from game_logic import place_separated_companion
+    names = [str(n) for n in (names or [])]
+    _cur9, _key9 = None, None
+    for _rk9, _a9 in state.armies.items():
+        _here9 = {l.name for l in _a9.leaders if isinstance(l, _CompG)}
+        if names and set(names) <= _here9:
+            _cur9, _key9 = sanitize(_rk9), _rk9
+            break
+    if _cur9 is None:
+        result["message"] = "Companion group not co-located on the board"
+        return _selfplay_refund(result)
+    if not _dest_ok_from(state, _cur9, dest_san, rng, allow_besieged=True):
+        result["message"] = f"{dest_san} out of range {label}"
+        return _selfplay_refund(result)   # LOW-6 / LOW-20
+    army = state.armies[_key9]
+    movers = [l for l in list(army.leaders)
+              if isinstance(l, _CompG) and l.name in names]
+    for l in movers:
+        army.leaders.remove(l)
+    if not army.units and not army.leaders:
+        state.armies.pop(_key9, None)
+    for l in movers:
+        place_separated_companion(state, l, dest_san)
+    result["effects"].append(
+        f"Moved {', '.join(l.name for l in movers)} to {dest_san} {label}")
     return result
 
 
@@ -2001,8 +2155,10 @@ def _effect_we_prove_swifter(state: "GameState", card, choices: dict) -> dict:
 
     if destination == '__remove_from_play__' \
             and state.fellowship.mordor_entered \
-            and action.startswith('sep_'):
-        _remove_companions_from_play(state, [action[4:]], result)
+            and (action == 'group' or action.startswith('sep_')):
+        names = (choices.get('companions') or []
+                 if action == 'group' else [action[4:]])
+        _remove_companions_from_play(state, names, result)
         return result
 
     dest_san = sanitize(destination)
@@ -2029,24 +2185,20 @@ def _effect_we_prove_swifter(state: "GameState", card, choices: dict) -> dict:
                                    allow_besieged=True):
             result["message"] = f"{destination} out of range (+2)"
             return _selfplay_refund(result)   # LOW-20
-    elif action.startswith('move_'):
+    elif action == 'move_group' or action.startswith('move_'):
         # QA 2026-07-11 (almanac C16): a previously separated companion
-        # moves up to ITS level + 2 regions FROM ITS OWN REGION
+        # (or a co-located GROUP - card: "one Companion or one group of
+        # Companions") moves up to ITS level (+ the group's max level)
+        # + 2 regions FROM ITS OWN REGION; ONE body for both arms.
         from game_state import Companion as _CompW
-        _cn9 = action[5:]
-        _cur9, _lvl9 = None, 0
-        for _rk9, _a9 in state.armies.items():
-            for l in _a9.leaders:
-                if isinstance(l, _CompW) and l.name == _cn9:
-                    _cur9, _lvl9 = sanitize(_rk9), l.level
-                    break
-            if _cur9:
-                break
-        if _cur9 is None or not _dest_ok_from(state, _cur9, dest_san,
-                                              _lvl9 + 2,
-                                              allow_besieged=True):
-            result["message"] = f"{destination} out of range (+2)"
-            return _selfplay_refund(result)   # LOW-20
+        _names9 = (list(choices.get('companions') or [])
+                   if action == 'move_group' else [action[5:]])
+        from ai import _companion_group_movement
+        _lvl9 = _companion_group_movement([
+            l for a in state.armies.values() for l in a.leaders
+            if isinstance(l, _CompW) and l.name in _names9])
+        return _card_move_board_group(state, _names9, dest_san, _lvl9 + 2,
+                                      result, '(+2 regions)')
 
     if action.startswith("sep_"):
         # Separating from fellowship
@@ -2058,25 +2210,13 @@ def _effect_we_prove_swifter(state: "GameState", card, choices: dict) -> dict:
                 place_separated_companion(state, comp, dest_san)
                 result["effects"].append(f"Separated {comp_name} to {destination} (+2 regions)")
 
-                # Update guide if needed
+                # a separated Guide re-picks by HIGHEST Level; a Level
+                # tie is the learned pending_guide_change (CL-219)
                 from game_logic import change_guide
-                if state.fellowship.guide and state.fellowship.guide.name == comp_name:
-                    try:
-                        change_guide(state)
-                    except:
-                        pass
+                change_guide(state, allow_pending=True)
+                from game_logic import check_companion_persistent_discards
+                check_companion_persistent_discards(state)
                 break
-
-    elif action.startswith("move_"):
-        # Moving already separated companion
-        comp_name = action[5:]  # Remove "move_"
-        for region_key, army in list(state.armies.items()):
-            for leader in list(army.leaders):
-                if isinstance(leader, Companion) and leader.name == comp_name:
-                    army.leaders.remove(leader)
-                    place_separated_companion(state, leader, dest_san)
-                    result["effects"].append(f"Moved {comp_name} to {destination} (+2 regions)")
-                    break
 
     return result
 
@@ -2089,6 +2229,13 @@ def _effect_there_and_back_again(state: "GameState", card, choices: dict) -> dic
 
     companions_to_separate = choices.get("companions", [])
     destination = choices.get("destination", "")
+
+    # BL-90 (2026-08-25): the printed "Then, if Gimli or Legolas ARE in Dale,
+    # Erebor or the Woodland Realm ..." clause is a BOARD test after the
+    # separation, reached by BOTH arms (a Mordor-track separation must not
+    # drop it); the Mordor arm leaves dest_san/separated_names empty.
+    dest_san = ''
+    separated_names = []
 
     if companions_to_separate and (
             destination == '__remove_from_play__'
@@ -2110,7 +2257,6 @@ def _effect_there_and_back_again(state: "GameState", card, choices: dict) -> dic
             result["message"] = f"{destination} out of range (+1)"
             return _selfplay_refund(result)   # LOW-18: no-op must not consume
 
-        separated_names = []
         for comp in list(state.fellowship.companions):
             if comp.name in companions_to_separate:
                 state.fellowship.companions.remove(comp)
@@ -2123,53 +2269,52 @@ def _effect_there_and_back_again(state: "GameState", card, choices: dict) -> dic
         if separated_names:
             result["effects"].append(f"Separated {', '.join(separated_names)} to {destination}")
 
-            # Update guide if needed
+            # a separated Guide re-picks by HIGHEST Level; a Level tie
+            # is the learned pending_guide_change (CL-219)
             from game_logic import change_guide
-            if state.fellowship.guide and state.fellowship.guide.name in separated_names:
-                try:
-                    change_guide(state)
-                except:
-                    pass
+            change_guide(state, allow_pending=True)
+            from game_logic import check_companion_persistent_discards
+            check_companion_persistent_discards(state)
 
-        # Check for Gimli/Legolas in Dale/Erebor/Woodland Realm
-        trigger_regions = {"dale", "erebor", "woodland realm", "woodlandrealm", "woodland_realm"}
-        gimli_legolas_in_trigger = False
+    elif not (getattr(state.fellowship.guide, 'name', None) == 'Gollum'
+              and not any(c.name != 'Gollum' and c.level > 0
+                          for c in state.fellowship.companions)):
+        result["message"] = "No companions separated"
+        return _selfplay_refund(result)
 
-        # almanac p32 (QA 2026-07-11 cluster L): a CAPTURED region
-        # does not activate/advance - exclude Shadow-controlled regions
-        _cap_sh9 = state.enemy_controlled.get(Side.SHADOW, set())
-        # Check if Gimli or Legolas just went to a trigger region
-        if dest_san in trigger_regions and dest_san not in _cap_sh9 \
-                and any(n in ("Gimli", "Legolas")
-                        for n in separated_names):
-            gimli_legolas_in_trigger = True
+    # Almanac14: this board test also applies when Gollum needs no separation.
+    # Check for Gimli/Legolas in Dale/Erebor/Woodland Realm
+    trigger_regions = {"dale", "erebor", "woodland realm", "woodlandrealm", "woodland_realm"}
+    gimli_legolas_in_trigger = False
 
-        # Also check if Gimli/Legolas were already in a trigger region
-        for region_key, army in state.armies.items():
-            _rs9 = sanitize(region_key)
-            if _rs9 in trigger_regions and _rs9 not in _cap_sh9:
-                for leader in army.leaders:
-                    if isinstance(leader, Companion) and leader.name in ("Gimli", "Legolas"):
-                        gimli_legolas_in_trigger = True
-                        break
+    # almanac p32 (QA 2026-07-11 cluster L): a CAPTURED region
+    # does not activate/advance - exclude Shadow-controlled regions
+    _cap_sh9 = state.enemy_controlled.get(Side.SHADOW, set())
+    # Check if Gimli or Legolas just went to a trigger region
+    if dest_san in trigger_regions and dest_san not in _cap_sh9 \
+            and any(n in ("Gimli", "Legolas")
+                    for n in separated_names):
+        gimli_legolas_in_trigger = True
 
-        if gimli_legolas_in_trigger:
-            # Printed card text: "activate the Dwarven and North Nations
-            # and advance the Dwarven, Elven, and North Nations one step
-            # each on the Political Track."
-            # USER RULING (2026-07, revised): this card DOES activate —
-            # the earlier blanket "only Wisdom of Elrond activates"
-            # ruling was mistaken for this card. Activation restored;
-            # activate BEFORE advancing so the passive clamp (box 2)
-            # does not swallow the advancement.
-            for nation in [Nation.DWARVES, Nation.THE_NORTH]:
-                activate_nation(state, nation)
-            for nation in [Nation.DWARVES, Nation.ELVES, Nation.THE_NORTH]:
-                advance_nation(state, nation, 1)
-            result["effects"].append("Gimli/Legolas in Dale/Erebor/Woodland - activated Dwarves+North, advanced Dwarves, Elves, North!")
-    else:
-        result["message"] = "No companions separated"  # no-op: NOT an effect (iter 39)
-        return _selfplay_refund(result)   # LOW-18: no-op must not consume
+    # Also check if Gimli/Legolas were already in a trigger region
+    for region_key, army in state.armies.items():
+        _rs9 = sanitize(region_key)
+        if _rs9 in trigger_regions and _rs9 not in _cap_sh9:
+            for leader in army.leaders:
+                if isinstance(leader, Companion) and leader.name in ("Gimli", "Legolas"):
+                    gimli_legolas_in_trigger = True
+                    break
+
+    if gimli_legolas_in_trigger:
+        # Card text: activate the Dwarven and North Nations and advance the
+        # Dwarven, Elven and North Nations one step.  USER RULING (2026-07,
+        # revised): this card DOES activate; activate BEFORE advancing so the
+        # passive clamp does not swallow the step.
+        for nation in [Nation.DWARVES, Nation.THE_NORTH]:
+            activate_nation(state, nation)
+        for nation in [Nation.DWARVES, Nation.ELVES, Nation.THE_NORTH]:
+            advance_nation(state, nation, 1)
+        result["effects"].append("Gimli/Legolas in Dale/Erebor/Woodland - activated Dwarves+North, advanced Dwarves, Elves, North!")
 
     return result
 
@@ -2205,8 +2350,7 @@ def _effect_eagles_are_coming(state: "GameState", card, choices: dict) -> dict:
         return result
     result = {"effects": []}
 
-    # USER FIX 2026-07-08: actually ELIMINATE Nazgûl and MOVE survivors.
-    # Target the Shadow army (with a Nazgûl) in contact with an FP army
+    # Target: the Shadow army (with a Nazgul) in contact with an FP army
     # containing a Companion (the card requirement).
     from game_state import Nazgul as _Naz, Companion as _Comp, Army as _Army
 
@@ -2255,12 +2399,9 @@ def _effect_eagles_are_coming(state: "GameState", card, choices: dict) -> dict:
         army.leaders.remove(nazgul.pop())
     result["effects"].append(f"Rolled {rolls}, eliminated {kills} Nazgûl")
 
-    # Surviving Nazgul: 'must all be moved together (by the SHADOW
-    # player) to another uncaptured Sauron Stronghold' - a different
-    # one when the targeted region is itself a Shadow stronghold; the
-    # pick is a cross-side LEARNED decision on the pending path (QA
-    # 2026-07-11 cluster E: a NameError here was swallowed and the
-    # move half never ran; the card also stuck in hand upstream).
+    # Survivors "must all be moved together (by the SHADOW player) to another
+    # uncaptured Sauron Stronghold" - a learned cross-side pick on the
+    # pending path.
     survivors = [l for l in army.leaders if isinstance(l, _Naz)]
     if survivors:
         _cap_fp9 = state.enemy_controlled.get(Side.FREE_PEOPLES, set())
@@ -2274,13 +2415,9 @@ def _effect_eagles_are_coming(state: "GameState", card, choices: dict) -> dict:
             if ks9 in _cap_fp9:
                 continue  # captured Sauron strongholds invalid
             if ks9 == sanitize(rk):
-                # almanac web ruling (Eagles LOW-11 adjudication
-                # 2026-07-21): "it must be a DIFFERENT Stronghold if
-                # the region targeted is a Shadow Stronghold" — do NOT
-                # allow survivors to stay in the targeted SH (the
-                # sole-uncaptured-stronghold edge already stays put
-                # via the empty-candidates fallback below).
-                continue  # must be a DIFFERENT stronghold
+                # must be a DIFFERENT stronghold when the target is itself a
+                # Shadow stronghold (Eagles LOW-11 adjudication 2026-07-21)
+                continue
             cands9.append(ks9)
         cands9 = sorted(set(cands9))
         if not cands9:
@@ -2352,14 +2489,27 @@ def _effect_ents_awake_common(state: "GameState", card, choices: dict) -> dict:
         _ai9._execute_action(state, _ai9.Action(
             die_idx=-1, action_type='play_event',
             params={'card_id': _cid9, 'side': 'fp'}))
-        result["effects"].append(
-            f"Ents Awake chain: played {_cid9} without a die")
+        # honest reporting: a nested play that did not resolve leaves
+        # the card in hand - never claim it was played
+        if _cid9 in state.hands[Side.FREE_PEOPLES].hand:
+            result["effects"].append(
+                f"Ents Awake chain: {_cid9} could not be played")
+        else:
+            result["effects"].append(
+                f"Ents Awake chain: played {_cid9} without a die")
         return result
 
-    rolls = _d6_batch(3)
-    _ann_rng(state, 'The Ents Awake: Entmoot roll', faces=rolls)
-    hits = sum(1 for r in rolls if r >= 4)
-    result["effects"].append(f"Rolled {rolls}, {hits} hits against Orthanc")
+    # USER RULING 1.254: the hits are the Shadow OWNER's learned
+    # allocation; '_ents_cas_resumed' re-enters after that pending with
+    # the roll already spent (continuation via _complete_card_casualty).
+    _resumed9 = bool(choices.get('_ents_cas_resumed'))
+    hits = 0
+    if not _resumed9:
+        rolls = _d6_batch(3)
+        _ann_rng(state, 'The Ents Awake: Entmoot roll', faces=rolls)
+        hits = sum(1 for r in rolls if r >= 4)
+        result["effects"].append(
+            f"Rolled {rolls}, {hits} hits against Orthanc")
 
     _okey9 = _find_army_key(state, "orthanc")
     orthanc_army = state.armies.get(_okey9) if _okey9 else None
@@ -2368,12 +2518,8 @@ def _effect_ents_awake_common(state: "GameState", card, choices: dict) -> dict:
                   if orthanc_army else [])
 
     def _eliminate_saruman():
-        # CARD-FLEET LOW-14 (2026-07-21): guard on Saruman's ACTUAL
-        # figure at Orthanc — the old getattr-default-True flag fired
-        # a phantom 'Saruman eliminated' whenever Orthanc held no
-        # Saruman, permanently False-corrupting _saruman_in_play
-        # (nothing resets it), which then wrongly blocked every
-        # Shadow 'Saruman is in play' card for the rest of the game.
+        # Guard on Saruman's ACTUAL figure at Orthanc (LOW-14): a phantom
+        # elimination permanently corrupted the in-play state.
         if orthanc_army is None:
             return
         _sar9 = [l for l in list(orthanc_army.leaders)
@@ -2382,41 +2528,49 @@ def _effect_ents_awake_common(state: "GameState", card, choices: dict) -> dict:
             return
         for l in _sar9:
             orthanc_army.leaders.remove(l)
-        # METROLOGY BUG (2026-07-27, 30/183 games): only the LEGACY
-        # _saruman_in_play flag was cleared here — calculate_bonus_dice
-        # reads state.saruman.in_play, so the Shadow kept a PHANTOM
-        # +1 action die for the rest of the game (9 dice rolled for
-        # four turns after a T5 Ents kill, w4_g12).  Route through the
-        # combat path's minion-elimination helper: both flags + the
-        # Saruman-dependent table-card discards (Palantir/Wormtongue).
-        # SELF-PLAY ONLY (gate-1: Stella Rossa/Istarix kept 178->176):
-        # the VASSAL app KEPT Saruman's die after an Ents kill and the
-        # human spent it — log is truth, the teacher replays the
-        # historical 9-die turns (same sanctioned app-vs-rulebook
-        # class as 1.188).
+        # Route through combat._handle_eliminated_minions (in_play flags + the
+        # Saruman table-card discards).  SELF-PLAY ONLY: the VASSAL app kept
+        # Saruman's die after an Ents kill and the teacher replays that
+        # (same sanctioned app-vs-rulebook class as 1.188).
         import combat as _cmb_ents9
         if _cmb_ents9.FINAL_HITS_HOOK is None:
             _cmb_ents9._handle_eliminated_minions(state, _sar9)
         result["effects"].append("Saruman eliminated")
 
-    if _sh_units9:
-        # a Shadow Army is present: the play is an ATTACK for the
-        # Political Track (almanac)
-        _gl9.advance_defenders_political(state, "orthanc",
-                                         attacker_side=Side.FREE_PEOPLES)
+    if _sh_units9 or _resumed9:
+        if not _resumed9:
+            # a Shadow Army is present: the play is an ATTACK for the
+            # Political Track (almanac)
+            _gl9.advance_defenders_political(
+                state, "orthanc", attacker_side=Side.FREE_PEOPLES)
         if hits > 0:
-            casualties = _apply_card_hits_to_shadow(state, orthanc_army,
-                                                    hits)
-            result["effects"].append(
-                f"{len(casualties)} Shadow casualties in Orthanc")
-        _sh_left9 = any(u.nation in SHADOW_NATIONS
-                        for u in orthanc_army.units)
-        if not _sh_left9:
-            # destroyed Shadow army takes its Nazgul/Minions with it.
-            # USER RULING 2026-08-15: WHICH figures die is decided by the
-            # ONE classifier (The Ents Awake is not a sparing card, so
-            # every Shadow figure goes); only the BOOKKEEPING keeps the
-            # teacher gate below.
+            import combat as _cmb_ents7
+            if _cmb_ents7.FINAL_HITS_HOOK is None:
+                # 1.254: owner-allocated; the teacher keeps its
+                # certified logged-composition path below
+                if not _route_card_casualties(
+                        state, 'orthanc', Side.SHADOW, hits,
+                        card or _card_by_name('The Ents Awake: Treebeard'),
+                        choices, result):
+                    return result
+                _okey9 = _find_army_key(state, "orthanc")
+                orthanc_army = (state.armies.get(_okey9)
+                                if _okey9 else None)
+            else:
+                casualties = _apply_card_hits_to_shadow(
+                    state, orthanc_army, hits)
+                result["effects"].append(
+                    f"{len(casualties)} Shadow casualties in Orthanc")
+        _sh_left9 = orthanc_army is not None and any(
+            u.nation in SHADOW_NATIONS for u in orthanc_army.units)
+        if not _sh_left9 and orthanc_army is None:
+            # learned path: the ONE reconciler (shared casualty
+            # aftermath) already booked the wipe and any besieger capture
+            result["effects"].append("Orthanc Shadow army destroyed")
+        elif not _sh_left9:
+            # USER RULING 2026-08-15: the ONE classifier decides which figures
+            # die (The Ents Awake is not a sparing card); bookkeeping keeps
+            # the teacher gate below.
             import combat as _cmb_ents8
             _gone_objs9, _stay_objs9 = _cmb_ents8.classify_wipe_characters(
                 orthanc_army.leaders, Side.SHADOW,
@@ -2424,12 +2578,9 @@ def _effect_ents_awake_common(state: "GameState", card, choices: dict) -> dict:
             orthanc_army.leaders = _stay_objs9
             _gone9 = [getattr(l, 'name', type(l).__name__)
                       for l in _gone_objs9]
-            # METROLOGY BUG (2026-07-27): same phantom-die class as
-            # _eliminate_saruman — clear the CANONICAL in_play flags
-            # (Saruman/WK/Mouth) + Saruman table-card discards via the
-            # combat path's uniform helper, not just the legacy flag.
-            # SELF-PLAY ONLY: teacher replays the app's historical
-            # die/table state (log = truth; see _eliminate_saruman).
+            # clear the CANONICAL in_play flags + Saruman table-card discards
+            # via the combat helper; self-play only (teacher replays the app's
+            # historical die/table state)
             if _gone_objs9 and _cmb_ents8.FINAL_HITS_HOOK is None:
                 _cmb_ents8.book_eliminated_characters(state, _gone_objs9)
             result["effects"].append(
@@ -2471,16 +2622,17 @@ def _effect_ents_awake_common(state: "GameState", card, choices: dict) -> dict:
                 break
         if _gtw_here9 and _n9 < 4:
             _hand9 = state.hands[Side.FREE_PEOPLES].hand
-            # CARD-FLEET LOW-13/15/17 (2026-07-21): 'play ANOTHER
-            # Character Event card' — exclude the card being resolved
-            # (still in hand here; play_event_card discards it only
-            # AFTER this handler returns). Exclude by card_id so a
-            # DIFFERENT Ents copy in hand still legally chains.
+            # "play ANOTHER Character Event card" (LOW-13/15/17): exclude the
+            # card being resolved by card_id (a different Ents copy still
+            # chains)
             _res_cid9 = getattr(card, 'card_id', None)
+            # a 'play' still carries the card's own play condition:
+            # only cards whose requirement holds are legal chain picks
             _opts9 = [{'ents_chain_play': c9}
                       for c9 in _hand9
                       if isinstance(c9, str) and '_Character_' in c9
-                      and c9 != _res_cid9]
+                      and c9 != _res_cid9
+                      and check_event_requirement(state, c9)[0]]
             if _opts9:
                 _opts9.append({'_ents_chain_done': True})
                 state.pending_card_option = {
@@ -2500,10 +2652,35 @@ def _effect_ents_awake_common(state: "GameState", card, choices: dict) -> dict:
 
 @register_effect("Dead Men of Dunharrow")
 def _effect_dead_men(state: "GameState", card, choices: dict) -> dict:
-    """Move Strider to Erech/Lamedon/Pelargir, attack Shadow army, recruit 3."""
+    """Move Strider, attack/retreat the Shadow army, then choose 0..3 recruits."""
     target = choices.get("target_region", "erech")
     return effect_dead_men_of_dunharrow(state, target,
-                                        choices.get("companions"), choices)
+                                        choices.get("companions"), choices,
+                                        card=card)
+
+
+def _validate_stewards_recruit_choice(state: "GameState", choices: dict,
+                                      require_complete=False) -> None:
+    """Reject a forged region/kind before payment, placement or either draw.
+
+    Public actions require a complete legal choice. Direct legacy callers
+    may omit the kind but still must name Boromir's actual Gondor region.
+    """
+    if not isinstance(choices, dict):
+        raise ValueError("House of the Stewards choices must be a dictionary")
+    from card_options import house_of_the_stewards_options
+    available = house_of_the_stewards_options(state, Side.FREE_PEOPLES)
+    region = sanitize(str(choices.get('boromir_region', '')))
+    if not available or region != available[0]['boromir_region']:
+        raise ValueError("House of the Stewards requires Boromir's Gondor region")
+    if 'unit_type' in choices and choices['unit_type'] not in {
+            o.get('unit_type') for o in available if 'unit_type' in o}:
+        raise ValueError("House of the Stewards unit_type is not available")
+    if require_complete:
+        clean = {k: v for k, v in choices.items() if not k.startswith('_')}
+        clean['boromir_region'] = region
+        if clean not in available:
+            raise ValueError("House of the Stewards choice is not available")
 
 
 @register_effect("House of the Stewards")
@@ -2516,6 +2693,7 @@ def _effect_house_of_stewards(state: "GameState", card, choices: dict) -> dict:
     normal captured-gate) blocks placement into a Shadow-held Gondor
     region, so NO recapture/control-flip. Boromir alone (no army with him)
     still musters via get_or_create_army inside recruit_unit."""
+    _validate_stewards_recruit_choice(state, choices)
     result = {"effects": []}
     region = choices.get("boromir_region")
     if region:
@@ -2625,8 +2803,8 @@ def _effect_tom_bombadil(state: "GameState", card, choices: dict) -> dict:
 def _move_companion_ranged(state, comp_key, dest, result):
     """Move a separated companion up to its LEVEL regions (USER RULE
     2026-07-08: Book of Mazarbul / Fear! Fire! Foes! "let companions
-    move equal to their movement speed" — the old code teleported with
-    no range check).  Returns the destination key if moved."""
+    move equal to their movement speed").  Returns the destination key
+    if moved."""
     from game_state import Companion, Army
     for region_key, army in list(state.armies.items()):
         for leader in list(army.leaders):
@@ -2652,7 +2830,10 @@ def _move_companion_ranged(state, comp_key, dest, result):
             army.leaders.remove(leader)
             if not army.units and not army.leaders:
                 state.armies.pop(region_key, None)
-            _army_entry_for(state, dest_san).leaders.append(leader)
+            destination_army = _army_entry_for(state, dest_san)
+            destination_army.leaders.append(leader)
+            from game_logic import _check_companion_activates_nation
+            _check_companion_activates_nation(state, dest_san, [leader])
             result["effects"].append(f"Moved {leader.name} to {dest}")
             return dest_san
     return None
@@ -2674,28 +2855,40 @@ def _dest_ok_from(state, cur, dest_san, rng, allow_besieged=False):
     """Is `dest_san` a legal card-move destination within `rng` regions
     of `cur`?  `allow_besieged` permits a besieged stronghold as the
     END region (Gwaihir / We Prove Swifter)."""
-    from ai import _companion_reachable
+    from ai import _companion_reachable, _friendly_besieged_strongholds
     cur = sanitize(cur)
     if dest_san == cur:
         return True
+    # These cards permit entering, but never leaving, a friendly siege.
+    # Keep this before the destination-only exception's fallback walk.
+    if cur in _friendly_besieged_strongholds(state):
+        return False
     if dest_san in _companion_reachable(state, cur, max(0, rng)):
         return True
-    if allow_besieged and dest_san in getattr(
-            state, 'besieged_strongholds', set()):
-        # reachable ignoring the besieged-exclusion, via plain adjacency
+    bs = getattr(state, 'besieged_strongholds', set())
+    if allow_besieged and dest_san in bs:
+        # reachable ignoring the besieged-exclusion for the END region
+        # only: the path still obeys _companion_reachable's rules - no
+        # passing THROUGH a besieged stronghold, and a Shadow-controlled
+        # stronghold may be ENTERED but stops the movement (standing
+        # ruling: stop-on-entry is per movement action)
+        from ai import _is_shadow_controlled_stronghold
         from collections import deque
         seen, q = {cur}, deque([(cur, 0)])
         while q:
             r, d = q.popleft()
-            if r == dest_san:
-                return True
             if d >= rng:
                 continue
             for adj in state.board.adjacent(r):
                 a = sanitize(adj)
-                if a not in seen:
-                    seen.add(a)
-                    q.append((a, d + 1))
+                if a in seen:
+                    continue
+                seen.add(a)
+                if a == dest_san:
+                    return True
+                if a in bs or _is_shadow_controlled_stronghold(state, a):
+                    continue
+                q.append((a, d + 1))
     return False
 
 
@@ -2720,11 +2913,7 @@ def _remove_companions_from_play(state, names, result):
             state.fellowship.companions.remove(comp)
             removed.append(comp.name)
     if removed:
-        if state.fellowship.guide not in state.fellowship.companions:
-            try:
-                _gl.change_guide(state, allow_pending=True)
-            except Exception:
-                pass
+        _gl.change_guide(state, allow_pending=True)
         _gl.check_companion_persistent_discards(state)
         result["effects"].append(
             "Removed from play (Mordor Track separation): "
@@ -2740,49 +2929,48 @@ def _companion_group_move_options(state, exclude=None) -> list:
     `exclude` = names already moved this play/die (each companion moves
     once).
 
-    Subset-lattice CAP justification (task: companion-multigroup):
-    there are only 7 companions in the game (Gandalf, Strider, Boromir,
-    Legolas, Gimli, Meriadoc, Peregrin), so >4 SEPARATED companions in
-    ONE region is essentially never seen.  The full lattice is 2**n-1
-    per region (n=4 -> 15, n=5 -> 31, n=6 -> 63, n=7 -> 127) times each
-    subset's reachable destinations, so an uncapped menu explodes.  We
-    keep the full lattice up to 4 and singles+full-group beyond that;
-    crucially the CHAIN composes - after any group moves, the pending
-    re-offers subsets of the STILL-unmoved companions, so arbitrary
-    multi-group splits of a large stack remain reachable ACROSS chained
-    decisions even though a single menu never enumerates them all."""
-    from ai import _companion_group_movement, _companion_reachable
+    Every subset remains available: a low-Level companion may need to
+    travel with an escort while the rest stay behind. Reusing legal
+    destinations by movement allowance avoids repeated path searches
+    without removing groups or imposing a separate destination rule."""
+    from ai import (Action, _companion_group_movement, _companion_reachable,
+                    is_legal_companion_action)
     from game_state import Companion
-    from combat import side_of_nation as _son
     from itertools import combinations
     exclude = exclude or set()
     army_by_san = {sanitize(k): a for k, a in state.armies.items()}
-
-    def _dest_ok(dest):
-        d = army_by_san.get(dest)
-        return not (d and any(_son(u.nation) == Side.SHADOW
-                              for u in d.units))
-
+    validator_cache = {}
     opts = []
     for src, army in sorted(army_by_san.items()):
         comps = [l for l in army.leaders if isinstance(l, Companion)
                  and l.name not in exclude]
         if not comps:
             continue
-        if len(comps) <= 4:
-            subs = [list(c) for r in range(1, len(comps) + 1)
-                    for c in combinations(comps, r)]
-        else:
-            subs = [[c] for c in comps] + [list(comps)]
+        subs = (c for r in range(1, len(comps) + 1)
+                for c in combinations(comps, r))
+        legal_by_movement = {}
         for sub in subs:
             mv = _companion_group_movement(sub)
             if mv <= 0:
                 continue
-            for dest in sorted(_companion_reachable(state, src, mv)):
-                if dest != src and _dest_ok(dest):
-                    opts.append({'move_group': {
-                        'from': src, 'to': dest,
-                        'companions': sorted(c.name for c in sub)}})
+            names = sorted(c.name for c in sub)
+            if mv not in legal_by_movement:
+                legal_by_movement[mv] = [
+                    dest for dest in sorted(_companion_reachable(state, src, mv))
+                    if is_legal_companion_action(
+                        state, Action(-1, 'companion_move', {
+                            'from': src, 'to': dest, 'companions': names}),
+                        validator_cache)[0]]
+            destinations = list(legal_by_movement[mv])
+            if is_legal_companion_action(
+                    state, Action(-1, 'companion_move', {
+                        'from': src, 'to': src, 'companions': names}),
+                    validator_cache)[0]:
+                destinations.append(src)
+                destinations.sort()
+            for dest in destinations:
+                opts.append({'move_group': {
+                    'from': src, 'to': dest, 'companions': list(names)}})
     return opts
 
 
@@ -2807,6 +2995,10 @@ def _move_companion_group(state, grp: dict, result: dict) -> bool:
         result["effects"].append(
             f"Group {sorted(names)}: {dst} out of range - not moved")
         return False
+    if dst == src:
+        from game_logic import _check_companion_activates_nation
+        _check_companion_activates_nation(state, dst, comps)
+        return True
     for c in comps:
         army.leaders.remove(c)
     if not army.units and not army.leaders:
@@ -2820,6 +3012,10 @@ def _move_companion_group(state, grp: dict, result: dict) -> bool:
     else:
         dst_key = dst
     state.armies[dst_key].leaders.extend(comps)
+    # Event movement and ordinary continuation both activate on arrival.
+    # Existing destination Companions are not part of this move.
+    from game_logic import _check_companion_activates_nation
+    _check_companion_activates_nation(state, dst, comps)
     result["effects"].append(
         f"Moved group {', '.join(sorted(c.name for c in comps))} "
         f"to {dst}")
@@ -2904,8 +3100,8 @@ def _effect_book_of_mazarbul(state: "GameState", card, choices: dict) -> dict:
 
     # Check for Dwarves At War condition
     dwarven_regions = {"erebor", "ered luin", "eredluin", "ered_luin"}
-    # almanac p32 (QA 2026-07-09): a Companion ending at a CAPTURED
-    # (Shadow-controlled) region does not activate/advance the nation
+    # almanac p32: a Companion ending at a Shadow-controlled region does not
+    # activate/advance
     _ec_sh = state.enemy_controlled.get(Side.SHADOW, set())
     if any(sanitize(r) in dwarven_regions and sanitize(r) not in _ec_sh
            for r in companion_final_regions):
@@ -2931,15 +3127,16 @@ def _apply_card_hits_to_shadow(state, army, hits):
     return casualties
 
 
-def _side_filtered_kills(army, dying_side, hits):
+def _side_filtered_kills(army, dying_side, hits, eligible_nations=None):
     """preserve_elites kills restricted to one side of a (possibly
     shared siege) entry — the no-spec teacher fallback of
     _route_card_casualties."""
     from combat import apply_casualties, side_of_nation
-    mine = [u for u in army.units
-            if side_of_nation(u.nation) == dying_side]
-    other = [u for u in army.units
-             if side_of_nation(u.nation) != dying_side]
+    def eligible(unit):
+        return (side_of_nation(unit.nation) == dying_side
+                and (eligible_nations is None or unit.nation in eligible_nations))
+    mine = [u for u in army.units if eligible(u)]
+    other = [u for u in army.units if not eligible(u)]
     tmp = Army(region=army.region)
     tmp.units = mine
     cas = apply_casualties(tmp, hits)
@@ -2947,22 +3144,81 @@ def _side_filtered_kills(army, dying_side, hits):
     return cas
 
 
+# USER RULING 1.254 (all casualties are learned decisions): cards whose
+# remaining legs must RESUME once the owner's allocation pending
+# resolves.  The ai.py card_casualty executor applies the allocation and
+# calls _complete_card_casualty(card_name=...), which re-enters the
+# handler with the marker choices below (keyed by the pending's
+# card_name; the marker names what the roll already settled).
+_CARD_CASUALTY_RESUME = {
+    'dead men of dunharrow': lambda region: {
+        'target_region': region, '_dmd_cas_resumed': True},
+    'the ents awake: treebeard': lambda region: {'_ents_cas_resumed': True},
+    'the ents awake: huorns': lambda region: {'_ents_cas_resumed': True},
+    'the ents awake: entmoot': lambda region: {'_ents_cas_resumed': True},
+    "faramir's rangers": lambda region: {
+        'target_region': region, '_far_cas_resumed': True},
+    'return to valinor': lambda region: {'_rtv_cas_resumed': region},
+}
+
+
+def _resume_card_after_casualty(state, card_name, region, result):
+    """Re-enter the card handler after its owner-allocated casualty
+    pending resolved (1.254 continuation).  Same dispatch choke point
+    as the direct-pending executor: recruit overstack + active-state
+    published around the handler, overstacks re-scanned after."""
+    key = str(card_name or '').lower()
+    mk = _CARD_CASUALTY_RESUME.get(key)
+    if mk is None:
+        return
+    handler = CARD_EFFECT_HANDLERS.get(key)
+    if handler is None:
+        raise RuntimeError(
+            "card casualty continuation: no handler for %r" % (card_name,))
+    card = _card_by_name(card_name)
+    global CARD_RECRUIT_OVERSTACK
+    from combat import set_active_state as _sas_r
+    CARD_RECRUIT_OVERSTACK = True
+    _prev_r = _sas_r(state)
+    try:
+        r2 = handler(state, card, dict(mk(region), _from_pending=True))
+    finally:
+        CARD_RECRUIT_OVERSTACK = False
+        _sas_r(_prev_r)
+    result["effects"].extend(r2.get("effects") or [])
+    resolve_overstacks(state, learned=True)
+
+
 def _complete_card_casualty(state, region_key, dying_side, result,
-                            card_name=None):
+                            card_name=None, resume=True):
     """Shared aftermath for card-inflicted casualties: the
     post-destruction CHARACTER reconciler + the standing orphan-leader
     sweep + the wiped-besieged-garrison capture, in both directions
     (extracted from the Spirit of Mordor / Dreadful Spells inline
     blocks; USER 2026-07-27 casualty-routing wave).
 
-    USER RULING 2026-08-15: an army wiped by a card takes ALL of its
-    characters with it, EXCEPT under The Spirit of Mordor / Dreadful
-    Spells, where Companions/Nazgul/Minions survive and only plain
-    Leaders die.  combat.reconcile_destroyed_army owns both branches;
+    Card-specific character survival is owned by
+    combat.reconcile_destroyed_army and CHARACTER_SPARING_CARDS.
+    Return to Valinor removes plain Leaders only when the army is
+    eliminated; Companions survive (Almanac p31).
     `card_name` (or, when omitted, combat's published wipe context)
     selects which.  It also reaches the shapes remove_orphaned_leaders
     cannot: a SHARED besieged entry stays non-empty (the enemy's units
-    keep it alive), so the standing sweep never sees the wipe."""
+    keep it alive), so the standing sweep never sees the wipe.
+
+    resume=True (the ai.py card_casualty executor's call, i.e. AFTER an
+    owner-allocation pending resolved): the card's remaining legs
+    resume through _CARD_CASUALTY_RESUME (1.254).  _route_card_casualties
+    passes resume=False - there the handler is still on the stack."""
+    _card_casualty_aftermath(state, region_key, dying_side, result,
+                             card_name)
+    if resume:
+        _resume_card_after_casualty(state, card_name,
+                                    sanitize(str(region_key)), result)
+
+
+def _card_casualty_aftermath(state, region_key, dying_side, result,
+                             card_name=None):
     import game_logic as _glcc
     from combat import (garrison_side_for, _check_settlement_capture,
                         reconcile_destroyed_army,
@@ -3004,28 +3260,23 @@ def _complete_card_casualty(state, region_key, dying_side, result,
                 "Garrison eliminated - Shadow captures " + rsan)
 
 
+def _card_casualty_options(state, region, side, hits):
+    """Card-option wrapper around the ordinary exact casualty vocabulary."""
+    import ai
+    return [{'casualty_operation': action.params['operation'],
+             'nation': action.params['nation'], 'target_region': sanitize(str(region))}
+            for action in ai._casualty_operations(state, region, side, hits)]
+
+
 def _route_card_casualties(state, region_key, dying_side, hits, card,
                            choices, result):
-    """USER RULING 2026-07-27: card casualties route through the same
-    allocation decision as combat — the dying army's OWNER chooses the
-    composition (k elite downgrades, rest kills), never a hardcoded
-    preserve_elites default.  Wired so far: The Spirit of Mordor and
-    Dreadful Spells; the older _apply_card_hits_to_shadow sites (Dead
-    Men / Ents Awake / Faramir's Rangers) still use the historical
-    preserve_elites default because their post-casualty steps (forced
-    retreats) are not yet continuation-safe.
+    """Allocate card hits as explicit owner-chosen casualty operations.
 
-    Teacher replay (combat.FINAL_HITS_HOOK installed): applies the
-    logged composition passed as choices['card_cas_spec'] via
-    apply_casualties_spec; without a spec, falls back to the historical
-    preserve_elites (documented default, no fidelity regression).
-    Self-play: opens a 'card_casualty' pending_card_option decided by
-    the dying army's owner (mirrors combat's post-roll allocation;
-    executor branch in ai.py applies _apply_allocation + aftermath).
-    When no real choice exists (no elites, or a total wipe) resolves
-    immediately with k=0.
-
-    Returns True when resolution completed, False when deferred."""
+    Teacher-hook replay retains its historical literal-spec path. Ordinary
+    play uses the shared sequential operations and completes the card's
+    aftermath once after all hits are allocated. The calling card handler
+    resumes its own remaining legs when this returns True.
+    """
     import combat as _cmbcc
     rsan = sanitize(str(region_key))
     if hits <= 0:
@@ -3049,32 +3300,34 @@ def _route_card_casualties(state, region_key, dying_side, hits, card,
             _cmbcc._track_fp_casualties(state, cas, Side.FREE_PEOPLES)
         result["effects"].append("%d casualties" % len(cas))
         _complete_card_casualty(state, rsan, dying_side, result,
-                                card_name=_cnm9)
+                                card_name=_cnm9, resume=False)
         return True
     import ai as _aicc
-    if not _aicc._alloc_choice_exists(state, rsan, dying_side, hits):
-        _aicc._apply_allocation(state, rsan, dying_side, hits, 0)
-        result["effects"].append("%d hits applied (no choice)" % hits)
-        _complete_card_casualty(state, rsan, dying_side, result,
-                                card_name=_cnm9)
-        return True
-    from combat import side_of_nation as _soncc
-    n_el = sum(1 for u in army.units
-               if _soncc(u.nation) == dying_side
-               and u.kind == UnitKind.ELITE)
-    cap = min(int(hits), n_el)
-    state.pending_card_option = {
+    pending = {
         'card_id': getattr(card, 'card_id', str(card)),
         'card_name': getattr(card, 'card_name', 'card'),
         'card_casualty': True, 'direct': True,
         'side': 'sh' if dying_side == Side.SHADOW else 'fp',
         'decider': 'sh' if dying_side == Side.SHADOW else 'fp',
         'cas_region': rsan, 'cas_side': dying_side,
-        'cas_hits': int(hits),
-        'options': [{'cas_downgrades': k, 'target_region': rsan}
-                    for k in range(cap + 1)]}
+        'cas_hits': int(hits)}
+    if str(_cnm9 or '').lower() == 'return to valinor':
+        # Almanac p31: other nations neither contribute dice nor take damage.
+        pending['cas_eligible_nations'] = (Nation.ELVES,)
+    # Publish card context while forced operations execute as well, so their
+    # gross-flow witnesses identify card timing rather than a combat stage.
+    state.pending_card_option = pending
+    remaining = _aicc._forced_casualty_allocation(state, rsan, dying_side, int(hits))
+    if remaining <= 0:
+        state.pending_card_option = None
+        result["effects"].append("%d hits applied (forced allocation)" % hits)
+        _complete_card_casualty(state, rsan, dying_side, result,
+                                card_name=_cnm9, resume=False)
+        return True
+    pending['cas_hits'] = remaining
+    pending['options'] = _card_casualty_options(state, rsan, dying_side, remaining)
     result["effects"].append(
-        "%d hits pending owner allocation at %s" % (hits, rsan))
+        "%d hits pending owner allocation at %s" % (remaining, rsan))
     return False
 
 
@@ -3112,16 +3365,38 @@ def _effect_spirit_of_mordor(state: "GameState", card, choices: dict) -> dict:
                                  f"Shadow army with units from 2+ Shadow Nations")
             return result
     else:
-        # AI default: the largest valid multi-nation Shadow army
-        best = None
-        for k, a in state.armies.items():
-            if _is_multi_nation_shadow(a):
-                if best is None or len(a.units) > len(best[1].units):
-                    best = (k, a)
-        if best is None:
+        valid = [(k, a) for k, a in state.armies.items()
+                 if _is_multi_nation_shadow(a)]
+        if not valid:
             result["message"] = "No Shadow army with units from 2+ Shadow Nations"
             return result
-        target_region, army = best
+        import combat as _cmb_som7
+        if len(valid) > 1 and _cmb_som7.FINAL_HITS_HOOK is None:
+            # SQF F4 (1.248-class, decision-ownership doctrine): with
+            # 2+ valid targets the target_region pick is the CARD
+            # PLAYER's learned decision - a silent default substitutes
+            # it.  The card leaves the hand on return (play_event_card
+            # tail); the chosen option re-dispatches here through the
+            # 'direct' card_option lane.  Teacher replay
+            # (FINAL_HITS_HOOK) keeps the documented default: log =
+            # truth, pendings never open there (same guard as
+            # _route_card_casualties).
+            _own7 = ('fp' if getattr(card, 'side', None)
+                     == Side.FREE_PEOPLES else 'sh')
+            state.pending_card_option = {
+                'card_id': getattr(card, 'card_id', str(card)),
+                'card_name': getattr(card, 'card_name',
+                                     'The Spirit of Mordor'),
+                'side': _own7, 'decider': _own7, 'direct': True,
+                'options': [{'target_region': sanitize(k)}
+                            for k, _a in valid]}
+            result["effects"].append(
+                "target choice pending (%d valid multi-nation Shadow "
+                "armies)" % len(valid))
+            return result
+        # forced pick (single valid target) / teacher default: the
+        # largest valid multi-nation Shadow army
+        target_region, army = max(valid, key=lambda kv: len(kv[1].units))
 
     rolls = _d6_batch(5)
     _ann_rng(state, 'The Spirit of Mordor roll', faces=rolls)
@@ -3144,15 +3419,79 @@ def _effect_spirit_of_mordor(state: "GameState", card, choices: dict) -> dict:
     return result
 
 
+def _faramir_targets(state):
+    """Printed strike regions containing actual Shadow Army units."""
+    return [r for r in ('osgiliath', 'south ithilien', 'north ithilien')
+            if any(sanitize(k) == r and any(u.nation in SHADOW_NATIONS for u in a.units)
+                   for k, a in state.armies.items())]
+
+
+def _faramir_fp_army_present(state):
+    """Almanac18: any FP Army in Osgiliath permits the recruitment leg."""
+    return any(sanitize(k) == 'osgiliath' and any(u.nation in FP_NATIONS for u in a.units)
+               for k, a in state.armies.items())
+
+
+def _faramir_recruit_options(state):
+    if not _faramir_fp_army_present(state):
+        return []
+    from ai import figures_available
+    return [{'_far_recruit': True, 'unit_type': kind}
+            for kind in ('regular', 'elite')
+            if figures_available(state, Nation.GONDOR, kind) > 0] or [{'_far_recruit': True}]
+
+
+def _validate_faramir_choices(state, choices, *, recruitment_stage=False,
+                             require_complete=False):
+    """Validate this card before payment or clearing its paid pending.
+
+    Positional legality is independent of supplies. Recruitment cannot be
+    selected before a required interactive strike: that later choice belongs
+    after its casualty allocation. Complete teacher records may carry both.
+    """
+    if choices is not None and not isinstance(choices, dict):
+        raise ValueError("Faramir's Rangers choices must be a dictionary")
+    selected = dict(choices or {})
+    selected.pop('_from_pending', None)
+    if recruitment_stage:
+        options = _faramir_recruit_options(state)
+        if selected.get('_far_recruit') is not True or selected not in options:
+            raise ValueError("Faramir's Rangers recruitment choice is not available")
+        return
+    if '_far_recruit' in selected or '_far_cas_resumed' in selected:
+        raise ValueError("Faramir's Rangers continuation cannot start a card play")
+    targets = _faramir_targets(state)
+    if not targets and not _faramir_fp_army_present(state):
+        raise ValueError("Faramir's Rangers requires a Shadow target or an FP Army in Osgiliath")
+    target = selected.get('target_region')
+    if target is not None and sanitize(str(target)) not in targets:
+        raise ValueError("Faramir's Rangers target is not available")
+    if require_complete and targets and target is None:
+        raise ValueError("Faramir's Rangers requires the selected Shadow target")
+    if 'unit_type' in selected:
+        kinds = {o.get('unit_type') for o in _faramir_recruit_options(state)
+                 if 'unit_type' in o}
+        if selected['unit_type'] not in kinds:
+            raise ValueError("Faramir's Rangers unit_type is not available")
+        import combat
+        if targets and combat.FINAL_HITS_HOOK is None:
+            raise ValueError("Choose Faramir's Rangers recruitment after the strike")
+
+
 @register_effect("Faramir's Rangers")
 def _effect_faramirs_rangers(state: "GameState", card, choices: dict) -> dict:
     """Roll 3 dice vs Shadow in Osgiliath area, recruit if FP army there."""
     result = {"effects": []}
+    recruit_stage = choices.get('_far_recruit') is True
+    resumed = bool(choices.get('_far_cas_resumed'))
+    if recruit_stage:
+        _validate_faramir_choices(state, choices, recruitment_stage=True,
+                                  require_complete=True)
+    elif not resumed:
+        _validate_faramir_choices(state, choices)
     target = choices.get("target_region", "osgiliath")
-    # QA 2026-07-09: sanitize() produces SPACE forms - the old
-    # underscore set never matched "south ithilien"/"north ithilien",
-    # silently skipping the strike; and the strike hit whatever army
-    # stood at the target (friendly fire on a recruitment-only play).
+    # sanitize() produces SPACE forms; the strike targets only the Shadow army
+    # at a valid region (no friendly fire on a recruitment-only play)
     valid_targets = {"osgiliath", "south ithilien", "north ithilien"}
 
     def _sh_army_at(r):
@@ -3163,45 +3502,88 @@ def _effect_faramirs_rangers(state: "GameState", card, choices: dict) -> dict:
 
     tsan = sanitize(target)
     army = _sh_army_at(tsan) if tsan in valid_targets else None
-    # ROOT-CAUSE FIX (item 3, 2026-07-22): the FP player targets the
-    # "Osgiliath area" region that HOLDS the enemy; the log records the
-    # casualty (a Sauron Regular dragged to Current FP Card) but never the
-    # target CHOICE, so the teacher passes no target_region and the default
-    # 'osgiliath' had no Shadow army -> the strike silently no-opped and the
-    # unit was never removed (2025-02-05 Vayze/ProniX T2: South Ithilien
-    # kept a 9th Sauron Regular).  When no target is explicitly chosen and
-    # the default holds no Shadow army, fall to the valid target that DOES
-    # (deterministic largest-first) so the strike always lands on a real
-    # stack.  apply_casualties removes an AVAILABLE type (Regulars first),
-    # never a silent no-op.
-    if army is None and not choices.get("target_region"):
-        cands = [r for r in ("south ithilien", "north ithilien", "osgiliath")
-                 if _sh_army_at(r) is not None]
-        if cands:
-            tsan = max(cands, key=lambda r: sum(
+    if not recruit_stage and not resumed and not choices.get("target_region"):
+        # FLC C10 (1.248-class, decision-ownership doctrine): the card
+        # text says CHOOSE a Shadow Army - with 2+ valid targets the
+        # target_region pick is the CARD PLAYER's learned decision, so
+        # a choiceless play opens pending_card_option (direct lane),
+        # exactly like The Spirit of Mordor.  Teacher replay
+        # (FINAL_HITS_HOOK, log = truth) keeps the documented default
+        # and never opens a pending.
+        import combat as _cmb_far7
+        _cands7 = [r for r in ("osgiliath", "south ithilien",
+                               "north ithilien")
+                   if _sh_army_at(r) is not None]
+        if len(_cands7) > 1 and _cmb_far7.FINAL_HITS_HOOK is None:
+            _own7 = ('fp' if getattr(card, 'side', None)
+                     == Side.FREE_PEOPLES else 'sh')
+            state.pending_card_option = {
+                'card_id': getattr(card, 'card_id', str(card)),
+                'card_name': getattr(card, 'card_name',
+                                     "Faramir's Rangers"),
+                'side': _own7, 'decider': _own7, 'direct': True,
+                'options': [{'target_region': sanitize(r)}
+                            for r in _cands7]}
+            result["effects"].append(
+                "target choice pending (%d valid Shadow-army targets)"
+                % len(_cands7))
+            return result
+        # forced single target / teacher default: the valid target
+        # holding the largest Shadow army (the strike lands; the log
+        # records the casualty, never the target choice)
+        if army is None and _cands7:
+            tsan = max(_cands7, key=lambda r: sum(
                 1 for u in _sh_army_at(r).units
                 if u.nation in SHADOW_NATIONS))
             army = _sh_army_at(tsan)
-    if army is not None:
+    # USER RULING 1.254: the hits are the Shadow OWNER's learned
+    # allocation; '_far_cas_resumed' re-enters after that pending with
+    # the roll already spent (continuation via _complete_card_casualty)
+    # and runs the recruit leg.
+    if army is not None and not resumed and not recruit_stage:
         rolls = _d6_batch(3)
         _ann_rng(state, "Faramir's Rangers roll", faces=rolls)
         hits = sum(1 for r in rolls if r >= 5)
         result["effects"].append(f"Rolled {rolls}, {hits} hits against {tsan}")
         if hits > 0:
-            casualties = _apply_card_hits_to_shadow(state, army, hits)
-            result["effects"].append(f"{len(casualties)} casualties")
-            # USER RULING 2026-08-15: a wiped army takes its characters
-            # with it — Faramir's Rangers is NOT one of the two sparing
-            # cards, so the Nazgul/Minions that used to be left standing
-            # in an emptied South Ithilien now die with the army.
-            if not any(u.nation in SHADOW_NATIONS for u in army.units):
-                from combat import reconcile_destroyed_army as _rda9f
-                _rda9f(state, tsan, Side.SHADOW,
-                       card_name="Faramir's Rangers")
+            import combat as _cmb_far
+            if _cmb_far.FINAL_HITS_HOOK is None:
+                if not _route_card_casualties(
+                        state, tsan, Side.SHADOW, hits,
+                        card or _card_by_name("Faramir's Rangers"),
+                        choices, result):
+                    return result
+            else:
+                # teacher: certified logged-composition path
+                casualties = _apply_card_hits_to_shadow(state, army, hits)
+                result["effects"].append(f"{len(casualties)} casualties")
+                # USER RULING 2026-08-15: a wiped army takes its
+                # characters with it (Faramir's Rangers is a sparing
+                # card only for Companions/Nazgul/Minions per combat's
+                # CHARACTER_SPARING_CARDS; the reconciler decides).
+                if not any(u.nation in SHADOW_NATIONS for u in army.units):
+                    from combat import reconcile_destroyed_army as _rda9f
+                    _rda9f(state, tsan, Side.SHADOW,
+                           card_name="Faramir's Rangers")
 
     # Recruit in Osgiliath if FP army there
-    osg_army = state.armies.get(_find_army_key(state, "osgiliath"))
-    if osg_army and _is_army_fp(osg_army):
+    if _faramir_fp_army_present(state):
+        # The unit kind is a human decision AFTER the strike and any Shadow
+        # casualty choice. AI policy projects this menu to Elite if legal.
+        options = _faramir_recruit_options(state)
+        import combat as _cmb_far_recruit
+        if not recruit_stage and 'unit_type' not in choices:
+            if len(options) > 1 and _cmb_far_recruit.FINAL_HITS_HOOK is None:
+                state.pending_card_option = {
+                    'card_id': getattr(card, 'card_id', None) or
+                               "FREE_PEOPLES_Strategy_Faramir's_Rangers",
+                    'card_name': "Faramir's Rangers", 'side': 'fp',
+                    'decider': 'fp', 'direct': True, 'faramir_recruit': True,
+                    'options': options}
+                result['effects'].append('Gondor recruitment choice pending in Osgiliath')
+                return result
+            if len(options) == 1:
+                choices = dict(choices, **options[0])
         # 1.211a: elite-preferred by default (honors an explicit logged
         # choices['unit_type'] first; regular only if the pool is dry).
         unit_type = _default_unit_type(state, Nation.GONDOR, choices)
@@ -3215,13 +3597,9 @@ def _effect_faramirs_rangers(state: "GameState", card, choices: dict) -> dict:
         if _l is not None:
             result["effects"].append(
                 "Recruited Gondor Leader in Osgiliath")
-    # CARD-FLEET LOW-28 (2026-07-21): a pure no-op play (no Shadow
-    # target hit-roll AND nothing recruited) refunds on self-play
-    if not result["effects"]:
-        result["message"] = ("Faramir's Rangers: no Shadow target and "
-                             "no Free Peoples Army in Osgiliath - "
-                             "not played")
-        return _selfplay_refund(result)
+    # RB22 permits supply-limited effects once the positional requirement
+    # is met, including no available unit or Leader. Missing position was
+    # rejected before execution; it is not converted to a legal no-op here.
     return result
 
 
@@ -3277,10 +3655,8 @@ def _effect_wisdom_of_elrond(state: "GameState", card, choices: dict) -> dict:
     result = {"effects": []}
     nation_name = choices.get("nation")
     if not nation_name:
-        # Rules-honest default ("Activate one FP Nation of your choice"):
-        # the first FP nation that can still benefit — without it the
-        # play was a no-op and got filtered from the legal actions
-        # (2023-12-06 T4: the human activated Rohan)
+        # Rules-honest default ("Activate one FP Nation of your choice"): the
+        # first FP nation that can still benefit
         for nat in (Nation.ROHAN, Nation.GONDOR, Nation.THE_NORTH,
                     Nation.DWARVES, Nation.ELVES):
             if state.political.boxes.get(nat, 0) < 3:
@@ -3304,9 +3680,8 @@ def _effect_wisdom_of_elrond(state: "GameState", card, choices: dict) -> dict:
                 result["effects"].append(
                     f"Activated and advanced {nation.value} to {new_pos}")
             else:
-                # almanac M8 (QA 2026-07-09): Wormtongue keeps Rohan
-                # passive - the card still advances the track, clamped
-                # at box 2 while passive (never to At War)
+                # almanac M8: Wormtongue keeps Rohan passive - the card still
+                # advances the track, clamped at box 2 while passive
                 new_pos = advance_nation(state, nation, 1)
                 result["effects"].append(
                     f"Advanced {nation.value} to {new_pos} "
@@ -3342,21 +3717,24 @@ def _effect_red_arrow(state: "GameState", card, choices: dict) -> dict:
 def _direct_army_move(state, frm_san, to_san, side,
                       exclude_not_at_war=False,
                       n_regular=None, n_elite=None,
-                      allow_overstack=False):
+                      allow_overstack=False, via_san=None, cargo=None,
+                      defer_overstack=False):
     """Move the acting side's army pieces DIRECTLY between two regions
     (card-granted movement), replicating game_logic.move_army's side
     effects: enemy/Saruman pieces stay behind, stacking cap 10 own
     units at the destination (overflow stays behind, regulars first),
     political entry check, companion activation, orphan-leader removal,
     settlement capture, and siege bookkeeping when a garrison departs.
-    Returns the number of units moved.  (QA 2026-07-09.)"""
+    Returns the number of units moved.  (QA 2026-07-09.)
+
+    exclude_not_at_war: the voluntary-move border rule, per UNIT
+    (amendment 1.222(b) via _unit_may_enter_nation) at the destination
+    and at `via_san` (the walked-through region of a 2-region move)."""
     import game_logic as _gl
     from combat import side_of_nation as _son, _check_settlement_capture, \
         garrison_side_for
-    # Almanac p17: card-granted moves cannot enter A Power too Great /
-    # Tom Bombadil protected regions either — the die-driven move path
-    # checks this in game_logic.move_army but card moves bypassed it
-    # (audit 2026-07-26, systemic persistence-block gap).
+    # Almanac p17: card-granted moves obey A Power too Great / Tom Bombadil
+    # like die-driven moves (audit 2026-07-26)
     if side == Side.SHADOW:
         from persistent_effects import can_shadow_move_to as _csm26
         _ok26, _ = _csm26(state, to_san)
@@ -3370,8 +3748,12 @@ def _direct_army_move(state, frm_san, to_san, side,
     for u in src.units:
         ok = _son(u.nation) == side
         if ok and exclude_not_at_war:
-            # almanac A11: units of not-At-War nations stay behind
-            ok = state.political.is_at_war(u.nation)
+            # 1.222(b) per unit: At War, or the region is free / the
+            # unit's own nation (passive units never cross ANOTHER
+            # nation's border - destination AND walked-through region)
+            ok = _unit_may_enter_nation(state, u, to_san) and (
+                via_san is None
+                or _unit_may_enter_nation(state, u, via_san))
         (mv_units if ok else stay_units).append(u)
     if n_regular is not None or n_elite is not None:
         # P4 (USER ruling 1.112.7): an INITIAL SPLIT - move only the
@@ -3391,12 +3773,31 @@ def _direct_army_move(state, frm_san, to_san, side,
         mv_units = _mv9
     mv_leaders, stay_leaders = [], []
     for l in src.leaders:
-        if _gl._is_saruman(l) or _gl._leader_side(l) != side:
+        if (_gl._is_saruman(l) or _gl._leader_side(l) != side
+                or (exclude_not_at_war and _gl.leader_must_follow(l)
+                    and (not _unit_may_enter_nation(state, l, to_san)
+                         or (via_san is not None
+                             and not _unit_may_enter_nation(state, l, via_san))))):
             stay_leaders.append(l)
         else:
             mv_leaders.append(l)
+    if cargo is not None:
+        from army_card_cargo import selected
+        if side != Side.SHADOW or n_regular is not None or n_elite is not None:
+            raise ValueError('Exact Shadow cargo cannot mix with aggregate splits')
+        exact_units, exact_leaders = selected(state, frm_san, cargo)
+        if not set(map(id, exact_units)) <= set(map(id, mv_units)):
+            raise ValueError('Selected cargo cannot enter destination')
+        unit_ids, leader_ids = set(map(id, exact_units)), set(map(id, exact_leaders))
+        mv_units, mv_leaders = exact_units, exact_leaders
+        stay_units = [u for u in src.units if id(u) not in unit_ids]
+        stay_leaders = [l for l in src.leaders if id(l) not in leader_ids]
     if not mv_units:
         return 0  # leaders alone cannot make the move
+    if (any(_gl.leader_must_follow(l) and _gl._leader_side(l) == side
+            for l in stay_leaders)
+            and not any(_son(u.nation) == side for u in stay_units)):
+        raise ValueError('Mandatory plain leader needs a unit left behind')
     dst_key = next((k for k in state.armies if sanitize(k) == to_san),
                    None)
     dst = state.armies.get(dst_key) if dst_key else None
@@ -3410,7 +3811,7 @@ def _direct_army_move(state, frm_san, to_san, side,
         # region is recorded and resolve_overstacks() (learned pending
         # on the pending path, regulars-first heuristic otherwise) runs
         # right after the card effect completes
-        if len(mv_units) > room:
+        if len(mv_units) > room and not defer_overstack:
             _ovr9 = getattr(state, '_overstack_regions', None)
             if _ovr9 is None:
                 _ovr9 = set()
@@ -3454,7 +3855,7 @@ def _direct_army_move(state, frm_san, to_san, side,
             if rem and any(_son(u.nation) == other for u in rem.units):
                 _check_settlement_capture(state, frm_san, other)
     _gl._check_political_activation_for_entry(state, to_san, side)
-    _gl._check_companion_activates_nation(state, to_san, dst)
+    _gl._check_companion_activates_nation(state, to_san, mv_leaders)
     _gl.remove_orphaned_leaders(state)
     if not any(_son(u.nation) != side for u in dst.units):
         _check_settlement_capture(state, to_san, side)
@@ -3462,11 +3863,9 @@ def _direct_army_move(state, frm_san, to_san, side,
 
 
 def _army_reachable_free(state, start, max_steps, side):
-    """Regions reachable in <= max_steps army moves where every
-    INTERMEDIATE region holds no units at all (enemy units: cannot
-    enter; own units: passing through would pick them up, which the
-    movement cards forbid) and is not besieged.  The DESTINATION may
-    hold own units (merge) but never enemy units.  (QA 2026-07-09.)"""
+    """Reachable destinations without crossing enemy armies or sieges.
+    Friendly intermediate armies remain untouched: the moving group's cargo
+    is fixed at action start. Besieger joins are terminal destinations."""
     from collections import deque
     from combat import side_of_nation as _son
     bs = getattr(state, 'besieged_strongholds', set())
@@ -3500,9 +3899,20 @@ def _army_reachable_free(state, start, max_steps, side):
             if (has_enemy or asan in bs) and not _bes_join9:
                 continue  # cannot enter at all
             out.add(asan)
-            if not has_own:
-                q.append((asan, d + 1))  # pass through only when empty
+            if asan not in bs:
+                q.append((asan, d + 1))
     return out
+
+
+def _card_move_needs_guard(state, army, to_san, via_san=None):
+    """A politically barred FP plain leader must retain an Army unit."""
+    import game_logic as _gl
+    return any(_gl.leader_must_follow(l)
+               and _gl._leader_side(l) == Side.FREE_PEOPLES
+               and (not _unit_may_enter_nation(state, l, to_san)
+                    or (via_san is not None
+                        and not _unit_may_enter_nation(state, l, via_san)))
+               for l in army.leaders)
 
 
 def _paths_of_woses_options(state):
@@ -3537,15 +3947,90 @@ def _paths_of_woses_options(state):
             continue
         if not any(u.nation in FP_NATIONS for u in a.units):
             continue
-        opts.extend({"from_region": san, "to_region": d}
-                    for d in dests if d != san)
+        # (the per-unit 1.222(b) border rule lives in the MOVER; an army
+        # none of whose units may enter completes as a zero-effect play
+        # per 1.230 - never pruned from the surface, CL-239)
+        fp_units = [u for u in a.units if u.nation in FP_NATIONS]
+        for d in dests:
+            if d == san:
+                continue
+            pool = [u for u in fp_units if _unit_may_enter_nation(state, u, d)]
+            if (pool and len(pool) == len(fp_units)
+                    and _card_move_needs_guard(state, a, d)):
+                # The mandatory leader stays; expose the legal initial splits
+                # instead of a whole-stack choice that would orphan it.
+                nr = sum(u.kind != UnitKind.ELITE for u in pool)
+                ne = len(pool) - nr
+                for mr in range(nr + 1):
+                    for me in range(ne + 1):
+                        if (mr + me == 0 and len(pool) > 1) or (mr == nr and me == ne):
+                            continue
+                        opts.append(dict(from_region=san, to_region=d,
+                                         n_regular=mr, n_elite=me))
+            else:
+                opts.append({"from_region": san, "to_region": d})
     return opts
+
+
+def _tdaan_path(state, frm, to, units, n_regular=None, n_elite=None):
+    """Through a Day and a Night path for the FP `units` at `frm` moving
+    to `to` (<= 2 regions): returns (mid, pool) - `pool` is the subset
+    that may make the move under the per-unit 1.222(b) border rule at
+    the destination AND the walked-through region, `mid` the free
+    (friendly or empty, unbesieged) intermediate (None when adjacent). (None,
+    []) when no legal selected group may move. Each route is checked
+    against the chosen composition and any plain leader left behind;
+    ties prefer routes carrying more of the Army's leaders. ONE body
+    for the option surface and the handler."""
+    frm, to = sanitize(frm), sanitize(to)
+    adj_frm = {sanitize(x) for x in state.board.adjacent(frm)}
+    candidates = []
+    if to in adj_frm:
+        candidates.append(None)
+    else:
+        bs = getattr(state, 'besieged_strongholds', set())
+        for m in sorted(adj_frm):
+            if m in bs:
+                continue
+            a_m = state.armies.get(_find_army_key(state, m))
+            if a_m and any(u.nation not in FP_NATIONS for u in a_m.units):
+                continue
+            if to in {sanitize(x) for x in state.board.adjacent(m)}:
+                candidates.append(m)
+    import game_logic as _gl
+    army = state.armies.get(_find_army_key(state, frm))
+    best, best_score = (None, []), (-1, -1)
+    for m in candidates:
+        pool = [u for u in units
+                if _unit_may_enter_nation(state, u, to)
+                and (m is None or _unit_may_enter_nation(state, u, m))]
+        nr = sum(u.kind != UnitKind.ELITE for u in pool)
+        ne = len(pool) - nr
+        mr = nr if n_regular is None else n_regular
+        me = ne if n_elite is None else n_elite
+        if mr < 0 or me < 0 or mr > nr or me > ne or mr + me == 0:
+            continue
+        if (army and mr + me == len(units)
+                and _card_move_needs_guard(state, army, to, m)):
+            continue
+        leaders = sum(_gl.leader_must_follow(l)
+                      and _gl._leader_side(l) == Side.FREE_PEOPLES
+                      and _unit_may_enter_nation(state, l, to)
+                      and (m is None or _unit_may_enter_nation(state, l, m))
+                      for l in (army.leaders if army else []))
+        score = (len(pool), leaders)
+        if score > best_score:
+            best, best_score = (m, pool), score
+    return best
 
 
 def _tdaan_options(state):
     """Through a Day and a Night choices: FP armies containing at least
-    one Companion; destinations within 2 regions via free (unit-less,
-    unbesieged) intermediates, destination free of enemy units."""
+    one Companion (never a besieged garrison - 1.211h, the siege rule
+    the Shadow movement cards already honour); destinations within 2
+    regions via friendly or empty, unbesieged intermediates, destination
+    free of enemy units; the composition grid is built from the pool
+    that may legally make the move (1.222(b))."""
     from game_state import Companion as _Comp
     opts = []
     for k, a in state.armies.items():
@@ -3556,20 +4041,26 @@ def _tdaan_options(state):
         if not any(isinstance(l, _Comp) for l in a.leaders):
             continue
         frm = sanitize(k)
-        n_r = sum(1 for u in a.units if u.nation in FP_NATIONS
-                  and u.kind != UnitKind.ELITE)
-        n_e = sum(1 for u in a.units if u.nation in FP_NATIONS
-                  and u.kind == UnitKind.ELITE)
+        if _besieged_garrison_source(state, frm, Side.FREE_PEOPLES):
+            continue
+        fp_units = [u for u in a.units if u.nation in FP_NATIONS]
         for dest in sorted(_army_reachable_free(
                 state, frm, 2, Side.FREE_PEOPLES)):
-            # full stack: legacy option shape (teacher choices)
-            opts.append({"from_region": frm, "to_region": dest})
+            _mid, pool = _tdaan_path(state, frm, dest, fp_units)
+            full_r = sum(u.kind != UnitKind.ELITE for u in pool)
+            full_e = len(pool) - full_r
+            if pool:
+                opts.append({"from_region": frm, "to_region": dest})
             # P4 (USER ruling 1.112.7): initial splits - the full
             # composition grid, like army_move; the moving group takes
             # the leaders/companions with it, the remainder stays
+            n_r = sum(u.kind != UnitKind.ELITE for u in fp_units)
+            n_e = len(fp_units) - n_r
             for mr in range(n_r + 1):
                 for me in range(n_e + 1):
-                    if mr + me == 0 or (mr == n_r and me == n_e):
+                    if mr + me == 0 or (pool and mr == full_r and me == full_e):
+                        continue
+                    if not _tdaan_path(state, frm, dest, fp_units, mr, me)[1]:
                         continue
                     opts.append({"from_region": frm, "to_region": dest,
                                  "n_regular": mr, "n_elite": me})
@@ -3597,15 +4088,10 @@ def _effect_help_unlooked_for(state: "GameState", card, choices: dict) -> dict:
     from combat import garrison_side_for
     result = {"effects": []}
 
-    # REGRESSION FIX (canary, 2026-07-21): SAME shape as Fighting Uruk-hai.
-    # On the TEACHER / closed-loop path HUF's relief battle is synthesized
-    # by the schedule's own army_attack record (combat cards + forced
-    # casualties consumed from the schedule in order). Opening the battle
-    # here at event-play time pre-empts that cursor and desyncs casualties/
-    # combat-card consumption. This handler performs NO board mutation
-    # before the battle-open (no political advance; all lookups above are
-    # read-only), so the gate sits at the very top. Self-play (no hook)
-    # keeps the unconditional interactive field battle per USER 1.210(a).
+    # TEACHER path: the schedule's own army_attack record synthesizes the
+    # relief battle; opening it here would pre-empt that cursor (no board
+    # mutation precedes this gate).  Self-play keeps the interactive field
+    # battle (USER 1.210(a)).
     import combat as _cmbx9
     if _cmbx9.FINAL_HITS_HOOK is not None:
         return result
@@ -3614,9 +4100,8 @@ def _effect_help_unlooked_for(state: "GameState", card, choices: dict) -> dict:
     atk_region = choices.get("attack_from")
 
     def _atwar_fp_army(a):
-        return bool(a and any(u.nation not in SHADOW_NATIONS
-                              and state.political.is_at_war(u.nation)
-                              for u in a.units))
+        from game_logic import can_attack_with_army
+        return bool(a and can_attack_with_army(state, a, side=Side.FREE_PEOPLES)[0])
 
     # --- heuristic: FP-garrisoned besieged stronghold + adjacent At-War
     # FP relief army (the card only applies to armies BESIEGING) -------
@@ -3658,14 +4143,11 @@ def _effect_help_unlooked_for(state: "GameState", card, choices: dict) -> dict:
     fp_unit_count = sum(1 for u in (sh_entry.units if sh_entry else [])
                         if u.nation not in SHADOW_NATIONS)
 
-    # 1.210(a) USER: Help Unlooked For "absolutely does not resolve in a
-    # single round."  MULTI-ROUND field battle - the Shadow dice reduction
-    # (one per FP unit in the besieged stronghold) LASTS UNTIL THE COMBAT
-    # ENDS (persists ALL rounds via pc['def_dice_reduction'], re-read every
-    # round, min 1); the full press/retreat/advance set applies.  BOTH the
-    # teacher and self-play run the interactive machine (supersedes the old
-    # single-round gl_battle default).  FP attacker; "if shadow cannot
-    # retreat, free people can keep going as long as they want."
+    # 1.210(a) USER: Help Unlooked For "absolutely does not resolve in a single
+    # round" - a MULTI-ROUND field battle whose Shadow dice reduction (one per
+    # FP unit inside the stronghold, min 1) lasts until the combat ends; full
+    # press/retreat/advance set; "if shadow cannot retreat, free people can
+    # keep going as long as they want."
     import ai as _ai9
     _pc9 = {
         'attacker_region': atk_san,
@@ -3704,14 +4186,17 @@ def _effect_paths_of_woses(state: "GameState", card, choices: dict) -> dict:
         if not opts:
             result["message"] = "No legal Paths of the Woses move"
             return result
-        frm, to = opts[0]["from_region"], opts[0]["to_region"]
+        choices = dict(choices, **opts[0])
+        frm, to = choices["from_region"], choices["to_region"]
     frm, to = sanitize(frm), sanitize(to)
     if not any(o["from_region"] == frm and o["to_region"] == to
                for o in opts):
         result["message"] = f"Illegal Paths of the Woses move {frm} to {to}"
         return result
     moved = _direct_army_move(state, frm, to, Side.FREE_PEOPLES,
-                              exclude_not_at_war=True)
+                              exclude_not_at_war=True, allow_overstack=True,
+                              n_regular=choices.get('n_regular'),
+                              n_elite=choices.get('n_elite'))
     if moved:
         result["effects"].append(
             f"Paths of the Woses: army moved from {frm} to {to}")
@@ -3736,36 +4221,43 @@ def _effect_through_day_and_night(state: "GameState", card, choices: dict) -> di
         if not opts:
             result["message"] = "No FP army with a Companion can move"
             return result
-        frm, to = opts[0]["from_region"], opts[0]["to_region"]
+        choices = dict(choices, **opts[0])
+        frm, to = choices["from_region"], choices["to_region"]
     frm, to = sanitize(frm), sanitize(to)
     from game_state import Companion as _Comp
     src = state.armies.get(_find_army_key(state, frm))
     if not src or not any(isinstance(l, _Comp) for l in src.leaders):
         result["message"] = f"No FP army with a Companion in {frm}"
         return result
+    # 1.211h: a besieged FP GARRISON cannot march out through the siege
+    # lines (sortie is a battle) - the guard the Shadow cards use
+    if _besieged_garrison_source(state, frm, Side.FREE_PEOPLES):
+        result["message"] = (
+            f"{frm} is a besieged garrison - cannot move out")
+        return result
     if to not in _army_reachable_free(state, frm, 2, Side.FREE_PEOPLES):
         result["message"] = (
             f"{to} not reachable within 2 free regions from {frm}")
         return result
     # walk-through capture (USER RULE 2026-07-08: walking through empty
-    # settlements captures them) - find the free intermediate, if any
-    _mid = None
-    _adj_frm = {sanitize(x) for x in state.board.adjacent(frm)}
-    if to not in _adj_frm:
-        bs = getattr(state, 'besieged_strongholds', set())
-        for m in sorted(_adj_frm):
-            if m in bs:
-                continue
-            a_m = state.armies.get(_find_army_key(state, m))
-            if a_m and a_m.units:
-                continue
-            if to in {sanitize(x) for x in state.board.adjacent(m)}:
-                _mid = m
-                break
+    # settlements captures them) - the free intermediate, if any, and
+    # the pool that may legally move (1.222(b)); ONE body with the
+    # option surface (_tdaan_path)
     _nr9 = choices.get('n_regular')
     _ne9 = choices.get('n_elite')
+    _nr9 = int(_nr9) if _nr9 is not None else None
+    _ne9 = int(_ne9) if _ne9 is not None else None
+    _mid, _pool = _tdaan_path(
+        state, frm, to, [u for u in src.units if u.nation in FP_NATIONS],
+        _nr9, _ne9)
+    if not _pool:
+        result["message"] = (
+            f"No unit in {frm} may enter {to} (non-belligerent border "
+            f"rule, 1.222b)")
+        return result
     moved = _direct_army_move(
         state, frm, to, Side.FREE_PEOPLES,
+        exclude_not_at_war=True, via_san=_mid,
         n_regular=(int(_nr9) if _nr9 is not None else None),
         n_elite=(int(_ne9) if _ne9 is not None else None),
         # P4/P1: overstack-then-learned-resolution on the PENDING path
@@ -3776,7 +4268,11 @@ def _effect_through_day_and_night(state: "GameState", card, choices: dict) -> di
     if moved:
         if _mid is not None:
             from combat import _check_settlement_capture
+            import game_logic as _gl_td
             _check_settlement_capture(state, _mid, Side.FREE_PEOPLES)
+            # rulebook 370-371: a walked-through region is ENTERED
+            _gl_td._check_political_activation_for_entry(
+                state, _mid, Side.FREE_PEOPLES)
         result["effects"].append(
             f"Through a Day and a Night: army moved from {frm} to {to}"
             + (f" ({_nr9}R+{_ne9}E split)" if _nr9 is not None else ""))
@@ -3785,15 +4281,28 @@ def _effect_through_day_and_night(state: "GameState", card, choices: dict) -> di
     return result
 
 
+def _cirdan_unit_combos(state):
+    """Supply-valid full recruitment alternatives; AI projects Elite-first."""
+    from ai import figures_available
+    regular = figures_available(state, Nation.ELVES, 'regular')
+    elite = figures_available(state, Nation.ELVES, 'elite')
+    total = min(2, regular + elite)
+    if total == 0:
+        return []
+    if total == 1:
+        return ['2elite'] if elite else ['2regular']
+    return [name for name, nr, ne in (('2regular', 2, 0), ('mixed', 1, 1), ('2elite', 0, 2))
+            if regular >= nr and elite >= ne]
+
+
 @register_effect("Cirdan's Ships")
 def _effect_cirdans_ships(state: "GameState", card, choices: dict) -> dict:
     """Recruit 2 Elven units in coastal region with FP army."""
     result = {"effects": []}
     region = choices.get("region")
-    # CARD-FLEET LOW-25/26 + USER RULING 2026-07-21: SELF-PLAY
-    # validates the target (must be an authoritative coastal region
-    # holding an FP army) and refunds a no-op; the TEACHER trusts the
-    # logged region (log = truth).
+    # LOW-25/26 + USER RULING 2026-07-21: self-play validates the target (an
+    # authoritative coastal region holding an FP army) and refunds a no-op;
+    # the teacher trusts the logged region.
     if not region:
         result["message"] = ("Cirdan's Ships: no coastal region "
                              "chosen - not played")
@@ -3802,13 +4311,9 @@ def _effect_cirdans_ships(state: "GameState", card, choices: dict) -> dict:
     _rs = sanitize(str(region))
     _a9 = next((a for k, a in state.armies.items()
                 if sanitize(k) == _rs), None)
-    # USER RULING 2026-07-21g: test FP PRESENCE (any FP unit), not
-    # _is_army_fp's units[0] check — a BESIEGED FP stronghold
-    # shares one army entry with its Shadow besiegers, and a
-    # besieger at units[0] made this guard refund a legal
-    # recruit-under-siege (5R Dol Amroth + Cirdan is the USER's
-    # canonical example; the overstack machinery then trims with
-    # the owner's choice, excess to reinforcements).
+    # USER 2026-07-21g: test FP PRESENCE (any FP unit) - a besieged FP
+    # stronghold shares its entry with the Shadow besiegers (recruit under
+    # siege is legal; the overstack machinery trims with the owner's choice).
     _fp_present = bool(_a9 and _a9.units and any(
         u.nation not in SHADOW_NATIONS for u in _a9.units))
     if _rs not in _COASTAL or not _fp_present:
@@ -3817,6 +4322,8 @@ def _effect_cirdans_ships(state: "GameState", card, choices: dict) -> dict:
                              "not played" % region)
         return _selfplay_refund(result)
     combo = _default_unit_combo(state, Nation.ELVES, choices)
+    if choices.get('unit_combo') is not None and combo not in _cirdan_unit_combos(state):
+        raise ValueError("Cirdan's Ships recruitment combination unavailable")
     _got = []
     if combo == "2regular":
         _got = [recruit_unit(state, region, Nation.ELVES,
@@ -3848,22 +4355,37 @@ def _effect_cirdans_ships(state: "GameState", card, choices: dict) -> dict:
     return result
 
 
+def _validate_guards_recruit_choice(state: "GameState", choices: dict) -> None:
+    """Validate an explicit Guards choice before payment or placement."""
+    if not isinstance(choices, dict):
+        raise ValueError("Guards of the Citadel choices must be a dictionary")
+    if 'region' in choices and sanitize(str(choices['region'])) != 'minas tirith':
+        raise ValueError("Guards of the Citadel recruits only in Minas Tirith")
+    if 'unit_type' in choices:
+        from card_options import guards_of_the_citadel_options
+        available = {o.get('unit_type') for o in
+                     guards_of_the_citadel_options(state, Side.FREE_PEOPLES)
+                     if o.get('unit_type') is not None}
+        if choices['unit_type'] not in ('regular', 'elite') \
+                or choices['unit_type'] not in available:
+            raise ValueError("Guards of the Citadel unit_type is not available")
+
+
 @register_effect("Guards of the Citadel")
 def _effect_guards_of_citadel(state: "GameState", card, choices: dict) -> dict:
-    """Recruit Gondor unit and Leader in Minas Tirith."""
+    """Recruit the chosen Gondor unit and independent Leader in Minas Tirith.
+
+    The public action path exposes Regular/Elite through the card spec.
+    Direct legacy callers without a choice retain their default; an explicit
+    malformed or unavailable kind is never silently replaced or omitted.
+    """
+    _validate_guards_recruit_choice(state, choices)
     result = {"effects": []}
     unit_type = _default_unit_type(state, Nation.GONDOR, choices)
     kind = UnitKind.ELITE if unit_type == "elite" else UnitKind.REGULAR
-    # iter 39 (user-observed no-effect): recruit_unit returns None when
-    # the stacking cap (5 besieged / 10) or the pool blocks placement —
-    # claiming success anyway defeated the no-op dry-run filter and the
-    # net burned a die on nothing.  Report only what actually happened.
-    # CARD-FLEET LOW-30 (2026-07-21): the leader recruit was GATED on
-    # the unit recruit succeeding, silently dropping an entitled
-    # leader whenever the Gondor unit pool was exhausted. Card text
-    # ("Recruit one Gondor unit ... AND one Gondor Leader") places the
-    # two pieces independently — decouple. Unit FIRST so a fresh unit
-    # satisfies recruit_leader's no-stand-alone guard.
+    # Report only what actually happened (recruit_unit returns None when the
+    # cap or pool blocks).  LOW-30: unit and Leader are placed independently -
+    # unit FIRST so the Leader's no-stand-alone guard passes.
     _u = recruit_unit(state, "Minas Tirith", Nation.GONDOR, kind)
     _l = recruit_leader(state, "Minas Tirith", Nation.GONDOR)
     if _u is not None:
@@ -3905,13 +4427,10 @@ def _effect_riders_of_theoden(state: "GameState", card, choices: dict) -> dict:
     """Recruit Rohan unit and Leader in Edoras or companion region."""
     result = {"effects": []}
     region = choices.get("region", "Edoras")
-    # 1.211c (2026-07-21, MAIN-SESSION CORRECTED INTERPRETATION): the card
-    # text ("or any Rohan region CONTAINING a Companion") is a PER-REGION
-    # gate, NOT a Rohan-wide unlock. The legal set is Edoras (if free)
-    # UNION every Rohan-parent region that contains a BOARD Companion,
-    # where Helm's Deep qualifies EVEN UNDER SIEGE (companion inside) but
-    # every other Rohan region must still be free for the Free Peoples.
-    # Fellowship companions do not exist on the board (doctrine 1.211l).
+    # 1.211c: "or any Rohan region CONTAINING a Companion" is a PER-REGION gate:
+    # Edoras (if free) UNION every Rohan region holding a BOARD Companion -
+    # Helm's Deep qualifies even under siege, any other must be free for the
+    # FP.  Fellowship companions are not on the board (1.211l).
     from game_state import Companion as _Comp9
     from card_options import _free_for_side as _ffs9
     _rsan9 = sanitize(region)
@@ -4084,14 +4603,8 @@ def _effect_eomer(state: "GameState", card, choices: dict) -> dict:
     Exception: cannot recruit into Helm's Deep while it is under siege."""
     result = {"effects": []}
     region = choices.get("region", "Edoras")
-    # 1.211b (2026-07-21): NO silent besieged-Helm's-Deep -> Edoras
-    # redirect. A besieged Helm's Deep is simply NOT a legal Eomer
-    # target, so the self-play validator below REFUNDS an illegal
-    # besieged-HD pick instead of converting it (exclude_besieged=True
-    # drops it from the free-settlement list).
-    # self-play target validation (honest-reporting wave 2026-07-21): the
-    # target must be a FREE Rohan settlement; teacher / log-replay keeps
-    # the byte-identical legacy behaviour (log = truth).
+    # 1.211b: a besieged Helm's Deep is not a legal Eomer target - refund an
+    # illegal pick, never redirect it to Edoras; the teacher keeps log truth.
     if sanitize(region) not in {
             sanitize(r) for r in _get_free_rohan_settlements(
                 state, exclude_besieged=True)}:
@@ -4196,7 +4709,12 @@ def _effect_orc_patrol(state: "GameState", card, choices: dict) -> dict:
     # hunt-card-draws (QA 2026-07-11): tile source is either a redrawn
     # tile forced by the Mithril continuation, or a fresh Shadow draw.
     _ftile = choices.get('_forced_tile') if choices else None
-    if not state.hunt_pool:
+    if (_ftile is None and not (choices or {}).get('_skip_wizard')
+            and _wizardstaff_interposes(state)):
+        _wizardstaff_stash_card(state, 'orc_patrol', choices)
+        result['effects'].append("Wizard's Staff prevent decision pending")
+        return result
+    if _ftile is None and not state.hunt_pool:
         import game_logic as _gl136
         _gl136._recycle_hunt_pool(state)   # 1.136 (USER RULE)
     if state.hunt_pool or _ftile is not None:
@@ -4223,8 +4741,7 @@ def _effect_orc_patrol(state: "GameState", card, choices: dict) -> dict:
             pass
 
 
-        # Closed loop passes the LOGGED tile (the handler's random
-        # draw is self-play only; the scheduled draw is ground truth)
+        # Closed loop passes the LOGGED tile (the random draw is self-play only)
         _fdmg = choices.get("damage")
         if _fdmg is not None:
             damage, reveal = int(_fdmg), bool(choices.get("reveal"))
@@ -4248,14 +4765,13 @@ def _effect_orc_patrol(state: "GameState", card, choices: dict) -> dict:
             result["effects"].append("Drew Fellowship special tile - discarded without effect")
         else:
             # Apply hunt
-            damage = getattr(tile, 'damage', 0)
+            damage = _card_tile_damage(tile)
             reveal = getattr(tile, 'reveal', False)
             result["effects"].append(f"Drew hunt tile: {damage} damage, reveal={reveal}")
             # Closed loop passes the LOGGED resolution: the humans may
             # sacrifice a companion instead of taking corruption
-            # (2025-11-14 branstonpickle T9 L1042-1045: Orc Patrol tile
-            # resolved by guide-sacrificing Boromir).  _apply_fellowship
-            # _damage handles level absorption; no RNG either way.
+            # (_apply_fellowship_damage handles level absorption; no RNG
+            # either way)
             vname = str(choices.get("victim", "") or "").strip().lower()
             victim = next((c for c in state.fellowship.companions
                            if c.name.strip().lower() == vname), None)                 if vname else None
@@ -4266,33 +4782,15 @@ def _effect_orc_patrol(state: "GameState", card, choices: dict) -> dict:
                 result["effects"].append(f"{victim.name} sacrificed")
             elif choices.get("damage") is None and choices.get(
                     "victim") is None and "victim" not in choices                     and not choices.get("_from_log"):
-                # SELF-PLAY (no logged resolution): route through the
-                # learned hunt-damage decision instead of raw corruption
-                # (USER 2026-07-09 tile-card verification)
+                # SELF-PLAY (no logged resolution): route through the learned
+                # hunt-damage decision instead of raw corruption (USER
+                # 2026-07-09)
                 state._pending_hunt_damage = getattr(
                     state, '_pending_hunt_damage', 0) + damage
             else:
                 state.fellowship.corruption = min(12, state.fellowship.corruption + damage)  # CL-217a: 12-ceiling clamp (2026-07-21)
-            # Reveal icon: live for card tile-draws; the Gollum guide
-            # may ignore it (same almanac ruling as the Isildur's
-            # Bane / Foul Thing twins).
-            if reveal and getattr(state.fellowship.guide,
-                                  'guide_ability', None) \
-                    != 'no_reveal_on_damage':
-                state.fellowship.hidden = False
-                # 1.132 gate (sibling twins): placement is self-play
-                # only and never on the Mordor track (progress IS
-                # the track position there).
-                import combat as _cmb132op
-                if (_cmb132op.FINAL_HITS_HOOK is None
-                        and not state.fellowship.mordor_entered
-                        and not choices.get("victim")
-                        and choices.get("damage") is None):
-                    # AUTO-RESOLVER PURGE (2026-08-16): placement is a
-                    # LEARNED FP DECISION - defer to
-                    # ai.open_reveal_placement (apply_action tail)
-                    state._reveal_place_due = True
-                    state._sh_tile_drawn_regions = set()
+            _gl.stage_hunt_reveal(state, tile, reveal)
+            _gl.settle_hunt_reveal(state)
     return result
 
 
@@ -4313,7 +4811,7 @@ def _effect_isildurs_bane(state: "GameState", card, choices: dict) -> dict:
         _wizardstaff_stash_card(state, 'isildur', choices)
         result["effects"].append("Wizard's Staff prevent decision pending")
         return result
-    if not state.hunt_pool:
+    if _ftile is None and not state.hunt_pool:
         import game_logic as _gl136
         _gl136._recycle_hunt_pool(state)   # 1.136 (USER RULE)
     if state.hunt_pool or _ftile is not None:
@@ -4349,49 +4847,20 @@ def _effect_isildurs_bane(state: "GameState", card, choices: dict) -> dict:
                 f"Hunt tile (logged): {damage} damage as Corruption")
             state.fellowship.corruption = min(12, state.fellowship.corruption + damage)  # CL-217a: 12-ceiling clamp (2026-07-21)
             return result
-        # USER RULING 1.112 (verified vs the GenericPie T8 log: the
-        # humans killed the Eye with no effect): EYE tiles = 0 damage,
-        # no reveal, EVEN on the Mordor track; still leave the pool.
-        # The old hunt-box-damage branch was a phantom +4 the replay
-        # only tolerated because of a compensating drift downstream.
+        # USER RULING 1.112: card-drawn EYE tiles = 0 damage, no reveal, EVEN on
+        # the Mordor track; they still leave the pool.
         if (getattr(tile, 'is_eye', False)
                 or getattr(tile, 'is_fellowship_special', False)):
             result["effects"].append("Drew Eye/FP tile - discarded without effect")
         else:
-            # Special-tile dynamics (1.35 family): Shelob's Lair rolls a
-            # d6 for damage (the closed loop forces the logged roll —
-            # 2023-08-13 HombreLobo T12: 'gg' after Shelob + d6=2 took
-            # corruption 11 -> 13, the humans' Shadow Ring T12 win; the
-            # old flat tile.damage=0 read lost the kill shot).  (Eyes
-            # never reach this branch - ruling 1.112.1: card-drawn
-            # Eyes have no effect, EVEN on the Mordor track; caught by
-            # the is_eye guard above.)
-            if getattr(tile, 'is_dice_roll', False):
-                damage = _d6_batch(1, 'shelob d6 damage')[0]
-            else:
-                damage = getattr(tile, 'damage', 0)
+            # Shelob's Lair rolls a d6 for damage (the closed loop forces the
+            # logged roll); Eyes never reach this branch (1.112.1).
+            damage = _card_tile_damage(tile)    # ONE body with Foul Thing
             result["effects"].append(f"Hunt tile: {damage} damage taken as Corruption only")
             state.fellowship.corruption = min(12, state.fellowship.corruption + damage)  # CL-217a: 12-ceiling clamp (2026-07-21)
-            # almanac ruling 4 (QA 2026-07-11): reveal icons are live
-            # for this card; Gollum-guide may ignore them
-            if getattr(tile, 'reveal', False) and state.fellowship.hidden:
-                _g9 = state.fellowship.guide
-                if getattr(_g9, 'guide_ability', None) \
-                        != 'no_reveal_on_damage':
-                    state.fellowship.hidden = False
-                    result["effects"].append(
-                        "Reveal icon - Fellowship revealed")
-                    # 1.132: full reveal = figure placement + progress
-                    # reset (self-play only; teacher reveals reconcile
-                    # from the log's own placement records)
-                    import combat as _cmb132
-                    if _cmb132.FINAL_HITS_HOOK is None \
-                            and not state.fellowship.mordor_entered:
-                        # AUTO-RESOLVER PURGE (2026-08-16): placement
-                        # is a LEARNED FP DECISION - defer to
-                        # ai.open_reveal_placement (apply_action tail)
-                        state._reveal_place_due = True
-                        state._sh_tile_drawn_regions = set()
+            from game_logic import stage_hunt_reveal, settle_hunt_reveal
+            stage_hunt_reveal(state, tile, getattr(tile, 'reveal', False))
+            settle_hunt_reveal(state)
     return result
 
 
@@ -4405,9 +4874,6 @@ def _effect_foul_thing(state: "GameState", card, choices: dict) -> dict:
     import game_logic as _gl
     from game_trace import emit_annotation
     result = {"effects": []}
-    # (dead '_foul_victim_pick' re-entry removed 2026-07-27 — the
-    # same-day adversarial repair made the victim a RANDOM draw per
-    # almanac p.43; nothing ever set that flag)
     # tile source: forced (Mithril redraw continuation) or a fresh draw
     _ftile = choices.get('_forced_tile') if choices else None
     # 1.217 (USER 2026-07-23): the FP may discard "Wizard's Staff" to
@@ -4426,6 +4892,10 @@ def _effect_foul_thing(state: "GameState", card, choices: dict) -> dict:
         state.hunt_discard.append(tile)
     else:
         if not state.hunt_pool:
+            # 1.136: the used pile recycles into an empty pool (the
+            # ONE recycler; Orc Patrol / Isildur's Bane / BotF match)
+            _gl._recycle_hunt_pool(state)
+        if not state.hunt_pool:
             return result
         tile = _tile_choice(state)
         state.hunt_pool.remove(tile)
@@ -4443,7 +4913,9 @@ def _effect_foul_thing(state: "GameState", card, choices: dict) -> dict:
         damage = 0
         tname = tile.special_name or repr(tile)
     else:
-        damage = int(getattr(tile, 'damage', 0) or 0)
+        # Shelob's Lair rolls its d6 here exactly as under Isildur's
+        # Bane (ONE body: _card_tile_damage)
+        damage = int(_card_tile_damage(tile))
         tname = tile.special_name or repr(tile)
     try:
         emit_annotation(state, 'hunt_tile_draw', {
@@ -4451,43 +4923,23 @@ def _effect_foul_thing(state: "GameState", card, choices: dict) -> dict:
             'damage': damage})
     except Exception:
         pass
-    # almanac (QA 2026-07-11 r3 C18): reveal icons apply even when the
-    # tile deals no damage; the Gollum guide may ignore them.
-    # USER RULING 2026-07-20 (trace w5_g2 T7): an EYE (or FP-special)
-    # tile drawn by a card-forced draw (this card, Isildur's Bane, Orc
-    # Patrol, stronghold extra tile) has NO EFFECT — the Eye tile's
-    # reveal=True flag must not fire here. (The sibling handlers
-    # already check is_eye first; this one hoisted the reveal block
-    # above the eye branch.)
-    if (getattr(tile, 'reveal', False) and state.fellowship.hidden
-            and not getattr(tile, 'is_eye', False)
-            and not getattr(tile, 'is_fellowship_special', False)):
-        if getattr(state.fellowship.guide, 'guide_ability',
-                   None) != 'no_reveal_on_damage':
-            state.fellowship.hidden = False
-            result["effects"].append("Reveal icon - Fellowship revealed")
-            # 1.132: full reveal = figure placement + progress reset
-            # (self-play only; teacher reconciles from logged records)
-            import combat as _cmb132
-            if _cmb132.FINAL_HITS_HOOK is None \
-                    and not state.fellowship.mordor_entered:
-                # AUTO-RESOLVER PURGE (2026-08-16): placement is a
-                # LEARNED FP DECISION - defer to
-                # ai.open_reveal_placement (apply_action tail)
-                state._reveal_place_due = True
-                state._sh_tile_drawn_regions = set()
+    # USER RULING 2026-07-20: an EYE (or FP-special) tile drawn by a card-forced
+    # draw has NO EFFECT - its reveal flag must not fire (almanac C18: reveal
+    # icons otherwise apply even with no damage; the Gollum guide may ignore
+    # them).
+    _gl.stage_hunt_reveal(
+        state, tile, bool(getattr(tile, 'reveal', False)
+                          and not getattr(tile, 'is_eye', False)
+                          and not getattr(tile, 'is_fellowship_special', False)))
     if damage <= 0:
         if not result["effects"]:
             result["effects"].append("Tile has no effect (eye/FP special)")
         return result
-    # almanac (QA 2026-07-11 E13): FP may discard Axe and Bow / Horn of
-    # Gondor to reduce the damage BEFORE the forced random casualty
-    # (one card per tile). USER RULING 2026-07-21: this is a LEARNED
-    # FP decision — SELF-PLAY suspends into the hunt_reduction
-    # interpose (the card_option executor resumes via
-    # _foul_apply_after_reduction); the TEACHER forces the logged
-    # use/decline through choices['hunt_reduction_used'] (hunt
-    # forcing) — the old always-use heuristic is removed.
+    # almanac E13: FP may discard Axe and Bow / Horn of Gondor to reduce the
+    # damage BEFORE the forced random casualty (one card per tile).  USER
+    # RULING 2026-07-21: a LEARNED FP decision - self-play suspends into the
+    # hunt_reduction interpose (_foul_apply_after_reduction resumes); the
+    # teacher forces the logged use/decline via choices['hunt_reduction_used'].
     import combat as _cmbft
     _pc9 = getattr(state, 'persistent_cards', None)
     if _cmbft.FINAL_HITS_HOOK is None and _pc9 is not None \
@@ -4503,9 +4955,7 @@ def _effect_foul_thing(state: "GameState", card, choices: dict) -> dict:
                     'hunt_reduction': True,
                     'foul_resume': {'damage': damage,
                                     'victim': choices.get('victim')},
-                    'options': [{'use_hunt_reduction': 1,
-                                 'card_id': _c9.card_id},
-                                {'use_hunt_reduction': 0}]}
+                    'options': _gl._hunt_reduction_options(state)}
                 result["effects"].append(
                     "Axe/Horn reduction decision pending")
                 return result
@@ -4540,17 +4990,8 @@ def _effect_foul_thing(state: "GameState", card, choices: dict) -> dict:
     if victim is None:
         cands = [c for c in state.fellowship.companions
                  if c.name != 'Gollum']
-        # hunt-card-draws (QA 2026-07-11) gap (b): two or more eligible
-        # victims -> the random casualty becomes a LEARNED decision (one
-        # option per legal victim) on the learned path.  Almanac: the
-        # Shadow player performs the random Companion draw, so the pick
-        # is the SHADOW net's decision.  The teacher supplies the logged
-        # victim (handled above) and never reaches this branch; a single
-        # or zero eligible victim needs no decision (keeps the certified
-        # single-companion behaviour byte-identical).
-        # adversarial repair 2026-07-11: the almanac (p.43) makes this
-        # a RANDOM companion draw - an optimizable SHADOW pick was a
-        # rules deviation; the random path below is the rule.
+        # Almanac p.43: the victim is a RANDOM companion draw (never an
+        # optimizable pick); the teacher supplies the logged victim above.
         if cands:
             from game_logic import pick_random_companion
             victim = pick_random_companion(cands, 'Foul Thing victim')
@@ -4579,6 +5020,12 @@ def _foul_apply_after_reduction(state: "GameState", foul_resume: dict,
     if damage <= 0:
         result["effects"].append(
             "Damage fully neutralised - no casualty")
+        # A guide may already have separated while reducing this event.
+        # Even without a casualty, its placement remains a learned choice.
+        import combat as _foul_combat
+        if _foul_combat.FINAL_HITS_HOOK is None:
+            from game_logic import pop_hobbit_place_queue
+            pop_hobbit_place_queue(state)
         return result
     vname = str((foul_resume or {}).get("victim", "") or "") \
         .strip().lower()
@@ -4603,6 +5050,12 @@ def _foul_apply_after_reduction(state: "GameState", foul_resume: dict,
         state.fellowship.corruption = min(
             12, state.fellowship.corruption + damage)
         result["effects"].append(f"No companions: +{damage} Corruption")
+        # A guide may already have separated while reducing this event.
+        # Even without a casualty, its placement remains a learned choice.
+        import combat as _foul_combat
+        if _foul_combat.FINAL_HITS_HOOK is None:
+            from game_logic import pop_hobbit_place_queue
+            pop_hobbit_place_queue(state)
         return result
     return _foul_apply_casualty(state, victim.name, damage, result)
 
@@ -4616,8 +5069,9 @@ def _foul_guide_can_reduce(state, g):
     ab = getattr(g, 'guide_ability', None)
     if ab == 'sacrifice_reduce_hunt':          # Merry/Pippin separate -1
         return True
-    if ab == 'no_reveal_on_damage' and state.fellowship.hidden:
-        return True                            # Gollum reveal -1 (one-shot)
+    if ab == 'no_reveal_on_damage':
+        from game_logic import _gollum_reveal_available
+        return _gollum_reveal_available(state)
     return False
 
 
@@ -4672,7 +5126,17 @@ def _move_all_nazgul_to_fellowship(state, result):
     Ring-bearers' region (Nazgul Search / Nazgul Strike move-half)."""
     import game_logic as _gl9
     from game_state import Army as _Army9
+    from ai import _stronghold_controller as _sc9
     _fsp9 = sanitize(_gl9.fellowship_region(state))
+    # rulebook 2128-2131: Nazgul never enter a Free Peoples-controlled
+    # stronghold unless a Shadow army besieges it (the rule the learned
+    # per-figure chain applies in ai._get_nazgul_move_actions)
+    if _sc9(state, _fsp9) == Side.FREE_PEOPLES and _fsp9 not in getattr(
+            state, 'besieged_strongholds', set()):
+        result["effects"].append(
+            f"Nazgul cannot enter the unbesieged Free Peoples stronghold "
+            f"at {_fsp9} - no Nazgul moved")
+        return 0
     _moved9 = 0
     for rk, a in list(state.armies.items()):
         if sanitize(rk) == _fsp9:
@@ -4749,11 +5213,8 @@ def _effect_cruel_weather(state: "GameState", card, choices: dict) -> dict:
         # (prefer Shadow-controlled or away from Mordor)
         adj_regions = state.board.adjacent(fsp_region)
         best, best_score = None, -999
-        from game_logic import _MORDOR_INTERIOR as _MI_cw
         for adj in adj_regions:
             adj_san = sanitize(adj)
-            if adj_san in _MI_cw:      # pawn never enters the interior
-                continue
             score = 0
             # Prefer Shadow regions
             if is_shadow_region(adj_san):
@@ -4780,15 +5241,6 @@ def _effect_cruel_weather(state: "GameState", card, choices: dict) -> dict:
     if target_san not in [
             sanitize(a) for a in state.board.adjacent(fsp_region)]:
         result["message"] = f"Cruel Weather: {target} is not adjacent to {fsp_region}"
-        return _selfplay_refund(result)
-
-    # Batch-003 audit catch (2026-07-29): the pawn never enters
-    # Mordor's interior — the track model (1.155) has no physical
-    # interior position.  Defensive twin of the option-spec filter.
-    import game_logic as _gl_cw
-    if target_san in _gl_cw._MORDOR_INTERIOR:
-        result["message"] = ("Cruel Weather: cannot move the "
-                             "Ring-bearers into Mordor's interior")
         return _selfplay_refund(result)
 
     # Move fellowship figure (no hunt, no progress change)
@@ -4946,14 +5398,22 @@ def _effect_nazgul_strike(state: "GameState", card, choices: dict) -> dict:
         import game_logic as _gl
         from game_state import Side as _Side
         result["effects"].append("Rolling for Hunt...")
+        # Hunt Level = Shadow dice in the Hunt Box (rulebook p.40, the
+        # same count the fellowship_move path rolls): 0 dice -> no roll
         hunt_level = sum(1 for d in state.hunt_box
                          if d.side is _Side.SHADOW)
-        num_dice = min(5, max(1, hunt_level))
+        num_dice = min(5, hunt_level)
         fp_dice_in_box = sum(1 for d in state.hunt_box
                              if d.side is _Side.FREE_PEOPLES)
-        successes = _gl._hunt_roll(state, num_dice, 6,
-                                   fp_modifier=fp_dice_in_box)
-        if successes and state.hunt_pool:
+        if num_dice <= 0:
+            result["effects"].append("Hunt Level 0 - no Hunt dice to roll")
+            successes = 0
+        else:
+            successes = _gl._hunt_roll(state, num_dice, 6,
+                                       fp_modifier=fp_dice_in_box)
+        # (1.136: _resolve_hunt_tile recycles an empty pool itself - no
+        # pool guard here)
+        if successes:
             _gl._resolve_hunt_tile(state, successes, mordor=False)
             result["effects"].append(
                 f"Hunt hit ({successes}): tile drawn")
@@ -5013,44 +5473,74 @@ def _effect_lure_of_ring(state: "GameState", card, choices: dict) -> dict:
         state.fellowship.corruption = min(12, state.fellowship.corruption + 1)  # CL-217a: 12-ceiling clamp (2026-07-21)
         result["effects"].append("Gollum is guide - added 1 Corruption instead")
     elif state.fellowship.companions:
-        # Closed loop passes the LOGGED draw: the Controls.637 line
-        # names the victim (random pick only for self-play; 2023-11-03
-        # ketchuptime T2: the log drew Gimli and ELIMINATED him — the
-        # unforced default corrupted a random pick and the teacher's
-        # fellowship/corruption drifted all game).
+        # Teacher: the logged draw names the victim.  STAGE 2 ('_lure_drawn',
+        # the FP's cross-side pick): the draw already happened - no new draw
+        # and no stream-compat consume.
         victim = None
+        _stage2 = bool(choices.get('_lure_drawn'))
         vname = str(choices.get("victim", "") or "").strip().lower()
         if vname:
             victim = next((c for c in state.fellowship.companions
                            if c.name.strip().lower() == vname), None)
-            if victim is not None:
+            if victim is not None and not _stage2:
                 # stream-compat: consume the draw the unforced path
                 # would have made (seeded-RNG alignment, see ai.py
                 # hunt_sacrifice_random)
                 random.choice(state.fellowship.companions)
+        if victim is None and _stage2:
+            result["message"] = (
+                f"Lure of the Ring: drawn victim {vname!r} is no longer "
+                f"in the Fellowship")
+            return result
         if victim is None:
             from game_logic import pick_random_companion
             victim = pick_random_companion(state.fellowship.companions,
                                            'Lure of the Ring victim')
-        try:
-            from game_trace import emit_annotation as _ea132
-            _ea132(state, 'random_draw', {
-                'ctx': 'Lure of the Ring victim',
-                'result': victim.name,
-                'pool': [c.name for c in state.fellowship.companions]})
-        except Exception:
-            pass
-        action = choices.get("action", "corruption")  # "corruption" or "eliminate"
+        if not _stage2:
+            try:
+                from game_trace import emit_annotation as _ea132
+                _ea132(state, 'random_draw', {
+                    'ctx': 'Lure of the Ring victim',
+                    'result': victim.name,
+                    'pool': [c.name for c in state.fellowship.companions]})
+            except Exception:
+                pass
+        action = choices.get("action")  # "corruption" or "eliminate"
+        if action is None:
+            import combat as _cmb_lure
+            if _cmb_lure.FINAL_HITS_HOOK is not None:
+                action = "corruption"      # teacher: historical default
+            else:
+                # STAGE 1 (audit EE2-3): card text - the Companion is
+                # drawn FIRST, then "the Free Peoples player must
+                # choose".  The FP decides SEEING the draw: a direct
+                # cross-side pending (Stormcrow pattern, decider fp)
+                # whose options carry the drawn victim's name and Level.
+                _lvl9 = int(getattr(victim, 'level', 0) or 0)
+                state.pending_card_option = {
+                    'card_id': getattr(card, 'card_id',
+                                       'SHADOW_Character_Lure_of_the_Ring'),
+                    'card_name': 'Lure of the Ring',
+                    'side': 'sh', 'decider': 'fp', 'direct': True,
+                    'options': [
+                        {'action': 'corruption', 'victim': victim.name,
+                         'level': _lvl9, '_lure_drawn': True},
+                        {'action': 'eliminate', 'victim': victim.name,
+                         'level': _lvl9, '_lure_drawn': True}]}
+                result["effects"].append(
+                    f"Lure of the Ring drew {victim.name} (Level {_lvl9}) "
+                    f"- Free Peoples choose Corruption or elimination "
+                    f"(pending)")
+                return result
         if action == "eliminate":
             import game_logic as _gl9
             state.fellowship.companions.remove(victim)
-            # QA 2026-07-11 CASE 9: a Lure elimination is NOT a Hunt
-            # casualty - Worn with Sorrow and Toil must not trigger
-            # Adjudication #3 (2026-07-21): a separated guide re-picks by
-            # HIGHEST Level (Level tie -> pending_guide_change), not
-            # arbitrary companions[0].
-            if state.fellowship.guide not in state.fellowship.companions:
-                _gl9.change_guide(state, allow_pending=True)
+            # USER RULING 1.257: a Lure elimination is NOT a Hunt casualty - WWSAT
+            # does not fire; the companion still leaves play through the ONE
+            # bookkeeper (casualty=False).  A departing guide re-picks by
+            # HIGHEST Level (tie -> pending_guide_change).
+            _gl9._on_companion_casualty(state, victim.name, casualty=False)
+            _gl9.change_guide(state, allow_pending=True)
             if _gl9.hobbit_hunt_placement_applies(state, victim.name):
                 # almanac (QA 2026-07-11 C9): a drawn Hobbit uses
                 # Take-Them-Alive - placed on the board, not eliminated
@@ -5074,15 +5564,34 @@ def _effect_lure_of_ring(state: "GameState", card, choices: dict) -> dict:
 def _effect_breaking_of_fellowship(state: "GameState", card, choices: dict) -> dict:
     """Draw hunt tile; separate companions = tile number."""
     result = {"effects": []}
+    choices = dict(choices or {})
+    card_id = getattr(card, 'card_id', None) or choices.get('_breaking_card_id')
     guide_name = state.fellowship.guide.name if state.fellowship.guide else ""
 
     if "Gollum" in guide_name:
         state.fellowship.corruption = min(12, state.fellowship.corruption + 1)  # CL-217a: 12-ceiling clamp (2026-07-21)
         result["effects"].append("Gollum is guide - added 1 Corruption instead")
-    elif state.hunt_pool or _recycle_bof136(state):
-        tile = _tile_choice(state)
-        state.hunt_pool.remove(tile)
-        state.hunt_discard.append(tile)  # drawn = used pile (returns on entry)
+    else:
+        # Almanac p.25: this is not a Hunt, but both protection cards
+        # apply to its Shadow draw. Gollum's alternative above draws no tile.
+        forced = choices.get('_forced_tile')
+        continuation = dict(choices, _breaking_card_id=card_id)
+        if (forced is None and not choices.get('_skip_wizard')
+                and _wizardstaff_interposes(state)):
+            _wizardstaff_stash_card(state, 'breaking', continuation)
+            result['effects'].append("Wizard's Staff prevent decision pending")
+            return result
+        if forced is None:
+            if not state.hunt_pool and not _recycle_bof136(state):
+                return result
+            tile = _tile_choice(state)
+            state.hunt_pool.remove(tile)
+            if _mithril_interposes(state):
+                _mithril_stash_card(state, tile, 'breaking', continuation)
+                return result
+        else:
+            tile = forced
+        state.hunt_discard.append(tile)
         try:
             from game_trace import emit_annotation as _ea132
             _ea132(state, 'hunt_tile_draw', {
@@ -5096,24 +5605,15 @@ def _effect_breaking_of_fellowship(state: "GameState", card, choices: dict) -> d
         if getattr(tile, 'is_eye', False) or getattr(tile, 'is_fellowship_special', False):
             result["effects"].append("Drew Eye/FP tile - discarded without effect")
         else:
-            # USER FIX 2026-07-08: actually separate `damage` companions
-            # into the Ring-bearers' region (ignore Reveal/Stop).
-            # P2 pure-parity fix (2026-07-22, GAME21 rendered L261-264):
-            # WHICH companions leave is the FREE PEOPLES PLAYER'S
-            # DECISION, never the engine's list order (movable[:n]
-            # ejected Gimli+Legolas while the human chose Merry+Pippin
-            # -> Legolas lost from the engine fellowship for the rest
-            # of the game).  Replay path: the handler separates NO ONE
-            # - the companion_separate records that follow the play
-            # carry the decision and execute it.  Choices path (GUI /
-            # explicit): 'separate' lists the names.  Self-play
-            # fallback: LOWEST-Level first (rules-sensible default,
-            # flagged in card_validation_flags.csv for a learned
-            # pending upgrade).
+            # Separate `damage` companions into the Ring-bearers' region (ignore
+            # Reveal/Stop).  WHICH companions leave is the FREE PEOPLES
+            # player's decision: replay = the logged companion_separate
+            # records (the handler separates no one); explicit choices =
+            # 'separate'; self-play = the chained learned pending.
             import combat as _cmb_bof
             import game_logic as _gl
             from game_state import Army as _Army
-            n = int(getattr(tile, 'damage', 0))
+            n = _card_tile_damage(tile)
             cur = sanitize(_gl.fellowship_region(state))
             movable = [c for c in state.fellowship.companions
                        if c.name not in ("Frodo", "Sam", "Gollum")]
@@ -5132,14 +5632,11 @@ def _effect_breaking_of_fellowship(state: "GameState", card, choices: dict) -> d
                 # replay that reality, never pick for them
                 sep = []
             else:
-                # USER 2026-07-27: WHICH companions leave is the FP
-                # player's decision — a chained LEARNED pending (one
-                # pick per option, like the nazgul chain), never the
-                # old lowest-level auto-pick.  MCTS evaluates each
-                # child state even without policy priors.
+                # USER 2026-07-27: a chained LEARNED pending (one pick per
+                # option, like the nazgul chain), never an auto-pick
                 if n > 0 and movable:
                     state.pending_card_option = {
-                        'card_id': getattr(card, 'card_id', None),
+                        'card_id': card_id,
                         'card_name': 'The Breaking of the Fellowship',
                         'side': 'sh', 'decider': 'fp',
                         'bof_separation': True,
@@ -5157,12 +5654,8 @@ def _effect_breaking_of_fellowship(state: "GameState", card, choices: dict) -> d
                 sep = []
             if sep:
                 _mordor9 = state.fellowship.mordor_entered
-                # CARD-FLEET HIGH-5 (2026-07-20): the old raw
-                # `state.armies[cur] = Army(...)` keyed on the
-                # SANITIZED name — with an existing original-case
-                # entry ('Rivendell') it MINTED a duplicate army
-                # ('rivendell') canonical lookups couldn't reconcile.
-                # Armies ONLY via get_or_create_army (standing rule).
+                # Armies ONLY via get_or_create_army (standing rule; a raw
+                # sanitized-key write minted a duplicate entry)
                 _host9 = (None if _mordor9
                           else _gl.get_or_create_army(state, cur))
                 for c in sep:
@@ -5176,10 +5669,13 @@ def _effect_breaking_of_fellowship(state: "GameState", card, choices: dict) -> d
                         _host9.leaders.append(c)
                 # Adjudication #3 (2026-07-21): a separated guide re-picks
                 # by HIGHEST Level (Level tie -> pending_guide_change), not
-                # arbitrary companions[0].  Only when the guide left the
-                # Fellowship (change_guide: empty->Gollum, else highest).
-                if state.fellowship.guide not in state.fellowship.companions:
-                    _gl.change_guide(state, allow_pending=True)
+                # arbitrary companions[0].  Every composition change opens
+                # this opportunity (Rulebook p37), retaining the old guide if chosen.
+                _gl.change_guide(state, allow_pending=True)
+                # card texts (Horn of Gondor / Axe and Bow / Wizard's
+                # Staff): discard when the required companion leaves
+                # the Fellowship - the ONE implementation
+                _gl.check_companion_persistent_discards(state)
                 result["effects"].append(
                     f"Separated {len(sep)} companion(s) to {cur}: "
                     + ', '.join(c.name for c in sep))
@@ -5206,6 +5702,9 @@ def _bof_apply_separation(state, pco, name):
             # almanac C7: Mordor-track separations are REMOVED from
             # play; otherwise place with the Ring-bearers
             _gl.get_or_create_army(state, cur).leaders.append(comp)
+        # companion-linked table cards (Horn / Axe and Bow / Wizard's
+        # Staff) discard when their companion leaves - ONE implementation
+        _gl.check_companion_persistent_discards(state)
     n_left = int(pco.get('bof_n_left', 1)) - 1
     movable = [c for c in state.fellowship.companions
                if c.name not in ('Frodo', 'Sam', 'Gollum')]
@@ -5214,8 +5713,7 @@ def _bof_apply_separation(state, pco, name):
             pco, bof_n_left=n_left,
             options=[{'companions': [c.name]} for c in movable])
         return
-    if state.fellowship.guide not in state.fellowship.companions:
-        _gl.change_guide(state, allow_pending=True)
+    _gl.change_guide(state, allow_pending=True)
 
 
 @register_effect("Worn with Sorrow and Toil")
@@ -5269,9 +5767,10 @@ def _effect_dreadful_spells(state: "GameState", card, choices: dict) -> dict:
 
     if not target_region:
         # Default (the card requirement guarantees one exists): a Shadow
-        # army containing Nazgul in or adjacent to a region with FP units
+        # ARMY containing Nazgul (units + Nazgul, USER 2026-07-16 item 5)
+        # in or adjacent to a region with FP units
         for k, a in state.armies.items():
-            if not _army_contains_nazgul(a):
+            if not _is_shadow_army_with_nazgul(a):
                 continue
             k_san = sanitize(k)
             for r in [k_san] + [sanitize(x)
@@ -5294,7 +5793,9 @@ def _effect_dreadful_spells(state: "GameState", card, choices: dict) -> dict:
         t_san = sanitize(str(target_region))
         army = next((a for k, a in state.armies.items()
                      if sanitize(k) == t_san), None)
-        if army and _army_contains_nazgul(army):
+        # "that Army" = a Shadow Army (units) containing the Nazgul - a
+        # lone Nazgul entry is not an Army (ONE predicate with the gate)
+        if _is_shadow_army_with_nazgul(army):
             import game_logic as _gl9
             # the Witch-king provides a die too (almanac, QA C6)
             nazgul_count = sum(1 for l in army.leaders
@@ -5336,8 +5837,8 @@ def _effect_dreadful_spells(state: "GameState", card, choices: dict) -> dict:
 def _effect_grond(state: "GameState", card, choices: dict) -> dict:
     """Attack stronghold: 3 rounds, FP can't play card first round unless companion.
 
-    Requires a Shadow army with at least one Sauron unit adjacent to
-    an FP stronghold.  The battle is a siege lasting up to 3 rounds.
+    Requires the Witch-king with a Shadow Army besieging a native
+    Free Peoples Stronghold. The battle has 3 mandatory rounds.
     Round-1 FP combat card blocked UNLESS a Companion is in the battle
     (printed exception; pc key no_def_card_r1_unless_companion on the
     learned path - the legacy gl_battle fallback passes no defender
@@ -5346,14 +5847,9 @@ def _effect_grond(state: "GameState", card, choices: dict) -> dict:
     from game_logic import battle as gl_battle
     result = {"effects": []}
 
-    # TEACHER-PATH GUARD (2026-07-27 review P1-1): identical machinery
-    # to Fighting Uruk-hai (whose 2026-07-21 canary regression fix
-    # documents WHY) — on the closed-loop path the log's own
-    # card_effect army_attack record synthesizes this assault IN
-    # SCHEDULE ORDER; opening it here at event-play time pre-empts the
-    # cursor (combat cards flushed, rounds over-run, casualties
-    # desync).  Self-play (no hook) keeps the interactive assault.
-    # Grond was the ONLY sibling missing this gate.
+    # TEACHER path: the schedule's own army_attack record synthesizes this
+    # assault; opening it here would pre-empt that cursor.  Self-play keeps
+    # the interactive assault.
     import combat as _cmbg9
     if _cmbg9.FINAL_HITS_HOOK is not None and \
             not choices.get('_from_pending'):
@@ -5363,24 +5859,14 @@ def _effect_grond(state: "GameState", card, choices: dict) -> dict:
     def_region = choices.get("attack_target")
 
     # --- co-located target selection when AI has no explicit choices ---
-    # (row 31: Grond is a co-located Witch-king siege, NOT an adjacent
-    # assault; mirror the card_options _spec - a besieged FP stronghold
-    # with a Sauron unit among the besiegers, best by army size.)
+    # Share the printed prerequisite and option predicate, preferring the
+    # largest eligible besieging Army when no target was supplied.
     if not atk_region or not def_region:
-        from combat import garrison_side_for as _gsf9c
-        _bs9c = getattr(state, 'besieged_strongholds', set())
+        _targets = set(_grond_siege_regions(state))
         best, best_score = None, -1
         for rkey, army in state.armies.items():
             rsan = sanitize(rkey)
-            if rsan not in _bs9c:
-                continue
-            if _gsf9c(state, rsan) != Side.FREE_PEOPLES:
-                continue
-            # FIX (game 16): the Sauron-unit proxy excluded the REAL
-            # WK-led S&E siege at Dol Amroth and false-matched Erebor via
-            # one stray Sauron regular, fabricating a 4-round phantom
-            # siege.  Grond is the Witch-king's weapon - require him.
-            if not _army_contains_witch_king(army):
+            if rsan not in _targets:
                 continue
             score = len(army.units)
             if score > best_score:
@@ -5469,7 +5955,7 @@ def _effect_balrog_of_moria(state: "GameState", card, choices: dict) -> dict:
         # MAY discard the table card to draw a hunt tile after a
         # declaration from/into Moria (almanac C17: declaration fully
         # resolves first; Eye = discarded without effect; a Reveal icon
-        # is ignored when declared in an uncaptured FP City/Stronghold)
+        # is ignored in an originally FP City/Stronghold, captured or not)
         if not choices['balrog_declare_draw']:
             result["effects"].append("Balrog of Moria kept in play")
             return result
@@ -5480,72 +5966,31 @@ def _effect_balrog_of_moria(state: "GameState", card, choices: dict) -> dict:
                if _pcb else None)
         if _cb is None:
             return result
-        if state.hunt_pool:
-            # ONE DRAW THROUGH THE FUNNEL (attempt-103 game-1 halt,
-            # fixed 2026-08-18 BRIDGE-9).  This branch used to peek
-            # `state.hunt_pool[-1]` to decide eye-vs-not and then pop
-            # through `_tile_pop`.  The live bridge patches
-            # game_logic.pop_hunt_tile so the engine consumes the tile
-            # the CLIENT drew, so under the bridge the peeked tile and
-            # the popped tile are DIFFERENT: the engine decided "Eye"
-            # from its own pool tail, popped the client's '2r', and
-            # filed the peeked EYE into hunt_discard - leaving the Eye
-            # in the pool as well (duplicated) and losing the '2r'
-            # entirely.  The emitter then tried to render a drawn
-            # 'eye' the client had never drawn and the fabrication
-            # guard correctly halted the game.
-            #
-            # `_resolve_hunt_tile(..., eye_no_effect=True)` is the one
-            # answerer: it pops through the funnel and applies the
-            # eye-without-effect rule (almanac QA 2026-07-11) to the
-            # tile ACTUALLY drawn.  The Balrog's OTHER trigger - the
-            # movement one in game_logic - has called it that way since
-            # the same class was fixed there; this declaration path was
-            # its unfixed sibling.
-            _was_hidden9 = state.fellowship.hidden
-            _nd9 = len(state.hunt_discard or [])
-            _gl9._resolve_hunt_tile(state, 1, mordor=False,
-                                    eye_no_effect=True)
-            # Describe what was ACTUALLY drawn, never a peek.  A
-            # Mithril-Coat interpose can defer the application, in
-            # which case nothing has been filed yet and we say so
-            # rather than inventing a tile.
-            _new9 = (state.hunt_discard or [])[_nd9:]
-            _t9 = _new9[-1] if _new9 else None
-            if _t9 is None:
-                result["effects"].append(
-                    "Balrog draw: resolution deferred (interposed "
-                    "card decision pending)")
-            elif getattr(_t9, 'is_eye', False):
-                result["effects"].append(
-                    "Balrog draw: Eye tile - discarded without effect")
-            else:
-                # CARD-FLEET HIGH-4 (2026-07-20): HuntTile has no
-                # `.name` — the old f-string raised AttributeError on
-                # EVERY non-Eye draw (swallowed by the executor's
-                # try/except), aborting BEFORE the remove_card below:
-                # the one-shot Balrog stayed on the table re-triggerable.
-                _tdesc9 = (getattr(_t9, 'special_name', None)
-                           or ('damage %s%s' % (
-                               getattr(_t9, 'damage', '?'),
-                               ' reveal' if getattr(_t9, 'reveal',
-                                                    False) else '')))
-                result["effects"].append(
-                    f"Balrog draw: hunt tile ({_tdesc9}) resolved")
-            # reveal-icon ignored in an uncaptured FP City/Stronghold
-            if _t9 is not None and not getattr(_t9, 'is_eye', False):
-                _fr9 = sanitize(_gl9.fellowship_region(state))
-                _meta9 = board.regions.get(_fr9, {})
-                if (_was_hidden9 and not state.fellowship.hidden
-                        and (_meta9.get('is_city')
-                             or _meta9.get('is_stronghold'))
-                        and _gl9.is_fp_region(_fr9)
-                        and _fr9 not in state.enemy_controlled.get(
-                            Side.SHADOW, set())):
-                    state.fellowship.hidden = True
-                    result["effects"].append(
-                        "Reveal icon ignored (declared in FP "
-                        "City/Stronghold)")
+        # ONE draw through the funnel (_resolve_hunt_tile with
+        # eye_no_effect=True): the live bridge patches pop_hunt_tile, so a
+        # pool-tail PEEK and the popped tile can differ (BRIDGE-9 halt).
+        # The eye-without-effect rule applies to the tile ACTUALLY drawn.
+        _t9 = _gl9._resolve_hunt_tile(state, 1, mordor=False,
+                                     eye_no_effect=True)
+        # The funnel returns a resolved tile. Counting discard entries is
+        # unreliable when an empty-pool refill removes the previous pile.
+        if _t9 is None:
+            result["effects"].append(
+                "Balrog draw: resolution deferred (interposed card decision pending)"
+                if state.pending_card_option is not None else
+                "Balrog draw: no eligible Hunt tile available")
+        elif getattr(_t9, 'is_eye', False):
+            result["effects"].append(
+                "Balrog draw: Eye tile - discarded without effect")
+        else:
+            # HuntTile has no .name (HIGH-4)
+            _tdesc9 = (getattr(_t9, 'special_name', None)
+                       or ('damage %s%s' % (
+                           getattr(_t9, 'damage', '?'),
+                           ' reveal' if getattr(_t9, 'reveal',
+                                                False) else '')))
+            result["effects"].append(
+                f"Balrog draw: hunt tile ({_tdesc9}) resolved")
         # CARD CONSERVATION (2026-08-15): discarded face-up
         from persistent_effects import discard_table_card as _dtc9
         _dtc9(state, _pcb.remove_card(_cb.card_id) or _cb)
@@ -5725,8 +6170,7 @@ def _effect_ringwraiths_abroad(state: "GameState", card, choices: dict) -> dict:
     # --- move up to 4 Nazgul to destination ---------------------------------
     moved = 0
     for src_rkey, naz in nazgul_sources:
-        # 'Move any or ALL of the Nazgul' - the old cap of 4 left the
-        # 5th+ behind (QA 2026-07-11 C5)
+        # "any or ALL of the Nazgul" - no cap (C5)
         src_san = sanitize(src_rkey)
         if src_san == dest_san:
             continue  # already there
@@ -5742,9 +6186,8 @@ def _effect_ringwraiths_abroad(state: "GameState", card, choices: dict) -> dict:
 
     result["effects"].append(f"Moved {moved} Nazgul to {dest_region}")
 
-    # QA 2026-07-11 C11: the internal heuristic battle DOUBLE-attacked
-    # (the follow-up machinery already provides the card's attack as a
-    # learned decision) - removed; the follow-up grant IS the attack
+    # the follow-up grant IS the card's attack (C11: no internal heuristic
+    # battle)
     _grant_card_followup(state, Side.SHADOW, 'nazgul_armies', moves=2)
     return result
 
@@ -5783,16 +6226,10 @@ def _effect_black_captain_commands(state: "GameState", card, choices: dict) -> d
         else:
             result["message"] = "Witch-king not on the board"
     elif choices.get('_from_pending'):
-        # LEARNED PATH (USER 2026-07-11, amendment 1.128): 'move any or
-        # all of the Nazgul' is a chained per-Nazgul decision wired to the
-        # shared '__nazgul_moves__' machinery - ONE plain Nazgul per
-        # flight, any destinations.  The Witch-king himself stays put (he
-        # is moved by the follow-up half via the include_wk group variant,
-        # matching amendment 1.128's plain-Nazgul chain).  The 'Then, you
-        # may move or attack with an Army containing the Witch-king' half
-        # is DEFERRED to the chain's end (via '_then_followup') so it fires
-        # AFTER the flights, preserving the printed ordering - the
-        # follow-up otherwise outranks a coexisting pending.
+        # LEARNED PATH (1.128): "move any or all of the Nazgul" is the shared
+        # '__nazgul_moves__' per-figure chain (the Witch-king rides the
+        # follow-up half); the "Then, move or attack with the Witch-king's
+        # Army" half is DEFERRED to the chain's end via '_then_followup'.
         _fu = {'kind': 'wk_army', 'moves': 1}
         _opts = _nazgul_chain_options(state, {'__wk_ok__': 1})
         if _opts:
@@ -5809,11 +6246,8 @@ def _effect_black_captain_commands(state: "GameState", card, choices: dict) -> d
         # No plain Nazgul anywhere to move: fall through to grant the
         # Witch-king army follow-up directly (the move half was empty).
     else:
-        # TEACHER / legacy fx replication: the log's own per-piece flights
-        # (choices['nazgul_moves']) replay exactly as before.  With no
-        # choices this branch is a NO-OP and must not claim an effect
-        # (iter 39: the claimed string defeated the dry-run filter and
-        # the net burned dice on nothing — the user-observed bug)
+        # TEACHER / legacy fx: replay the logged per-piece flights; with no
+        # choices this branch is a NO-OP and claims no effect.
         moves = choices.get("nazgul_moves") or []
         moved = 0
         for mv in moves:
@@ -5834,20 +6268,15 @@ def _effect_black_captain_commands(state: "GameState", card, choices: dict) -> d
                     dk = sanitize(str(to))
                     state.armies[dk] = _Army(region=state.board.region(dk))
                     dst = state.armies[dk]
-                # honor the LOGGED plain-Nazgul count when present (the
-                # fx 'n'; GAME19 T4 L317 moved WK + ONE Nazgul while the
-                # all-naz sweep also dragged Lorien's second) - legacy
-                # callers without 'n' keep the all-at-source semantics
+                # honor the LOGGED plain-Nazgul count ('n') when present; legacy
+                # callers without it keep all-at-source semantics
                 _nwant9 = int(mv.get('n', len(nz)) or len(nz))
                 for l in nz[:_nwant9]:
                     src_a.leaders.remove(l)
                     dst.leaders.append(l)
                     moved += 1
-                # RB-02/RB-04 class: the Witch-king (a Minion, not a
-                # Nazgul object) rides the logged flight when the fx
-                # counted him as moved['leader'] - the plain-Nazgul
-                # sweep alone stranded him (GAME19 T4 L317: 'WK, The
-                # Black Captain, Nazgul' Lorien -> Woodland Realm).
+                # The Witch-king (a Minion, not a Nazgul object) rides the
+                # logged flight when the fx counted him as moved['leader'];
                 # Saruman never leaves Orthanc.
                 _nmin9 = int(mv.get('nmin', 0) or 0)
                 if _nmin9 > 0:
@@ -5875,33 +6304,53 @@ def _effect_black_captain_commands(state: "GameState", card, choices: dict) -> d
     return result
 
 
+def _lidless_options(state):
+    """Distinct face multisets: equal-face physical dice are exchangeable."""
+    from itertools import combinations
+    from game_state import ActionDieFace
+    faces = sorted(d.current.name for d in state.dice.get(Side.SHADOW, [])
+                   if not d.used and d.current is not None and d.current != ActionDieFace.EYE)
+    return [{"dice_count": count, "dice_faces": list(selected)}
+            for count in range(min(3, len(faces)) + 1)
+            for selected in sorted(set(combinations(faces, count)))]
+
+
 @register_effect("The Lidless Eye")
 def _effect_lidless_eye(state: "GameState", card, choices: dict) -> dict:
-    """Convert up to 3 unused non-Eye Shadow dice (choices['dice_count'])
-    to Eyes in the Hunt Box; each converted die is marked used."""
+    """Convert the selected unused faces, excluding the funding die."""
     from game_state import ActionDieFace
     result = {"effects": []}
 
-    dice_count = min(choices.get("dice_count", 1), 3)
-    converted = 0
-
-    shadow_dice = state.dice.get(Side.SHADOW, [])
-    for die in shadow_dice:
-        if converted >= dice_count:
-            break
-        if die.used:
-            continue
-        if die.current == ActionDieFace.EYE:
-            continue  # already an Eye
+    options = _lidless_options(state)
+    requested = choices.get('dice_faces')
+    if requested is not None:
+        if not isinstance(requested, (list, tuple)) or any(not isinstance(f, str) for f in requested):
+            raise ValueError('Lidless Eye requires a face multiset')
+        selected = sorted(requested)
+        count = choices.get('dice_count', len(selected))
+        matches = [o for o in options if o['dice_faces'] == selected and o['dice_count'] == count]
+    else:
+        # Old callers may specify only a count, but it cannot choose between
+        # strategically different remaining dice on the player's behalf.
+        count = choices.get('dice_count', 0)
+        matches = [o for o in options if o['dice_count'] == count]
+    if isinstance(count, bool) or not isinstance(count, int) or len(matches) != 1:
+        raise ValueError('Lidless Eye selection unavailable or ambiguous')
+    selected_dice = []
+    for face in matches[0]['dice_faces']:
+        die = next(d for d in state.dice[Side.SHADOW]
+                   if not d.used and d.current.name == face and d not in selected_dice)
+        selected_dice.append(die)
+    for die in selected_dice:
         die.current = ActionDieFace.EYE
         die.mark_used()
         state.hunt_box.append(die)
-        converted += 1
+    converted = len(selected_dice)
 
     if converted > 0:
         result["effects"].append(f"Converted {converted} Shadow dice to Eyes and placed in Hunt Box")
     else:
-        result["effects"].append("No unused non-Eye Shadow dice available")
+        result["effects"].append("Converted no Shadow dice")
     return result
 
 
@@ -5909,15 +6358,44 @@ def _effect_lidless_eye(state: "GameState", card, choices: dict) -> dict:
 # Registered Card Effect Handlers - Shadow Strategy Cards
 # ---------------------------------------------------------------------------
 
+_RETURN_VALINOR_REGIONS = ('rivendell', 'lorien', 'grey_havens', 'woodland_realm')
+
+
+def _return_valinor_roll_targets(state):
+    """Ordered public regions and dice counts for this card's resolution."""
+    targets = []
+    besieged = getattr(state, 'besieged_strongholds', set())
+    for name in _RETURN_VALINOR_REGIONS:
+        region = sanitize(name)
+        if region in besieged:
+            continue
+        army = next((a for key, a in state.armies.items() if sanitize(key) == region), None)
+        if army is not None and _is_army_fp(army):
+            count = min(5, sum(unit.nation == Nation.ELVES for unit in army.units))
+            if count:
+                targets.append((region, count))
+    return targets
+
+
 @register_effect("Return to Valinor")
 def _effect_return_to_valinor(state: "GameState", card, choices: dict) -> dict:
     """Roll vs Elven armies in non-besieged Elven strongholds, hit on 6."""
     result = {"effects": []}
-    elven_strongholds = ["rivendell", "lorien", "grey_havens", "woodland_realm"]
+    elven_strongholds = _RETURN_VALINOR_REGIONS
 
+    # USER RULING 1.254: each stronghold's hits are the FP OWNER's
+    # learned allocation; when that pending opens the remaining
+    # strongholds resume through _complete_card_casualty with
+    # '_rtv_cas_resumed' = the stronghold just settled.
+    _resume_after9 = choices.get('_rtv_cas_resumed')
+    _skipping9 = _resume_after9 is not None
     _bsg9 = getattr(state, 'besieged_strongholds', set())
     for sh in elven_strongholds:
         sh_san = sanitize(sh)
+        if _skipping9:
+            if sh_san == sanitize(str(_resume_after9)):
+                _skipping9 = False
+            continue
         if sh_san in _bsg9:
             continue  # card text: only strongholds NOT under siege
         army = next((a for k, a in state.armies.items()
@@ -5929,21 +6407,30 @@ def _effect_return_to_valinor(state: "GameState", card, choices: dict) -> dict:
                 rolls = _d6_batch(dice_count)
                 _ann_rng(state, 'Return to Valinor roll', faces=rolls)
                 hits = sum(1 for r in rolls if r == 6)
-                if hits > 0:
-                    from combat import (apply_casualties,
-                                        _track_fp_casualties,
+                import combat as _cmb_rtv
+                if hits > 0 and _cmb_rtv.FINAL_HITS_HOOK is None:
+                    result["effects"].append(
+                        f"{sh}: Rolled {rolls}, {hits} hits")
+                    if not _route_card_casualties(
+                            state, sh_san, Side.FREE_PEOPLES, hits,
+                            card or _card_by_name('Return to Valinor'),
+                            choices, result):
+                        return result
+                elif hits > 0:
+                    # teacher: certified logged-composition path
+                    from combat import (_track_fp_casualties,
                                         reconcile_destroyed_army
                                         as _rda9v)
-                    casualties = apply_casualties(army, hits)
+                    casualties = _side_filtered_kills(
+                        army, Side.FREE_PEOPLES, hits, (Nation.ELVES,))
                     # FP losses are PERMANENT: book them or the units
                     # silently return to the Elven reinforcement pool
                     _track_fp_casualties(state, casualties,
                                          Side.FREE_PEOPLES)
                     result["effects"].append(f"{sh}: Rolled {rolls}, {len(casualties)} casualties")
-                    # USER RULING 2026-08-15: an army wiped out takes
-                    # ALL of its characters with it — Return to Valinor
-                    # is NOT one of the two sparing cards, so Companions
-                    # standing with the garrison no longer survive it.
+                    # Almanac p31: a wiped army loses plain Leaders,
+                    # while Companions remain. Mixed-nation survivors
+                    # still support the army's Elven Leaders.
                     if not army.units:
                         _rda9v(state, sh_san, Side.FREE_PEOPLES,
                                card_name='Return to Valinor')
@@ -5968,17 +6455,9 @@ def _effect_fighting_uruk_hai(state: "GameState", card, choices: dict) -> dict:
     no_def_card_r1_unless_companion)."""
     result = {"effects": []}
 
-    # REGRESSION FIX (canary games 0+5, 2026-07-21): on the TEACHER /
-    # closed-loop path the log's own army_attack (card_effect) record
-    # synthesizes this assault IN SCHEDULE ORDER (combat cards + forced
-    # casualties consumed from the schedule). Opening the battle here at
-    # event-play time pre-empts that cursor: combat cards get flushed
-    # unplayed (game 0: Mustering of a Long-planned War at Helm's Deep),
-    # mandatory rounds over-run the log's roll span, casualties desync,
-    # and downstream board state corrupts (game 0: Westemnet empty at
-    # T8; game 5: the T9 Lorien battle orphaned its five combat cards
-    # and the Rage combat_effect_choice). Self-play (no hook) keeps the
-    # unconditional interactive assault per USER 1.210(d).
+    # TEACHER path: the schedule's own army_attack record synthesizes this
+    # assault; opening it here would pre-empt that cursor.  Self-play keeps
+    # the interactive assault (USER 1.210(d)).
     import combat as _cmbx9
     if _cmbx9.FINAL_HITS_HOOK is not None:
         return result
@@ -6055,6 +6534,14 @@ def _effect_fighting_uruk_hai(state: "GameState", card, choices: dict) -> dict:
     return result
 
 
+def _denethor_targets(state):
+    """Printed target is a FP Leader of any nation, never a Companion."""
+    from game_state import Leader
+    army = state.armies.get(_find_army_key(state, "minas tirith"))
+    return [leader for leader in getattr(army, 'leaders', [])
+            if type(leader) is Leader and leader.nation not in SHADOW_NATIONS]
+
+
 @register_effect("Denethor's Folly")
 def _effect_denethors_folly(state: "GameState", card, choices: dict) -> dict:
     """Persistent: Eliminate FP leader in MT, no FP combat cards in MT."""
@@ -6063,23 +6550,23 @@ def _effect_denethors_folly(state: "GameState", card, choices: dict) -> dict:
     # Eliminate one FP LEADER from Minas Tirith (almanac A3: Companions
     # are NOT Leaders and cannot be eliminated; a mixed siege entry also
     # holds Shadow Nazgul/Minions which must never be the target)
-    from game_state import Companion as _Comp, Nazgul as _Naz
     mt_army = state.armies.get(_find_army_key(state, "minas tirith"))
-    if mt_army:
-        for leader in list(mt_army.leaders):
-            if isinstance(leader, (_Comp, _Naz)):
-                continue
-            if type(leader).__name__ == 'Minion':
-                continue
-            nat = getattr(leader, 'nation', None)
-            if nat is None or nat in SHADOW_NATIONS:
-                continue
-            mt_army.leaders.remove(leader)
-            from combat import _track_fp_leader_deaths
-            _track_fp_leader_deaths(state, [leader])   # W6 BUG-1: p.30
-            result["effects"].append(
-                "Eliminated a Free Peoples Leader in Minas Tirith")
-            break
+    targets = _denethor_targets(state)
+    nation = choices.get('nation')
+    if nation is not None:
+        requested = str(nation).lower()
+        targets = [leader for leader in targets
+                   if requested in (leader.nation.name.lower(), leader.nation.value.lower())]
+        if not targets:
+            raise ValueError("Denethor's Folly leader target unavailable")
+    elif len({leader.nation for leader in targets}) > 1:
+        raise ValueError("Denethor's Folly requires a leader nation")
+    if targets:
+        leader = targets[0]
+        mt_army.leaders.remove(leader)
+        from combat import _track_fp_leader_deaths
+        _track_fp_leader_deaths(state, [leader])
+        result['effects'].append(f'Eliminated a {leader.nation.value} Leader in Minas Tirith')
 
     _handle_persistent_card(state, Side.SHADOW, card, result)
     result["effects"].append("Denethor's Folly in play - no FP Combat cards in MT battles")
@@ -6305,17 +6792,16 @@ def _effect_shadows_gather(state: "GameState", card, choices: dict) -> dict:
     result = {"effects": []}
     from_region = choices.get("from_region")
     to_region = choices.get("to_region")
+    if from_region and to_region:
+        from army_card_cargo import stage
+        choices = stage(state, card, choices, from_region)
+        if choices is None:
+            return {'effects': ['Choose the figures moving with this army']}
 
     if not (from_region and to_region):
-        # LOG = TRUTH (item 6, 2026-07-22): when the log carries no
-        # from/to for this SG play (its optional army move was declined, or
-        # its board evidence lives in die-based moves the fx already
-        # replicates), the handler must NOT auto-pick a join move — the old
-        # _sg_join_options[0] consolidated Orthanc's Isengard stack to North
-        # Dunland (draining r4->r0) and skewed conservation by +1 (2025-04-06
-        # demanray T6).  Self-play still auto-picks (the card should act).
-        # (2026-07-27: gate converted from the retired teacher's
-        #  SEPARATION_FROM_LOG flag to the live extraction indicator.)
+        # LOG = TRUTH: the teacher never auto-picks a join move (the log carries
+        # the move or it was declined); self-play auto-picks (the card should
+        # act).
         import combat as _cmb_sg
         if _cmb_sg.FINAL_HITS_HOOK is not None:
             return result
@@ -6341,7 +6827,8 @@ def _effect_shadows_gather(state: "GameState", card, choices: dict) -> dict:
     _ne = choices.get("n_elite")
     _sg_join_move(state, from_region, to_region, 3, result, dests0,
                   n_regular=(int(_nr) if _nr is not None else None),
-                  n_elite=(int(_ne) if _ne is not None else None))
+                  n_elite=(int(_ne) if _ne is not None else None),
+                  cargo=choices.get('cargo'))
     if not result["effects"]:
         result["message"] = "No legal Shadows Gather move"
     return result
@@ -6356,133 +6843,40 @@ def _effect_shadow_lengthens(state: "GameState", card, choices: dict) -> dict:
     # moves is an INDEPENDENT chained pending (amendment 1.117, the TSiM
     # pattern).  The choice arrives via the card_option executor which
     # injects '_from_pending'; the TEACHER path (logged choices / GUI
-    # direct calls) never carries it and keeps the byte-identical
-    # staged/sequential body below.
+    # direct calls) uses the same simultaneous mover below.
     if choices.get('_from_pending'):
         return _tsl_learned_chain(state, card, choices)
 
-    from1 = choices.get("from_region") or choices.get("from_region_1")
-    to1 = choices.get("to_region") or choices.get("to_region_1")
-    from2 = choices.get("from_region_2")
-    to2 = choices.get("to_region_2")
-    if not (from1 and to1):
-        result["message"] = "No movements selected"  # no-op (iter 39)
+    moves = []
+    for suffix in ('', '_2'):
+        source = choices.get('from_region' + suffix)
+        target = choices.get('to_region' + suffix)
+        if not suffix:
+            source = source or choices.get('from_region_1')
+            target = target or choices.get('to_region_1')
+        if source and target:
+            moves.append([source, target, choices.get('n_regular' + suffix),
+                          choices.get('n_elite' + suffix), choices.get('cargo' + suffix)])
+    if not moves:
+        result['message'] = 'No movements selected'
         return _selfplay_refund(result)
-    # destination qualification is fixed at the START of the action
-    # (almanac A8): compute once, before any move
-    bs = getattr(state, 'besieged_strongholds', set())
-    dests0 = {sanitize(k) for k, a in state.armies.items()
-              if any(u.nation in SHADOW_NATIONS for u in a.units)
-              and (sanitize(k) not in bs
-                   or not _besieged_garrison_source(
-                       state, sanitize(k), Side.SHADOW))}
-    # (besieged-region entries qualify when the Shadow army there is
-    # the BESIEGER - joining besiegers outside the walls is a normal
-    # move; only a besieged SH garrison is unjoinable.  GAME19 T5 TSL:
-    # Moria's two fresh elites reinforce the Lorien siege.)
-    if from2 and to2 and (sanitize(from2) == sanitize(to1)
-                          or sanitize(to2) == sanitize(from1)):
-        # CHAINED/SWAP pair (almanac: qualification and cargo fixed at
-        # the start of the Action) - sequential joins re-pick-up
-        # delivered units; stage both move-outs before both merges
-        # (QA 2026-07-11 CASE5: general chains, not only pure swaps)
-        from combat import side_of_nation as _son9
-        import game_logic as _gl9
-        f1, t1 = sanitize(from1), sanitize(to1)
-        f2, t2 = sanitize(from2), sanitize(to2)
-        ok1 = t1 in dests0 and t1 in _army_reachable_free(
-            state, f1, 2, Side.SHADOW)
-        ok2 = t2 in dests0 and t2 in _army_reachable_free(
-            state, f2, 2, Side.SHADOW)
-        if not (ok1 and ok2):
-            result["message"] = "Chained pair not legal"
-            return result
-        # 1.211h / row 43: neither source may be a besieged Shadow
-        # garrison (the chained/swap pair bypasses _sg_join_move).
-        if (_besieged_garrison_source(state, f1, Side.SHADOW)
-                or _besieged_garrison_source(state, f2, Side.SHADOW)):
-            result["message"] = ("Besieged garrison cannot move out - "
-                                  "chained pair refused")
-            return result
-        # ruling 1.216 item 2 (USER 2026-07-23 emission spec): the
-        # chained/swap pair bypasses _sg_join_move, so it must capture
-        # the same walk-through settlements (empty unconquered enemy
-        # settlements passed through are captured, e.g. Folde->Helm's
-        # Deep via Edoras+Westemnet).  Compute the free intermediates
-        # from the PRE-move board, then capture after the merge.
-        _mids_chain = (_free_path_mids(state, f1, t1, 2)
-                       + _free_path_mids(state, f2, t2, 2))
-        # Both sources must hold an army (a named-but-empty region
-        # would AttributeError below).
-        for _frm_chk in (f1, f2):
-            if state.armies.get(_find_army_key(state, _frm_chk)) is None:
-                result["message"] = f"No movable units in {_frm_chk}"
-                return result
-        groups = []
-        for frm in (f1, f2):
-            key = _find_army_key(state, frm)
-            src = state.armies.get(key)
-            mv_u = [u for u in src.units
-                    if _son9(u.nation) == Side.SHADOW]
-            mv_l = [l for l in src.leaders
-                    if not _gl9._is_saruman(l)
-                    and _gl9._leader_side(l) == Side.SHADOW]
-            _mu = set(map(id, mv_u))
-            _ml = set(map(id, mv_l))
-            src.units = [u for u in src.units if id(u) not in _mu]
-            src.leaders = [l for l in src.leaders if id(l) not in _ml]
-            if not src.units and not src.leaders:
-                state.armies.pop(key, None)
-            groups.append((frm, mv_u, mv_l))
-        for (frm, mv_u, mv_l), to in zip(groups, (t1, t2)):
-            dst_key = next((k for k in state.armies
-                            if sanitize(k) == to), None)
-            if dst_key is None:
-                state.armies[to] = Army(region=state.board.region(to))
-                dst_key = to
-            state.armies[dst_key].units.extend(mv_u)
-            state.armies[dst_key].leaders.extend(mv_l)
-            # Stacking cap: record an over-cap landing so
-            # resolve_overstacks (after the card completes) trims it
-            # with the owner's choice — same contract as TSiM landings.
-            if _overstack_excess(state, state.armies[dst_key], to,
-                                 Side.SHADOW) > 0:
-                _ovr9 = getattr(state, '_overstack_regions', None)
-                if _ovr9 is None:
-                    _ovr9 = set()
-                    state._overstack_regions = _ovr9
-                _ovr9.add(to)
-            result["effects"].append(f"Army moved from {frm} to {to}")
-        # ruling 1.216 item 2: capture the walk-through settlements
-        from combat import _check_settlement_capture as _csc_chain
-        for _m in _mids_chain:
-            _csc_chain(state, _m, Side.SHADOW)
-        _gl9.remove_orphaned_leaders(state)
-        return result
-    # USER 1.208n: honor the learned initial split per move (whole army
-    # when the keys are absent -> legacy path byte-identical).
-    _nr1 = choices.get("n_regular")
-    _ne1 = choices.get("n_elite")
-    _sg_join_move(state, from1, to1, 2, result, dests0,
-                  n_regular=(int(_nr1) if _nr1 is not None else None),
-                  n_elite=(int(_ne1) if _ne1 is not None else None))
-    if from2 and to2:
-        _nr2 = choices.get("n_regular_2")
-        _ne2 = choices.get("n_elite_2")
-        _sg_join_move(state, from2, to2, 2, result, dests0,
-                      n_regular=(int(_nr2) if _nr2 is not None else None),
-                      n_elite=(int(_ne2) if _ne2 is not None else None))
-    if not result["effects"]:
-        result["message"] = "No movements selected"  # no-op (iter 39)
-        return _selfplay_refund(result)
+    _tsl_execute_staged(state, moves, result)
     return result
 
 
 @register_effect("The Shadow is Moving")
 def _effect_shadow_is_moving(state: "GameState", card, choices: dict) -> dict:
     """Move up to 4 Shadow armies 1 region each."""
+    from staged_army_cards import handler, execute_staged
+    if choices.get('_from_pending'):
+        if not choices.get('_tsim_done'):
+            from army_card_cargo import stage
+            choices = stage(state, card, choices, choices['from_region'])
+            if choices is None:
+                return {'effects': ['Choose the figures moving with this army']}
+        return handler(state, card, choices)
     result = {"effects": []}
-    # P1 (USER ruling 1.112.7): a chain-terminating pick
+    # An explicit aggregate caller may end without movement.
     if choices.get('_tsim_done'):
         result["effects"].append("The Shadow is Moving: movement ends")
         return result
@@ -6507,167 +6901,28 @@ def _effect_shadow_is_moving(state: "GameState", card, choices: dict) -> dict:
     if not mvs:
         result["message"] = "No movements selected"  # no-op (iter 39)
         return result
-    # SIMULTANEOUS movement (almanac A9): each source army moves once;
-    # destinations may not hold enemy units; process all move-OUTs
-    # first so move-in-then-move-out is order-independent, then merge.
-    from combat import side_of_nation as _son, _check_settlement_capture
-    import game_logic as _gl9
-    seen_src = set()
-    staged = []
-    for frm, to, _comp9 in mvs:
-        if frm in seen_src:
-            result["effects"].append(
-                f"{frm} already moved this card - move skipped")
-            continue
-        if to not in {sanitize(x) for x in state.board.adjacent(frm)}:
-            result["effects"].append(f"{to} not adjacent to {frm}")
-            continue
-        a_to = state.armies.get(_find_army_key(state, to))
-        if a_to and any(_son(u.nation) != Side.SHADOW
-                        for u in a_to.units):
-            result["effects"].append(
-                f"{to} holds an enemy army - entering requires an "
-                f"attack, move refused")
-            continue
-        if to in getattr(state, 'besieged_strongholds', set()) \
-                and _besieged_garrison_source(state, to, Side.SHADOW):
-            # only a besieged SH GARRISON is unjoinable; moving into a
-            # region where Shadow BESIEGES is a normal join (GAME19)
-            result["effects"].append(f"{to} is besieged - move refused")
-            continue
-        # 1.211h / row 43: a besieged Shadow garrison cannot march out.
-        if _besieged_garrison_source(state, frm, Side.SHADOW):
-            result["effects"].append(
-                f"{frm} is a besieged garrison - cannot move out")
-            continue
-        src_key = _find_army_key(state, frm)
-        src = state.armies.get(src_key)
-        if not src or not any(u.nation in SHADOW_NATIONS
-                              for u in src.units):
-            result["effects"].append(f"No Shadow army in {frm}")
-            continue
-        mv_u, mv_l = [], []
-        if _comp9:
-            # TEACHER pure-mode: move the LOGGED composition only
-            import game_state as _gs9c
-            _want9 = {
-                _gs9c.UnitKind.REGULAR:
-                    int(_comp9.get('regular', 0) or 0),
-                _gs9c.UnitKind.ELITE:
-                    int(_comp9.get('elite', 0) or 0)}
-            for u in list(src.units):
-                if _son(u.nation) == Side.SHADOW \
-                        and _want9.get(u.kind, 0) > 0:
-                    src.units.remove(u)
-                    mv_u.append(u)
-                    _want9[u.kind] -= 1
-            _wn9 = int(_comp9.get('nazgul', 0) or 0)
-            _wl9 = int(_comp9.get('leader', 0) or 0)
-            for l in list(src.leaders):
-                if _gl9._is_saruman(l):
-                    continue
-                if _gl9.is_nazgul_figure(l):
-                    if _wn9 > 0:
-                        src.leaders.remove(l)
-                        mv_l.append(l)
-                        _wn9 -= 1
-                elif _gl9._leader_side(l) == Side.SHADOW and _wl9 > 0:
-                    src.leaders.remove(l)
-                    mv_l.append(l)
-                    _wl9 -= 1
-        else:
-            for u in list(src.units):
-                if _son(u.nation) == Side.SHADOW:
-                    src.units.remove(u)
-                    mv_u.append(u)
-            for l in list(src.leaders):
-                if _gl9._is_saruman(l):
-                    continue
-                if _gl9._leader_side(l) == Side.SHADOW:
-                    src.leaders.remove(l)
-                    mv_l.append(l)
-        if not src.units and not src.leaders:
-            state.armies.pop(src_key, None)
-        seen_src.add(frm)
-        staged.append((frm, to, mv_u, mv_l))
-    for frm, to, mv_u, mv_l in staged:
-        dst_key = next((k for k in state.armies
-                        if sanitize(k) == to), None)
-        if dst_key is None:
-            state.armies[to] = Army(region=state.board.region(to))
-            dst_key = to
-        dst = state.armies[dst_key]
-        own = sum(1 for u in dst.units
-                  if _son(u.nation) == Side.SHADOW)
-        room = _gl9.MAX_ARMY_UNITS - own
-        # Battle-path FIX 2 (2026-07-21): BOTH paths land the WHOLE
-        # moving group, then record any over-stack region.  The excess
-        # return-to-reinforcements is resolved regulars-first via
-        # resolve_overstacks - the same certified heuristic every other
-        # over-stacking card uses (almanac A9 'taking from any units in
-        # the stack'), NOT the moving-group tail-drop.  The learned path
-        # keeps the recorded pending (the card_option executor runs
-        # resolve_overstacks(learned=True) after this direct-stage
-        # effect); the teacher path resolves immediately after the loop.
-        # CANARY CAVEAT: a prior Adobim regression rode this teacher
-        # path - if campaign_survey shifts the Adobim game, revert to the
-        # tail-drop and pursue the parser-side log-faithful alternative.
-        dst.units.extend(mv_u)
-        dst.leaders.extend(mv_l)
-        if len(mv_u) > max(0, room):
-            _ovr9 = getattr(state, '_overstack_regions', None)
-            if _ovr9 is None:
-                _ovr9 = set()
-                state._overstack_regions = _ovr9
-            _ovr9.add(to)
-            result["effects"].append(
-                f"over-stack at {to} recorded (excess returns to "
-                f"reinforcements)")
-        _gl9._check_political_activation_for_entry(state, to,
-                                                   Side.SHADOW)
-        _gl9._check_companion_activates_nation(state, to, dst)
-        if not any(_son(u.nation) != Side.SHADOW for u in dst.units):
-            _check_settlement_capture(state, to, Side.SHADOW)
-        result["effects"].append(f"Army moved from {frm} to {to}")
-    _gl9.remove_orphaned_leaders(state)
-    if not choices.get('_from_pending'):
-        # teacher/GUI: resolve the recorded over-stacks now, whole-stack
-        # regulars-first (the learned path defers to the chained pending)
-        resolve_overstacks(state, learned=False)
-    if not result["effects"]:
-        result["message"] = "No movements selected"  # no-op (iter 39)
-        return result
-    # P1 (USER ruling 1.112.7): moves 2-4 are INDEPENDENT learned
-    # decisions - chain a direct pending with the remaining single
-    # moves (each source army moves once; via-pending plays only)
-    if choices.get('_from_pending'):
-        _moved9 = set(str(x) for x in
-                      (choices.get('_tsim_moved') or []))
-        _moved9.update(frm for frm, _to9x, _c9x in mvs)
-        _n9 = int(choices.get('_tsim_n') or 0) + len(mvs)
-        if _n9 < 4:
-            _opts9 = _tsim_next_options(state, _moved9, _n9)
-            if _opts9:
-                _opts9.append({'_tsim_done': True})
-                state.pending_card_option = {
-                    'card_id': getattr(card, 'card_id',
-                                       'The Shadow is Moving'),
-                    'card_name': 'The Shadow is Moving',
-                    'side': 'sh', 'decider': 'sh', 'direct': True,
-                    'options': _opts9}
-                result["effects"].append(
-                    f"Move {_n9 + 1} of up to 4 (pending choice)")
+    result = execute_staged(state, mvs, result)
+    resolve_overstacks(state, learned=False)
+    if not result['effects']:
+        result['message'] = 'No movements selected'
     return result
 
 
 @register_effect("Corsairs of Umbar")
 def _effect_corsairs_of_umbar(state: "GameState", card, choices: dict) -> dict:
-    """Move army from Umbar to Gondor coast, attack (no retreat for defender)."""
+    """Land selected Umbar cargo, then resolve the Almanac A10 battle."""
+    if '_corsairs_landing_pc' in choices:
+        from corsairs_landing import remove
+        return remove(state, card, choices)
     result = {"effects": []}
     target = choices.get("target_region")
     if not target:
         result["message"] = "No target region selected"  # no-op (iter 39)
         return _selfplay_refund(result)
+    from army_card_cargo import stage
+    choices = stage(state, card, choices, 'umbar')
+    if choices is None:
+        return {'effects': ['Choose the figures sailing from Umbar']}
     tsan = sanitize(target)
     from combat import garrison_side_for
     import game_logic as _gl9
@@ -6694,46 +6949,36 @@ def _effect_corsairs_of_umbar(state: "GameState", card, choices: dict) -> dict:
     fp_there = bool(tarmy and any(u.nation in FP_NATIONS
                                   for u in tarmy.units))
     if fp_there:
-        # almanac A10: movement completes BEFORE the battle - engine
-        # models it as a battle initiated from Umbar (non-adjacent
-        # attack); the victor advances into the region afterwards.
-        # LIMITATION: the moved-in-then-fight ordering is approximated.
-        # 1.210(b) USER: movement FULLY COMPLETES first (the corsairs move
-        # INTO the target), THEN the co-located battle resolves through the
-        # interactive pending_combat machine - BOTH the teacher and
-        # self-play (supersedes the old from-Umbar max_rounds default).  The
-        # FP DEFENDER MUST be offered a retreat (field, or withdraw into the
-        # stronghold as a siege); THE ATTACKER CANNOT VOLUNTARILY CEASE
-        # (attacker_no_retreat suppresses its cease in attacker_continue) -
-        # "battle runs round after round until FP retreats out."  EXCEPTION
-        # (example c): corsairs landing into a stronghold ALREADY UNDER
-        # SIEGE start a NORMAL siege battle where the no-cease rule does NOT
-        # apply (Shadow may siege_no_press) - the Umbar-relief case.
+        # 1.210(b) USER: movement FULLY COMPLETES first (the corsairs move INTO
+        # the target), THEN the co-located battle runs through pending_combat:
+        # the FP DEFENDER must be offered a retreat (field, or withdraw into
+        # the stronghold) and THE ATTACKER CANNOT VOLUNTARILY CEASE
+        # (attacker_no_retreat).  EXCEPTION (example c): landing into a
+        # stronghold ALREADY UNDER SIEGE starts a normal siege battle
+        # (no-cease does not apply).
         _pre_siege9 = (tsan in getattr(state, 'besieged_strongholds', set()))
-        moved = _direct_army_move(state, umb, tsan, Side.SHADOW)
+        _relief9 = _pre_siege9 and garrison_side_for(state, tsan) == Side.SHADOW
+        _garrison9 = None
+        if _relief9:
+            from army_card_cargo import inventory, freeze
+            _garrison9 = freeze(inventory(state, tsan))
+        moved = _direct_army_move(state, umb, tsan, Side.SHADOW,
+                                 cargo=choices.get('cargo'), allow_overstack=True,
+                                 defer_overstack=_relief9)
         if not moved:
-            # review P2-1 (2026-07-27): the landing failed (protected/
-            # full destination), so NO attack was declared — the old
-            # order advanced the defenders' political track first and
-            # kept the card+die (partial effect, misleading message).
+            # A blocked landing means NO attack was declared - refund with no
+            # political advance (review P2-1)
             result["message"] = (
                 "Corsairs landing at %s blocked (protected or full "
                 "destination)" % tsan)
             return _selfplay_refund(result)
-        # P5 (USER ruling 1.112.5): the battle portion is an ATTACK for
-        # the Political Track — advanced only once the landing REALLY
-        # happened (review P2-1 reorder).
+        # 1.112.5: the battle portion is an ATTACK for the Political Track -
+        # advanced only once the landing REALLY happened
         _gl9.advance_defenders_political(state, tsan,
                                          attacker_side=Side.SHADOW)
-        # REGRESSION FIX (canary, 2026-07-21): gate ONLY the battle-open,
-        # NOT the landing. On the TEACHER / closed-loop path the scheduled
-        # army_attack record synthesizes the co-located battle when the log
-        # fought one (combat cards + forced casualties consumed from the
-        # schedule in order); opening it here pre-empts that cursor. The
-        # LANDING (advance_defenders_political + _direct_army_move above) is
-        # real and must still run on the teacher path; a landing with no FP
-        # army has no battle either way. Self-play (no hook) keeps the
-        # interactive co-located battle per USER 1.210(b).
+        # TEACHER path: gate ONLY the battle-open (the schedule's army_attack
+        # record synthesizes it); the LANDING is real and must still run.
+        # Self-play keeps the interactive co-located battle (USER 1.210(b)).
         import combat as _cmbx9
         if _cmbx9.FINAL_HITS_HOOK is not None:
             result["effects"].append(
@@ -6743,7 +6988,7 @@ def _effect_corsairs_of_umbar(state: "GameState", card, choices: dict) -> dict:
         _pc9 = {
             'attacker_region': tsan,
             'defender_region': tsan,   # co-located (moved in)
-            'is_siege': bool(_pre_siege9),
+            'is_siege': bool(_pre_siege9 and not _relief9),
             'stronghold_region': tsan if _gc.get('is_stronghold')
                                   else None,
             'phase': 'combat_setup',
@@ -6751,44 +6996,38 @@ def _effect_corsairs_of_umbar(state: "GameState", card, choices: dict) -> dict:
             'attacker_side': Side.SHADOW,
             'defender_side': Side.FREE_PEOPLES,
             'rounds_fought': 0,
-            'attacker_no_retreat': (not _pre_siege9),  # 1.210(b) no-cease
+            'attacker_no_retreat': (not _pre_siege9 or _relief9),
         }
-        state.pending_combat = _pc9
-        if _pre_siege9 or _pc9['stronghold_region']:
-            # stronghold target: the FP defender first chooses to give
-            # field battle or withdraw into the stronghold (siege); a
-            # pre-besieged landing routes straight into the siege decisions
-            _ai9._post_rearguard_transition(state, _pc9)
-        else:
-            _ai9._run_combat_round(state, _pc9)
+        if _relief9:
+            # A10(ii): the original SH garrison remains inside. Only the
+            # transported force fights the FP besiegers outside the walls.
+            _pc9['corsairs_relief_garrison'] = _garrison9
+        # A10(iii): joining existing besiegers resolves the ten-unit limit
+        # before either player selects a combat card or the first round.
+        getattr(state, '_overstack_regions', set()).discard(tsan)
+        from corsairs_landing import begin
+        begin(state, card, _pc9)
         result["effects"].append(
             f"Corsairs land at {tsan}: co-located battle "
             f"({'siege relief' if _pre_siege9 else 'Shadow cannot retreat'})")
         return result
-    moved = _direct_army_move(state, umb, tsan, Side.SHADOW)
+    moved = _direct_army_move(state, umb, tsan, Side.SHADOW,
+                             cargo=choices.get('cargo'), allow_overstack=True)
     if not moved:
-        # review P2-1 (2026-07-27): same treatment as the fp-defended
-        # branch — a blocked landing (no movable units, protected or
-        # full destination) means the card had NO effect: refund on the
-        # self-play path instead of silently consuming card + die.
+        # A blocked landing means the card had NO effect - refund (review P2-1)
         result["message"] = (
             "Corsairs landing at %s blocked (no movable units, "
             "protected or full destination)" % tsan)
         return _selfplay_refund(result)
     result["effects"].append(f"Corsairs moved from Umbar to {tsan}")
-    # almanac A10b: entering an empty Gondor region activates Gondor;
-    # politics advances additionally when it is a Settlement/City/
-    # Stronghold (capture side effects run in _direct_army_move; the
-    # activation is guaranteed here)
+    # almanac A10b: entering an empty Gondor region activates Gondor
+    # (guaranteed here); the settlement CAPTURE-advance (rulebook p.35,
+    # ONE step) already fired natively inside _direct_army_move ->
+    # _check_settlement_capture - never advanced a second time here.
     from persistent_effects import can_activate_nation as _can9
     _ok9, _ = _can9(state, Nation.GONDOR, "attack", region=tsan)
     if _ok9:
         state.political.active[Nation.GONDOR] = True
-    if _gc.get('is_town') or _gc.get('is_city') or _gc.get('is_stronghold'):
-        _np = advance_nation(state, Nation.GONDOR, 1)
-        result["effects"].append(
-            f"Gondor {'activated and ' if _ok9 else ''}advanced to {_np}")
-    elif _ok9:
         result["effects"].append("Gondor activated")
     return result
 
@@ -6833,20 +7072,14 @@ def _shadow_units_at(state, san):
 
 def _sg_join_options(state, max_steps):
     """Shadows Gather / The Shadow Lengthens choices: move a Shadow army
-    up to max_steps regions through free (unit-less, unbesieged)
+    up to max_steps regions through friendly or empty, unbesieged
     intermediates to a region ALREADY holding another Shadow army that
     is not under siege (qualification at the start of the action,
     almanac A7/A8)."""
-    bs = getattr(state, 'besieged_strongholds', set())
-    dests0 = {sanitize(k) for k, a in state.armies.items()
-              if any(u.nation in SHADOW_NATIONS for u in a.units)
-              and (sanitize(k) not in bs
-                   or not _besieged_garrison_source(
-                       state, sanitize(k), Side.SHADOW))}
-    # (besieged-region entries qualify when the Shadow army there is
-    # the BESIEGER - joining besiegers outside the walls is a normal
-    # move; only a besieged SH garrison is unjoinable.  GAME19 T5 TSL:
-    # Moria's two fresh elites reinforce the Lorien siege.)
+    # ONE body with the TSL chain (_tsl_dests0): a Shadow BESIEGER stack
+    # qualifies; only a besieged SH garrison is unjoinable (1.211h).
+    from shadow_join_rules import select as select_join
+    dests0 = _tsl_dests0(state)
     singles = []
     for k, a in state.armies.items():
         frm = sanitize(k)
@@ -6857,29 +7090,15 @@ def _sg_join_options(state, max_steps):
         if not any(u.nation in SHADOW_NATIONS for u in a.units):
             continue
         reach = _army_reachable_free(state, frm, max_steps, Side.SHADOW)
-        # USER 1.208n: the INITIAL SPLIT (which units group up) is a
-        # LEARNED decision - emit the source Shadow army's composition
-        # grid alongside the legacy whole-army option (kept FIRST for
-        # teacher parity).
-        _nr = sum(1 for u in a.units if u.nation in SHADOW_NATIONS
-                  and u.kind != UnitKind.ELITE)
-        _ne = sum(1 for u in a.units if u.nation in SHADOW_NATIONS
-                  and u.kind == UnitKind.ELITE)
         for d in sorted(reach & dests0):
-            if d == frm:
-                continue
-            singles.append({"from_region": frm, "to_region": d})
-            for mr in range(_nr + 1):
-                for me in range(_ne + 1):
-                    if mr + me == 0 or (mr == _nr and me == _ne):
-                        continue        # skip empty + whole-army (legacy)
-                    singles.append({"from_region": frm, "to_region": d,
-                                    "n_regular": mr, "n_elite": me})
+            if d != frm and select_join(state, frm, d, max_steps,
+                                        [u for u in a.units if u.nation in SHADOW_NATIONS])[0]:
+                singles.append({"from_region": frm, "to_region": d})
     return singles
 
 
 def _sg_join_move(state, frm, to, max_steps, result, dests0,
-                  n_regular=None, n_elite=None):
+                  n_regular=None, n_elite=None, cargo=None):
     """Validated single join-move + walk-through capture of empty
     settlements (almanac A7/A8 headline: control is taken of empty FP
     settlements AND FP-controlled Shadow settlements moved through).
@@ -6903,36 +7122,42 @@ def _sg_join_move(state, frm, to, max_steps, result, dests0,
             f"{to} not reachable within {max_steps} free regions "
             f"from {frm}")
         return False
-    # identify the free intermediate(s) for walk-through capture
-    mids = []
-    if to not in {sanitize(x) for x in state.board.adjacent(frm)}:
-        bs = getattr(state, 'besieged_strongholds', set())
-        # simple 1- or 2-intermediate reconstruction via BFS parents
-        from collections import deque
-        seen = {frm}
-        q = deque([(frm, [])])
-        while q:
-            c, path = q.popleft()
-            if c == to:
-                mids = path
-                break
-            if len(path) >= max_steps:
-                continue
-            for adj in state.board.adjacent(c):
-                asan = sanitize(adj)
-                if asan in seen:
-                    continue
-                seen.add(asan)
-                a_m = state.armies.get(_find_army_key(state, asan))
-                if asan != to and (asan in bs
-                                   or (a_m and a_m.units)):
-                    continue
-                q.append((asan, path + ([asan] if asan != to else [])))
+    # identify the free intermediate(s) for walk-through capture (ONE BFS
+    # body: _free_path_mids)
+    from shadow_join_rules import select as select_join
+    from army_card_cargo import figures, selected, key, freeze
+    from collections import Counter
+    units, leaders = figures(state, frm)
+    if cargo is not None:
+        units, leaders = selected(state, frm, cargo)
+    units, mids = select_join(state, frm, to, max_steps, units, exact=cargo is not None)
+    if not units:
+        if cargo is not None:
+            raise ValueError('Selected cargo cannot cross political borders')
+        result['effects'].append(f'{frm} has no army units allowed across the route borders')
+        return False
+    if n_regular is not None or n_elite is not None:
+        limits = {UnitKind.REGULAR: n_regular, UnitKind.ELITE: n_elite}
+        chosen = []
+        for unit in units:
+            left = limits[unit.kind]
+            if left is None or left > 0:
+                chosen.append(unit)
+                if left is not None:
+                    limits[unit.kind] -= 1
+        units = chosen
+    if not units:
+        return False
+    cargo = freeze(Counter([key(u, True) for u in units] + [key(l) for l in leaders]))
     moved = _direct_army_move(state, frm, to, Side.SHADOW,
-                              n_regular=n_regular, n_elite=n_elite)
+                              allow_overstack=True, cargo=cargo)
     if moved:
+        import game_logic as _gl_sg
         for m in mids:
             _check_settlement_capture(state, m, Side.SHADOW)
+            # rulebook 370-371: a walked-through region is ENTERED
+            _gl_sg._check_political_activation_for_entry(state, m,
+                                                         Side.SHADOW)
         result["effects"].append(f"Army moved from {frm} to join {to}")
         return True
     result["effects"].append(f"No movable units in {frm}")
@@ -6940,110 +7165,103 @@ def _sg_join_move(state, frm, to, max_steps, result, dests0,
 
 
 def _free_path_mids(state, frm, to, max_steps):
-    """Free (empty, unbesieged) intermediate regions on a <=max_steps
-    join path frm->to, for pass-through settlement capture (ruling 1.216
-    item 2 / USER 2026-07-23 emission spec).  Mirrors the BFS inside
-    _sg_join_move so the chained/swap pair (which bypasses _sg_join_move)
-    captures the same walk-through settlements.  Returns [] when adjacent
-    or unreachable within the free-path constraint."""
-    frm, to = sanitize(frm), sanitize(to)
-    if to in {sanitize(x) for x in state.board.adjacent(frm)}:
-        return []
+    """Shadow join-path intermediates, excluding enemy armies and sieges.
+    Friendly armies are traversable without joining or picking up figures.
+    Destination legality is checked by the caller; [] also means no path.
+    """
     from collections import deque
-    bs = getattr(state, 'besieged_strongholds', set())
+    from combat import side_of_nation
+    frm, to = sanitize(frm), sanitize(to)
+    blocked = getattr(state, 'besieged_strongholds', set())
     seen = {frm}
-    q = deque([(frm, [])])
-    while q:
-        c, path = q.popleft()
-        if c == to:
-            return path
-        if len(path) >= max_steps:
+    queue = deque([(frm, [], 0)])
+    while queue:
+        current, intermediates, distance = queue.popleft()
+        if distance >= max_steps:
             continue
-        for adj in state.board.adjacent(c):
-            asan = sanitize(adj)
-            if asan in seen:
+        for adjacent in state.board.adjacent(current):
+            region = sanitize(adjacent)
+            if region in seen:
                 continue
-            seen.add(asan)
-            a_m = state.armies.get(_find_army_key(state, asan))
-            if asan != to and (asan in bs or (a_m and a_m.units)):
+            seen.add(region)
+            if region == to:
+                return intermediates
+            army = state.armies.get(_find_army_key(state, region))
+            if region in blocked or (army and any(side_of_nation(unit.nation) != Side.SHADOW for unit in army.units)):
                 continue
-            q.append((asan, path + ([asan] if asan != to else [])))
+            queue.append((region, intermediates + [region], distance + 1))
     return []
 
 
 def _rage_split_options(state, dest: str) -> list:
-    """1.210(c): the 'move up to 4 Isengard units from N/S Dunland to that
-    region' clause is ONE learned decision - a grid over (n_north, n_south)
-    with n_north + n_south <= 4 in ANY combination (4+0, 0+4, 2+2, ...),
-    ALWAYS including the (0,0) option NOT to move.  Combos beyond the
-    destination stacking room are skipped."""
-    from combat import side_of_nation as _son
+    """Every legal source and Regular/Elite composition, including no move."""
+    from combat import side_of_nation
     dsan = sanitize(dest)
 
-    def _avail(src):
-        if sanitize(src) == dsan:
-            return 0
-        a = state.armies.get(_find_army_key(state, src))
-        if a is None:
-            return 0
-        return sum(1 for u in a.units if u.nation == Nation.ISENGARD)
+    def available(src):
+        army = state.armies.get(_find_army_key(state, src))
+        units = army.units if army is not None and src != dsan else []
+        return tuple(sum(u.nation == Nation.ISENGARD and u.kind == kind
+                         for u in units)
+                     for kind in (UnitKind.REGULAR, UnitKind.ELITE))
 
-    avail_n = _avail("north dunland")
-    avail_s = _avail("south dunland")
-    # destination stacking room (no overstack clause on this card)
-    _ad = state.armies.get(_find_army_key(state, dsan))
-    _mine = sum(1 for u in _ad.units
-                if _son(u.nation) == Side.SHADOW) if _ad else 0
-    room = max(0, _stack_cap(state, dsan, Side.SHADOW) - _mine)
-
-    opts = []
-    for nn in range(0, min(avail_n, 4) + 1):
-        for ns in range(0, min(avail_s, 4 - nn) + 1):
-            if nn + ns > room:
-                continue
-            opts.append({'rage_split': {'n_north': nn, 'n_south': ns},
-                         '_rage_dest': dsan})
-    return opts
+    nr, ne = available('north dunland')
+    sr, se = available('south dunland')
+    army = state.armies.get(_find_army_key(state, dsan))
+    occupied = sum(side_of_nation(u.nation) == Side.SHADOW
+                   for u in army.units) if army else 0
+    room = max(0, _stack_cap(state, dsan, Side.SHADOW) - occupied)
+    options = []
+    for nn in range(min(nr + ne, 4, room) + 1):
+        for ns in range(min(sr + se, 4 - nn, room - nn) + 1):
+            for en in range(max(0, nn - nr), min(ne, nn) + 1):
+                for es in range(max(0, ns - sr), min(se, ns) + 1):
+                    options.append({'rage_split': {'n_north': nn, 'n_south': ns,
+                                    'n_north_elite': en, 'n_south_elite': es},
+                                    '_rage_dest': dsan})
+    return options
 
 
 def _rage_apply_split(state, rsplit: dict, dst: str) -> int:
-    """Move rsplit['n_north']/['n_south'] Isengard units from N/S Dunland to
-    dst.  Composition is regulars-first by DEFAULT (self-play); an optional
-    per-source elite count ('n_north_elite'/'n_south_elite') lets the
-    teacher override the composition to match the log.  Returns the number
-    of units moved.  Armies ONLY via game_logic.get_or_create_army."""
-    import game_logic as _gl9
+    """Validate the entire transfer before moving any unit.
+
+    Historical count-only callers retain Regulars-first composition. New legal
+    actions specify both Elite counts, so recorded and learned choices agree.
+    """
+    import numbers
+    import game_logic
     dst = sanitize(str(dst))
-    _moved = 0
-    for src, nkey, ekey in (("north dunland", 'n_north', 'n_north_elite'),
-                            ("south dunland", 'n_south', 'n_south_elite')):
-        want = int(rsplit.get(nkey) or 0)
-        if want <= 0 or sanitize(src) == dst:
-            continue
-        a = state.armies.get(_find_army_key(state, src))
-        if a is None:
-            continue
-        _ise = [u for u in a.units if u.nation == Nation.ISENGARD]
-        _we = rsplit.get(ekey)
-        if _we is None:
-            # regulars-first default
-            _order = sorted(_ise, key=lambda u: 0
-                            if u.kind == UnitKind.REGULAR else 1)
-            _pick = _order[:want]
-        else:
-            _we = max(0, min(int(_we), want))
-            _el = [u for u in _ise if u.kind == UnitKind.ELITE][:_we]
-            _rg = [u for u in _ise
-                   if u.kind == UnitKind.REGULAR][:want - len(_el)]
-            _pick = _el + _rg
-        for u in _pick:
-            a.units.remove(u)
-            _gl9.get_or_create_army(state, dst).units.append(u)
-            _moved += 1
-        if not a.units and not a.leaders:
-            state.armies.pop(_find_army_key(state, src), None)
-    _gl9.remove_orphaned_leaders(state)
-    return _moved
+    normalized = {}
+    selections = []
+    for src, nkey, ekey in (('north dunland', 'n_north', 'n_north_elite'),
+                            ('south dunland', 'n_south', 'n_south_elite')):
+        want = rsplit.get(nkey, 0)
+        if isinstance(want, bool) or not isinstance(want, numbers.Integral) or not 0 <= want <= 4:
+            raise RuntimeError('Invalid Rage troop count')
+        key = _find_army_key(state, src)
+        army = state.armies.get(key)
+        units = army.units if army is not None and src != dst else []
+        regulars = [u for u in units if u.nation == Nation.ISENGARD and u.kind == UnitKind.REGULAR]
+        elites = [u for u in units if u.nation == Nation.ISENGARD and u.kind == UnitKind.ELITE]
+        elite_count = rsplit.get(ekey, max(0, want - len(regulars)))
+        if (isinstance(elite_count, bool) or not isinstance(elite_count, numbers.Integral)
+                or not 0 <= elite_count <= want):
+            raise RuntimeError('Invalid Rage Elite count')
+        if elite_count > len(elites) or want - elite_count > len(regulars):
+            raise RuntimeError('Rage composition unavailable: refusing the partial split')
+        normalized[nkey] = int(want)
+        normalized[ekey] = int(elite_count)
+        selections.append((key, army, regulars[:want - elite_count] + elites[:elite_count]))
+    if {'rage_split': normalized, '_rage_dest': dst} not in _rage_split_options(state, dst):
+        raise RuntimeError('Rage split exceeds movement or stacking limit')
+    for key, army, selected in selections:
+        for unit in selected:
+            army.units.remove(unit)
+            game_logic.get_or_create_army(state, dst).units.append(unit)
+        if army is not None and not army.units and not army.leaders:
+            state.armies.pop(key, None)
+    game_logic.remove_orphaned_leaders(state)
+    return normalized['n_north'] + normalized['n_south']
 
 
 @register_effect("Rage of the Dunlendings")
@@ -7332,6 +7550,9 @@ def _effect_hill_trolls(state: "GameState", card, choices: dict) -> dict:
 @register_effect("A New Power is Rising")
 def _effect_new_power_is_rising(state: "GameState", card, choices: dict) -> dict:
     """Mass Isengard recruitment: 2 in each Dunland, 2 in Orthanc."""
+    if "recruit_counts" in choices:
+        from shadow_recruit_allocations import apply_allocation
+        return apply_allocation(state, card.card_name, choices)
     result = {"effects": []}
     # honest per-piece counts (honest-reporting wave 2026-07-21)
     _nd9 = sum(1 for _ in range(2)
@@ -7376,6 +7597,9 @@ def _effect_new_power_is_rising(state: "GameState", card, choices: dict) -> dict
 @register_effect("Many Kings to the Service of Mordor")
 def _effect_many_kings(state: "GameState", card, choices: dict) -> dict:
     """Recruit 2 SE regulars in each of 3 SE settlements."""
+    if "recruit_counts" in choices:
+        from shadow_recruit_allocations import apply_allocation
+        return apply_allocation(state, card.card_name, choices)
     result = {"effects": []}
     settlements = choices.get("settlements")
     if not settlements:
@@ -7496,6 +7720,9 @@ def _effect_shadows_on_misty_mountains(state: "GameState", card, choices: dict) 
 @register_effect("Orcs Multiplying Again")
 def _effect_orcs_multiplying_again(state: "GameState", card, choices: dict) -> dict:
     """Recruit 3 Sauron regulars in Dol Guldur and 3 in Mount Gundabad."""
+    if "recruit_counts" in choices:
+        from shadow_recruit_allocations import apply_allocation
+        return apply_allocation(state, card.card_name, choices)
     result = {"effects": []}
     # honest per-piece counts (a blocked placement is not an effect)
     _dg9 = sum(1 for _ in range(3)
@@ -7553,6 +7780,9 @@ def _effect_horde_from_east(state: "GameState", card, choices: dict) -> dict:
 @register_effect("Monsters Roused")
 def _effect_monsters_roused(state: "GameState", card, choices: dict) -> dict:
     """Recruit Sauron regulars in Angmar/Ettenmoors/Weather Hills, elite in Trollshaws."""
+    if "recruit_counts" in choices:
+        from shadow_recruit_allocations import apply_allocation
+        return apply_allocation(state, card.card_name, choices)
     result = {"effects": []}
     # honest per-piece counts (a blocked placement is not an effect)
     _placed9 = [r for r in ("Angmar", "Ettenmoors", "Weather Hills")
@@ -7598,6 +7828,9 @@ def _effect_musterings_of_long_planned_war(state: "GameState", card, choices: di
 @register_effect("Pits of Mordor")
 def _effect_pits_of_mordor(state: "GameState", card, choices: dict) -> dict:
     """Recruit 2 Sauron regulars in each of 3 Sauron strongholds."""
+    if "recruit_counts" in choices:
+        from shadow_recruit_allocations import apply_allocation
+        return apply_allocation(state, card.card_name, choices)
     result = {"effects": []}
     strongholds = choices.get("strongholds")
     if not strongholds:
@@ -7617,6 +7850,14 @@ def _effect_pits_of_mordor(state: "GameState", card, choices: dict) -> dict:
         if _n:
             result["effects"].append(
                 f"Recruited {_n} Sauron Regular(s) in {sh}")
+        if _n < 2:
+            # FLE-13b (g3#13): a committed stronghold that gets fewer
+            # than 2 Regulars (reinforcement pool exhausted - physical
+            # component limits, USER 2026-08-18) must SAY so, never
+            # skip silently.
+            result["effects"].append(
+                f"Pits of Mordor: only {_n} of 2 Sauron Regular(s) "
+                f"placed in {sh} (reinforcement pool exhausted)")
     return result
 
 
@@ -7655,8 +7896,6 @@ def _companion_in_fellowship(state: "GameState", name: str) -> bool:
     return any(c.name == name for c in state.fellowship.companions)
 
 
-
-
 def _find_companion_region(state: "GameState", companion_name: str) -> Optional[str]:
     """Find which region a separated companion is in."""
     for region_key, army in state.armies.items():
@@ -7668,13 +7907,16 @@ def _find_companion_region(state: "GameState", companion_name: str) -> Optional[
 
 def _find_character_with_army(state: "GameState", char_names: List[str],
                               units_required: bool = True) -> Optional[Tuple[str, str]]:
-    """Find if any of the named characters are with an army. Returns
+    """Find if any named characters are with a Free Peoples Army. Returns
     (char_name, region).  units_required=False also matches leader-only
     entries (QA 2026-07-11 Dead Men CASE 6: a LONE separated Strider in
     a Rohan region is a legal play - 'in any Rohan region' needs no
     army)."""
     for region_key, army in state.armies.items():
-        if units_required and not army.units:
+        # A separated Companion may share a region with only Shadow units.
+        # Those units never satisfy a printed Free Peoples Army requirement;
+        # mixed siege entries qualify whenever an FP unit is also present.
+        if units_required and not any(u.nation in FP_NATIONS for u in army.units):
             continue
         for leader in army.leaders:
             if hasattr(leader, 'name') and leader.name in char_names:
@@ -7701,8 +7943,6 @@ def _is_fp_nation_region(region_key: str) -> bool:
     return nation in ("gondor", "rohan", "elves", "dwarves", "the north", "north")
 
 
-
-
 def _army_contains_nazgul(army: Army) -> bool:
     """Check if army contains at least one Nazgul (the Witch-king IS a
     Nazgul for all rules - QA 2026-07-11)."""
@@ -7716,17 +7956,32 @@ def _army_contains_witch_king(army: Army) -> bool:
     for leader in army.leaders:
         if isinstance(leader, Nazgul) and getattr(leader, 'is_witch_king', False):
             return True
-        # the engine's Minion figure is named 'Witch King' (no hyphen) —
-        # normalize before matching (the hyphenated test never matched,
-        # so Grond's requirement failed in five campaign games)
-        # P2 hardening: strip ALL non-letters (same normalization as
-        # game_logic.is_nazgul_figure) so 'WitchKing' spellings match
+        # normalize to letters only (same as is_nazgul_figure) so 'Witch King' /
+        # 'WitchKing' both match
         import re as _re
         nm = _re.sub(r'[^a-z]', '',
                      str(getattr(leader, 'name', '') or '').lower())
         if 'witchking' in nm:
             return True
     return False
+
+
+def _grond_siege_regions(state: "GameState") -> List[str]:
+    """Grond needs the Witch-king outside an FP-held native FP Stronghold."""
+    from combat import garrison_side_for
+    besieged = getattr(state, 'besieged_strongholds', set()) or set()
+    out = []
+    for key, army in state.armies.items():
+        region = sanitize(key)
+        if region not in besieged or garrison_side_for(state, region) != Side.FREE_PEOPLES:
+            continue
+        meta = _get_region_metadata(region)
+        if not meta.get("is_stronghold") or meta.get("owner") != "free":
+            continue
+        if (any(unit.nation in SHADOW_NATIONS for unit in army.units)
+                and _army_contains_witch_king(army)):
+            out.append(region)
+    return out
 
 
 def _army_contains_companion(state: "GameState", army: Army) -> bool:
@@ -7742,15 +7997,11 @@ def _army_contains_companion(state: "GameState", army: Army) -> bool:
     return False
 
 
-
-
 def _is_army_shadow(army: Army) -> bool:
     """Check if army belongs to Shadow."""
     if not army.units:
         return False
     return army.units[0].nation in SHADOW_NATIONS
-
-
 
 
 def _get_adjacent_regions(region_key: str) -> List[str]:
@@ -7792,6 +8043,13 @@ def _stronghold_controlled_by(state: "GameState", region_key: str) -> Optional[s
     if rkey in state.enemy_controlled.get(Side.FREE_PEOPLES, set()):
         return "free"
 
+    # RB31: the besieged player still controls the Stronghold. Partial
+    # besieger movement can put its remaining units first in the shared
+    # Army entry; that list order cannot transfer control.
+    if rkey in getattr(state, 'besieged_strongholds', set()):
+        from combat import garrison_side_for
+        return "shadow" if garrison_side_for(state, rkey) == Side.SHADOW else "free"
+
     # Check if there's an army there (sanitized scan — engine army keys
     # are display names like 'Lôrien', never bare sanitized keys)
     army = None
@@ -7823,6 +8081,11 @@ def check_event_requirement(state: "GameState", card_id: str) -> Tuple[bool, str
         return False, "Card not found"
 
     req_text = card.event_req.lower() if card.event_req else ""
+
+    if getattr(card, 'card_name', '') == "Faramir's Rangers":
+        if not _faramir_targets(state) and not _faramir_fp_army_present(state):
+            return False, "Requires a Shadow target or an FP Army in Osgiliath"
+        return True, "OK"
 
     # 1.210(e): The Spirit of Mordor has an EMPTY event_req but is only
     # playable when a legal target exists - a Shadow army containing units
@@ -7950,18 +8213,12 @@ def check_event_requirement(state: "GameState", card_id: str) -> Tuple[bool, str
             return False, "Aragorn must be outside Free Peoples Nation borders"
 
     if "aragorn is in play" in req_text:
-        # Check if Aragorn exists (upgraded from Strider).  NOTE:
-        # _find_character_with_army requires army UNITS — a lone figure
-        # in an empty region is still "in play" (2025-05-16 Adobim T6:
-        # Gandalf the White alone at Fangorn).
-        has_aragorn = (getattr(getattr(state, 'aragorn_crowned', None),
-                               'crowned', False) or
-                      _companion_in_fellowship(state, "Aragorn") or
-                      _companion_in_fellowship(state, "Aragorn - Heir to Isildur") or
-                      any(getattr(l, 'name', '') in
-                          ("Aragorn", "Aragorn - Heir to Isildur")
-                          for a in state.armies.values()
-                          for l in a.leaders))
+        # Promotion markers survive elimination to forbid a second promotion.
+        # The printed "in play" requirement needs the living map figure;
+        # a lone Companion qualifies without any Army units.
+        has_aragorn = _find_character_with_army(
+            state, ["Aragorn", "Aragorn - Heir to Isildur"],
+            units_required=False) is not None
         if not has_aragorn:
             return False, "Aragorn must be in play"
 
@@ -7970,19 +8227,14 @@ def check_event_requirement(state: "GameState", card_id: str) -> Tuple[bool, str
     # -------------------------------------------------------------------------
 
     if "gandalf the white is in play" in req_text:
-        has_gandalf_white = (getattr(getattr(state, 'gandalf_the_white',
-                                             None), 'in_play', False) or
-                           _companion_in_fellowship(state, "Gandalf the White") or
-                           any(getattr(l, 'name', '') == 'Gandalf the White'
-                               for a in state.armies.values()
-                               for l in a.leaders))
+        has_gandalf_white = _find_character_with_army(
+            state, ["Gandalf the White"], units_required=False) is not None
         if not has_gandalf_white:
             return False, "Gandalf the White must be in play"
 
     if "saruman is in play" in req_text:
-        # QA 2026-07-11 (Wormtongue CASE 2b): the _saruman_in_play flag
-        # defaults True when never set (the 1.101 getattr-blindness
-        # class) - consult the real figure state
+        # consult the real figure state (in_play + map presence) - the single
+        # source of truth
         _sar9 = getattr(state, 'saruman', None)
         _sar_in = bool(getattr(_sar9, 'in_play', False))
         if not _sar_in:
@@ -7990,16 +8242,12 @@ def check_event_requirement(state: "GameState", card_id: str) -> Tuple[bool, str
                 type(l).__name__ == 'Minion'
                 and 'saruman' in str(getattr(l, 'name', '')).lower()
                 for a in state.armies.values() for l in a.leaders)
-        # stale-state sweep 2026-07-27: the legacy _saruman_in_play
-        # veto is gone — the canonical figure state (in_play + map
-        # presence above) is the single source of truth
         if not _sar_in:
             return False, "Saruman must be in play"
 
     if "the witch-king is in play" in req_text or "witch-king is in play" in req_text:
-        # QA 2026-07-10: the old check leaked (returned OK with no WK
-        # on the board); WK piece names vary ('The Witch-king', 'Witch
-        # King', 'WitchKing') - normalized containment match
+        # WK piece names vary ('The Witch-king', 'Witch King', 'WitchKing') -
+        # normalized containment match
         _wk_found = any(
             'witchking' in re.sub(r'[^a-z]', '',
                                   getattr(l, 'name', '').lower())
@@ -8012,8 +8260,8 @@ def check_event_requirement(state: "GameState", card_id: str) -> Tuple[bool, str
         # 'Gandalf the White must be in play AND a Companion must be
         # in Fangorn' - the earlier OR reading was wrong (the gate
         # leaked whenever GtW was in play).
-        gtw = getattr(state, 'gandalf_the_white', None)
-        gtw_ok = gtw is not None and getattr(gtw, 'in_play', False)
+        gtw_ok = _find_character_with_army(
+            state, ["Gandalf the White"], units_required=False) is not None
         # USER RULING 2026-07-21e: a Companion INSIDE the Fellowship is
         # never "in" the Fellowship's region — a Fellowship parked in
         # Fangorn does NOT satisfy "a Companion is in Fangorn". Only a
@@ -8035,11 +8283,7 @@ def check_event_requirement(state: "GameState", card_id: str) -> Tuple[bool, str
 
     if "a free peoples army containing a companion is adjacent to" in req_text and "shadow army containing a nazgûl" in req_text:
         # Membership tests, not units[0]: mixed besieged entries hold
-        # BOTH sides in one shared army entry.
-        def _sh_with_naz9(a):
-            return (a is not None and _army_contains_nazgul(a)
-                    and any(u.nation in SHADOW_NATIONS for u in a.units))
-
+        # BOTH sides in one shared army entry (_is_shadow_army_with_nazgul).
         found = False
         for region_key, army in state.armies.items():
             if any(u.nation not in SHADOW_NATIONS for u in army.units) \
@@ -8047,17 +8291,17 @@ def check_event_requirement(state: "GameState", card_id: str) -> Tuple[bool, str
                 # Check adjacent regions for Shadow army with Nazgul
                 for adj in _get_adjacent_regions(region_key):
                     adj_army = state.armies.get(_find_army_key(state, adj))
-                    if _sh_with_naz9(adj_army):
+                    if _is_shadow_army_with_nazgul(adj_army):
                         found = True
                         break
                 # Also check same region (incl. the SAME shared entry)
-                if not found and _sh_with_naz9(army):
+                if not found and _is_shadow_army_with_nazgul(army):
                     found = True
                 for other_key, other_army in state.armies.items():
                     if found or other_key == region_key:
                         continue
                     if sanitize(other_key) == sanitize(region_key):
-                        if _sh_with_naz9(other_army):
+                        if _is_shadow_army_with_nazgul(other_army):
                             found = True
                             break
             if found:
@@ -8075,8 +8319,7 @@ def check_event_requirement(state: "GameState", card_id: str) -> Tuple[bool, str
             # USER 2026-07-16 (item 5): the Nazgûl must be part of a Shadow
             # ARMY - a lone Nazgûl figure (an entry with a Nazgûl leader but
             # NO Shadow units) is not "a Shadow Army containing a Nazgûl".
-            if not (_army_contains_nazgul(army)
-                    and any(u.nation in SHADOW_NATIONS for u in army.units)):
+            if not _is_shadow_army_with_nazgul(army):
                 continue
             k_san = sanitize(region_key)
             cand = {k_san}
@@ -8096,26 +8339,10 @@ def check_event_requirement(state: "GameState", card_id: str) -> Tuple[bool, str
     # Siege requirements
     # -------------------------------------------------------------------------
 
-    # NOTE on siege entries: while a stronghold is besieged its army
-    # entry is MIXED (garrison units first, besiegers co-located), so
-    # _is_army_shadow (units[0]) reads the GARRISON side — any() over
-    # units is required (2026-01-05 kapcerz T3 Denethor's Folly; the
-    # old exact-key lookups 'minas_tirith'/'minastirith' also never
-    # matched the real key 'minas tirith').
+    # Siege entries are MIXED (garrison first, besiegers co-located): use
+    # membership tests and sanitized keys, never units[0] or exact keys.
     if "witch-king is in play and is with a shadow army besieging a free peoples stronghold" in req_text:
-        found = False
-        _besieged = getattr(state, 'besieged_strongholds', set()) or set()
-        for region_key, army in state.armies.items():
-            if not _army_contains_witch_king(army):
-                continue
-            if not any(u.nation in SHADOW_NATIONS for u in army.units):
-                continue
-            meta = _get_region_metadata(region_key)
-            if meta.get("is_stronghold") and meta.get("owner") == "free" \
-                    and sanitize(region_key) in _besieged:
-                found = True
-                break
-        if not found:
+        if not _grond_siege_regions(state):
             return False, "Witch-king must be with Shadow Army besieging FP Stronghold"
 
     if "minas tirith is besieged by a shadow army" in req_text:
@@ -8280,15 +8507,8 @@ def check_event_requirement(state: "GameState", card_id: str) -> Tuple[bool, str
 
 
 # ---------------------------------------------------------------------------
-# Get Playable Event Cards
-# ---------------------------------------------------------------------------
-
-
-
-# ---------------------------------------------------------------------------
 # Card Choice Requirements
 # ---------------------------------------------------------------------------
-
 
 def _get_free_rohan_settlements(state: "GameState", exclude_besieged: bool = False) -> List[str]:
     """Get free Rohan settlements.
@@ -8329,37 +8549,56 @@ def _get_multi_nation_shadow_armies(state: "GameState") -> List[str]:
 # untouched (byte-identical).
 # ============================================================================
 def _tsl_dests0(state):
-    """Regions holding an un-besieged Shadow army - the destination
-    qualification for The Shadow Lengthens, established at the start of
-    the Action (almanac A8).  Because relocation is deferred to chain
-    end, the live board is still the start-of-action board throughout
-    selection, so this recomputes the same set at every stage."""
-    bs = getattr(state, 'besieged_strongholds', set())
+    """Regions holding a Shadow army that is not a besieged GARRISON -
+    the destination qualification for The Shadow Lengthens / Shadows
+    Gather, established at the start of the Action (almanac A8).  A
+    Shadow BESIEGER stack qualifies (1.211h / row 43: the region around
+    a besieged stronghold is free for the besieger, GAME19 T5); only a
+    walled-in Shadow garrison is unjoinable.  Because relocation is
+    deferred to chain end, the live board is still the start-of-action
+    board throughout selection, so this recomputes the same set at
+    every stage."""
     return {sanitize(k) for k, a in state.armies.items()
             if any(u.nation in SHADOW_NATIONS for u in a.units)
-            and sanitize(k) not in bs}
+            and not _besieged_garrison_source(state, sanitize(k),
+                                              Side.SHADOW)}
+
+
+def _tsim_dest_ok(state, to):
+    """The Shadow is Moving 1-region destination test (ONE predicate for
+    the spec, the chain surface and the handler): a besieged region is
+    enterable only as the BESIEGER (Shadow units outside the walls, FP
+    garrison inside - a normal join, GAME19); a besieged Shadow garrison
+    is unjoinable; any other region must hold no enemy units."""
+    from combat import side_of_nation as _son9d, garrison_side_for
+    to = sanitize(to)
+    a_to = state.armies.get(_find_army_key(state, to))
+    has_enemy = bool(a_to and any(_son9d(u.nation) != Side.SHADOW
+                                  for u in a_to.units))
+    has_own = bool(a_to and any(_son9d(u.nation) == Side.SHADOW
+                                for u in a_to.units))
+    if to in getattr(state, 'besieged_strongholds', set()):
+        return has_own and garrison_side_for(state, to) != Side.SHADOW
+    return not has_enemy
 
 
 def _tsim_next_options(state, moved_set, n_done):
     """The Shadow is Moving's remaining single-army move options
     (amendment 1.133: extracted from the handler so the teacher chain
-    emitter enumerates EXACTLY the learned path's options)."""
-    from combat import side_of_nation as _son9b
-    _bs9b = getattr(state, 'besieged_strongholds', set())
+    emitter enumerates EXACTLY the learned path's options).  1.211h:
+    only a besieged Shadow GARRISON may not move; a besieger stack may
+    (lifting the siege) and may be joined (_tsim_dest_ok)."""
     _opts9 = []
     for k, a in state.armies.items():
         frm9 = sanitize(k)
-        if frm9 in moved_set or frm9 in _bs9b:
+        if frm9 in moved_set \
+                or _besieged_garrison_source(state, frm9, Side.SHADOW):
             continue
         if not any(u.nation in SHADOW_NATIONS for u in a.units):
             continue
         for adj in state.board.adjacent(frm9):
             to9 = sanitize(adj)
-            if to9 in _bs9b:
-                continue
-            a_to9 = state.armies.get(_find_army_key(state, to9))
-            if a_to9 and any(_son9b(u.nation) != Side.SHADOW
-                             for u in a_to9.units):
+            if not _tsim_dest_ok(state, to9):
                 continue
             _opts9.append({'from_region': frm9,
                            'to_region': to9,
@@ -8374,62 +8613,8 @@ def _tsl_next_options(state, exclude_src):
     each qualifying destination it can reach through free regions.
     Sources already selected are excluded via exclude_src (the progress
     data)."""
-    dests0 = _tsl_dests0(state)
-    bs = getattr(state, 'besieged_strongholds', set())
-    opts = []
-    for k, a in state.armies.items():
-        frm = sanitize(k)
-        if frm in exclude_src or frm in bs:
-            continue
-        if not any(u.nation in SHADOW_NATIONS for u in a.units):
-            continue
-        reach = _army_reachable_free(state, frm, 2, Side.SHADOW)
-        # USER 1.208n: learned initial split (mirrors _sg_join_options);
-        # legacy whole-army option kept FIRST for teacher parity.
-        _nr = sum(1 for u in a.units if u.nation in SHADOW_NATIONS
-                  and u.kind != UnitKind.ELITE)
-        _ne = sum(1 for u in a.units if u.nation in SHADOW_NATIONS
-                  and u.kind == UnitKind.ELITE)
-        for d in sorted(reach & dests0):
-            if d == frm:
-                continue
-            opts.append({'from_region': frm, 'to_region': d})
-            for mr in range(_nr + 1):
-                for me in range(_ne + 1):
-                    if mr + me == 0 or (mr == _nr and me == _ne):
-                        continue
-                    opts.append({'from_region': frm, 'to_region': d,
-                                 'n_regular': mr, 'n_elite': me})
-    return opts
-
-
-def _tsl_walk_mids(state, frm, to, max_steps):
-    """The free intermediate region(s) a join move passes THROUGH, for
-    walk-through settlement capture - mirrors the _sg_join_move BFS so
-    chained moves capture empty settlements identically to single ones."""
-    frm, to = sanitize(frm), sanitize(to)
-    if to in {sanitize(x) for x in state.board.adjacent(frm)}:
-        return []
-    from collections import deque
-    bs = getattr(state, 'besieged_strongholds', set())
-    seen = {frm}
-    q = deque([(frm, [])])
-    while q:
-        c, path = q.popleft()
-        if c == to:
-            return path
-        if len(path) >= max_steps:
-            continue
-        for adj in state.board.adjacent(c):
-            asan = sanitize(adj)
-            if asan in seen:
-                continue
-            seen.add(asan)
-            a_m = state.armies.get(_find_army_key(state, asan))
-            if asan != to and (asan in bs or (a_m and a_m.units)):
-                continue
-            q.append((asan, path + ([asan] if asan != to else [])))
-    return []
+    return [option for option in _sg_join_options(state, 2)
+            if option['from_region'] not in exclude_src]
 
 
 def _tsl_execute_staged(state, moves, result):
@@ -8437,16 +8622,20 @@ def _tsl_execute_staged(state, moves, result):
     merge.  The cargo of each move is its source's army at the start of
     the Action; a region that received a delivery therefore never has
     those delivered figures picked up by a later move (almanac A8).
-    Walk-through settlement capture, the destination-qualification and
-    reachability guards, and the stacking cap (overflow stays behind,
-    regulars first) match the single-move _sg_join_move / _direct_army_move
-    path used by the teacher."""
+    Destination qualification and cargo are fixed at the action start.
+    Land all selected figures after every move-out, then offer the owner
+    any required overstack removals. Capacity never changes the selection."""
+    from card_movement_witness import row as _witness_row
+    _gross_witness = []
+    state._card_army_move_witness = ('SHADOW_Strategy_The_Shadow_Lengthens', ())
     if not moves:
         result["message"] = "No movements selected"
         return
     from combat import side_of_nation as _son9, _check_settlement_capture
     import game_logic as _gl9
     dests0 = _tsl_dests0(state)      # qualification fixed at start
+    if len(moves) > 2 or len({sanitize(m[0]) for m in moves}) != len(moves):
+        raise ValueError('Lengthens requires up to two distinct original armies')
     plans = []
     for mv in moves:
         frm, to = sanitize(mv[0]), sanitize(mv[1])
@@ -8456,13 +8645,14 @@ def _tsl_execute_staged(state, moves, result):
         _ne = mv[3] if len(mv) > 3 else None
         if to not in dests0:
             result["effects"].append(
-                "%s has no (unbesieged) Shadow army - move refused" % to)
+                "%s has no joinable Shadow army (none, or a besieged "
+                "garrison) - move refused" % to)
             continue
         if to not in _army_reachable_free(state, frm, 2, Side.SHADOW):
             result["effects"].append(
                 "%s not reachable within 2 free regions from %s" % (to, frm))
             continue
-        mids = _tsl_walk_mids(state, frm, to, 2)
+        mids = _free_path_mids(state, frm, to, 2)
         key = _find_army_key(state, frm)
         src = state.armies.get(key)
         if src is None:
@@ -8472,6 +8662,10 @@ def _tsl_execute_staged(state, moves, result):
         mv_l = [l for l in src.leaders
                 if not _gl9._is_saruman(l)
                 and _gl9._leader_side(l) == Side.SHADOW]
+        from shadow_join_rules import select as select_join
+        exact = len(mv) > 4 and mv[4] is not None
+        if not exact:
+            mv_u, mids = select_join(state, frm, to, 2, mv_u)
         if _nr is not None or _ne is not None:
             _tr = _nr if _nr is not None else 10 ** 6
             _te = _ne if _ne is not None else 10 ** 6
@@ -8484,6 +8678,13 @@ def _tsl_execute_staged(state, moves, result):
                     _sel.append(u)
                     _tr -= 1
             mv_u = _sel
+        if len(mv) > 4 and mv[4] is not None:
+            from army_card_cargo import selected
+            mv_u, mv_l = selected(state, frm, mv[4])
+        if exact:
+            eligible, mids = select_join(state, frm, to, 2, mv_u, exact=True)
+            if len(eligible) != len(mv_u):
+                raise ValueError('Selected cargo cannot cross political borders')
         if not mv_u:
             result["effects"].append("No movable units in %s" % frm)
             continue
@@ -8506,30 +8707,25 @@ def _tsl_execute_staged(state, moves, result):
         if dst is None:
             dst = Army(region=state.board.region(to))
             state.armies[to] = dst
-        own = sum(1 for u in dst.units if _son9(u.nation) == Side.SHADOW)
-        room = _gl9.MAX_ARMY_UNITS - own
-        keep = []
-        if room < len(mv_u):
-            overflow = len(mv_u) - max(0, room)
-            keep = [u for u in mv_u if u.kind == UnitKind.REGULAR][:overflow]
-            if len(keep) < overflow:
-                keep += [u for u in mv_u
-                         if u.kind == UnitKind.ELITE][:overflow - len(keep)]
-        _kb = set(map(id, keep))
-        land = [u for u in mv_u if id(u) not in _kb]
+        land = mv_u
         dst.units.extend(land)
         dst.leaders.extend(mv_l)
-        if keep:      # overflow stays behind at the source
-            skey = _find_army_key(state, frm)
-            sarm = state.armies.get(skey)
-            if sarm is None:
-                sarm = Army(region=state.board.region(frm))
-                state.armies[frm] = sarm
-            sarm.units.extend(keep)
+        _gross_witness.append(_witness_row(frm, to, land, mv_l))
+        own = sum(1 for u in dst.units if _son9(u.nation) == Side.SHADOW)
+        if own > _gl9.MAX_ARMY_UNITS:
+            overstack = getattr(state, '_overstack_regions', None)
+            if overstack is None:
+                overstack = set()
+                state._overstack_regions = overstack
+            overstack.add(to)
         for m in mids:
             _check_settlement_capture(state, m, Side.SHADOW)
+            # rulebook 370-371: a walked-through region is ENTERED
+            _gl9._check_political_activation_for_entry(state, m,
+                                                       Side.SHADOW)
         result["effects"].append("Army moved from %s to join %s" % (frm, to))
     _gl9.remove_orphaned_leaders(state)
+    state._card_army_move_witness = ('SHADOW_Strategy_The_Shadow_Lengthens', tuple(_gross_witness))
 
 
 def _tsl_learned_chain(state, card, choices):
@@ -8542,6 +8738,11 @@ def _tsl_learned_chain(state, card, choices):
     further legal move), then executed with staged move-OUTs."""
     result = {"effects": []}
     _cid = getattr(card, 'card_id', 'The Shadow Lengthens')
+    if not choices.get('_tsl_done'):
+        from army_card_cargo import stage
+        choices = stage(state, card, choices, choices['from_region'])
+        if choices is None:
+            return {'effects': ['Choose the figures moving with this army']}
     moves = [list(m) for m in (choices.get('_tsl_moves') or [])]
     if not choices.get('_tsl_done'):
         f = choices.get('from_region')
@@ -8553,7 +8754,8 @@ def _tsl_learned_chain(state, card, choices):
             _ne = choices.get('n_elite')
             moves.append([sanitize(f), sanitize(t),
                           (int(_nr) if _nr is not None else None),
-                          (int(_ne) if _ne is not None else None)])
+                          (int(_ne) if _ne is not None else None),
+                          choices.get('cargo')])
     picked_src = {m[0] for m in moves}
     # offer another INDEPENDENT move while under the two-army limit
     if not choices.get('_tsl_done') and len(moves) < 2:
@@ -8572,6 +8774,8 @@ def _tsl_learned_chain(state, card, choices):
             return result
     # chain complete: execute the accumulated moves with staged move-OUTs
     _tsl_execute_staged(state, moves, result)
+    if choices.get('_tsl_done') and not moves:
+        return {'effects': ['The Shadow Lengthens: movement ends']}
     if not result["effects"]:
         return _selfplay_refund(result)
     return result
@@ -8699,21 +8903,36 @@ def _foul_apply_casualty(state, victim_name, damage, result) -> dict:
         return result
     absorbed = min(damage, int(getattr(victim, 'level', 1) or 1))
     remainder = damage - absorbed
+    # GL-4 class (rulebook p.42 new-Guide note, 1.83, standing ruling
+    # 2026-08-16): the forced pick is the casualty-TAKEN row (WWSAT
+    # fires; a hobbit separates outside Mordor) and the REMAINDER
+    # continues the SAME damage event through game_logic's hunt chain
+    # with the NEW guide's ability live - exactly hunt_sacrifice_random.
+    # The teacher (FINAL_HITS_HOOK) keeps its certified inline body.
+    import combat as _cmb_ft
+    _learned = _cmb_ft.FINAL_HITS_HOOK is None
     if _gl.hobbit_hunt_placement_applies(state, victim.name):
-        # hobbit uses his ability: SEPARATES (placement decision), not
-        # eliminated.  A random pick is still a CASUALTY for 'Worn with
-        # Sorrow and Toil' (almanac, QA 2026-07-11 E12b).
-        state.fellowship.companions.remove(victim)
-        _gl._on_companion_casualty(state, victim.name)
-        if victim is state.fellowship.guide or not any(
-                c.name != 'Gollum' for c in state.fellowship.companions):
+        if _learned:
+            # separates, alive; the learned hobbit_place decision opens
+            # AFTER the chain (queue drained by _finish_hunt_decision)
+            _gl.remove_hobbit_for_placement(state, victim, absorbed)
+            q = getattr(state, '_hobbit_place_queue', None)
+            if q is None:
+                q = state._hobbit_place_queue = []
+            q.append(victim)
+        else:
+            # hobbit uses his ability: SEPARATES (placement decision),
+            # not eliminated.  A random pick is still a CASUALTY for
+            # 'Worn with Sorrow and Toil' (almanac, QA 2026-07-11 E12b).
+            state.fellowship.companions.remove(victim)
+            _gl._on_companion_casualty(state, victim.name)
             _gl.change_guide(state, allow_pending=True)
-        if getattr(state, 'pending_hunt', None) is None:
-            state.pending_hunt = {
-                'phase': 'hobbit_place',
-                'companion': victim.name,
-                'level': int(getattr(victim, 'level', 1) or 1),
-                'companion_obj': victim, 'damage': 0}
+            if getattr(state, 'pending_hunt', None) is None:
+                state.pending_hunt = {
+                    'phase': 'hobbit_place',
+                    'companion': victim.name,
+                    'level': int(getattr(victim, 'level', 1) or 1),
+                    'companion_obj': victim, 'damage': 0}
         result["effects"].append(
             f"{victim.name} separates (hobbit ability), absorbs "
             f"{absorbed}")
@@ -8722,7 +8941,17 @@ def _foul_apply_casualty(state, victim_name, damage, result) -> dict:
                                      kill_name=victim.name)
         result["effects"].append(f"{victim.name} eliminated, absorbs "
                                  f"{absorbed}")
-    if remainder > 0:
+    if _learned:
+        # the card's damage is fully carried by `damage` here; the
+        # reduction interpose's staging scalar must not be re-settled
+        # by the chain's close (the executor zeroes it right after)
+        state._pending_hunt_damage = 0
+        _gl.continue_hunt_chain(state, remainder, casualty_taken=True)
+        if remainder > 0:
+            result["effects"].append(
+                f"{remainder} remaining damage continues with the new "
+                f"guide (hunt chain)")
+    elif remainder > 0:
         state.fellowship.corruption = min(
             12, state.fellowship.corruption + remainder)
         result["effects"].append(
@@ -8785,16 +9014,6 @@ def _effect_companion_chain(state: "GameState", card, choices: dict) -> dict:
     if grp['from'] and grp['to'] and grp['companions']:
         if _move_companion_group(state, grp, result):
             moved.update(str(n) for n in grp['companions'])
-            # a companion ending movement in its nation's city/stronghold
-            # activates that nation (rulebook p.34) - parity with the
-            # first move in the ai companion_move executor
-            import game_logic as _gl9
-            dst = sanitize(str(grp['to']))
-            dkey = next((k for k in state.armies
-                         if sanitize(k) == dst), None)
-            if dkey is not None:
-                _gl9._check_companion_activates_nation(
-                    state, dst, state.armies[dkey])
     opts = _companion_chain_options(state, moved)
     if opts:
         opts.append({'_comp_done': True})
@@ -8807,3 +9026,5 @@ def _effect_companion_chain(state: "GameState", card, choices: dict) -> dict:
 
 
 CARD_EFFECT_HANDLERS["__companion_moves__"] = _effect_companion_chain
+
+

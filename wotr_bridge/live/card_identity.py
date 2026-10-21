@@ -1,12 +1,12 @@
-"""AI-draw card identity from the raw request stream.
+"""Drawn-card identity from the raw request stream - BOTH hands.
 
 SANCTIONED RAW IMPORT #1 (rendered-baseline directive; REBUILD_PLAN
 Phase 3 item 2): exactly two client statements live only on the raw
-channel - this one is the COMMITMENT DECODE of the AI's OWN drawn
-cards.  The rendered feed says only 'draws Shadow Character Card.';
-which physical card that is exists nowhere but in the client's
-commitment tables (fact 10: at hand-claim Game.I()/J() reassign every
-deck piece's identity from the aY commitment shuffle, so the static
+channel - this one is the COMMITMENT DECODE of drawn cards.  The
+rendered feed says only 'draws Shadow Character Card.'; which
+physical card that is exists nowhere but in the client's commitment
+tables (fact 10: at hand-claim Game.I()/J() reassign every deck
+piece's identity from the aY commitment shuffle, so the static
 alphabetical pid map is WRONG in a claimed game - PROTOCOL.md, the
 root cause of the old card desync).
 
@@ -21,14 +21,14 @@ LIFTED (donor read-only, nothing imported from it):
   src/rendered_extract.py:111-113 (pattern copied, module NOT imported
   - a live consumer imports nothing from rendered_extract).
 
-BLINDING (design rule 8, fail-closed BY CONSTRUCTION):
-  * only the AI side's password is ever set; the human side's decoder
-    password is a poison string no client accepts, so the human's
-    commitments can NEVER crack in this process even if asked;
-  * harvest() decodes ONLY draws whose destination is the AI's OWN
-    hand zone (Controls.45=FP hand, 46=SH hand - fact 3: attribution
-    by ZONE, never nick) AND whose deck is the AI side's;
-  * a human draw line yields nothing - not even a decode attempt.
+USER RULING 2026-08-25: "the engine should see the human hand" -
+harvest() decodes BOTH sides' draws (AiBoot claims both hands with
+one known password), so human draws resolve to real cids, the engine
+hand carries them, and get_legal_actions enumerates the human's card
+plays into the published menu.  Attribution stays by ZONE, never nick
+(Controls.45=FP hand, 46=SH hand - fact 3).  The AI's CHAT never
+names the human's cards (chat policy unchanged); only the engine and
+the human's own panel see them.
 
 The CardDecoder import comes from log_replay's re-export - the ONE
 sanctioned log_replay surface for live consumers (REBUILD_PLAN keep
@@ -43,13 +43,11 @@ _SRC = os.path.abspath(os.path.join(_HERE, '..', '..', 'src'))
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-# the strict draw-to-hand pattern.  EVERY deck menu has its OWN
-# Controls key family (donor _DRAW_LINE_RE, ai_move_server.py:96-98:
-# 'Controls.491/509/0/549/557 vary by menu, the zone does not');
-# the deck ZONE token identifies side+deck and the hand tail
-# distinguishes a real draw from other deck events.  LIVE SPECIMENS
-# (boot2 leg, 2026-08-19 -- the 509-only shape matched NONE of the
-# AI's own draws and wedged the ai_draws step):
+# the strict draw-to-hand pattern: EVERY deck menu has its OWN Controls
+# key family (491/509/0/549/557 vary by menu; the deck ZONE token
+# identifies side+deck and the hand tail distinguishes a real draw from
+# other deck events).  LIVE SPECIMENS (all three shapes are the AI's
+# own draws):
 #   $Wey<~Controls.491~>117<~Controls.492~><~Game.2004~><~Controls.493~><~Controls.45~>
 #   $Wey<~Controls.509~>119<~Controls.510~><~Game.2005~><~Controls.511~><~Controls.45~>
 #   $Wey<~Controls.0~>200<~Controls.549~><~Game.2006~><~Controls.550~><~Controls.46~>
@@ -64,10 +62,6 @@ DECK_INFO = {
     '2006': ('SHADOW', 'character', '46', 'SA Character'),
     '2007': ('SHADOW', 'strategy', '46', 'SA Strategy'),
 }
-
-# a password no client ever accepts: guarantees the human side's
-# commitment tables never crack in this process (rule 8)
-_POISON_PW = '\x00__never_a_client_password__\x00'
 
 
 def _norm(s):
@@ -115,7 +109,7 @@ def _build_name_index():
 
 
 # client titles that differ from the engine name beyond a leading
-# article ('A Balrog is Come!' = Balrog_of_Moria) - donor :12301-12303
+# article ('A Balrog is Come!' = Balrog_of_Moria)
 _KEYWORD_ALIASES = (('balrog',), ('muster', 'long'), ('corsair',),
                     ('nazgul', 'strike'), ('prove', 'swifter'),
                     ('wisdom', 'elrond'))
@@ -167,19 +161,25 @@ class CardIdentity(object):
     failed - the caller must HALT loudly (donor rule: undecodable AI
     cards are a LIVE HALT, never a guess)."""
 
-    def __init__(self, ai_side_name, password='ai'):
+    def __init__(self, ai_side_name, password='ai',
+                 human_password=None):
+        """Both sides decode (USER 2026-08-25: the engine sees the
+        human hand).  AiBoot claims BOTH hands with the same password
+        in the play-vs-AI head, so human_password defaults to the AI
+        one; pass a different value if a launch ever splits them."""
         if ai_side_name not in ('SHADOW', 'FREE_PEOPLES'):
             raise ValueError('ai_side_name must be SHADOW or '
                              'FREE_PEOPLES, got %r' % (ai_side_name,))
         from log_replay import CardDecoder      # sanctioned import
         self.ai_side = ai_side_name
         self.decoder = CardDecoder()
+        hpw = password if human_password is None else human_password
         if ai_side_name == 'SHADOW':
             self.decoder.sa_password = password
-            self.decoder.fp_password = _POISON_PW
+            self.decoder.fp_password = hpw
         else:
             self.decoder.fp_password = password
-            self.decoder.sa_password = _POISON_PW
+            self.decoder.sa_password = hpw
         self._seen = 0              # raw lines already processed
         self._claims = set()        # claim lines already brute-forced
         self.restarted = False      # a shrunk log was observed
@@ -192,29 +192,28 @@ class CardIdentity(object):
             # own FeedRestart for the rendered channel)
             self._seen = 0
             self.restarted = True
-        new = lines[self._seen:]
+        start = self._seen
+        new = lines[start:]
         self._seen = len(lines)
         out = []
-        for ln in new:
+        for raw_index, ln in enumerate(new, start):
             if 'Controls.464' in ln or 'Controls.479' in ln:
                 if ln not in self._claims:
                     self._claims.add(ln)
-                    # brute-forces ONLY sides whose password is set
-                    # correctly; the poison side never cracks
                     self.decoder.preprocess_log([ln])
             m = RAW_DRAW_RE.search(ln)
             if m is None:
                 continue
             pid, deck_code, hand = m.group(1), m.group(2), m.group(3)
             side, deck, hand_zone, deck_type = DECK_INFO[deck_code]
-            if side != self.ai_side or hand != hand_zone:
-                # the HUMAN's draw (or a cross-zone oddity): identity
-                # is never decoded here - blinding by construction
+            if hand != hand_zone:
+                # a cross-zone oddity (deck event that is not a draw
+                # to the owning hand): never an identity claim
                 continue
             num = self.decoder.decode_piece(int(pid), deck_type)
             name = (self.decoder.get_card_name(num, deck_type)
                     if num is not None else None)
             cid = name_to_cid(name, deck_type) if name else None
             out.append({'side': side, 'deck': deck, 'cid': cid,
-                        'pid': pid, 'name': name})
+                        'pid': pid, 'name': name, 'raw_index': raw_index})
         return out

@@ -14,7 +14,8 @@ is imported from it):
         block)
   * _read_panel_control()   :18259-18314  panel control JSON (paused
         honored here; everything else surfaced to the driver)
-  * pid-owner lock          :18340-18378  liveness is NEVER a bare pid
+  * exclusive alive-byte lock prevents concurrent server writers;
+    pid-owner check         :18340-18378  liveness is NEVER a bare pid
         (client fact 18: Windows reuses pids - the Discord.exe
         adoption, twice); ownership proven by COMMAND LINE via
         wotr_bridge/pid_owner.owner_check, THE one answerer -
@@ -62,6 +63,8 @@ import json
 import os
 import sys
 import time
+import threading
+from contextlib import contextmanager
 from collections import namedtuple
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -104,8 +107,8 @@ SIDE_HEADERS = ('SHADOW', 'FREE_PEOPLES', 'AUTO',
 # The status keys that belong to a SESSION, not to the file: a status
 # file written by a DIFFERENT pid is a dead session's - merging its
 # session state would carry a stale 'turn' into ours (BOOT-1).
-_SESSION_KEYS = ('turn', 'acting', 'phase', 'note', 'started',
-                 'manual_edit', 'sims')
+_SESSION_KEYS = ('turn', 'acting', 'phase', 'note', 'started', 'recovery',
+                 'manual_edit', 'sims', 'thinking', 'request_id', 'request_session')
 
 Request = namedtuple('Request', ('side', 'log_lines', 'raw'))
 
@@ -171,6 +174,17 @@ class FileBridge(object):
         self.control = {}
         self._pause_ticks = 0
         self._stop = False
+        self._status_lock = threading.RLock()
+        self._active_request = None
+        self._heartbeat_interval = 2.0
+        # Once the handler has run, its response belongs to that exact
+        # request.  A transient file lock must not discard it or rerun
+        # the handler.  Only one response can be awaiting publication.
+        self._pending_response = None
+        # Only this instance's successful rename establishes a claim.
+        # Retry a temporarily unreadable claimed file before a newer REQ;
+        # never adopt an arbitrary .processing file left by another run.
+        self._claimed_request = None
 
     # ------------------------------------------------------------ lock
     def acquire_lock(self):
@@ -178,10 +192,16 @@ class FileBridge(object):
         exactly).  Returns 'own' / 'fresh' / 'takeover'; raises
         BridgeLockError when a foreign pid PROVEN (or conservatively
         assumed, on probe failure) to be a live server owns the dir."""
+        if getattr(self, '_alive_fh', None) is not None:
+            return 'own'
+        # PID inspection alone races when two servers start together. Claim
+        # the same OS byte the Java client probes BEFORE publishing ownership.
+        self.hold_alive_lock()
         how = 'fresh'
         try:
             if os.path.exists(self.lock_path):
-                _op = int(open(self.lock_path).read().strip() or 0)
+                with open(self.lock_path, encoding='ascii') as owner_file:
+                    _op = int(owner_file.read().strip() or 0)
                 if _op and _op == os.getpid():
                     how = 'own'
                 elif _op:
@@ -207,67 +227,55 @@ class FileBridge(object):
                     how = 'takeover'
             with open(self.lock_path, 'w') as _lf:
                 _lf.write(str(os.getpid()))
-        except BridgeLockError:
-            raise
         except Exception as _le:
-            print('! server lock check skipped: %r' % (_le,))
-        self.hold_alive_lock()
+            self.release_alive_lock()
+            if isinstance(_le, BridgeLockError):
+                raise
+            raise BridgeLockError('Cannot establish exclusive server ownership: %s' % _le) from _le
         return how
 
     def hold_alive_lock(self):
         """Write our pid into ALIVE_NAME and keep the handle open with
         an exclusive lock on the byte at ALIVE_LOCK_OFFSET (msvcrt
-        LK_NBLCK) for the rest of the process - the liveness proof the
-        client reads (see ALIVE_NAME/ALIVE_LOCK_OFFSET).  Never raises:
-        a failure is printed and the client falls back to its other
-        proofs."""
+        LK_NBLCK) for the rest of the process. A failed claim must refuse
+        startup, since continuing would permit two engine writers."""
         try:
-            import msvcrt
-            path = os.path.join(self.client_dir, ALIVE_NAME)
-            fh = open(path, 'w+')
-            fh.write(str(os.getpid()))
-            fh.flush()
-            fh.seek(ALIVE_LOCK_OFFSET)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-            self._alive_fh = fh            # held for the process lifetime
+            from .server_ownership import claim
+            self._alive_fh = claim(os.path.join(self.client_dir, ALIVE_NAME), ALIVE_LOCK_OFFSET)
         except Exception as _ae:
-            print('! liveness lock not held: %r' % (_ae,))
             self._alive_fh = None
+            raise BridgeLockError('Client directory already owned or unavailable: %s' % _ae) from _ae
 
     def release_alive_lock(self):
         fh = getattr(self, '_alive_fh', None)
         if fh is None:
             return
-        try:
-            import msvcrt
-            fh.seek(ALIVE_LOCK_OFFSET)
-            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-        except Exception:
-            pass
-        try:
-            fh.close()
-        except Exception:
-            pass
+        from .server_ownership import release
+        release(os.path.join(self.client_dir, ALIVE_NAME), fh)
         self._alive_fh = None
-        try:
-            os.remove(os.path.join(self.client_dir, ALIVE_NAME))
-        except OSError:
-            pass
 
     def release_lock(self):
         """Remove the lock ONLY if it names our pid (test teardown
         helper - production relies on the liveness proof, as always)."""
-        self.release_alive_lock()
+        if getattr(self, '_alive_fh', None) is None:
+            return
         try:
             if os.path.exists(self.lock_path):
-                if open(self.lock_path).read().strip() == \
-                        str(os.getpid()):
+                with open(self.lock_path, encoding='utf-8') as stream:
+                    owner = stream.read().strip()
+                if owner == str(os.getpid()):
                     os.remove(self.lock_path)
         except Exception:
             pass
+        finally:
+            self.release_alive_lock()
 
     # ----------------------------------------------------------- panel
     def write_status(self, **kw):
+        with self._status_lock:
+            self._write_status_locked(**kw)
+
+    def _write_status_locked(self, _enrich=True, **kw):
         """Panel status JSON (lifted :18177-18253).  Ownership BEFORE
         the merge: a foreign-pid file's session keys are popped so a
         dead session's 'turn' never leaks into ours; identity keys
@@ -278,8 +286,8 @@ class FileBridge(object):
             cur = {}
             if os.path.exists(self.status_path):
                 try:
-                    cur = json.load(open(self.status_path,
-                                         encoding='utf-8'))
+                    with open(self.status_path, encoding='utf-8') as stream:
+                        cur = json.load(stream)
                 except Exception:
                     cur = {}
             _pid = os.getpid()
@@ -288,7 +296,7 @@ class FileBridge(object):
                     cur.pop(_k, None)
             cur.update(kw)
             try:
-                if self.status_extra is not None:
+                if _enrich and self.status_extra is not None:
                     extra = self.status_extra() or {}
                     for k, v in extra.items():
                         if v is not None:
@@ -304,23 +312,25 @@ class FileBridge(object):
             except Exception:
                 cur['client_dir'] = str(self.client_dir)
             cur['ts'] = time.time()
-            # IDENTITY KEYS ARE EMITTED FIRST - and this is load-
-            # bearing, not cosmetic.  The client reads this file with
-            # AiOpp.jsonField(), a naive scanner that returns the
-            # FIRST occurrence of "pid" anywhere in the text.  The
-            # Phase-3 human_menu publication nests a "pid" on every
-            # DIE PIECE, so the client was reading a die id ("210") as
-            # the server pid, failing the owner proof, and spawning a
-            # SECOND server - the RETIRED ai_move_server.py monolith -
-            # alongside this one: two brains writing one
-            # ai_bridge_move.txt for a live human game.  Reproduced
-            # 2026-08-20 on the manual-play launcher (ai_boot.log:
-            # 'NOT adopting pid 210 ... spawning our own').  Until the
-            # jar's parser is fixed, the fix is ours: stamp identity
-            # first so the first "pid" in the file IS the server's.
-            # test_status_identity_first pins it (it replays the
-            # client's exact scan).
-            ident = ('pid', 'client_dir', 'ts')
+            # AiOpp.serverThinking reads this exact top-level boolean, not
+            # state='thinking'. Only the currently executing request may own
+            # it. Publish before nested diagnostic/menu fields for its simple
+            # first-occurrence JSON reader. A heartbeat never recomputes menus.
+            cur['thinking'] = (self._active_request is not None
+                               and cur.get('state') == 'thinking')
+            if self._active_request is not None:
+                _, request_id, session = self._active_request
+                cur['request_id'] = request_id
+                cur['request_session'] = session
+            # IDENTITY KEYS ARE EMITTED FIRST - load-bearing: the
+            # client reads this file with AiOpp.jsonField(), a naive
+            # scanner that returns the FIRST occurrence of "pid"
+            # anywhere in the text, and the human_menu publication
+            # nests a "pid" on every DIE PIECE; stamping identity first
+            # keeps the owner proof correct (a wrong pid makes the
+            # client spawn a second server).  test_status_identity_first
+            # pins it (it replays the client's exact scan).
+            ident = ('pid', 'client_dir', 'ts', 'thinking', 'request_id', 'request_session')
             ordered = dict((k, cur[k]) for k in ident if k in cur)
             for k, v in cur.items():
                 if k not in ident:
@@ -328,6 +338,48 @@ class FileBridge(object):
             atomic_write(self.status_path, json.dumps(ordered))
         except Exception:
             pass
+
+    @contextmanager
+    def _request_heartbeat(self, request):
+        """Keep native wait liveness fresh for this handler only.
+
+        No game callbacks run on the heartbeat thread. Status updates share
+        one lock/atomic writer and preserve existing diagnostics. Completion,
+        exceptions and interrupted handlers retire the token before a later
+        request can start; an old heartbeat cannot renew a new request.
+        """
+        from .client_protocol import split_seq_header
+        header, _ = split_seq_header(request.log_lines)
+        header = header or {}
+        token = (object(), header.get('req'), header.get('session'))
+        done = threading.Event()
+        with self._status_lock:
+            if self._active_request is not None:
+                raise RuntimeError('Concurrent handlers cannot own one FileBridge')
+            self._active_request = token
+            self._write_status_locked(state='thinking', requesting=str(request.side))
+
+        def beat():
+            while not done.wait(self._heartbeat_interval):
+                with self._status_lock:
+                    if self._active_request is not token:
+                        return
+                    # Preserve state/error/note fields, and do not invoke the
+                    # engine's status_extra hook from this background thread.
+                    self._write_status_locked(_enrich=False)
+
+        worker = threading.Thread(target=beat, name='FileBridge-request-heartbeat', daemon=True)
+        try:
+            worker.start()
+            yield
+        finally:
+            done.set()
+            with self._status_lock:
+                if self._active_request is token:
+                    self._active_request = None
+                    self._write_status_locked(_enrich=False)
+            if worker.ident is not None:
+                worker.join()
 
     def read_control(self):
         """Panel control JSON (lifted :18259-18314).  PAUSE is honored
@@ -369,6 +421,30 @@ class FileBridge(object):
         """Ask a running serve() to return after the current cycle."""
         self._stop = True
 
+    def _flush_response(self):
+        text, status = self._pending_response
+        atomic_write(self.resp, text)
+        self._pending_response = None
+        return status
+
+    def _write_response(self, lines, header, status=None):
+        """Retain the complete wire reply until its atomic publication.
+
+        The envelope is transport metadata, stripped by AiOpp before
+        injection.  Legacy requests without #SEQ retain plain replies.
+        Capture identity from the consumed request, never the next REQ
+        file or a newer client session that arrived during the handler.
+        """
+        from .client_protocol import resp_echo_line
+        body = list(lines or ())
+        if header is not None and 'req' in header:
+            echo = resp_echo_line(header['req'])
+            if 'session' in header:
+                echo += ' session=%d' % header['session']
+            body.insert(0, echo)
+        self._pending_response = ('\n'.join(body), dict(status or {}))
+        return self._flush_response()
+
     def serve(self, handler, max_cycles=None):
         """Request/response with deletion as the handshake (lifted
         :18324-18552): the client writes REQ; we consume+delete it,
@@ -395,18 +471,30 @@ class FileBridge(object):
         while (max_cycles is None or cycles < max_cycles) \
                 and not self._stop:
             cycles += 1
+            response_header = None
+            response_published = False
+            request_consumed = False
             try:
-                if not os.path.exists(self.req):
+                if self._pending_response is not None:
+                    # Do not consume another request (or apply its
+                    # controls) ahead of a completed, unpublished reply.
+                    status = self._flush_response()
+                    response_published = True
+                    if status.get('state') != 'error':
+                        self._err_note = ''
+                    self.write_status(**status)
+                    continue
+                if self._claimed_request is None and not os.path.exists(self.req):
                     # heartbeat: refresh the panel's status ts + apply
                     # the control file even while no requests arrive
                     now = time.time()
                     if now - hb > 2.0:
                         hb = now
                         self.read_control()
-                        # a STICKY error: the 2s heartbeat used to
-                        # repaint state='idle' over the error a failed
-                        # cycle had just written, so the panel showed a
-                        # calm idle server that was in fact halted.
+                        # a STICKY error: the heartbeat must never
+                        # repaint state='idle' over an error a failed
+                        # cycle wrote (the panel would show a calm idle
+                        # server that is in fact halted)
                         if self._err_note:
                             self.write_status(
                                 connected=True, state='error',
@@ -420,15 +508,22 @@ class FileBridge(object):
                 # rename IS the dedup: a request that cannot be renamed
                 # away is left for the next cycle; a request renamed
                 # away can never be processed twice.
-                proc = self.req + '.processing'
-                try:
-                    os.replace(self.req, proc)
-                except OSError:
-                    time.sleep(self.poll)
-                    continue
+                if self._claimed_request is None:
+                    proc = self.req + '.processing'
+                    try:
+                        os.replace(self.req, proc)
+                    except OSError:
+                        time.sleep(self.poll)
+                        continue
+                    self._claimed_request = proc
+                proc = self._claimed_request
                 with open(proc, 'r', encoding='utf-8',
                           errors='replace') as f:
                     text = f.read()
+                # A successful read retires the claim BEFORE disposal
+                # or handler execution.  Failed deletion cannot replay a
+                # request whose handler may already have committed.
+                self._claimed_request = None
                 try:
                     os.remove(proc)
                 except OSError:
@@ -436,13 +531,19 @@ class FileBridge(object):
                 if not text.strip():
                     time.sleep(self.poll)
                     continue
+                from .client_protocol import split_seq_header
+                # Wire identity has a fixed position after the side
+                # line, including a request rejected for an invalid side.
+                response_header, _ = split_seq_header(text.splitlines()[1:])
                 side, log_lines = parse_request(text)
+                request_consumed = True
                 if side is None:
                     # the handshake still completes: an EMPTY reply is
                     # a no-op to AiOpp, while a missing reply makes
                     # requestMove wait its full 30 s
                     print('! request without side header - ignored')
-                    atomic_write(self.resp, '')
+                    self._write_response([], response_header)
+                    response_published = True
                     continue
                 self.read_control()
                 if self.paused:
@@ -458,33 +559,33 @@ class FileBridge(object):
                                 side, self._pause_ticks) or [])
                     except Exception as _pe:
                         print('! paused_reply error: %r' % (_pe,))
-                    atomic_write(self.resp,
-                                 '\n'.join(keep) if keep else '')
-                    self.write_status(state='paused',
-                                      note='PAUSED by user')
+                    reply_status = dict(state='paused', note='PAUSED by user')
+                    self._write_response(keep, response_header, reply_status)
+                    response_published = True
+                    self.write_status(**reply_status)
                     print('[%s] PAUSED (tick %d)'
                           % (side, self._pause_ticks))
                     continue
                 self._pause_ticks = 0
-                self.write_status(state='thinking',
-                                  requesting=str(side))
                 t0 = time.time()
-                out = handler(Request(side, log_lines, text))
+                with self._request_heartbeat(Request(side, log_lines, text)):
+                    out = handler(Request(side, log_lines, text))
                 self._err_note = ''      # a good cycle clears it
                 if isinstance(out, tuple):
                     lines, how = out
                 else:
                     lines, how = out, ''
                 lines = list(lines or [])
-                atomic_write(self.resp,
-                             '\n'.join(lines) if lines else '')
                 # waiting_on: the state machine's own words, ALWAYS
                 # surfaced (USER 2026-08-16: "it should say what it's
                 # waiting on")
-                self.write_status(
+                reply_status = dict(
                     state='idle', waiting_on=str(how)[:140],
                     note=(str(how)[:140]
                           if 'waiting for your' in str(how) else ''))
+                self._write_response(lines, response_header, reply_status)
+                response_published = True
+                self.write_status(**reply_status)
                 print('[%s] %4d log lines -> %s (%.2fs) | %d line(s)'
                       % (side, len(log_lines), how or '-',
                          time.time() - t0, len(lines)))
@@ -502,13 +603,19 @@ class FileBridge(object):
                 # was waiting on' class.  The panel is the only channel
                 # a diagnostic may use (chat is whitelist-by-
                 # construction and must never carry server errors).
-                print('! server cycle error: %r' % (e,))
+                if self._err_note != str(e):
+                    print('! server cycle error: %r' % (e,))
                 self._err_note = str(e)
                 try:
-                    # complete the handshake (empty reply = no-op to
-                    # AiOpp; no reply = a 30 s wait per failed cycle
-                    # before the client re-requests)
-                    atomic_write(self.resp, '')
+                    # A handler error completes this identified request
+                    # with a no-op.  A publication error retains the
+                    # handler's output; a later panel/status error must
+                    # never overwrite an already published response.
+                    if (request_consumed and self._pending_response is None
+                            and not response_published):
+                        self._write_response([], response_header, dict(
+                            state='error', waiting_on=str(e)[:140],
+                            note=str(e)[:400]))
                 except Exception:
                     pass
                 try:
