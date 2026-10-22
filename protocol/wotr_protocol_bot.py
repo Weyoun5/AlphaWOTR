@@ -1687,6 +1687,68 @@ def setup_discard(bot, st, dec, view):
     return ('discard', None)
 
 
+def _sail_in(bot, st, b, frm, reg, atk):
+    """Corsairs of Umbar: the referee's battle is fought from Umbar (the
+    attackers advance by themselves on a win); the engine moves the Army
+    into the region first and fights there (event_effects
+    _effect_corsairs_of_umbar: attacker_region = defender_region).  Moves
+    the attacking figures of [frm] into [reg] as that effect does and
+    returns the frozen Shadow garrison of [reg] for a relief landing (a
+    besieged Shadow Stronghold: the garrison stays inside, the landed
+    force fights the besiegers), else None."""
+    from army_card_cargo import inventory, freeze
+    from combat import garrison_side_for
+    names = bot.names
+    src = army_at(st, frm)
+    if src is None:
+        return None
+    relief = None
+    if (reg in st.besieged_strongholds
+            and garrison_side_for(st, reg) is atk and army_at(st, reg)):
+        relief = freeze(inventory(st, reg))
+    want = None
+    if b.get('attackers'):
+        want = {}
+        for p in b['attackers']:
+            k = (p.get('nation'), p.get('unit'))
+            want[k] = want.get(k, 0) + int(p.get('n', 0))
+
+    def take(k):
+        # without the referee's list: every figure of the attacker
+        if want is None:
+            return True
+        if want.get(k, 0) > 0:
+            want[k] -= 1
+            return True
+        return False
+
+    dst = gl.get_or_create_army(st, reg)
+    keep_units = []
+    for u in src.units:
+        unit = 'regular' if u.kind is gs.UnitKind.REGULAR else 'elite'
+        if (ai._side_of_nation(u.nation) is atk
+                and take((names.nation_out[u.nation], unit))):
+            dst.units.append(u)
+        else:
+            keep_units.append(u)
+    keep_leaders = []
+    for ld in src.leaders:
+        tn = type(ld).__name__
+        if gl._leader_side(ld) is not atk or gl._is_saruman(ld):
+            go = False
+        elif tn == 'Nazgul':
+            go = take(('SAURON', 'nazgul'))
+        elif tn == 'Leader':
+            go = take((names.nation_out[ld.nation], 'leader'))
+        else:
+            go = True           # a Minion goes with the Army
+        (dst.leaders if go else keep_leaders).append(ld)
+    src.units, src.leaders = keep_units, keep_leaders
+    if not (src.units or src.leaders):
+        st.armies = dict((k, a) for k, a in st.armies.items() if a is not src)
+    return relief
+
+
 def _battle(bot, st, view, phase, rounds_fought):
     """The engine's pending_combat for the referee's battle."""
     names = bot.names
@@ -1700,6 +1762,13 @@ def _battle(bot, st, view, phase, rounds_fought):
         return None
     kind = b.get('battle')
     meta = board.regions.get(reg, {})
+    sailed = frm != reg and reg not in BOARD.adjacent(frm)
+    relief = None
+    if sailed:
+        # only Corsairs of Umbar attacks a region not adjacent
+        relief = _sail_in(bot, st, b, frm, reg, atk)
+        pre_siege = reg in st.besieged_strongholds
+        frm = reg
     pc = {'attacker_region': frm, 'defender_region': reg,
           'attacker_side': atk, 'defender_side': other(atk),
           'is_siege': kind == 'siege',
@@ -1710,6 +1779,13 @@ def _battle(bot, st, view, phase, rounds_fought):
           'def_casualty_policy': 'preserve_elites'}
     if b.get('white_rider'):
         pc['gtw_shine'] = True
+    if sailed:
+        # as the engine's own landing: the Shadow may not cease the
+        # battle, unless it joins a siege already under way
+        pc['attacker_no_retreat'] = not pre_siege or relief is not None
+        if relief is not None:
+            pc['is_siege'] = False
+            pc['corsairs_relief_garrison'] = relief
     # A rearguard: the units of the attacker's region not in the attack
     if frm != reg and b.get('attackers'):
         want = {}

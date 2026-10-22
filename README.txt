@@ -149,6 +149,10 @@ PLAY THROUGH THE WotR BOT PROTOCOL (other bots, hosted matches)
   engine has no matching decision a plain rule answers, and the log
   says so ("fallbacks" in the end-of-game line).
 
+  Test (plain Python, a few seconds): python -I protocol/test_corsairs.py
+  (Corsairs of Umbar's battle, which a referee reports as fought from
+  Umbar, set up as the engine's co-located landing battle).
+
 CREDITS / LICENSE
   AlphaWOTR code (engine, bridge, panel, nets): MIT - see LICENSE.
   War of the Ring is a board game by Ares Games (Roberto Di Meglio,
