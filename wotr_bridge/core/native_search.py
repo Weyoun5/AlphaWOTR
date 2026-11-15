@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import platform
 import sys
 import threading
 from types import ModuleType
@@ -19,6 +20,11 @@ BACKEND = ROOT / 'native_backend'
 CORE = BACKEND / 'experiments/native_search_core'
 OWN = CORE / 'own_value_controller_sep13'
 DEFAULT_BOX = BACKEND / 'live_search_oct19'
+# The library that is loaded: on Windows the box's own MSVC build; on every other platform the runtime box its
+# build_portable.py made there for this platform (platform/<tag>).  The pin is the box's on every platform: it
+# certifies Python sources and data, which do not differ.
+RUNTIME_BOX = DEFAULT_BOX if os.name == 'nt' else DEFAULT_BOX / 'platform' / (
+    '%s-%s' % (sys.platform, platform.machine().lower()))
 _loaded = None
 _lock = threading.Lock()
 
@@ -127,9 +133,13 @@ def verify_executed_boundary(files, pinned):
 def load(ai):
     """Return the verified controller and its startup receipt; no fallback."""
     global _loaded
-    box = Path(os.environ.get('WOTR_LIVE_NATIVE_BOX', DEFAULT_BOX)).resolve()
+    box = Path(os.environ.get('WOTR_LIVE_NATIVE_BOX', RUNTIME_BOX)).resolve()
+    if not (box / 'build' / 'manifest.json').is_file():
+        raise RuntimeError('The search library is not built for this platform: run  python %s  (%s is missing)'
+                           % (DEFAULT_BOX / 'build_portable.py', box / 'build' / 'manifest.json'))
+    own_pin = box / 'reference_live.json'
     reference = Path(os.environ.get('WOTR_LIVE_NATIVE_REFERENCE',
-                                   box / 'reference_live.json')).resolve()
+                                   own_pin if own_pin.is_file() else DEFAULT_BOX / 'reference_live.json')).resolve()
     with _lock:
         if _loaded is not None:
             old_ai, old_box, old_reference, native, identity = _loaded

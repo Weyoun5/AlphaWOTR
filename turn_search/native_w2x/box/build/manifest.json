@@ -154,7 +154,7 @@
     "cpp\\minion_muster.inc": "713f57f194d6f4d704ec93c5ce25ecd8c19ffc9ebc7d31de9cf85a565312a4f9",
     "cpp\\mouth_move.inc": "955c941be4bb5195b7ee3e6e2afa5a655270cd91d3b1ec47491f76d35fcec76c",
     "cpp\\movement_effects.inc": "acb588f75418ee247b19fc02473355f2824c51cbc83f9be78f1b05219b9b3052",
-    "cpp\\muster_action.inc": "d3351853b181896fdcf1c9ca0ee531ac4935ae0c1dfc7f49dd16b2e6eba2f420",
+    "cpp\\muster_action.inc": "dd1aa3b5e0a3fdf40426068699e68aab5a9afb1a4c3b602225d4bc370cee5603",
     "cpp\\muster_menu.inc": "2db5c70ebef19cf0a00b148fd68f3a406f8196db6edccbfc61ffd31ec0cac12b",
     "cpp\\nazgul_move.inc": "17be55bca5974cc7c7f2d155b1c7e50fb31e82e7add3b4cfaa2ccf541d1712eb",
     "cpp\\nazgul_siege_hunt.inc": "27d1b336f29bbcd887f82989a4666486d64656fddc1d809fae07647e4e09931d",
@@ -265,9 +265,9 @@
     "vendor\\mimalloc-3.5.3\\src\\threadlocal.c": "01dbaacd5ac6685dc59c40d82a3f8932e5290d4d05f9a441424e4ea53e1ba973",
     "vendor\\PROVENANCE.json": "5700f3bb381585a2e3044103bf3dc8ea65d28407dc3f96238327b6d269222e97"
   },
-  "binary": "C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\7a03b2d285c98719fd49\\wotr_native.dll",
-  "binary_relative": "build\\7a03b2d285c98719fd49\\wotr_native.dll",
-  "binary_sha256": "ee98afccb26a30632837f07287eefca5d725a34e57cd85f9ea8ec937f7e9e6d4",
+  "binary": "C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\398d3ad474e96102e102\\wotr_native.dll",
+  "binary_relative": "build\\398d3ad474e96102e102\\wotr_native.dll",
+  "binary_sha256": "1fef0e28aec1a773d1a3e0f30a9dd00aafe73774e8bb80252c28d3f3f235e0fe",
   "command": [
     "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\HostX64\\x64\\cl.exe",
     "/nologo",
@@ -286,18 +286,18 @@
     "C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\cpp\\raw_game.cpp",
     "C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\cpp\\random_stream.cpp",
     "C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\cpp\\allocator_mimalloc.cpp",
-    "C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\7a03b2d285c98719fd49\\mimalloc_static.obj",
+    "C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\398d3ad474e96102e102\\mimalloc_static.obj",
     "/link",
-    "/OUT:C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\7a03b2d285c98719fd49\\wotr_native.dll",
-    "/IMPLIB:C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\7a03b2d285c98719fd49\\wotr_native.lib",
-    "/MAP:C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\7a03b2d285c98719fd49\\wotr_native.map",
+    "/OUT:C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\398d3ad474e96102e102\\wotr_native.dll",
+    "/IMPLIB:C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\398d3ad474e96102e102\\wotr_native.lib",
+    "/MAP:C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\398d3ad474e96102e102\\wotr_native.map",
     "psapi.lib",
     "shell32.lib",
     "user32.lib",
     "advapi32.lib",
     "bcrypt.lib",
     "/LTCG",
-    "/USEPROFILE:PGD=C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\7a03b2d285c98719fd49\\profile.pgd"
+    "/USEPROFILE:PGD=C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\398d3ad474e96102e102\\profile.pgd"
   ],
   "allocator_command": [
     "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\HostX64\\x64\\cl.exe",
@@ -318,17 +318,17 @@
     "/DMI_STATIC_LIB",
     "/IC:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\vendor\\mimalloc-3.5.3\\include",
     "C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\vendor\\mimalloc-3.5.3\\src\\static.c",
-    "/FoC:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\7a03b2d285c98719fd49\\mimalloc_static.obj"
+    "/FoC:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\398d3ad474e96102e102\\mimalloc_static.obj"
   ],
   "compiler_sha256": "88c8344236a27a6e727e0a8edc49aaa2690bdc7a9464b9d18cc7abe70a9f1c0d",
   "platform": "Windows-10-10.0.26200-SP0",
-  "seconds": 48.086404800007585,
+  "seconds": 47.76780219998909,
   "compiler_variant": "pgo_optimize",
-  "pgo_profile": "C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\7a03b2d285c98719fd49\\profile.pgd",
+  "pgo_profile": "C:\\Users\\sarve\\Downloads\\WOTR_AI_training\\claude_bugscan_2026-10-21\\turnsearch_1114\\native_w2x\\box\\build\\398d3ad474e96102e102\\profile.pgd",
   "pgo_inputs": {
-    "profile_sha256": "2ddf8ddb6eb159f2fad03a7098ab6dbf244d1780fa1bba5d6f437541b0fa579e",
-    "training_sha256": "c7622341651cff02f49378441d1d56c8d5d907ff81a583748dabd4bb15508688",
-    "instrument_binary_sha256": "026b29f300236cf57b4acda143d41a02d35beb3821ffd8fa21935ca4fbbbc584"
+    "profile_sha256": "42032d895e1e117c5a23ee0eddafd023b32c1bc1466c63040ae90e97ea34148a",
+    "training_sha256": "ea7ced2dcfd01e6ac1242c64704a6faec51489fd25d64ec2f248528421d818ca",
+    "instrument_binary_sha256": "21bbef99bdd8935bacf97c018920f2159fb6bd90ff5817ab7fca5c9709f25ce0"
   },
   "instrument_runtime": {},
   "scope": "native raw-game generator (claude_bugscan_2026-10-21/native_raw); not the live box"

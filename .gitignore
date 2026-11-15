@@ -16,6 +16,10 @@ wotr_bridge/play_client/logs/**/*.vlog
 wotr_bridge/play_client/WOTR-GandalfV8.jar
 # the bundled Python runtime (ships in the GitHub Release zip, not the repo)
 python/
+# a Mac or Linux PC's own Python environment and the search libraries it built
+.venv/
+native_backend/live_search_oct19/platform/
+turn_search/native_w2x/box/platform/
 # logs
 *.log
 # python bytecode, extensions built for one Python version

@@ -69,17 +69,24 @@ def main():
                 print("turn-search service: could not write %s: %s" % (args.tell, error), flush=True)
     if args.parent:
         # the service lives exactly as long as the AI server that started it
-        import ctypes
         import threading
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.OpenProcess.restype = ctypes.c_void_p
-        k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        handle = k32.OpenProcess(0x00100000, False, int(args.parent))          # SYNCHRONIZE
+        if os.name == "nt":
+            import ctypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = ctypes.c_void_p
+            k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            handle = k32.OpenProcess(0x00100000, False, int(args.parent))          # SYNCHRONIZE
 
-        def watch():
-            while True:
-                if not handle or k32.WaitForSingleObject(handle, 2000) != 0x102:   # not WAIT_TIMEOUT: the parent is gone
-                    os._exit(0)
+            def watch():
+                while True:
+                    if not handle or k32.WaitForSingleObject(handle, 2000) != 0x102:   # not WAIT_TIMEOUT: the parent is gone
+                        os._exit(0)
+        else:
+            def watch():                # (a process whose parent ended is handed to another parent)
+                while True:
+                    if os.getppid() != int(args.parent):
+                        os._exit(0)
+                    time.sleep(2)
         threading.Thread(target=watch, daemon=True).start()
     path = Path(__file__).resolve().parent / "search_settings.json"
     settings = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
@@ -216,7 +223,7 @@ def main():
         finally:
             base.close()
 
-    with Listener(args.pipe, family="AF_PIPE", authkey=b"wotr-turn-search") as listener:
+    with Listener(args.pipe, authkey=b"wotr-turn-search") as listener:       # (a pipe or a socket file: by the address)
         while True:
             conn = listener.accept()
             try:

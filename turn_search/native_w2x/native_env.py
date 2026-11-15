@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import platform
 import sys
 
 import numpy as np
@@ -28,6 +29,10 @@ ROOT = Path(os.environ.get("WOTR_TREE") or HERE.parents[2])     # the code tree:
 ORIGINAL = ROOT / "claude_bugscan_2026-10-21" / "native_w2"
 BACKEND = ROOT / "native_backend"
 BOX = HERE / "box"
+# The library that is loaded: on Windows the box's own MSVC build; on every other platform the runtime box that
+# box/build_portable.py made there for this platform (box/platform/<tag>).  WOTR_TS_BOX names another (a check).
+RUNTIME_BOX = Path(os.environ.get("WOTR_TS_BOX") or (
+    BOX if os.name == "nt" else BOX / "platform" / ("%s-%s" % (sys.platform, platform.machine().lower())))).resolve()
 PIN = ORIGINAL / "NATIVE_RAW_PIN.json"      # the certified folder's engine pin (this copy adds one export)
 PHASES = {0: "opening", 1: "declaration", 3: "preaction", 5: "actions"}
 ROUTES = {1: "military", 2: "ring_destroyed", 3: "ring_corruption"}
@@ -73,13 +78,16 @@ def load(ai, *, verify_pin=True):
     import bridge
     if bridge._LIB is None:
         original = bridge.HERE
-        bridge.HERE = BOX
+        if not (RUNTIME_BOX / "build" / "manifest.json").is_file():
+            raise RuntimeError("the fast engine is not built for this platform: run  python %s  (%s is missing)" % (
+                BOX / "build_portable.py", RUNTIME_BOX / "build" / "manifest.json"))
+        bridge.HERE = RUNTIME_BOX
         try:
             bridge.library()
         finally:
             bridge.HERE = original
     resident = Path(bridge._LIB._name).resolve()
-    if not resident.is_relative_to((BOX / "build").resolve()):
+    if not resident.is_relative_to((RUNTIME_BOX / "build").resolve()):
         raise RuntimeError(f"another native library is resident ({resident}); load the raw generator first")
     bridge.load_reference = lambda: ai
     import snapshot

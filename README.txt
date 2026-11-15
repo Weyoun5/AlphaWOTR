@@ -26,6 +26,22 @@ INSTALL
   Git clone instead: Python 3.10+, then  pip install -r requirements.txt
     (set ALPHAWOTR_PYTHON=<python.exe> to force one).  The repository
     holds everything but the python\ runtime.
+  Mac (and Linux): see MAC below.  New and not yet played on a real Mac.
+
+MAC (and Linux)
+  Git clone the repository (the release zip is the Windows build).
+  Needs: Python 3.10+, Java 8+, the C++ compiler ( xcode-select --install ),
+  macOS 13.3 or newer.
+  Setup_Mac.command    once: makes .venv, installs the packages, builds
+                       the two search libraries for your Mac (they ship
+                       as sources), starts the AI server once as a test
+  Play_vs_AI.command   as Play_vs_AI.bat:  Play_vs_AI.command SA COR
+  The turn search runs on the processor there (the Mac's GPU is not
+  used), so the slider starts at 1.
+  python wotr_bridge/selftest.py   checks that the libraries you built
+  pick the same moves as the Python engine, and that the turn search
+  answers.  If it fails, please send its output.
+  Messages inside the client still say "Play_vs_AI.bat".
 
 PLAY
   Play_vs_AI.bat          pick your side and the AI's net; the game client opens

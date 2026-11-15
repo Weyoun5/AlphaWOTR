@@ -65,6 +65,8 @@ BAT_PATH = os.path.join(ROOT, 'Play_vs_AI.bat')
 
 PY = r'C:\ProgramData\spyder-6\envs\spyder-runtime\python.exe'
 PYW = r'C:\ProgramData\spyder-6\envs\spyder-runtime\pythonw.exe'
+if os.name != 'nt':     # (not Windows: no development runtime to fall back on - the Python that runs this)
+    PY = PYW = sys.executable
 
 # the deployed nets: league_main's four final mains (cycle 200, 2M learning
 # games each; USER 2026-11-01 "give alphawotr the option to load any of the
@@ -194,7 +196,7 @@ SERVER_TOKENS = ('{py}', '-u', '-m', 'core.server',
 JAVA_MIN = 8
 
 JAVA_TOKENS = ('java',
-               '-javaagent:' + FEED_JAR + '={client}\\' + FEED_NAME,
+               '-javaagent:' + FEED_JAR + '={feed}',
                '-Dai.feed.aiside={side}',
                '-Dai.python={pyw}',
                '-Dai.bridgedir={bridge}',
@@ -235,7 +237,7 @@ WATCH_JAVA_OPTS = ('-Dai.feed.blinding=off', '-Dai.side=' + WATCH_SIDE,
 _FEED_SIDE_TOKEN = '-Dai.feed.aiside={side}'
 
 # tokens whose substituted value is a path (quoted in the bat)
-_PATH_TOKENS = ('{py}', '{client}', '{pyw}', '{bridge}')
+_PATH_TOKENS = ('{py}', '{client}', '{pyw}', '{bridge}', '{feed}')
 
 
 def head_env(base=None):
@@ -266,7 +268,7 @@ def java_cmd(client_dir, ai_side, pythonw=PYW, bridge_dir=BRIDGE_DIR,
     AUTO (watch): -Dai.feed.aiside=none + WATCH_JAVA_OPTS right after it."""
     ai_side = _side(ai_side)
     watch = ai_side == WATCH_SIDE
-    toks = [t.format(client=client_dir,
+    toks = [t.format(client=client_dir, feed=os.path.join(client_dir, FEED_NAME),
                      side=WATCH_FEED_SIDE if watch else ai_side,
                      pyw=pythonw, bridge=bridge_dir, net=_net(net_tag))
             for t in JAVA_TOKENS]
@@ -317,7 +319,7 @@ def bat_java_line():
     """java_cmd() in the bat's variables: FEEDSIDE is SA / FP / none and
     WATCHOPTS is WATCH_JAVA_OPTS in watch mode, undefined (expands to
     nothing) otherwise; the bat's :sidechosen block sets both."""
-    toks = _bat_tokens(JAVA_TOKENS, client='!PLAY!', side='%FEEDSIDE%',
+    toks = _bat_tokens(JAVA_TOKENS, client='!PLAY!', feed='!PLAY!\\' + FEED_NAME, side='%FEEDSIDE%',
                        pyw='!PYW!', bridge='!BRIDGE!', net='%NETTAG%')
     i = JAVA_TOKENS.index(_FEED_SIDE_TOKEN) + 1
     toks[i:i] = ['%WATCHOPTS%']

@@ -19,23 +19,28 @@
  },
  "read_outside_the_python_installation": 502,
  "libraries": [
-  "native_w2x/box/build/7a03b2d285c98719fd49/wotr_native.dll"
+  "native_w2x/box/build/398d3ad474e96102e102/wotr_native.dll"
  ],
  "files": {
-  "native_w2x/box/build/7a03b2d285c98719fd49/wotr_native.dll": {
-   "sha256": "ee98afccb26a30632837f07287eefca5d725a34e57cd85f9ea8ec937f7e9e6d4",
+  "native_w2x/box/build/398d3ad474e96102e102/wotr_native.dll": {
+   "sha256": "1fef0e28aec1a773d1a3e0f30a9dd00aafe73774e8bb80252c28d3f3f235e0fe",
    "bytes": 3766784,
-   "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/build/7a03b2d285c98719fd49/wotr_native.dll"
+   "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/build/398d3ad474e96102e102/wotr_native.dll"
   },
   "native_w2x/box/build/manifest.json": {
-   "sha256": "f7b885c407e906dc43fd009a932b0a0668cf6198f4694377c5a73d1b5ffbb113",
-   "bytes": 31729,
+   "sha256": "daa1905b42b12e56fced887e89ac121959d81bdbad952a402aea46c14297bd49",
+   "bytes": 31728,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/build/manifest.json"
   },
   "native_w2x/box/build.py": {
    "sha256": "0f58eb981fe27e6bc71ff0672c862042eeb4cd04f8ba23b2c7bd5366b9449a08",
    "bytes": 7855,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/build.py"
+  },
+  "native_w2x/box/build_portable.py": {
+   "sha256": "da5371755c20e5baedd4525d8d35d46812171f449dfaee3257146c7b30277250",
+   "bytes": 8727,
+   "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/build_portable.py"
   },
   "native_w2x/box/cpp/action_clone.inc": {
    "sha256": "7fff6d3bb2bef52ed0d9be1022d38cea1b5a121afb326ff06104d5fdfc6187d2",
@@ -783,8 +788,8 @@
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/movement_effects.inc"
   },
   "native_w2x/box/cpp/muster_action.inc": {
-   "sha256": "d3351853b181896fdcf1c9ca0ee531ac4935ae0c1dfc7f49dd16b2e6eba2f420",
-   "bytes": 9610,
+   "sha256": "dd1aa3b5e0a3fdf40426068699e68aab5a9afb1a4c3b602225d4bc370cee5603",
+   "bytes": 9625,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/muster_action.inc"
   },
   "native_w2x/box/cpp/muster_menu.inc": {
@@ -1072,6 +1077,11 @@
    "bytes": 29191,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/include/wotr_snapshot.h"
   },
+  "native_w2x/box/portable/intrin.h": {
+   "sha256": "e5a53cd7c22e430dddb268ca227692bebc4cce5b0fd2409c8e19a120c1481e4d",
+   "bytes": 1377,
+   "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/portable/intrin.h"
+  },
   "native_w2x/box/vendor/mimalloc-3.5.3/CMakeLists.txt": {
    "sha256": "f06ff097ad6f5714547934da4d0dacd043aa3f960cc663a547fc288795747169",
    "bytes": 54017,
@@ -1333,8 +1343,8 @@
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/vendor/PROVENANCE.json"
   },
   "native_w2x/native_env.py": {
-   "sha256": "5ef0f9eff850834f5be915d0b3bb3b37ea7fcc0bc680eb8560df9d25edd5b435",
-   "bytes": 31437,
+   "sha256": "6e2acaea6bc90704281a46db83744b2bbe08ad844413d65d35ab516d4ac01ad0",
+   "bytes": 32136,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/native_env.py"
   },
   "nets/policy/fp_mil/fp_seed.pt": {
@@ -2529,8 +2539,8 @@
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/ts_pool.py"
   },
   "ts_service.py": {
-   "sha256": "29a1a41ea233bc0c599cb81c219972d02f2e05f8104a77123e757bbfaf0aaed7",
-   "bytes": 15824,
+   "sha256": "89dc70cbac688defa7d3a9dcbc422a6d48143c6584fe03eed24dc8878bc6cf76",
+   "bytes": 16190,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/ts_service.py"
   },
   "tscommon.py": {

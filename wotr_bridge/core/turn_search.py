@@ -29,6 +29,7 @@ import os
 import pickle
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -36,7 +37,7 @@ FLAG = Path(__file__).resolve().parents[1] / 'turn_search.json'
 GAME = FLAG.parents[1]          # the game's folder: a path of the file that is not absolute is a place in the game
 GPU_FAILED, CANNOT_RUN = 4, 5   # the service's exit codes (the kit's ts_device.py)
 TOLD = 'ai_turn_search.json'    # in the client's folder: what the PC gives, in the service's own words (its --tell)
-_S = {'proc': None, 'conn': None, 'cfg': None, 'fails': 0, 'off': False, 'log': None, 'told': None,
+_S = {'proc': None, 'conn': None, 'cfg': None, 'fails': 0, 'off': False, 'cannot_run': False, 'log': None, 'told': None,
       'asked': 0, 'switched': 0, 'seconds': 0.0, 'nets': {}, 'unknown': set(), 'device': None, 'slow': {}}
 
 
@@ -58,6 +59,12 @@ def config():
 
 def _say(text):
     print('  [turn search] ' + text, flush=True)
+
+
+def channel(name, windows=os.name == 'nt'):
+    """The address of the channel to the service: a named pipe on Windows, a socket file in the temporary folder
+    elsewhere (the connection tells the two apart by the address)."""
+    return '\\\\.\\pipe\\' + name if windows else os.path.join(tempfile.gettempdir(), name + '.sock')
 
 
 def gpu():
@@ -107,13 +114,13 @@ def start(net_tag=None, client_dir=None):
                 _say('the Python the file names is not there (%s): this server\'s own Python runs the service' % python)
                 python = sys.executable
         workers = str(cfg.get('workers', 'auto'))
-        _S['pipe'] = r'\\.\pipe\wotr_turn_search_%d_%d' % (os.getpid(), int(time.time()))
+        _S['pipe'] = channel('wotr_turn_search_%d_%d' % (os.getpid(), int(time.time())))
         _S['proc'] = subprocess.Popen(
             [python, '-B', str(kit / 'ts_service.py'), '--pipe', _S['pipe'], '--workers', workers,
              '--policy', str(GAME / cfg['policy']), '--values', str(GAME / cfg['values']), '--parent', str(os.getpid())]
             + (['--device', _S['device']] if _S['device'] else []) + (['--tell', _S['told']] if _S['told'] else []),
             cwd=str(kit), env=env, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW)
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         _S['conn'] = None
         _say('starting the service (workers: %s%s)' % (workers, ', on the processor' if _S['device'] == 'cpu' else ''))
         return True
@@ -140,12 +147,12 @@ def _connect(cfg):
                     deadline = time.time() + float(cfg.get('start_seconds', 180))
                     continue
             if code == CANNOT_RUN:
-                _S['off'] = True
+                _S['off'] = _S['cannot_run'] = True
                 _say('this PC cannot run the turn search now (too little free memory: turn_search_service.log): '
                      'off for this session')
             raise RuntimeError('the service ended with code %s (see turn_search_service.log)' % code)
         try:
-            _S['conn'] = Client(_S['pipe'], family='AF_PIPE', authkey=b'wotr-turn-search')
+            _S['conn'] = Client(_S['pipe'], authkey=b'wotr-turn-search')
             return _S['conn']
         except (OSError, EOFError) as error:
             last = error

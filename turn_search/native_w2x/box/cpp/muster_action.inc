@@ -2,7 +2,7 @@
 // Card abilities (including Saruman's alternatives) remain separate actions.
 uint64_t mu_enum(Snapshot& s,std::string_view type,std::string_view member){
     for(uint64_t i=0;i<s.nodes.size();++i)if(enum_is(s,i,type,member))return i;
-    const auto cls=rr_string(s,type),name=rr_string(s,member),offset=s.edges.size();
+    const auto cls=rr_string(s,type),name=rr_string(s,member);const uint64_t offset=s.edges.size();
     s.edges.push_back(cls);s.edges.push_back(name);const auto n=s.nodes.size();
     s.nodes.push_back({WOTR_ENUM,0,0,0,offset,2});return n;
 }
