@@ -12,8 +12,8 @@ Every name, file list and command line is launch_head's (the one head): this mod
   5  the last session's files are swept: game logs archived, coordination files removed, diagnostics kept as .prev
   6  the AI server is started (its console in ai_server_console.log) and waited for until its heartbeat file is there
   7  the client runs in the foreground; when its window closes the server is stopped
-On macOS the client gets Swing's own look (MAC_JAVA_OPTS): the system menu bar shows menu items only, and the AI
-menu's strength slider is a component, so the menu bar must stay in the game's window.
+On macOS the client gets Swing's own look (MAC_JAVA_OPTS), the look it has on Windows.  The menu bar is brought into
+the game's window by the client itself (AiBoot.keepBarInWindow): the bar macOS draws leaves the strength slider out.
 The file that proves a live server (ai_server.alive) is never removed here: on these systems a file a process holds
 can be unlinked, and a server that survived would keep its lock on a file nobody sees.
 """

@@ -29,8 +29,9 @@ import javax.swing.UIManager;
  *
  * A java agent (-javaagent:MenuLook.jar=FOLDER through JAVA_TOOL_OPTIONS) in the REAL client, started as a person
  * starts it (Play_vs_AI.command's wotr_bridge/play.py).  It waits for the game's window and its "AI" menu, writes
- * what is there to FOLDER/look.json (the look and feel, where the menu bar is, every entry of the AI menu, the
- * strength slider: found, at which place, showing when the menu is open), opens the menu as a click does and keeps
+ * what is there to FOLDER/look.json (the look and feel, whether the menu bar is drawn in the game's window - a bar
+ * macOS draws at the top of the screen leaves the slider out -, every entry of the AI menu, the strength slider:
+ * found, at which place, showing when the menu is open), opens the menu from the window's bar and keeps
  * three pictures of it (menu_paint.png: the open menu painted into an image; screen_robot.png and
  * screen_capture.png: the screen, by Java and by macOS), and then ends the client: 0 = looked, 3 = no AI menu came.
  * Nothing here knows the client's classes: the menu is found by its title, the slider by its name.
@@ -160,7 +161,10 @@ public class MenuLook {
             SwingUtilities.invokeAndWait(new Runnable() {
                 public void run() {
                     JMenuBar bar = (JMenuBar) ai.getParent();
-                    put("menu_bar_showing_in_window", String.valueOf(bar.isShowing()));
+                    // a bar macOS draws at the top of the screen has no height in the window, and shows menu
+                    // entries only: what this agent opens below is then NOT what a person's click opens
+                    put("menu_bar_in_window", String.valueOf(bar.isShowing() && bar.getHeight() > 0));
+                    put("menu_bar_ui", q(bar.getUI().getClass().getName()));
                     put("menu_bar_bounds", q(String.valueOf(bar.getBounds())));
                     StringBuilder entries = new StringBuilder("[");
                     int at = -1;
