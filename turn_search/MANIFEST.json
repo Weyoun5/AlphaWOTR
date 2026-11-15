@@ -38,8 +38,8 @@
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/build.py"
   },
   "native_w2x/box/build_portable.py": {
-   "sha256": "da5371755c20e5baedd4525d8d35d46812171f449dfaee3257146c7b30277250",
-   "bytes": 8727,
+   "sha256": "15201c4a0bfd325d6d03f4a48fa6fec6e389715edf1febe3ca8eb3957573f1fe",
+   "bytes": 8981,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/build_portable.py"
   },
   "native_w2x/box/cpp/action_clone.inc": {

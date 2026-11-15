@@ -1,21 +1,22 @@
-"""Build this box's native library with clang or gcc, for a PC that is not Windows (macOS, Linux).
+"""Build this box's native library on a Mac (Apple silicon), with Apple's clang.
 
-    python build_portable.py                 build for this PC, into platform/<tag>/ beside this file
+    python build_portable.py                 build for this Mac, into platform/<tag>/ beside this file
     python build_portable.py --check         say whether that build is there and whole; build nothing
 
-Windows keeps the box's own MSVC library (build.py, build/manifest.json).  Every other platform gets a RUNTIME BOX of
-its own beside it,
+Windows keeps the box's own MSVC library (build.py, build/manifest.json).  The Mac gets a RUNTIME BOX of its own
+beside it,
 
     platform/<tag>/build/manifest.json                    what the loader reads (native_backend/bridge.py library())
-    platform/<tag>/build/<identity>/libwotr_native.dylib  (.so on Linux)
+    platform/<tag>/build/<identity>/libwotr_native.dylib
 
-where <tag> is sys.platform + "-" + the machine of the Python that will load it (darwin-arm64, darwin-x86_64,
-linux-x86_64).  The loaders pick the runtime box by that same tag; nothing of the Windows box is changed.
+where <tag> is sys.platform + "-" + the machine of the Python that will load it (darwin-arm64).  The loaders pick the
+runtime box by that same tag; nothing of the Windows box is changed.  The library runs on macOS MIN_MACOS and newer,
+whatever the macOS of the Mac that built it: the Mac download carries it prebuilt (.github/mac_release.py).
 
 THE NUMBERS MUST BE THE ENGINE'S: no fused multiply-add (-ffp-contract=off; arm64 has it always and clang uses it by
 default), no fast-math, and pow / log taken from the platform's libm, never folded by the compiler
-(-fno-builtin-pow -fno-builtin-log) - the flags the Linux build of the sibling box was proven with.  The search's
-results on one platform are compared with the Python engine ON THAT PLATFORM, not with another platform's binary.
+(-fno-builtin-pow -fno-builtin-log).  The search's results on the Mac are compared with the Python engine ON THE MAC
+(wotr_bridge/selftest.py), not with the Windows binary.
 
 THE ALLOCATOR IS THE PLATFORM'S.  The Windows library replaces operator new / delete with mimalloc, linked against a
 C++ runtime of its own.  Here the C++ runtime is the system's shared one (Apple's libc++): memory the runtime
@@ -25,7 +26,8 @@ compiled, and mimalloc is not linked: a speed choice of the Windows build, never
 
 The manifest lists no sources for the loader to re-hash (as an installed runtime box): the build's own sources are
 recorded under "build_sources_sha256", and the library by its sha256, which the loader checks before it loads it.
---cxx / --flags / --tag / --no-load exist for building for another platform than this PC's (a compile check).
+--cxx / --flags / --tag / --no-load exist for a compile check on another PC (a cross-compiler; a win32 tag builds a
+Windows library with clang, to compare with the MSVC one).
 """
 import argparse
 import ctypes
@@ -44,6 +46,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 NUMERIC = ["-ffp-contract=off", "-fno-fast-math", "-fno-builtin-pow", "-fno-builtin-log"]
 CXX_FLAGS = ["-std=c++17", "-O2", "-fexceptions", "-fvisibility=hidden", "-fvisibility-inlines-hidden", "-fPIC"]
+MIN_MACOS = "14.0"              # the oldest macOS the built library loads on (and the Mac download runs on)
 
 
 def tag():
@@ -85,8 +88,7 @@ def sources():
 
 
 def library_name(platform_tag):
-    return "wotr_native.dll" if platform_tag.startswith("win") else \
-        "libwotr_native.dylib" if platform_tag.startswith("darwin") else "libwotr_native.so"
+    return "wotr_native.dll" if platform_tag.startswith("win") else "libwotr_native.dylib"
 
 
 def loads(path):
@@ -120,6 +122,8 @@ def main():
     ap.add_argument("--tag", default=tag())
     ap.add_argument("--no-load", action="store_true", help="do not load the result here (it is for another platform)")
     a = ap.parse_args()
+    if not a.tag.startswith(("darwin", "win")):
+        raise SystemExit("this builds the Mac's library; %s is not built (Windows: build.py)" % a.tag)
     box = HERE / "platform" / a.tag
     if a.check:
         manifest, why = whole(box)
@@ -127,9 +131,11 @@ def main():
         return 0 if manifest else 1
     cxx, more = shlex.split(a.cxx), shlex.split(a.flags)
     if shutil.which(cxx[0]) is None:
-        raise SystemExit("no C++ compiler found (%s).  On a Mac:  xcode-select --install" % cxx[0])
-    if a.tag.startswith("darwin") and not more:
-        more = ["-arch", a.tag.split("-", 1)[1]]                # the machine of the Python that will load it
+        raise SystemExit("no C++ compiler found (%s):  xcode-select --install" % cxx[0])
+    if a.tag.startswith("darwin"):
+        if not more:
+            more = ["-arch", a.tag.split("-", 1)[1]]            # the machine of the Python that will load it
+        more = more + ["-mmacosx-version-min=" + MIN_MACOS]
     version = subprocess.run(cxx + ["--version"], capture_output=True, text=True).stdout.strip().splitlines()[:1]
     src = sources()
     include = ["-I" + str(HERE / "include")]
@@ -138,8 +144,6 @@ def main():
     link = ["-shared"]
     if a.tag.startswith("darwin"):
         link += ["-Wl,-undefined,error"]
-    elif not a.tag.startswith("win"):
-        link += ["-Wl,-z,defs", "-pthread"]
     identity = hashlib.sha256(json.dumps(
         {"sources": src, "tag": a.tag, "compiler": version, "flags": NUMERIC + CXX_FLAGS + more + link},
         sort_keys=True).encode()).hexdigest()[:20]

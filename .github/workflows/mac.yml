@@ -1,0 +1,42 @@
+# The Mac download (AlphaWOTR-mac.zip), made and tested on an Apple-silicon Mac at every push.
+# .github/mac_release.py makes it: this checkout, a Python of its own with the packages, the two search libraries
+# built here.  It is then unzipped somewhere else and run with its own Python and nothing of this job's environment:
+# the AI server must start, and on saved positions the library and the Python engine must pick the same move
+# (wotr_bridge/selftest.py).  No game client is started.  The Windows zip is made and checked on the Windows PC.
+name: mac
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  download:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Make the Mac download
+        run: python3 .github/mac_release.py --out "$RUNNER_TEMP/made"
+      - name: Unzip it somewhere else
+        run: |
+          mkdir "$RUNNER_TEMP/fresh"
+          cd "$RUNNER_TEMP/fresh"
+          unzip -q "$RUNNER_TEMP/made/AlphaWOTR-mac.zip"
+          test -x AlphaWOTR/Play_vs_AI.command
+          bash -n AlphaWOTR/Play_vs_AI.command
+      - name: The AI server starts
+        working-directory: ${{ runner.temp }}/fresh/AlphaWOTR
+        run: env -i HOME="$HOME" TMPDIR="$TMPDIR" JAVA_HOME="$JAVA_HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin ./python/bin/python3 -B wotr_bridge/play.py --self-check
+      - name: Both searches on saved positions
+        working-directory: ${{ runner.temp }}/fresh/AlphaWOTR
+        run: env -i HOME="$HOME" TMPDIR="$TMPDIR" JAVA_HOME="$JAVA_HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin ./python/bin/python3 -B wotr_bridge/selftest.py --out "$RUNNER_TEMP/made/selftest_mac.json"
+      - name: Keep the download and what was logged
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AlphaWOTR-mac
+          compression-level: 0
+          path: |
+            ${{ runner.temp }}/made/AlphaWOTR-mac.zip
+            ${{ runner.temp }}/made/AlphaWOTR-mac.zip.sha256
+            ${{ runner.temp }}/made/selftest_mac.json
+            ${{ runner.temp }}/fresh/AlphaWOTR/turn_search/turn_search_service.log
+            ${{ runner.temp }}/fresh/AlphaWOTR/wotr_bridge/play_client/ai_server_console.log

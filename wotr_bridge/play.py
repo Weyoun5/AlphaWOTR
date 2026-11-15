@@ -1,8 +1,8 @@
-"""One session of the game on a PC without cmd (macOS, Linux): what Play_vs_AI.bat does on Windows, step for step.
+"""One session of the game on a Mac: what Play_vs_AI.bat does on Windows, step for step.
 
     python wotr_bridge/play.py [SA|FP|AUTO] [net ...]     play (Play_vs_AI.command starts this)
     python wotr_bridge/play.py --self-check               start the AI server as a session does, without the client,
-                                                          and say whether it came up (Setup_Mac.command ends with this)
+                                                          and say whether it came up (the Mac download's check)
 
 Every name, file list and command line is launch_head's (the one head): this module only walks the steps.
   1  this Python has the packages; Java is there and new enough; the client jar is there
@@ -228,7 +228,7 @@ def main(argv=None):
     lacks = packages()
     if lacks:
         say('   [X] This Python (%s) lacks a package the game needs:\n       %s' % (sys.executable, lacks))
-        say('       Run Setup_Mac.command (or:  python -m pip install -r requirements.txt).')
+        say('       The Mac download carries them (AlphaWOTR-mac.zip); in your own Python:  pip install -r requirements.txt')
         return 1
     if not check:
         exe, major = java()
