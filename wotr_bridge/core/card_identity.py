@@ -1,0 +1,249 @@
+"""Drawn-card identity from the raw request stream - BOTH hands.
+
+SANCTIONED RAW IMPORT #1 (rendered-baseline directive; REBUILD_PLAN
+Phase 3 item 2): exactly two client statements live only on the raw
+channel - this one is the COMMITMENT DECODE of drawn cards.  The
+rendered feed says only 'draws Shadow Character Card.'; which
+physical card that is exists nowhere but in the client's commitment
+tables (fact 10: at hand-claim Game.I()/J() reassign every deck
+piece's identity from the aY commitment shuffle, so the static
+alphabetical pid map is WRONG in a claimed game - PROTOCOL.md, the
+root cause of the old card desync).
+
+LIFTED (donor read-only, nothing imported from it):
+  ai_move_server._build_pid_card_map / _client_name_to_cid
+                                :539-603, :12254-12319 -> name_to_cid
+  ai_move_server._live_card_maps decode use  :12321-12375 ->
+                                CardIdentity.harvest (per-draw, not
+                                whole-roster: the live driver needs
+                                identity per draw EVENT, in feed order)
+  raw draw shape: the strict draw-TO-HAND pattern of
+  src/rendered_extract.py:111-113 (pattern copied, module NOT imported
+  - a live consumer imports nothing from rendered_extract).
+
+USER RULING 2026-08-25: "the engine should see the human hand" -
+harvest() decodes BOTH sides' draws (AiBoot claims both hands with
+one known password), so human draws resolve to real cids, the engine
+hand carries them, and get_legal_actions enumerates the human's card
+plays into the published menu.  Attribution stays by ZONE, never nick
+(Controls.45=FP hand, 46=SH hand - fact 3).  The AI's CHAT never
+names the human's cards (chat policy unchanged); only the engine and
+the human's own panel see them.
+
+The CardDecoder import comes from log_replay's re-export - the ONE
+sanctioned log_replay surface for live consumers (REBUILD_PLAN keep
+table).
+"""
+import re
+from collections import Counter
+
+# R6-DEAD-CODE-4: src/ comes from live/__init__.py's one path setup
+# (R5-LIVE-PACKAGE-SYSPATH), which runs before any submodule in every
+# package shape; this module keeps no copy of it.
+
+# the strict draw-to-hand pattern: EVERY deck menu has its OWN Controls
+# key family (491/509/0/549/557 vary by menu; the deck ZONE token
+# identifies side+deck and the hand tail distinguishes a real draw from
+# other deck events).  LIVE SPECIMENS (all three shapes are the AI's
+# own draws):
+#   $Wey<~Controls.491~>117<~Controls.492~><~Game.2004~><~Controls.493~><~Controls.45~>
+#   $Wey<~Controls.509~>119<~Controls.510~><~Game.2005~><~Controls.511~><~Controls.45~>
+#   $Wey<~Controls.0~>200<~Controls.549~><~Game.2006~><~Controls.550~><~Controls.46~>
+RAW_DRAW_RE = re.compile(r'<~Controls\.(?:491|509|0|549|557)~>(\d+)'
+                         r'<~Controls\.\d+~><~Game\.(200[4-7])~>'
+                         r'<~Controls\.\d+~><~Controls\.(45|46)~>')
+
+# deck zone -> (side_name, deck key, owning hand zone, decoder type)
+DECK_INFO = {
+    '2004': ('FREE_PEOPLES', 'character', '45', 'FP Character'),
+    '2005': ('FREE_PEOPLES', 'strategy', '45', 'FP Strategy'),
+    '2006': ('SHADOW', 'character', '46', 'SA Character'),
+    '2007': ('SHADOW', 'strategy', '46', 'SA Strategy'),
+}
+
+
+def _norm(s):
+    import unicodedata
+    s = unicodedata.normalize('NFKD', str(s)).encode(
+        'ascii', 'ignore').decode()
+    return re.sub(r'[^a-z0-9]', '', s.lower())
+
+
+_NAME_IDX = None
+_NAME_BUCKETS = None
+
+
+def _build_name_index():
+    """(side, deck, normalized-title) -> cid index over cards.py
+    (donor :12254-12286, logic kept; accent/subtitle tolerant)."""
+    global _NAME_IDX, _NAME_BUCKETS
+    if _NAME_IDX is not None:
+        return
+    from cards import get_cards
+    idx = {}
+    buckets = {}
+    for cid, c in get_cards().items():
+        sd = 'FP' if cid.startswith('FREE_PEOPLES') else 'SA'
+        dk = 'Character' if '_Character_' in cid else 'Strategy'
+        names = set()
+        for attr in ('card_name', 'combat_name', 'event_name', 'name'):
+            v = getattr(c, attr, None)
+            if v:
+                names.add(_norm(v))
+        names.add(_norm(cid.split('_', 2)[-1]))
+        names = {n for n in names if n}
+        buckets.setdefault((sd, dk), []).append((cid, names))
+        for nm in names:
+            idx.setdefault((sd, dk, nm), cid)
+            pk = (sd, dk, nm[:12])
+            # a 12-char prefix shared by two DIFFERENT cards is ambiguous:
+            # mark it so only a unique prefix ever resolves
+            if pk in idx and idx[pk] != cid:
+                idx[pk] = None
+            else:
+                idx.setdefault(pk, cid)
+    _NAME_IDX = idx
+    _NAME_BUCKETS = buckets
+
+
+# client titles that differ from the engine name beyond a leading
+# article ('A Balrog is Come!' = Balrog_of_Moria)
+_KEYWORD_ALIASES = (('balrog',), ('muster', 'long'), ('corsair',),
+                    ('nazgul', 'strike'), ('prove', 'swifter'),
+                    ('wisdom', 'elrond'))
+
+
+def name_to_cid(name, deck_type):
+    """Engine card id for a client card title, within the title's deck
+    bucket (donor _client_name_to_cid :12254-12319, logic kept).
+    None = unresolved (the caller decides how loud to be)."""
+    _build_name_index()
+    sd = 'FP' if str(deck_type).startswith('FP') else 'SA'
+    dk = 'Character' if 'Character' in str(deck_type) else 'Strategy'
+    n0 = _norm(name)
+    n1 = _norm(re.sub(r'^(the|a)\s+', '', str(name), flags=re.I))
+    hit = (_NAME_IDX.get((sd, dk, n0)) or _NAME_IDX.get((sd, dk, n1))
+           or _NAME_IDX.get((sd, dk, n0[:12]))
+           or _NAME_IDX.get((sd, dk, n1[:12])))
+    if hit:
+        return hit
+    for kws in _KEYWORD_ALIASES:
+        if not all(k in n0 for k in kws):
+            continue
+        for cid, names in _NAME_BUCKETS.get((sd, dk), []):
+            blob = ''.join(sorted(names)) + _norm(cid)
+            if all(k in blob for k in kws):
+                return cid
+    # last resort: unique containment within the deck bucket
+    cands = set()
+    for cid, names in _NAME_BUCKETS.get((sd, dk), []):
+        for nm in names:
+            if n0 and (n0 in nm or nm in n0 or n1 in nm or nm in n1):
+                cands.add(cid)
+                break
+    if len(cands) == 1:
+        return cands.pop()
+    return None
+
+
+class CardIdentity(object):
+    """Incremental decoder over the raw request stream (the client log
+    AiOpp sends whole every tick).
+
+    harvest(raw_lines) consumes only lines not yet seen (the log is
+    append-only within a session; a SHRUNK log - or, R7-CARD-HARVEST-
+    LONGER-REWRITE, one whose already-read history was rewritten, of any
+    length - resets the cursor and is surfaced as `restarted` so the
+    driver can treat it as a restart) and
+    returns one dict per NEW AI-side draw:
+        {'side', 'deck', 'cid', 'pid', 'name'}
+    cid is None when the commitment decode or the name->cid mapping
+    failed - the caller must HALT loudly (donor rule: undecodable AI
+    cards are a LIVE HALT, never a guess)."""
+
+    def __init__(self, ai_side_name, password='ai',
+                 human_password=None):
+        """Both sides decode (USER 2026-08-25: the engine sees the
+        human hand).  AiBoot claims BOTH hands with the same password
+        in the play-vs-AI head (and, X1-02, re-claims a seat held under
+        any other password), so human_password defaults to the AI one.
+        A different value is only for corpus replay (live_server
+        --script), whose client keeps the recorded commitments; a live
+        launch refuses the split (live_server.split_password_refusal).
+
+        ai_side_name None = AI vs AI (R3-AI-VS-AI-SEATS): both hands are
+        AI hands and both decode with `password`; there is no human
+        password to split."""
+        if ai_side_name is None:
+            if human_password is not None and human_password != password:
+                raise ValueError('AI vs AI decodes both hands with the AI '
+                                 'password; a human_password %r has no seat'
+                                 % (human_password,))
+        elif ai_side_name not in ('SHADOW', 'FREE_PEOPLES'):
+            raise ValueError('ai_side_name must be SHADOW or '
+                             'FREE_PEOPLES, got %r' % (ai_side_name,))
+        from log_replay import CardDecoder      # sanctioned import
+        self.ai_side = ai_side_name
+        self.decoder = CardDecoder()
+        hpw = password if human_password is None else human_password
+        if ai_side_name is None:
+            self.decoder.sa_password = self.decoder.fp_password = password
+        elif ai_side_name == 'SHADOW':
+            self.decoder.sa_password = password
+            self.decoder.fp_password = hpw
+        else:
+            self.decoder.fp_password = password
+            self.decoder.sa_password = hpw
+        self._seen = 0              # raw lines already processed
+        # R7-CARD-HARVEST-LONGER-REWRITE: the line at _seen - 1 (the
+        # fingerprint native_die_identity.history_changed compares) and the
+        # driver's recovery epoch at the last read (harvest's driver=)
+        self._tail = None
+        self._epoch_read = None
+        self._claims = set()        # claim lines already brute-forced
+        self.restarted = False      # a restarted (shrunk or rewritten) log was observed
+        self._given = Counter()     # how often each draw line of the history was handed out
+
+    def harvest(self, raw_lines):
+        """One dict per NEW draw line of the raw log (see the class doc).  A draw is handed
+        out ONCE: when the history is read again from line 0 (it shrank, or a line already
+        read changed), the draws it still holds were handed out before - handed out again
+        they would be drawn cards nobody asked for.  The line is the key: its index moves
+        when lines before it go, and the same piece may be drawn twice."""
+        lines = list(raw_lines)
+        again = len(lines) < self._seen or bool(
+            self._seen and lines[self._seen - 1] != self._tail)
+        if again:
+            self._seen = 0
+            self.restarted = True
+        start = self._seen
+        new = lines[start:]
+        self._seen = len(lines)
+        self._tail = lines[-1] if lines else None
+        out = []
+        met = Counter() if again else self._given
+        for raw_index, ln in enumerate(new, start):
+            if 'Controls.464' in ln or 'Controls.479' in ln:
+                if ln not in self._claims:
+                    self._claims.add(ln)
+                    self.decoder.preprocess_log([ln])
+            m = RAW_DRAW_RE.search(ln)
+            if m is None:
+                continue
+            pid, deck_code, hand = m.group(1), m.group(2), m.group(3)
+            side, deck, hand_zone, deck_type = DECK_INFO[deck_code]
+            if hand != hand_zone:
+                # a cross-zone oddity (deck event that is not a draw
+                # to the owning hand): never an identity claim
+                continue
+            met[ln] += 1
+            if again and met[ln] <= self._given[ln]:
+                continue
+            num = self.decoder.decode_piece(int(pid), deck_type)
+            name = (self.decoder.get_card_name(num, deck_type)
+                    if num is not None else None)
+            cid = name_to_cid(name, deck_type) if name else None
+            out.append({'side': side, 'deck': deck, 'cid': cid,
+                        'pid': pid, 'name': name, 'raw_index': raw_index})
+        self._given = met
+        return out

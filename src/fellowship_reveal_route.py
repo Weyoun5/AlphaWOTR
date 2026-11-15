@@ -5,8 +5,10 @@ import heapq
 def reachable_regions(state):
     """Map destinations within progress along passable region borders.
 
-    Gorgoroth and its neighboring regions are ordinary map destinations;
-    the Mordor Track is separate from those regions (rulebook pp. 38, 43).
+    The walk may pass through Gorgoroth and its neighbours, but the
+    declare and reveal-placement MENUS drop Mordor's interior as a pawn
+    destination (USER ruling 2026-07-20b / 1.155: the pawn reaches it only
+    via the Mordor Track after a turn-start gateway entry).
     """
     import game_logic as gl
     from board import sanitize
@@ -87,6 +89,17 @@ def place(state, destination, path=None):
     import board
     route=choose_path(state,destination,path)
     destination=route[-1]
+    # R5-FORGED-PARAM-EXECUTORS-2 (d): the learned path never places the
+    # figure INTO Mordor's interior (1.275(a) / 1.155: the menus drop it;
+    # native apply_fellowship_reveal refuses 'Reveal destination not in legal
+    # menu').  Refused before any mutation.  The route may still cross
+    # Gorgoroth (coordinator call: R5-Q-GORGOROTH-TRANSIT is open), and
+    # staying put is no entry (the stay-in-place fallback of the menu and of
+    # open_reveal_placement).  The teacher (log = truth) is unchanged.
+    import combat as _cmb_r5d
+    if (_cmb_r5d.FINAL_HITS_HOOK is None and destination in gl._MORDOR_INTERIOR
+            and destination!=route[0]):
+        raise ValueError("Reveal cannot end in Mordor's interior (%s)" % destination)
     meta=board.regions[destination]
     if ((meta.get('is_city') or meta.get('is_stronghold'))
             and gl.is_fp_region(destination)

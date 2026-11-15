@@ -449,7 +449,7 @@ class _SideParams:
                  'rr_cancelled', 'confused', 'track_ones',
                  'eff', 'name', 'has_card',
                  'ma_kind', 'ma_pay', 'ma_max', 'ma_blocked',
-                 'captains', 'policy', 'pre_kind')
+                 'captains', 'policy', 'pre_kind', 'sar_lead')
 
     def __init__(self):
         self.t = 5
@@ -472,6 +472,9 @@ class _SideParams:
         self.captains = 0
         self.policy = 'preserve_elites'
         self.pre_kind = None     # 'ss' | 'charge' | 'db' | None
+        # per Elite in army order: 1 iff it is a Saruman Leader (Isengard
+        # Elite, Saruman in play) - E2-02 mid-round Leadership drop
+        self.sar_lead = ()
 
 
 class _RoundParams:
@@ -602,6 +605,16 @@ def stage0(ctx: ExchangeContext):
     p.atk.L5 = c.attacker_leadership
     p.dfn.L5 = c.defender_leadership
     p.naz = c.nazgul_in_battle
+    # Saruman in play: each Isengard Elite is a Leader, and one lost to a
+    # pre-combat attack or Relentless Assault self-hit leaves this round's
+    # re-roll Leadership (combat._drop_saruman_elite_leadership, E2-02).
+    # apply_casualties takes the LAST Elite first under every policy, so
+    # the Elites lost before the re-roll are always the tail of this list.
+    if getattr(c, '_saruman_in_play', False):
+        for sp, army in ((p.atk, c.attacker_army), (p.dfn, c.defender_army)):
+            sp.sar_lead = tuple(int(u.nation == Nation.ISENGARD)
+                                for u in army.units
+                                if u.kind == UnitKind.ELITE)
 
     # captains of the west (WoP-cancelled captain dropped on his side).
     # No own-side filter here: 1.233 battle rosters are own-side pure
@@ -793,6 +806,20 @@ def exact_distribution(ctx: ExchangeContext,
                 emit(pr0,0,0,preA,preD,0,0,0,0,ra0,ea0,rd0,ed0,
                      ra0+ea0==0,rd0+ed0==0,(),(),on_def=preA,on_atk=preD)
                 continue
+
+        # Saruman Leaders lost before the re-roll (E2-02): the tail of the
+        # stage-0 Elite list past the Elites still standing, one Leadership
+        # point each (mirrors combat._drop_saruman_elite_leadership).
+        if base_params.atk.sar_lead or base_params.dfn.sar_lead:
+            drops = [sum(sp.sar_lead[e_now:])
+                     for sp, e_now in ((p.atk, ea0), (p.dfn, ed0))]
+            if any(drops):
+                if p is base_params:
+                    p = copy.copy(base_params)
+                    p.atk = copy.copy(base_params.atk)
+                    p.dfn = copy.copy(base_params.dfn)
+                p.atk.L5 = max(0, p.atk.L5 - drops[0])
+                p.dfn.L5 = max(0, p.dfn.L5 - drops[1])
 
         # ---- Stage B: combat rolls ----
         def _n_dice(sp, units, capt):

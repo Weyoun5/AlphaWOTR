@@ -10,6 +10,9 @@ import snapshot
 
 _CACHE = {}
 _LOCK = threading.Lock()
+# The frozen v52 observation contract the native encode_state implements; a
+# v53 observation is this vector ++ the encoding_v53 state tail.
+V52_PREFIX_CONTRACT = 'v52_observed_combat_round_v3'
 
 
 class _ImmutableTables:
@@ -39,7 +42,17 @@ def table_data(ai):
              '_BREAKING_CONTEXT_ON', '_COMBAT_ROUND_CONTEXT_ON')
     if not all(getattr(ai, flag, False) for flag in flags):
         raise ValueError('Native full observation currently requires the complete v52 contract')
-    if ai.OBSERVATION_CONTRACT != 'v52_observed_combat_round_v3':
+    # R2-D5-V53-NATIVE: under generation v53 (USER D5 2026-10-22) the tables
+    # are the complete v52 tables - 'observation_contract' stays the v52
+    # PREFIX contract the untouched native encode_state checks, because the
+    # v53 observation is that v52 vector ++ the encoding_v53 state tail -
+    # plus appended v53 keys that only wotr_snapshot_encode_state_v53 reads.
+    v53 = bool(getattr(ai, '_V53_CONTEXT_ON', False))
+    if v53:
+        import encoding_v53
+        if ai.OBSERVATION_CONTRACT != encoding_v53.OBSERVATION_CONTRACT:
+            raise ValueError('Native observation contract does not match this encoder')
+    elif ai.OBSERVATION_CONTRACT != V52_PREFIX_CONTRACT:
         raise ValueError('Native observation contract does not match this encoder')
     vp = gl._vp_settlement_tables()
     # Entry/capture source helpers use this faction spelling map, which differs
@@ -51,9 +64,9 @@ def table_data(ai):
         southron=gs.Nation.SOUTHRON_EASTERLINGS)
     movement_nations.update({'the north': gs.Nation.THE_NORTH,
         'southrons and easterlings': gs.Nation.SOUTHRON_EASTERLINGS})
-    return {
+    data = {
         'schema': 'wotr_native_observation_tables_v1',
-        'observation_contract': ai.OBSERVATION_CONTRACT,
+        'observation_contract': V52_PREFIX_CONTRACT,
         'feature_count': 4647,
         'region_keys': list(ai.ALL_REGION_KEYS),
         'nation_names': [nation.name for nation in ai.ALL_NATIONS],
@@ -93,14 +106,32 @@ def table_data(ai):
         'fp_vp_victory': gl.FP_VP_VICTORY,
         'shadow_vp_victory': gl.SHADOW_VP_VICTORY,
     }
+    if v53:   # appended after the unchanged v52 body (graph key order preserved)
+        data['observation_contract_v53'] = encoding_v53.OBSERVATION_CONTRACT
+        data['feature_count_v53'] = 4647 + encoding_v53.STATE_TAIL_DIM
+        data['v53_state_tail_dim'] = encoding_v53.STATE_TAIL_DIM
+    return data
 
 
 def native_tables(ai):
-    """One owned, immutable table handle per reference module for this process."""
+    """One owned, immutable table handle per reference module AND victory thresholds.
+
+    game_logic.FP_VP_VICTORY / SHADOW_VP_VICTORY are module globals the Python
+    engine reads live; episodes set SHADOW_VP_VICTORY from config['shadow_vp']
+    and engine_play from --shadow-vp.  The native terminal check and the
+    vp_limit observation feature read them from this graph, so the cache key
+    carries the current values: a handle built at another threshold is never
+    returned (Q1-03).  Callers must therefore re-resolve per use, not pin one.
+    """
+    gl = ai.game_logic
+    key = (ai, gl.FP_VP_VICTORY, gl.SHADOW_VP_VICTORY)
     with _LOCK:
-        result = _CACHE.get(ai)
+        result = _CACHE.get(key)
         if result is None:
-            owner = snapshot.NativeSnapshot.from_graph(snapshot.encode_graph(ai, table_data(ai)))
+            data = table_data(ai)
+            if (ai, data['fp_vp_victory'], data['shadow_vp_victory']) != key:
+                raise RuntimeError('Victory thresholds changed while native observation tables were built')
+            owner = snapshot.NativeSnapshot.from_graph(snapshot.encode_graph(ai, data))
             try:
                 if owner._lib.wotr_snapshot_prepare_observation_tables(owner._pointer):
                     raise snapshot._error(owner._lib)
@@ -108,5 +139,5 @@ def native_tables(ai):
             except BaseException:
                 owner.close()
                 raise
-            _CACHE[ai] = result
+            _CACHE[key] = result
         return result

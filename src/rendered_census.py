@@ -38,7 +38,9 @@ import re
 import sys
 import glob
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# insert only when absent (one copy per process; src/ module names are unique on sys.path)
+if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', '-1')
 os.environ.setdefault('PYTHONHASHSEED', '0')
@@ -395,10 +397,16 @@ def _tile_obj(gs, name):
     # damage is equal to the subsequent roll of a die ... A negative value
     # (-2 or -1) means that there is no Hunt damage and instead the
     # indicated number is actually subtracted from the current Corruption".
+    # R17-CORPUS-CENSUS: compare FOLDED names (accents, case and punctuation
+    # dropped). The logs spell 'Smeagol' in ASCII and keep the comma of
+    # 'On, On They Went' (C6-04), while the engine keys are 'Sm\xe9agol ...'
+    # and 'On On They Went'; an exact compare returned None for every draw of
+    # the latter, as for a tile the engine does not model. The same fold as
+    # log_replay._tile_fold_name (C5-03) and rendered_mordor_pool.tile.
+    from rendered_mordor_pool import _norm as _fold
+    n9 = _fold(n)
     for key, tile in getattr(gs, 'SPECIAL_HUNT_TILES', {}).items():
-        # accent-fold: engine keys 'Sm\xe9agol...', logs spell ASCII
-        k9 = key.strip().lower().replace('\xe9', 'e')
-        if k9 == n or key.strip().lower() == n:
+        if n9 and _fold(key) == n9:
             return copy.deepcopy(tile)
     return None
 
@@ -416,15 +424,28 @@ def _tile_obj(gs, name):
 #   the engine reproduces them by construction; only the rule resolvers can
 #   diverge, and those divergences are the honest engine-handler signal.
 # --------------------------------------------------------------------------
+# Named minions: nation + engine Leadership (combat.calc_leadership and the
+# game_state ShadowMinion records: Witch-king 2, Saruman 1, Mouth of Sauron 2;
+# C7-06: the Mouth read 1 here).  Only the nation ([0]) is read
+# (_state_from_snapshot builds game_logic.Minion, whose Leadership the
+# engine's calc_leadership supplies); the Leadership value ([1]) is
+# documentation, pinned to the engine by test_fixwave_C7_06.
 _LDR_META = {'Witch King': ('SAURON', 2), 'Saruman': ('SAURON', 1),
-             'Mouth of Sauron': ('SAURON', 1)}
+             'Mouth of Sauron': ('SAURON', 2)}
+# C7-06: (Level, Leadership) of the companions that enter play mid-game - the
+# engine's own figures (game_logic transform_gandalf_white / crown_aragorn).
+# The seven starting companions read theirs from setup_initial_game.
+_LATE_COMPANION_STATS = {'Gandalf the White': (3, 1), 'Aragorn': (3, 2)}
 
 
 def _state_from_snapshot(snap):
     """Reconstruct a real engine GameState from a rendered mirror snapshot
-    (armies, political, fellowship, control, siege).  Named leaders become
-    real Leader objects carrying .name/.leadership so _board_snapshot round-
-    trips and combat leadership is modelled."""
+    (armies, political, fellowship, control, siege).  Named figures become
+    the engine's own board classes (C7-06): the minions game_logic.Minion,
+    the companions gs.Companion carrying name/Level/Leadership - the same
+    objects rendered_extract._recon_state's retype builds, so the engine
+    accepts them (army_participants._leader_side) and combat leadership is
+    modelled."""
     import game_state as gs
     import game_logic as gl
     b = board.load_board()
@@ -451,21 +472,36 @@ def _state_from_snapshot(snap):
             # Orthanc (2023-12-25 L761-770: the human dragged him with
             # the advance and the opponent put him back - the real
             # advance is [5]Isengard Elite + 1 Regular, Saruman stays).
-            # Narrow fix: Saruman only (Witch-king / Mouth stay as the
-            # _LDR_META leaders they were - a separate lead).
+            # Narrow fix: Saruman only (the Witch-king / Mouth followed
+            # in C7-06, below).
             st.saruman.in_play = True
             st.saruman.was_ever_in_play = True
             return gl.Minion(nation=Nation.SAURON, name='Saruman')
+        if kind == 'NAMED' and val in _LDR_META:
+            # C7-06: the Witch-king and the Mouth of Sauron are MINIONS
+            # too - the board object game_logic._add_minion_to_region
+            # places.  As plain named gs.Leader objects they led 1 in
+            # combat.calc_leadership (it dispatches on type 'Minion':
+            # both lead 2) and escaped Gandalf the White's shine.
+            return gl.Minion(nation=Nation[_LDR_META[val][0]], name=val)
         if kind == 'NAMED':
-            if val in _LDR_META:
-                nat, ldr = _LDR_META[val]
-                lo = gs.Leader(Nation[nat])
-            else:
-                c = comp_by_name.get(val)
-                ldr = getattr(c, 'leadership', 1) if c else 1
-                lo = gs.Leader(Nation.GONDOR)
+            c = comp_by_name.get(val)
+            stats = ((c.level, c.leadership) if c is not None
+                     else _LATE_COMPANION_STATS.get(val))
+            if stats is not None:
+                # C7-06: a companion on the board is a gs.Companion.  A
+                # plain gs.Leader carrying a .name is refused by the engine
+                # (army_participants._leader_side: 'Unsupported board
+                # leader/character'), so rendered_driven_census skipped
+                # every battle with a separated companion as a plan-error.
+                # Same thin object as rendered_extract._retype_companions
+                # (name/Level/Leadership), so the extractor's states are
+                # unchanged.
+                return gs.Companion(name=val, level=stats[0],
+                                    leadership=stats[1])
+            lo = gs.Leader(Nation.GONDOR)
             lo.name = val
-            lo.leadership = ldr
+            lo.leadership = 1
             return lo
         return gs.Leader(Nation.SAURON)
 
@@ -643,6 +679,79 @@ def _atk_units_at(st, region, atk_side):
     if not a:
         return 0
     return sum(1 for u in a.units if _unit_side(u) == atk_side)
+
+
+def _atk_gate_captain_leadership(st, region, atk_side):
+    """(Strider/Aragorn +1, Leadership) of the ATTACKER's OWN leaders at
+    `region`, for _drive_combat's attacker-strength gate (C7-03).
+
+    Mirrors the engine: setup_combat splits a co-located siege by
+    combat._combat_leader_side and calc_combat_strength / calc_leadership
+    count own-side leaders only (1.233).  The besieger and the besieged
+    garrison share ONE army key, so a garrison Strider/Aragorn must not raise
+    the Shadow besieger's strength, nor garrison leaders his re-rolls.
+    Leadership per calc_leadership: the Witch-king and the Mouth of Sauron
+    lead 2, Saruman 1, a Nazgul 1, a Companion / Leader its rating; with
+    Saruman in play each attacking Isengard Elite also leads 1
+    (combat._recompute_round_leadership).  Since C7-06 both reconstructions
+    (this module's _state_from_snapshot and the extractor's _recon_state)
+    build the minions as game_logic.Minion (no .leadership) and companions
+    as gs.Companion; the name match stays as a guard for other callers.
+    The Strider/Aragorn flag is the gate's LOWER-bound captain only;
+    _drive_combat takes the upper bound from _atk_strength_at."""
+    import combat as _cmb
+    reg = sanitize(region)
+    saruman = any(type(l).__name__ == 'Minion'
+                  and 'saruman' in str(getattr(l, 'name', '') or '').lower()
+                  for a in st.armies.values() for l in a.leaders)
+    captain = leadership = 0
+    for k, a in st.armies.items():
+        if sanitize(k) != reg:
+            continue
+        for ld in a.leaders:
+            if _cmb._combat_leader_side(ld).name != atk_side:
+                continue
+            nm = str(getattr(ld, 'name', '') or '')
+            low = nm.lower()
+            if 'Strider' in nm or 'Aragorn' in nm:
+                captain = 1
+            if 'witch' in low or 'mouth of sauron' in low:
+                leadership += 2
+            elif type(ld).__name__ == 'Minion':
+                leadership += 1
+            else:
+                leadership += int(getattr(ld, 'leadership', 1) or 1)
+        if saruman and atk_side == 'SHADOW':
+            leadership += sum(1 for u in a.units
+                              if u.nation.name == 'ISENGARD'
+                              and u.kind.name == 'ELITE')
+    return captain, leadership
+
+
+def _atk_strength_at(st, region, atk_side):
+    """The attacker's Combat Strength at `region` exactly as the engine
+    computes it (combat.calc_combat_strength): the attacker-side units plus
+    +1 per Captain of the West (Gandalf the Grey / Strider / Legolas / Gimli /
+    Boromir / Aragorn) in that army, capped at 5.  C7-02: captains are
+    matched by NAME against the engine's own set (both reconstructions build
+    named companions as gs.Companion since C7-06; the name match also serves
+    other callers' states); they are Free Peoples figures and add dice only
+    to a Free Peoples attack (1.233: leaders serve only their own side).  No
+    attacker units = no attacking army = 0."""
+    import combat as _cmb7
+    units = _atk_units_at(st, region, atk_side)
+    if units <= 0:
+        return 0
+    capt = 0
+    if atk_side == 'FREE_PEOPLES':
+        for k, aa in st.armies.items():
+            if sanitize(k) != sanitize(region):
+                continue
+            for ld in aa.leaders:
+                if str(getattr(ld, 'name', '') or '') \
+                        in _cmb7.CAPTAINS_OF_THE_WEST:
+                    capt += 1
+    return min(5, units + capt)
 
 
 def _attacker_advance_plan(st, batch, atk_side, bregs):
@@ -827,7 +936,18 @@ def _plan_combat(st, batch, expected_dice=None, chats=None):
                     return (_src9, dfn, False)
             except Exception:
                 pass
-        return (dfn, dfn, True)         # co-located siege (shared region key)
+        # R3-SORTIE-SIEGE-PRESS (fix round 3): a co-located battle opened by
+        # the GARRISON is a SORTIE - a FIELD battle (rulebook p.32, ruling
+        # 1.105), with attacker_continue / defender_retreat and no siege
+        # press.  Same predicate as the engine executor (ai.py army_attack:
+        # 'is_siege': already_besieged and not _is_sortie9, where
+        # _is_sortie9 = combat.garrison_side_for(state, to) == side).  The
+        # flat True gave the GAME21 T20 L1660 FP Minas Tirith sortie a gd
+        # siege_press row and skipped its continue / retreat rows.
+        from combat import garrison_side_for as _gsf9
+        _sortie9 = _gsf9(st, dfn).name == atk_side
+        # co-located siege / sortie (shared region key)
+        return (dfn, dfn, not _sortie9)
     # field battle: attacker is an adjacent region carrying attacker units;
     # prefer the one whose combat strength matches the observed roll size
     try:
@@ -875,8 +995,12 @@ def _plan_combat(st, batch, expected_dice=None, chats=None):
                             atk_cas.add(fk[1])
     pool = cands
     if expected_dice is not None:
+        # C7-02: the engine's Combat Strength (units + Captains of the West,
+        # cap 5), not bare units - a companion-led army (3 units + Boromir =
+        # 4 dice) was filtered out and a 4-unit neighbour returned as the
+        # unique match before the casualty evidence below could speak
         exact = [r for r in cands
-                 if min(5, _atk_units_at(st, r, atk_side)) == expected_dice]
+                 if _atk_strength_at(st, r, atk_side) == expected_dice]
         if len(exact) == 1:
             return (exact[0], dfn, False)
         if exact:
@@ -898,6 +1022,36 @@ def _plan_combat(st, batch, expected_dice=None, chats=None):
     _cas_named = [r for r in pool if r != dfn and r in atk_cas]
     if len(_cas_named) == 1:
         return (_cas_named[0], dfn, False)
+    # C7-02: a dice-consistent tie (more frequent now that captain-led
+    # armies match too) with no chat naming and no casualty evidence goes
+    # to the candidate whose attacker units moved INTO the defender region
+    # (the post-battle advance, rb p.31) even when the human walked part of
+    # it back in the same batch - two hits, so _attacker_advance_plan
+    # declined it (2025-06-28 dc v Stella Rossa L290: Woodland Realm ->
+    # Dale and back) - before falling to the bare adjacency order.
+    if len(pool) > 1:
+        _adv7 = set()
+        for r in batch['records']:
+            if r.get('op') != 'move':
+                continue
+            fk7 = rr.zone_kind(r.get('from', ''))
+            tk7 = rr.zone_kind(r.get('to', ''))
+            if fk7[0] not in ('region', 'stronghold') \
+                    or tk7[0] not in ('region', 'stronghold') \
+                    or tk7[1] != dfn or fk7[1] == dfn \
+                    or fk7[1] not in pool:
+                continue
+            o7 = str(r.get('obj', '') or '')
+            s7 = set()
+            for tok in (rr.split_group(o7.replace('group (', '').rstrip(')'))
+                        if 'group' in o7 else [o7]):
+                p = rr.parse_piece(tok)
+                if p and p[0] == 'unit':
+                    s7.add(_nat_side(p[1]))
+            if s7 == {atk_side}:
+                _adv7.add(fk7[1])
+        if len(_adv7) == 1:
+            return (next(iter(_adv7)), dfn, False)
     return (pool[0], dfn, False)
 
 
@@ -905,28 +1059,17 @@ def _combat_cards(batch):
     """(attacker_card_id, defender_card_id) from the batch's combat-card
     plays (moves of a '/'-titled card into a Current FP/SA Card slot),
     resolved to engine card ids via the closed_loop lookup (imported, never
-    edited).  Cards that don't resolve stay None (best-effort drive)."""
-    lk = _card_lookup()
-    fp_cid = sa_cid = None
-    for r in batch['records']:
-        if r.get('op') != 'move':
-            continue
-        to = str(r.get('to', '')).lower()
-        if 'card' not in to or 'current' not in to:
-            continue
-        title = r.get('obj', '')
-        if '/' not in str(title):
-            continue
-        cid = _lookup_cid(lk, title)
-        if cid is None:
-            continue
-        if 'fp' in to or 'free' in to:
-            fp_cid = cid
-        elif 'sa' in to or 'shadow' in to:
-            sa_cid = cid
-    if batch.get('die_side') == 'SHADOW':
-        return (sa_cid, fp_cid)
-    return (fp_cid, sa_cid)
+    edited).  Cards that don't resolve stay None (best-effort drive).
+
+    R18-CORPUS row 32: each card goes to the side that OWNS it, never to the
+    Current slot it was dropped into (players often drop their own card in
+    the opponent's slot: 2023-03-14 Messor/Etryski L427 'Orcs Multiplying
+    Again/Onslaught from Shadow Hand to Current FP Card' in a Shadow attack,
+    which the drive handed to the FP defender as its Onslaught).  The one
+    owner-keyed reader is rendered_extract._combat_cards_by_owner
+    (R17-CORPUS-EXTRACT row 2, round17 WAVE2_FOLLOWUPS item 2)."""
+    from rendered_extract import _combat_cards_by_owner
+    return _combat_cards_by_owner(batch)
 
 
 
@@ -1535,6 +1678,66 @@ def _drive_card_effect_combat(st, batch):
     return ('skip', [], 'combat:card-effect-cas(%d!=%d)' % (meter['cas'], hum))
 
 
+def _onslaught_kill_sacrifice(batch, own_r, owner_str):
+    """C7-04: True when the Onslaught owner's sacrifice is rendered as KILLS
+    of its own units in its battle region instead of a park onto the Current
+    card (2023-01-08 Mistakentuna/Vayze L774 'kills group ([4]S&E Regular)
+    in Osgiliath', then the 4-die strike at L775).  Kill records carry
+    'pieces' / 'zone' (rendered_replay.parse_line), never 'obj' / 'from'.
+
+    An own-region kill alone is NOT evidence: the owner's ordinary round
+    casualties render the same way.  The sacrifice is proven by the owner's
+    Onslaught STRIKE roll (one die per self-inflicted hit, combat.py
+    apply_onslaught_choice): a 'post'-classed chunk (_combat_chunk_rounds)
+    rolled by the owner after the owner committed a '/Onslaught' combat
+    card.  A table-slot transit (The Fighting Uruk-Hai/Onslaught used as a
+    Board siege counter) is no commit, as in _combat_card_commits.  The kill
+    must lie between that commit and the strike."""
+    recs = batch.get('records') or []
+    table = set()
+    for r in recs:
+        if (r.get('op') == 'move'
+                and rr.zone_kind(str(r.get('to', '') or ''))[0] == 'table'):
+            table.add(str(r.get('obj', '') or '').strip().lower())
+    commits = []
+    for r in recs:
+        if r.get('op') != 'move':
+            continue
+        obj = str(r.get('obj', '') or '').strip()
+        if (str(r.get('to', '') or '').strip().lower() in _CUR_CARD_ZONES
+                and obj.lower().endswith('/onslaught')
+                and obj.lower() not in table
+                and _card_title_side(obj, r.get('to', '')) == owner_str):
+            commits.append(int(r.get('line', 0) or 0))
+    if not commits:
+        return False
+    tag = 'A' if owner_str == (batch.get('die_side') or 'SHADOW') else 'D'
+    strikes = [int(c.get('line', 0) or 0)
+               for items in _combat_chunk_rounds(batch)
+               for c, s, cls in items
+               if cls == 'post' and s == tag
+               and any(cl < int(c.get('line', 0) or 0) for cl in commits)]
+    if not strikes:
+        return False
+    own_key = sanitize(str(own_r))
+    for r in recs:
+        if r.get('op') != 'kill':
+            continue
+        ln = int(r.get('line', 0) or 0)
+        if not any(cl < ln < sl for cl in commits for sl in strikes):
+            continue
+        zk = rr.zone_kind(str(r.get('zone', '') or ''))
+        if (zk[0] not in ('region', 'stronghold')
+                or sanitize(str(zk[1] or '')) != own_key):
+            continue
+        for pc in r.get('pieces') or []:
+            for t in _roll_tokens(pc):
+                p = rr.parse_piece(t)
+                if p and p[0] == 'unit' and _nat_side(p[1]) == owner_str:
+                    return True
+    return False
+
+
 def _drive_combat(st, batch):
     """Drive the engine's own combat resolver (game_logic.battle) from the
     rendered mirror under FORCED, RE-ORDERED dice, and compare the ENGINE's
@@ -1575,6 +1778,18 @@ def _drive_combat(st, batch):
     chunks = [r for r in batch['rng'] if r['kind'] == 'roll_num']
     if not chunks:
         return ('skip', [], 'combat:no-dice(card-effect/automatic)')
+    # R4-EXTRACT-COMBAT-ROUND-KEYS (b), R3-SORTIE-SIEGE-PRESS FU3: a CARD
+    # STRIKE (The Spirit of Mordor / Dreadful Spells / Faramir's Rangers
+    # class: the actor's event rolls alone against an army) fights NO battle
+    # (C3-03; the combat-family path returns before planning one).  The army
+    # planner still finds a pair for most of them (a co-located 'sortie' or
+    # an adjacent attack), and game_logic.battle then fought the strike as a
+    # battle.  It is an event-card effect: drive it through the card's own
+    # handler, exactly as a strike with no army plan is driven below.  The
+    # strike test is the shared W1-001 predicate.
+    from rendered_extract import _card_strike
+    if _card_strike(batch):
+        return _drive_card_effect_combat(st, batch)
     # The attacker's Combat Strength = his FIRST main-volley chunk size, which
     # must be the ATTACKER's roll, not chunks[0]: the two players roll
     # simultaneously (rb p.30) and the client sometimes prints the DEFENDER's
@@ -1597,22 +1812,27 @@ def _drive_combat(st, batch):
         # The attacker's PHYSICAL first throw = Combat Strength volley, possibly
         # with the Leader re-roll merged into the same throw (rb p.30 L2714-2727:
         # Leadership re-rolls up to Leadership failed dice).  Combat Strength =
-        # Army units capped at 5, +1 if Strider "Captain of the West" leads
-        # (rb Strider card).  So accept first_dice in [strength, strength +
-        # min(5, Leadership)] and let the engine split volley/re-roll itself;
-        # only a TRUE strength mismatch (wrong attacker region) is skipped.
+        # Army units capped at 5, +1 per Captain of the West in the army
+        # (engine combat.calc_combat_strength: Gandalf the Grey / Strider /
+        # Legolas / Gimli / Boromir / Aragorn).  So accept first_dice in
+        # [strength_lo, strength_hi + min(5, Leadership)] and let the engine
+        # split volley/re-roll itself; only a TRUE strength mismatch (wrong
+        # attacker region) is skipped.  The LOWER bound counts Strider/
+        # Aragorn only (humans leave out other captains' dice - 5 corpus
+        # throws, C7-03); the UPPER bound counts every captain, as the
+        # engine and _plan_combat (_atk_strength_at) do (R2-S4-EXTRACT,
+        # C7-03 rescan: a Legolas army's merged volley + re-roll throw was
+        # skipped as a mismatch).
         _units = _atk_units_at(st, atk, batch['die_side'])
-        _strider = _leadership = 0
-        for _kk, _aa in st.armies.items():
-            if sanitize(_kk) != atk:
-                continue
-            for _l in _aa.leaders:
-                _nm = str(getattr(_l, 'name', '') or '')
-                if 'Strider' in _nm or 'Aragorn' in _nm:
-                    _strider = 1
-                _leadership += int(getattr(_l, 'leadership', 1) or 1)
+        # C7-03: the ATTACKER's own leaders only (a co-located siege holds
+        # the garrison's leaders under the same key) at engine Leadership
+        _strider, _leadership = _atk_gate_captain_leadership(
+            st, atk, batch['die_side'])
         strength = min(5, _units + _strider)
-        if not (strength <= first_dice <= strength + min(5, _leadership)):
+        _strength_hi = max(strength,
+                           _atk_strength_at(st, atk, batch['die_side']))
+        if not (strength <= first_dice
+                <= _strength_hi + min(5, _leadership)):
             return ('skip', [],
                     'combat:atk-strength-mismatch(%d!=%d)'
                     % (strength, first_dice))
@@ -1638,6 +1858,17 @@ def _drive_combat(st, batch):
         except StopIteration:
             _m['fb'] = True
             return 1
+    _bchoices9 = {'defer_onslaught': True}
+    if sanitize(atk) == sanitize(dfn):
+        # R3-SORTIE-SIEGE-PRESS: a CO-LOCATED split is oriented by the
+        # acting side (combat.setup_combat defaults the attacker to the
+        # BESIEGER; the ai executor threads pending attacker_side the same
+        # way).  A sortie is the GARRISON attacking (die_side); a siege
+        # assault is unchanged (attacker == besieger == the default).
+        import game_state as _gs9
+        _bchoices9['attacker_side'] = (
+            _gs9.Side.SHADOW if str(batch['die_side']).upper()
+            .startswith('SH') else _gs9.Side.FREE_PEOPLES)
     orig_ri = random.randint
     orig_ch = random.choice
     random.randint = _forced
@@ -1654,7 +1885,7 @@ def _drive_combat(st, batch):
                         # the settled-totals gate, and the pending the
                         # back-calc emitter waits on never opens (USER
                         # 2026-07-24)
-                        choices={'defer_onslaught': True})
+                        choices=_bchoices9)
     except Exception as e:
         random.randint, random.choice = orig_ri, orig_ch
         # co-located / friendly-army plan failures are AMBIGUOUS-plan skips,
@@ -1716,17 +1947,26 @@ def _drive_combat(st, batch):
             # phantom K=1).
             _park = False
             for _r9 in batch.get('records') or []:
-                if _r9.get('op') not in ('move', 'kill'):
+                if _r9.get('op') != 'move':
                     continue
                 _ob = str(_r9.get('obj', '') or '')
                 _to9 = str(_r9.get('to', '') or '')
-                if (('Current' in _to9 or _r9.get('op') == 'kill')
+                if ('Current' in _to9
                         and ('Regular' in _ob or 'Elite' in _ob)
                         and 'Action Die' not in _ob
                         and sanitize(str(_r9.get('from', '') or '')
                                      ) == sanitize(_own_r)):
                     _park = True
                     break
+            # C7-04: the KILL-rendered sacrifice.  Kill records carry
+            # 'pieces'/'zone' (no 'obj'/'from'), so the old op=='kill'
+            # branch above could never fire; an own-region kill counts
+            # only with the owner's Onslaught strike roll after it.
+            if not _park:
+                _park = _onslaught_kill_sacrifice(
+                    batch, _own_r,
+                    'SHADOW' if _own_side == gs.Side.SHADOW
+                    else 'FREE_PEOPLES')
             if _mx > 0 and _park:
                 # surface the DECISION POINT for the emitter (a
                 # clone of the state BEFORE the sacrifice + the
@@ -1869,6 +2109,29 @@ _MITIGATION_CARDS = {
 _DICE_HUNT_CARDS = {"athelas", "candles of corpses"}
 
 
+def _metered_forced_randint(ints):
+    """C7-01 (fix wave 2026-10-21): the hunt drivers' FORCED random.randint.
+    Serves the logged dice in order and touches NO global randomness (the
+    former ``lambda a, b2: next(seq, orig(a, b2))`` evaluated its default
+    eagerly, drawing from the per-game stream on every forced call).  When
+    the engine asks for more dice than the batch logged, the call is metered
+    (meter['fb']) and answered with the range's low bound, so the caller can
+    name the drive un-drivable instead of letting a live die decide it.
+    Returns (randint_replacement, meter)."""
+    seq = iter(list(ints))
+    meter = {'n': 0, 'fb': 0}
+
+    def _forced(a, b2, _s=seq, _m=meter):
+        try:
+            v = next(_s)
+        except StopIteration:
+            _m['fb'] += 1
+            return a
+        _m['n'] += 1
+        return v
+    return _forced, meter
+
+
 def _drive_dice_card_hunt(st, batch, key, cardname):
     """Drive a 3-dice hunt-effect card (Athelas / Candles of Corpses) through
     the engine's own registered handler under the FORCED logged dice + the
@@ -1895,9 +2158,9 @@ def _drive_dice_card_hunt(st, batch, key, cardname):
                                          guide_ability=None)
         st.fellowship.guide = gobj
     ta = batch['truth']['fel']
-    seq = iter(list(rolls[0]['ints']))
+    _forced, _meter = _metered_forced_randint(rolls[0]['ints'])
     o_ri = random.randint
-    random.randint = lambda a, b2, _i=seq, _f=o_ri: next(_i, _f(a, b2))
+    random.randint = _forced
     try:
         handler(st, None, {})
     except Exception as e:
@@ -1905,6 +2168,10 @@ def _drive_dice_card_hunt(st, batch, key, cardname):
                 'hunt:card-error')
     finally:
         random.randint = o_ri
+    if _meter['fb']:
+        # C7-01: the handler rolled more dice than the 3 logged - the
+        # result would rest on an invented die, so it is un-drivable.
+        return ('skip', [], 'hunt:card-dice-exhausted(%s)' % cardname[:8])
     if st.fellowship.corruption != ta['corruption']:
         return ('skip', [], 'hunt:card-dice-other(%s)' % cardname[:8])
     return ('drove', [], None)
@@ -2014,12 +2281,19 @@ def _drive_breaking(st, batch, cardname):
     return ('drove', [], None)
 
 
-def _nazgul_flights(batch):
+def _nazgul_flights(batch, mouth_drags=None):
     """Reconstruct the logged Nazgul flights as the engine's own
-    {'from','to','n','nmin'} list (n = plain Nazgul, nmin = named minions:
-    Witch-king / Mouth of Sauron / the Black Captain) from the batch's
+    {'from','to','n','nmin'} list (n = plain Nazgul, nmin = the Witch-king,
+    read as 'Witch King': parse_line rewrites the logged caption) from the batch's
     region->region move records.  rb p.23: one Character die / event moves any
-    or all Nazgul to any region."""
+    or all Nazgul to any region.  R2-MOUTH (USER decision CR-D6-fix-01,
+    2026-10-22: "the mouth of sauron does NOT move with ringwraths / black
+    captain commands"): the Mouth of Sauron never rides a card's Nazgul
+    flight, and the card executors read nmin as Witch-king flights only, so
+    a logged Mouth drag is not counted (counting it made the executor fly
+    a co-located Witch-king in his place).  R3-MOUTH-EXECUTOR: when
+    *mouth_drags* is a list, each dropped Mouth drag is appended to it as
+    {'from','to'} so the caller can count that illegal logged move."""
     moves = []
     for r in batch['records']:
         if r.get('op') != 'move':
@@ -2039,17 +2313,62 @@ def _nazgul_flights(batch):
                 continue
             if p[0] == 'nazgul':
                 n += int(p[3] or 1)
-            elif p[0] == 'named' and str(p[1]) in ('Witch King',
-                                                   'Mouth of Sauron'):
+            elif p[0] == 'named' and str(p[1]) == 'Witch King':
+                # R6-DEAD-CODE-4: the one Witch-king token.  parse_line rewrites
+                # the logged 'The Witch-King, The Black Captain' to it
+                # (rendered_replay.COMMA_NAME_FIX) before any record exists, so
+                # the old rule for an unparsed 'black captain' token never fired
+                # (R4B-NAZGUL-HOPS-WITCHKING FU1) and was removed.
                 nmin += 1
-            elif p[0] == 'unknown' and 'black captain' in str(p[1]).lower():
-                nmin += 1
+            elif (p[0] == 'named' and str(p[1]) == 'Mouth of Sauron'
+                    and mouth_drags is not None and fk[1] != tk[1]):
+                mouth_drags.append({'from': fk[1], 'to': tk[1]})
         if n or nmin:
             moves.append({'from': fk[1], 'to': tk[1], 'n': n, 'nmin': nmin})
     return moves
 
 
+# R3-MOUTH-EXECUTOR (R2-MOUTH FU4): a census driver reports what it DETECTED
+# in the log (not an engine divergence, not a policy note) as a diff tagged
+# 'detected': <counter name>, resync False, on every status it returns.
+# Consumers count and strip those with _count_detected: the driven census
+# below reports them under 'detected', the extractor's process_batch adds
+# them to stats['detected'].
+_MOUTH_CARD_DRAG = 'nazgul_card_mouth_drag'
+
+
+def _count_detected(diffs, counter):
+    """Add each 'detected'-tagged diff to *counter* and return the other
+    diffs (the tagged ones never take part in match / resync accounting)."""
+    kept = []
+    for d in diffs or ():
+        if isinstance(d, dict) and d.get('detected'):
+            counter[d['detected']] += 1
+        else:
+            kept.append(d)
+    return kept
+
+
 def _drive_nazgul_reveal_chain(st, batch, key, cardname):
+    """R3-MOUTH-EXECUTOR wrapper around _drive_nazgul_reveal_chain_moves:
+    a logged Mouth of Sauron drag in a Nazgul Search / Strike! batch is an
+    illegal move (USER decision CR-D6-fix-01: the Mouth never rides a
+    card-funded Nazgul flight), which _nazgul_flights leaves out of the
+    replay.  Each one is now reported as a '_MOUTH_CARD_DRAG' detection on
+    the returned diffs, whatever the drive status, so the logs' rate of
+    that illegal move is counted instead of silently dropped."""
+    drags = []
+    moves = _nazgul_flights(batch, mouth_drags=drags)
+    status, diffs, reason = _drive_nazgul_reveal_chain_moves(
+        st, batch, key, cardname, moves)
+    notes = [{'field': 'mouth@%s' % d['from'], 'eng': d['from'],
+              'truth': d['to'], 'class': 'illegal-mouth-drag(card-nazgul)',
+              'resync': False, 'detected': _MOUTH_CARD_DRAG}
+             for d in drags]
+    return (status, list(diffs) + notes, reason)
+
+
+def _drive_nazgul_reveal_chain_moves(st, batch, key, cardname, moves):
     """Drive 'Nazgul Search' / 'The Nazgul Strike!' through the engine's own
     handler on the TEACHER path: fly the logged Nazgul, let the handler's
     co-location reveal-check fire, then apply the logged Hunt tile.  rb p.23
@@ -2068,7 +2387,7 @@ def _drive_nazgul_reveal_chain(st, batch, key, cardname):
     is_strike = 'strike' in key
     handler = (ee._effect_nazgul_strike if is_strike
                else ee._effect_nazgul_search)
-    moves = _nazgul_flights(batch)
+    # *moves* = _nazgul_flights(batch), read by the wrapper above
     tiles = [r for r in batch['rng'] if r['kind'] == 'draw_tile']
     if len(tiles) > 1:                         # multi-tile reveal chain
         return ('skip', [], 'hunt:card-multi-tile(Nazgul)')
@@ -2430,6 +2749,26 @@ def _drive_event_card_hunt(st, batch):
 
 
 def _drive_hunt(st, batch):
+    """RNG-NEUTRAL entry point for _drive_hunt_forced (C7-01, fix wave
+    2026-10-21).  The per-game global random stream (rendered_extract seeds
+    it once per game) is the other drivers' fallback; a hunt drive must not
+    shift it, or later fallbacks depend on how many hunts earlier batches
+    drove and how often each was re-driven (process_batch and
+    _emit_hunt_resolution both drive the same batch).  The forced dice are
+    served by _metered_forced_randint (no global draw), but the event-card
+    routes still draw tiles through game_logic.pick_hunt_tile
+    (random.choice) and the engine may shuffle a recycled pool - their net
+    consumption is undone here.  The dice never come from that stream: an
+    exhausted forced roll stream is a named skip ('hunt:roll-exhausted')."""
+    import random
+    _rng_state = random.getstate()
+    try:
+        return _drive_hunt_forced(st, batch)
+    finally:
+        random.setstate(_rng_state)
+
+
+def _drive_hunt_forced(st, batch):
     """Drive the engine's own hunt resolver (game_logic.move_fellowship) from
     the rendered mirror under FORCED roll + drawn tile.  The SIGNAL is
     (corruption + pending damage, hidden) vs rendered truth.
@@ -2558,8 +2897,11 @@ def _drive_hunt(st, batch):
         # '2 3 1' then '5'; 2023-11-26 L998: '3 5' then '3 6' = one
         # success, tile 3, corruption 8 -> 11).
         seq = iter(_all_roll_ints(batch))
+    # C7-01: metered forced dice (no global draw per forced call; an
+    # exhausted stream is recorded, never silently rolled live).
+    _forced, _meter = _metered_forced_randint(seq)
     orig_ri, orig_ch = random.randint, random.choice
-    random.randint = lambda a, b2, _i=seq, _f=orig_ri: next(_i, _f(a, b2))
+    random.randint = _forced
     random.choice = lambda s2: s2[-1]
     try:
         gl.move_fellowship(st, skip_auto_sacrifice=True)
@@ -2568,6 +2910,15 @@ def _drive_hunt(st, batch):
                 'hunt:error')
     finally:
         random.randint, random.choice = orig_ri, orig_ch
+    if _meter['fb']:
+        # C7-01: the engine rolled more d6 than the batch logged (an
+        # un-logged re-roll, a die-icon tile with no roll line, a chained
+        # tile).  Its hunt damage would rest on an invented die, so the drive
+        # is un-drivable - a NAMED skip.  Every caller keeps only
+        # tile-independent output on a skip (process_batch: the fellowship-
+        # move sample; _emit_hunt_resolution: no damage rows; census: the
+        # un-covered surface).
+        return ('skip', [], 'hunt:roll-exhausted')
     pend = int(getattr(st, '_pending_hunt_damage', 0) or 0)
     eng_corr = st.fellowship.corruption + pend
     tr_corr = ta['corruption']
@@ -2682,6 +3033,14 @@ def _prescan_mordor_box(g):
         anchor = anchor if anchor is not None else _fallback
         if anchor is None:
             continue
+        # R18-CORPUS row 33: the walk starts this turn at 0, so a take-out
+        # never drops it below 0.  The PREVIOUS turn's Hunt Box dice
+        # recovered after the '<replay> Turn N' marker are prepended to this
+        # turn's first batch (rendered_replay pending_pre) and used to cancel
+        # the turn's own allocation and rolled Eyes (2023-03-19 Sonnyl/
+        # CleanerCode T10 @1128: 4 recovered, 1 allocated, 2 rolled Eyes ->
+        # 0, true 3).  The extractor's twin (_turn_eye_counts) clamps the
+        # same way.
         box = 0
         for r in by_turn.get(b['turn'], []):
             if int(r.get('line', 0) or 0) >= anchor:
@@ -2698,11 +3057,12 @@ def _prescan_mordor_box(g):
                 if 'hunt for the ring' in to:
                     box += _die_count(obj)
                 elif 'hunt for the ring' in frm:
-                    box -= _die_count(obj)
+                    box = max(0, box - _die_count(obj))
             elif op == 'kill' and 'hunt for the ring' in \
                     str(r.get('zone', '')).lower():
-                box -= sum(_die_count(p) for p in (r.get('pieces') or []))
-        b['_mordor_box'] = max(0, box)
+                box = max(0, box - sum(_die_count(p)
+                                       for p in (r.get('pieces') or [])))
+        b['_mordor_box'] = box
 
 
 def _prescan_guide(g):
@@ -2747,6 +3107,8 @@ def rendered_driven_census(game):
     skip_reasons = collections.Counter()
     diverged = []
     policy_notes = []
+    detected = collections.Counter()      # R3-MOUTH-EXECUTOR
+    detected_notes = []
     matched = 0
     for b in g['batches']:
         kind = b['kind']
@@ -2766,6 +3128,14 @@ def rendered_driven_census(game):
         status_ct[status] += 1
         if reason:
             skip_reasons[reason] += 1
+        # R3-MOUTH-EXECUTOR: log-side detections count whatever the drive
+        # status and stay out of the match / divergence / policy accounting
+        detected_notes.extend(
+            {'batch': b['idx'], 'turn': b['turn'], 'kind': kind,
+             'detected': d['detected'], 'diff': _fmt_diff(d)}
+            for d in (diffs or ())
+            if isinstance(d, dict) and d.get('detected'))
+        diffs = _count_detected(diffs, detected)
         if status != 'drove':
             continue
         if not diffs:
@@ -2812,7 +3182,10 @@ def rendered_driven_census(game):
            'status_counts': dict(status_ct),
            'skip_reasons': dict(skip_reasons),
            'divergences': diverged,
-           'policy_notes': policy_notes}
+           'policy_notes': policy_notes,
+           # R3-MOUTH-EXECUTOR: illegal logged moves the drivers detected
+           'detected': dict(detected),
+           'detected_notes': detected_notes}
     return out
 
 

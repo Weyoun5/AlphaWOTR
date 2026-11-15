@@ -17,7 +17,10 @@ Pits of Mordor, which enumerate bounded combos (amendments 1.117/1.131);
 this registry is not a completeness claim for every printed choice.
 Most recruitment-card Regular/Elite choices remain absent;
 Dead Men exposes its companion subsets. Guards of the Citadel, House of the
-Stewards and Faramir's Rangers expose their unit kinds separately. The nazgul_moves
+Stewards and Faramir's Rangers expose their unit kinds separately; Cirdan's
+Ships offers one row per coastal region and `unit_combo` (2regular / mixed /
+2elite, the supply-valid ones; 1.280, D8 - the AI's projection stays
+Elite-first). The nazgul_moves
 half of The Black Captain Commands rides the __nazgul_moves__ chain
 (1.128).  Orc Patrol / Foul Thing victims are RNG DRAWS by rule
 (almanac p.43, adversarial repair 2026-07-11) — deliberately NOT
@@ -215,15 +218,17 @@ def dead_men_options(state, side):
 @_spec("Riders of Théoden")
 def _(state, side):
     # 1.211c: "or any Rohan region CONTAINING a Companion" is a PER-REGION gate:
-    # Edoras (if free) UNION every Rohan region with a BOARD Companion (Helm's
-    # Deep even under siege; any other must be free for the FP).  Fellowship
-    # companions are not on the board (1.211l).
-    _hd = sanitize("Helm's Deep")
+    # Edoras (if free) UNION every Rohan region with a BOARD Companion that is
+    # free for the FP.  Fellowship companions are not on the board (1.211l).
+    # Helm's Deep "even under siege" needs no bypass: _free_for_side already
+    # keeps an FP garrison besieged there.  A Shadow-CAPTURED Helm's Deep with
+    # a lone Companion is NOT eligible (recruit_unit/recruit_leader refuse it;
+    # fix wave E4-03).
     _rohan_comp = [
         r for r in _companion_regions(state)
         if board.fid_to_name.get(
             board.regions.get(r, {}).get('parent_id')) == 'rohan'
-        and (r == _hd or _free_for_side(state, r, Side.FREE_PEOPLES))]
+        and _free_for_side(state, r, Side.FREE_PEOPLES)]
     seen, opts = set(), []
     for r in _regions(["Edoras"]):
         if _free_for_side(state, r, Side.FREE_PEOPLES):
@@ -304,6 +309,11 @@ def _(state, side):
 def _(state, side):
     # USER RULING 2026-07-21g: a besieged FP stronghold counts - test FP
     # PRESENCE (any FP unit), never units[0].
+    # R3-RULES-DOC-SYNC (2026-10-23): an FP card - the Shadow side gets no
+    # rows, the same contract as the Guards of the Citadel spec (the
+    # Shadow never holds it, so play is unchanged).
+    if side != Side.FREE_PEOPLES:
+        return []
     from event_effects import SHADOW_NATIONS as _SN, _cirdan_unit_combos
     combos = _cirdan_unit_combos(state)
     out = []
@@ -473,8 +483,14 @@ def _(state, side):
         return (any(u.nation not in _SN for u in a.units)
                 and any(isinstance(l, Companion) for l in a.leaders))
 
+    from event_effects import _is_shadow_army_with_nazgul as _isawn
     for k, a in state.armies.items():
         if not any(isinstance(l, _NazE) for l in a.leaders):
+            continue
+        # E3-01/E4-01: 'a Shadow ARMY containing a Nazgul' - ONE predicate
+        # with the play gate (USER 2026-07-16 item 5): a lone Nazgul stack
+        # or a Nazgul inside an FP army entry (1.251) is not a target
+        if not _isawn(a):
             continue
         rsan = sanitize(k)
         near = [rsan] + [sanitize(x) for x in state.board.adjacent(rsan)]
@@ -580,8 +596,11 @@ def _(state, side):
 def _(state, side):
     import game_logic
     cur = game_logic.fellowship_region(state)
+    # 1.155 / 2026-07-20b (restored by 1.275): the pawn never enters
+    # Mordor's interior (INV-MORDOR-CW)
     return [{"target_region": sanitize(r)}
-            for r in state.board.adjacent(cur)]
+            for r in state.board.adjacent(cur)
+            if sanitize(r) not in game_logic._MORDOR_INTERIOR]
 
 
 @_spec("Dreadful Spells")
@@ -785,9 +804,17 @@ def _(state, side):
 def _(state, side):
     # 1.117 (TSiM pattern): each of the (up to two) moves is an INDEPENDENT
     # chained pending - the spec offers single joins, the handler chains the
-    # second move.
+    # second move.  INV-TSL-1 (2026-10-21): the card is mandatory to the
+    # maximum extent possible, so the FIRST pick offers no zero-move
+    # terminator while a join exists; with no join the lone terminator
+    # completes the play as zero-effect (1.230).  USER 1.279 (2026-10-22,
+    # D2): the second pick is mandatory too while a legal join exists (no
+    # terminator; event_effects._tsl_learned_chain).  Each join may go one
+    # or two regions.  Mirrored in both native event_shadow_lengthens.inc
+    # (esl_options).
     from event_effects import _sg_join_options
-    return _sg_join_options(state, 2) + [{"_tsl_done": True}]
+    joins = _sg_join_options(state, 2)
+    return joins or [{"_tsl_done": True}]
 
 
 @_spec("The Shadow is Moving")
@@ -795,7 +822,9 @@ def _(state, side):
     # single 1-region moves; moves 2-4 are INDEPENDENT chained pendings
     # (1.117 / 1.112.7).  1.211h / row 43: only a besieged Shadow GARRISON may
     # not move; a besieger stack may (lifting the siege) and may be joined -
-    # predicates shared with the handler and the chain surface
+    # predicates shared with the handler and the chain surface.  R17-ENG-EVENTS:
+    # _tsim_dest_ok also refuses a region A Power too Great / The Power of Tom
+    # Bombadil protects (the join cards' twin is _army_reachable_free)
     from event_effects import (SHADOW_NATIONS, _besieged_garrison_source,
                                _tsim_dest_ok)
     singles = []

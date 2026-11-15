@@ -9,12 +9,17 @@ messages.properties, the piece-id table, the location-code table), plus
 its own implementations of the client-level log normalizations that are
 properties of the LOG TRANSPORT, not parser opinion:
 
-  * VASSAL undo/redo netting (Controls.819 undo cancels the nearest
-    preceding snapshotted $-command; die-face-change lines are NOT
-    snapshotted so the walk continues past them; Controls.16 redo
-    restores LIFO; a fresh $-command clears the redo stack),
+  * undo/redo netting with the client's native snapshot stack
+    (client_snapshot_net.net_raw, shared with the production corpus
+    chain and with log_replay.LogReplayer.undo_prepass): only snapshot
+    commands (moves/kills/flips/allocates/draws) are pushed; Controls.819
+    undo pops the newest and folds the <auto> snapshot labels under it;
+    Controls.16 redo restores LIFO; only a snapshot command clears the
+    redo stack (rolls, die-face changes and card choices do not),
   * adjacent transport-echo dedupe (byte-identical adjacent action
-    lines, checksum-stripped, for move/kill/tile grammars),
+    lines, checksum-stripped, for move/kill/tile grammars), AFTER the
+    netting, as the production chain and the parser do (an undo after
+    an echo pair pops the echo: the client pushed a snapshot for it),
   * aborted-drag netting (same pieces A->B then straight back B->A),
   * split-drag merge (disjoint handful, same route, within 3 lines).
 
@@ -25,8 +30,12 @@ Usage:
         [--workers 4] [--no-parser] [--out data/log_census_report.json]
 
 Deterministic: files are sorted by name and sampled by even stride.
-Parser results are cached in data/log_census_parser_cache.jsonl so
-re-runs only parse new games.  Console output is ASCII-only (cp1252).
+Parser results are cached in data/log_census_parser_cache.jsonl, stamped
+with a fingerprint of the parser source (log_replay.py's src import
+closure): re-runs parse only new games and games last parsed by another
+parser version.  Each row's verdict is the 2026-08 triage label only while
+the live divergence is consistent with the triage baseline; otherwise
+RETRIAGE(was <label>).  Console output is ASCII-only (cp1252).
 """
 import argparse
 import collections
@@ -60,8 +69,10 @@ MOVE_RE = re.compile(
     r'<~(?:%s)~>([\d\s]+?)<~(?:%s)~><~([\w.]+)~><~(?:%s)~><~([\w.]+)~>'
     % (_K1, _K2, _K3))
 
-# Die-face change chat command: '$Name changes 211  to P'
-CHANGE_RE = re.compile(r'^\$[\w.]+\s+changes\s+(\d+)\s+to\s+([A-Z])\b')
+# Die-face change chat command: '$Name changes 211  to P'.  The nick is any
+# non-space run, mirroring rendered_extract._DIE_CHANGE_RE (`^\S+`): nicks
+# such as $Alexey'a / $Noir-Pelerin fall outside `[\w.]+` (C7-05, I3).
+CHANGE_RE = re.compile(r'^\$\S+\s+changes\s+(\d+)\s+to\s+([A-Z])\b')
 # Dice roll line: <~Controls.345~>ids<~Controls.346~>values
 ROLL_RE = re.compile(r'<~Controls\.345~>([\d\s]+?)<~Controls\.346~>([\d\s]+)')
 # Hunt tile draw button
@@ -91,8 +102,10 @@ DIE_SPEND_RE = re.compile(
     r'<~Controls\.345~>')
 # Kill / cleanup command
 KILL_RE = re.compile(r'<~Controls\.(?:296|644)~>([\d\s]+?)<~Controls\.(?:297|645)~>')
-# Chat line
-CHAT_RE = re.compile(r'^<([\w.]+)>\s*(.*)$')
+# Chat line.  Nick = any run without whitespace, '<', '>' or '~' (so
+# <Alexey'a> / <FP-kwojtasz> are read, C7-05); '~' keeps the encoded client
+# keys (<~Talker.31~>, <~Game.7~>) out, as the old `[\w.]+` class did.
+CHAT_RE = re.compile(r'^<([^<>\s~]+)>\s*(.*)$')
 
 # ---- piece vocabulary (authoritative piece table) -------------------------
 UNIT_PIDS = frozenset(k for k, v in AUTH_ARMY_PIECES.items()
@@ -156,7 +169,7 @@ SIEGE_BOX_CODES = frozenset({'Game.%d' % c for c in range(1988, 1997)}
 # ---------------------------------------------------------------------------
 # Raw-line loading and client-level normalization (independent impl)
 # ---------------------------------------------------------------------------
-DIE_CHANGE_LINE_RE = re.compile(r'^\$[\w.]+\s+changes\s+\d+\s+to\s+[A-Z]\b')
+DIE_CHANGE_LINE_RE = re.compile(r'^\$\S+\s+changes\s+\d+\s+to\s+[A-Z]\b')
 
 
 def read_lines(path):
@@ -287,7 +300,11 @@ def extract_gestures(lines, die_ids):
 def prepare_game(path):
     """Load + normalize a game log. Returns a context dict."""
     raw_lines = read_lines(path)
-    net_lines = undo_redo_net(dedupe_echoes(list(raw_lines)))
+    # R17-LOGREPLAY: net first, then dedupe (rendered_extract.
+    # _paired_physical_raw_view, cancelled_ring_roll and
+    # LogReplayer.preprocess all do), so the census and the parser count
+    # over one line set
+    net_lines = dedupe_echoes(undo_redo_net(list(raw_lines)))
     die_ids, sh_die_ids = collect_die_ids(net_lines)
     gestures, skipped = extract_gestures(net_lines, die_ids)
     return {
@@ -1140,8 +1157,72 @@ def _parser_worker(path):
                                         % (type(e).__name__, e)}
 
 
-def load_cache():
+# Parser-cache validity (C7-07): a cached summary is reused ONLY when the
+# CURRENT parser produced it.  Records are stamped with a fingerprint of
+# the parser source: every src module reachable from log_replay through
+# ANY import (module level, inside functions -- log_replay and game_logic
+# import lazily -- or __import__/import_module with a literal name), plus
+# the summary-extraction code above.  Conservative by design: an edit to
+# any module of that closure re-parses the sample.
+PARSER_ENTRY_MODULE = 'log_replay'
+PARSER_CACHE_FORMAT = 2
+
+
+def _parser_source_closure(entry=PARSER_ENTRY_MODULE, src_dir=SRC_DIR):
+    """{module name: file bytes} for the static import closure of `entry`
+    inside src_dir.  A closure module that does not parse raises."""
+    import ast
+    found = {}
+    stack = [entry]
+    while stack:
+        name = stack.pop()
+        if name in found:
+            continue
+        path = os.path.join(src_dir, name + '.py')
+        if not os.path.isfile(path):
+            continue                    # stdlib / third-party module
+        with open(path, 'rb') as f:
+            data = f.read()
+        found[name] = data
+        for node in ast.walk(ast.parse(data, filename=path)):
+            if isinstance(node, ast.Import):
+                stack.extend(a.name.split('.')[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level == 0 and node.module:
+                    stack.append(node.module.split('.')[0])
+            elif (isinstance(node, ast.Call) and node.args
+                  and isinstance(node.args[0], ast.Constant)
+                  and isinstance(node.args[0].value, str)
+                  and ((isinstance(node.func, ast.Name)
+                        and node.func.id == '__import__')
+                       or (isinstance(node.func, ast.Attribute)
+                           and node.func.attr == 'import_module'))):
+                stack.append(node.args[0].value.split('.')[0])
+    if entry not in found:
+        raise FileNotFoundError('parser entry module %s.py not in %s'
+                                % (entry, src_dir))
+    return found
+
+
+def parser_fingerprint(entry=PARSER_ENTRY_MODULE, src_dir=SRC_DIR):
+    """Hex digest identifying the parser version a summary came from."""
+    import hashlib
+    import inspect
+    h = hashlib.sha256(b'log_census parser cache v%d\n' % PARSER_CACHE_FORMAT)
+    for name, data in sorted(_parser_source_closure(entry, src_dir).items()):
+        h.update(name.encode('utf-8') + b'\0' + hashlib.sha256(data).digest())
+    for fn in (parser_summarize, _parser_worker):
+        h.update(inspect.getsource(fn).encode('utf-8'))
+    return h.hexdigest()[:20]
+
+
+def load_cache(fingerprint):
+    """Return (summaries by log basename, records dropped).  Only records
+    stamped with `fingerprint` count; records from any other parser
+    version (including the unstamped pre-C7-07 format), parser-crash
+    records and superseded duplicates are dropped."""
     cache = {}
+    n_records = 0
     if os.path.exists(CACHE_PATH):
         with open(CACHE_PATH, 'r', encoding='utf-8') as f:
             for ln in f:
@@ -1150,25 +1231,45 @@ def load_cache():
                     continue
                 try:
                     rec = json.loads(ln)
-                    cache[rec['file']] = rec['summary']
+                    fn, summary = rec['file'], rec['summary']
                 except (ValueError, KeyError):
                     continue
-    return cache
+                n_records += 1
+                # an error record (written before R17-LOGREPLAY) is
+                # dropped like a stale one: that game is parsed again
+                if rec.get('parser_fp') == fingerprint \
+                        and 'error' not in summary:
+                    cache[fn] = summary
+    return cache, n_records - len(cache)
 
 
-def append_cache(records):
-    with open(CACHE_PATH, 'a', encoding='utf-8') as f:
+def append_cache(records, fingerprint, mode='a'):
+    """Append (log basename, summary) records stamped with `fingerprint`.
+    R17-LOGREPLAY: a parser crash ({'error': ...}) is never cached - the
+    next run parses that game again, so a one-off environmental failure
+    (a DLL load under commit pressure, a MemoryError) does not stand for
+    the parser version, and main() reports every crash of the run."""
+    with open(CACHE_PATH, mode, encoding='utf-8') as f:
         for fn, summary in records:
-            f.write(json.dumps({'file': fn, 'summary': summary}) + '\n')
+            if 'error' in summary:
+                continue
+            f.write(json.dumps({'file': fn, 'parser_fp': fingerprint,
+                                'summary': summary}) + '\n')
 
 
-def run_parser(files, workers=4, refresh=False):
+def run_parser(files, workers=4, refresh=False, fingerprint=None):
+    fp = fingerprint or parser_fingerprint()
     if refresh and os.path.exists(CACHE_PATH):
         # append_cache opens in 'a' mode: without truncation every
         # refresh duplicates all records (last-write-wins masks it)
         open(CACHE_PATH, 'w').close()
-    cache = {} if refresh else load_cache()
-    todo = [p for p in files if os.path.basename(p) not in cache]
+    cache, dropped = ({}, 0) if refresh else load_cache(fp)
+    if dropped:
+        # compact: rewrite the file with only the current parser's records
+        print('parser cache: dropped %d stale/duplicate records '
+              '(parser fingerprint %s)' % (dropped, fp))
+        append_cache(sorted(cache.items()), fp, mode='w')
+    todo =[p for p in files if os.path.basename(p) not in cache]
     if todo:
         print('parser: %d cached, %d to parse (workers=%d)'
               % (len(files) - len(todo), len(todo), workers))
@@ -1178,7 +1279,7 @@ def run_parser(files, workers=4, refresh=False):
                 new.append(_parser_worker(p))
                 if (i + 1) % 25 == 0:
                     print('  parsed %d/%d' % (i + 1, len(todo)))
-                    append_cache(new)
+                    append_cache(new, fp)
                     cache.update(dict(new))
                     new = []
         else:
@@ -1191,11 +1292,11 @@ def run_parser(files, workers=4, refresh=False):
                     done += 1
                     if done % 25 == 0:
                         print('  parsed %d/%d' % (done, len(todo)))
-                        append_cache(new)
+                        append_cache(new, fp)
                         cache.update(dict(new))
                         new = []
         if new:
-            append_cache(new)
+            append_cache(new, fp)
             cache.update(dict(new))
     return {os.path.basename(p): cache.get(os.path.basename(p))
             for p in files}
@@ -1387,16 +1488,22 @@ REPORT_ROWS = [
 
 # Per-row verdicts from the 2026-08 500-game triage (kept with the row
 # results in the JSON report; update after re-triage when the parser or
-# census changes).
+# census changes).  The labels are the triage's; the notes name code by
+# function and grammar, never by line number (R17-LOGREPLAY: line loci
+# rotted as log_replay grew), and say which part was fixed since.
 VERDICTS = {
     'elven_ring_fp_use': ('PARSER-BUG-SUSPECTED',
-                          'phantom uses on active->active tidy drags '
-                          '(log_replay.py:3454 lacks a to-in-active '
-                          'guard) and no netting of quick returns'),
+                          'no netting of quick returns (a ring used and '
+                          'returned a few lines later stays a use; P3). '
+                          'The triage also counted phantom uses on '
+                          'active->active tidy drags (P3-R1), since fixed '
+                          '(PARSER_DEFECTS_FIXED)'),
     'elven_ring_collect': ('PARSER-BUG-SUSPECTED',
                            'used->active returns and used->used tidies '
-                           'recorded as Shadow collects '
-                           '(log_replay.py:3473, 4019); collects can '
+                           'recorded as Shadow collects (P3-R2: the '
+                           'Scribe ring branch and the Controls.366 '
+                           'handler of LogReplayer._process_line book '
+                           'used->any as a collect); collects can '
                            'exceed FP uses in parser output'),
     'elven_ring_fp_state': ('PARSER-BUG-SUSPECTED',
                             'fp_elven_rings never restored on ring '
@@ -1406,9 +1513,10 @@ VERDICTS = {
     'dice_roll': ('MATCH', ''),
     'fellowship_move': ('PARSER-BUG-SUSPECTED',
                         'two handlers for progress-marker drags; the '
-                        'sync-only path (log_replay.py:4693) records NO '
+                        "sync-only path (the 'Track -> Track' branch of "
+                        'LogReplayer._handle_move) records NO '
                         'fellowship_move for real +1 advances (2025-07-03 '
-                        'Eazy_kapcerz: 10 advances, 0 records)'),
+                        'Eazy_kapcerz: 10 advances, 0 records; P2)'),
     'companion_separate': ('MATCH', ''),
     'nazgul_move': ('REGEX-LIMITATION',
                     'census excludes WK/Saruman/Mouth flights and '
@@ -1421,9 +1529,10 @@ VERDICTS = {
                            'census SIEGE_BOX_CODES misses Game.20/21/'
                            '22/23/26'),
     'mordor_move': ('PARSER-SUSPECTED-MILD',
-                    'parser records backward Mordor-track oscillation '
-                    'drags (from_step > to_step, game-illegal) as '
-                    'mordor_move; census counts forward steps only'),
+                    'parser records backward Mordor-track drags '
+                    "(from_step > to_step: a stop tile's cancelled step, "
+                    'never an FP move - C5-03) as mordor_move; census '
+                    'counts forward steps only (P6)'),
     'fsp_pawn_place': ('REGEX-LIMITATION',
                        'declare-in-place via corruption-marker walks, '
                        'Mordor-entry declares, and pawn+army group drags '
@@ -1444,15 +1553,17 @@ VERDICTS = {
                               'combat_casualties records; whole games '
                               'have zero records despite battles'),
     'use_token': ('PARSER-BUG-SUSPECTED',
-                  'FP die-consumption interceptions (log_replay.py:3227 '
-                  'Controls.271 grammar) swallow token pids 426/427 '
-                  'before _handle_token_move: Controls.271-dialect token '
-                  'uses are never recorded (~66 uses in 500 games)'),
+                  'FP die-consumption interceptions (the Controls.271 '
+                  'grammar of LogReplayer._process_line) swallow token '
+                  'pids 426/427 before LogReplayer._handle_token_move: '
+                  'Controls.271-dialect token uses are never recorded '
+                  '(~66 uses in 500 games; P1)'),
     'dwarven_ring': ('GRAMMAR-ROUTING-ASYMMETRY',
                      'ring pids 428-431 riding the die-consumption '
-                     'grammars (log_replay.py:3201/3227) are swallowed '
-                     '(252/257 of the delta); the ring doubles as a '
-                     'rolled die in placeholder clients so routing is '
+                     'grammars (the HighlightLabel.86 / Controls.271 '
+                     'interceptions of LogReplayer._process_line) are '
+                     'swallowed (252/257 of the delta); the ring doubles '
+                     'as a rolled die in placeholder clients so routing is '
                      'defensible but lossy; die_used missing on 92.2% '
                      'of dwarven_ring records (741/804) - structural'),
     'play_event': ('REGEX-LIMITATION',
@@ -1484,8 +1595,9 @@ VERDICTS = {
     'companion_death_family': ('PARSER-BUG-SUSPECTED',
                                'consecutive Mordor-track sacrifices '
                                'dropped (hunt-resolution latch not '
-                               're-armed, log_replay.py:7303-7315); '
-                               'census side also overcounts re-drags/'
+                               're-armed in '
+                               'LogReplayer._handle_fellowship_companions; '
+                               'P5); census side also overcounts re-drags/'
                                'Gollum/leader-cas kills'),
     'choose_guide': ('REGEX-LIMITATION',
                      'census nets guide SWAPS to zero (new guide in + '
@@ -1494,17 +1606,88 @@ VERDICTS = {
                          'reveal dialects vs play_event+combat_card'),
 }
 
-# Parser defects the census believes are REAL (2026-08 triage; report,
-# do not fix here).  Each entry: locus, mechanism, example games with
-# line numbers (stripped non-empty numbering, = parser _rec_line).
+# The measurement each VERDICTS label was assigned on (C7-07): diverging
+# games per row in the 2026-08 500-game report the triage annotated
+# (data/log_census_report.json, Aug 3; its ring deep dive's 32/500 and
+# use_token's 433-367=66 are the figures quoted above).  A label is shown
+# only while the live divergence rate stays consistent with this baseline
+# (_triage_holds); otherwise the row prints RETRIAGE(was <label>).  Update
+# together with VERDICTS after a re-triage.
+TRIAGE_BASELINE_GAMES = 500
+TRIAGE_BASELINE_DIVERGING = {
+    'elven_ring_fp_use': 16,
+    'elven_ring_fp_state': 15,
+    'elven_ring_collect': 29,
+    'pass': 1,
+    'dice_roll': 63,
+    'hunt_tile_draw': 56,
+    'draw_card': 29,
+    'eye_allocate': 86,
+    'fellowship_move': 21,
+    'mordor_move': 136,
+    'fellowship_hide_reveal': 459,
+    'fsp_pawn_place': 200,
+    'political_walk': 57,
+    'political_activate': 71,
+    'dwarven_ring': 48,
+    'use_token': 59,
+    'play_event': 321,
+    'card_reveals_all': 166,
+    'crown_aragorn': 0,
+    'companion_separate': 35,
+    'choose_guide': 139,
+    'companion_death_family': 313,
+    'muster_gesture': 381,
+    'muster_plus_swap': 485,
+    'army_gesture': 450,
+    'nazgul_move': 434,
+    'retreat_into_siege': 158,
+    'combat_casualty_units': 495,
+    'casualty_units_vs_marks': 483,
+    'combat_card_none': 412,
+    'combat_effect_choice_ff': 273,
+}
+
+
+# Tolerance of the verdict test (|z| of the pooled two-proportion test).
+# R2-S4-EXTRACT (C7-07 rescan): rows labelled MATCH use the tighter z=2 - a
+# MATCH label is a claim that the parser agrees with the census, and at z=3
+# up to 11/500 regressed 'pass' games (baseline 1/500) kept it.  The live,
+# base and rate columns always show the raw numbers.
+TRIAGE_Z = 3.0
+TRIAGE_Z_MATCH = 2.0
+
+
+def _triage_holds(base_div, base_games, div, games, z=TRIAGE_Z):
+    """True when div/games is consistent with the triage baseline
+    base_div/base_games (pooled two-proportion test, |z| <= z; compare()
+    passes TRIAGE_Z_MATCH for MATCH-labelled rows).  With a
+    zero pooled variance (both 0 or both all-diverging) only an identical
+    rate holds."""
+    pooled = (base_div + div) / float(base_games + games)
+    var = pooled * (1.0 - pooled) * (1.0 / base_games + 1.0 / games)
+    diff = abs(div / float(games) - base_div / float(base_games))
+    if var <= 0.0:
+        return diff == 0.0
+    return diff <= z * var ** 0.5
+
+# Parser defects the census believes are REAL and still OPEN (2026-08
+# triage; report, do not fix here).  Each entry: locus, mechanism,
+# example games with line numbers (stripped non-empty numbering, =
+# parser _rec_line).  R17-LOGREPLAY: a locus names the LogReplayer
+# method and grammar, never a log_replay.py line number (those rotted as
+# the file grew); a defect fixed in the parser moves to
+# PARSER_DEFECTS_FIXED below, with the code that fixed it.
 PARSER_DEFECTS = {
     'P1_use_token_swallowed': {
-        'locus': 'log_replay.py:3227 (Controls.271 grammar) and :3201 '
-                 '(HighlightLabel.86) FP die-consumption interceptions',
+        'locus': 'LogReplayer._process_line FP die-consumption '
+                 'interceptions: the Controls.271 grammar and the '
+                 'HighlightLabel.86 grammar',
         'mechanism': 'the interception captures ANY pid, no-ops '
-                     '_track_die_consumed for non-die pids (426/427 not '
-                     'in die_id_map) and returns, so Controls.271-'
-                     'dialect token uses never reach _handle_token_move '
+                     'LogReplayer._track_die_consumed for non-die pids '
+                     '(426/427 not in die_id_map) and returns, so '
+                     'Controls.271-dialect token uses never reach '
+                     'LogReplayer._handle_token_move '
                      '(~66 unrecorded uses / 500 games; dwarven-ring '
                      'pids 428-431 share the mechanism, 252 drags)',
         'examples': [
@@ -1516,8 +1699,10 @@ PARSER_DEFECTS = {
             '2024-06-30_180803_FP_GJB_SP_gus833.log L362, L446'],
     },
     'P2_fellowship_move_dropped': {
-        'locus': 'log_replay.py:4693-4703 (sync-only marker-drag path) '
-                 'vs :7574-7578 (recording path)',
+        'locus': "the 'Track -> Track' marker-drag branch of "
+                 'LogReplayer._handle_move (sync-only path: Scribe '
+                 'drags) vs LogReplayer._handle_fellowship_track '
+                 '(recording path: the Controls.790 grammar)',
         'mechanism': 'inconsistent dispatch: a subset of real +1 '
                      'progress advances hit the sync-only path and emit '
                      'NO fellowship_move record',
@@ -1528,18 +1713,20 @@ PARSER_DEFECTS = {
             '(Track0->Track1 legs)'],
     },
     'P3_elven_ring_branch': {
-        'locus': 'log_replay.py:3427 (len==1 guard), :3454 (active-> '
-                 'any = use), :3473 and :4019 (used->any = collect)',
-        'mechanism': 'R1: active->active slot tidies recorded as FP '
-                     'uses; R2: used->active returns and used->used '
+        'locus': 'LogReplayer._process_line ring branches: the Scribe '
+                 'drag branch (len(pieces) == 1 guard; used -> any = '
+                 'collect) and the Controls.366 handler (used -> any = '
+                 'collect)',
+        'mechanism': 'R2: used->active returns and used->used '
                      'tidies recorded as Shadow collects (collects can '
                      'exceed uses; fp_elven_rings never restored, '
                      'clipped by max(0,...)); R3: multi-ring drags '
                      'bypass the ring branch entirely. 32/500 games '
-                     'diverge; census invariant <=6 holds in 100%',
+                     'diverged in the 2026-08 triage, R1 (active->active '
+                     'tidies booked as uses) included - R1 is fixed, see '
+                     'PARSER_DEFECTS_FIXED; census invariant <=6 holds '
+                     'in 100%',
         'examples': [
-            "R1: 2024-04-04_191632_FP_Mistakentuna_SP_Jaymanen.log "
-            "L1312 (251 Game.2008->Game.2010) -> phantom elven_ring use",
             "R2: 2025-07-06_191415_FP_Alexey'a_SP_Rexxarchik.log L804/"
             "L806 returns -> collect records; parser collects 4 > uses "
             "3 (impossible); final board has 2 active rings, parser "
@@ -1551,26 +1738,10 @@ PARSER_DEFECTS = {
             'R3: Mistakentuna L1311 (249 251 dragged together, ring '
             'branch skipped)'],
     },
-    'P4_dead_marshes_companion_death': {
-        'locus': "log_replay.py:7272 death_areas = ['Card Play', "
-                 "'Dead', 'Casualties', 'Current Action'] + :7278 "
-                 'substring match',
-        'mechanism': "'Dead' in 'Dead Marshes' -> a companion "
-                     'SEPARATING to the Dead Marshes region is recorded '
-                     'as companion_death and removed. 34 affected games '
-                     'found in the first 4000 corpus logs scanned '
-                     '(Dead Marshes is on the natural path to Mordor)',
-        'examples': [
-            '2023-01-18_140317_FP_Franatleti_SP_Lancer.log L632: '
-            'Boromir (244) Game.1998->Game.1959, parser records '
-            'companion_death (PROVEN by replay)',
-            '2023-01-27_015435_FP_GrayPockets_SP_Matzerotti.log L1011: '
-            'Peregrin (246) Guide Box->Dead Marshes',
-            '2023-02-21_200620_FP_Amroth_SP_Sonnyl.log L929: 245+246 '
-            'group separation Guide Box->Dead Marshes'],
-    },
     'P5_mordor_sacrifices_dropped': {
-        'locus': 'log_replay.py:7303-7315 hunt-resolution latch',
+        'locus': 'LogReplayer._handle_fellowship_companions hunt-'
+                 'sacrifice branch (the _in_hunt_resolution latch is '
+                 'cleared by the first sacrifice)',
         'mechanism': 'consecutive/late Mordor-track companion '
                      'sacrifices with the identical 644 <pid> <tile> -> '
                      'Used grammar are only partially recorded (latch '
@@ -1583,17 +1754,23 @@ PARSER_DEFECTS = {
             '(Legolas), L915 (Peregrin) missed; 3/5 recorded'],
     },
     'P6_mordor_move_backward': {
-        'locus': 'log_replay.py:~7668 Mordor-track handler',
-        'mechanism': 'no direction check: backward oscillation drags '
-                     '(from_step > to_step, game-illegal) are recorded '
-                     'as mordor_move; mild (human re-drag noise)',
+        'locus': 'LogReplayer._handle_fellowship_track Mordor-track '
+                 'branch',
+        'mechanism': 'no direction check: backward drags (from_step > '
+                     'to_step) are recorded as mordor_move; mild.  '
+                     "C5-03: such a drag is a stop tile's cancelled step "
+                     "(Shelob's Lair, 'On, On They Went', ...), never an "
+                     'FP move - LogReplayer._is_stop_tile_step_back keeps '
+                     'it from closing a hunt decision, but the record is '
+                     'still booked',
         'examples': [
             '2025-02-23 Gotti16850_TheLastNumenorean game: L934, '
             'L1042, L1113 each Mordor4->Mordor3',
             '2024-01-21 Disgruntled_Feanor game: L904, L1119, L1243'],
     },
     'P7_staged_relocation_as_muster': {
-        'locus': 'muster path (card-box staging)',
+        'locus': 'the muster path (LogReplayer._handle_muster) for '
+                 'card-box staging',
         'mechanism': 'map->Game.2037->map staged relocations: pickup '
                      'leg silently dropped, drop leg booked as muster '
                      '(a move mislabeled; board state stays correct); '
@@ -1604,8 +1781,8 @@ PARSER_DEFECTS = {
             '2024-12-21 Feanor_Upward game L1832-1833'],
     },
     'P8_casualty_representation': {
-        'locus': '_remove_pieces_from_armies (drag path) emits marks '
-                 'only; non-battle removals emit neither',
+        'locus': 'LogReplayer._remove_pieces_from_armies (drag path) '
+                 'emits marks only; non-battle removals emit neither',
         'mechanism': 'REPRESENTATION note, not a bug: drag-based '
                      'casualties produce casualty MARKS (no '
                      'combat_casualties record; whole games have 0 '
@@ -1617,6 +1794,44 @@ PARSER_DEFECTS = {
         'examples': [
             '2024-09-28_065122_FP_Pallando_SP_Ira.log: 18 attacks, 0 '
             'combat_casualties records, 39 marks / 53 mark-units'],
+    },
+}
+
+# Triage defects since FIXED in log_replay (R17-LOGREPLAY): kept so the
+# report says what was fixed and where, instead of listing them as open.
+# Each entry: was (the 2026-08 mechanism), fixed_by (the code), examples
+# (the triage's games), test (the regression pin).
+PARSER_DEFECTS_FIXED = {
+    'P3_R1_active_to_active_ring_tidy': {
+        'was': 'R1 of P3: active->active Elven-Ring slot tidies '
+               'recorded as FP uses (phantom elven_ring records)',
+        'fixed_by': 'LogReplayer._process_line Scribe ring branch: a '
+                    'use needs raw_to not in RING_ACTIVE_LOCS (an '
+                    'active->active re-seat is a display shuffle, never '
+                    'a use)',
+        'examples': [
+            '2024-04-04_191632_FP_Mistakentuna_SP_Jaymanen.log L1312 '
+            '(251 Game.2008->Game.2010): no elven_ring record'],
+        'test': 'src/test_round17_R17_LOGREPLAY_defect_ledger.py',
+    },
+    'P4_dead_marshes_companion_death': {
+        'was': "'Dead' in 'Dead Marshes' (a substring list death_areas "
+               "= ['Card Play', 'Dead', 'Casualties', 'Current "
+               "Action']) -> a companion SEPARATING to the Dead Marshes "
+               'region was recorded as companion_death and removed; 34 '
+               'affected games in the first 4000 corpus logs',
+        'fixed_by': 'LogReplayer._zone_is_companion_death: a map region '
+                    'or stronghold is never a casualty pile (exact board '
+                    'membership); LogReplayer._handle_fellowship_'
+                    'companions calls it',
+        'examples': [
+            '2023-01-18_140317_FP_Franatleti_SP_Lancer.log L632: '
+            'Boromir (244) Game.1998->Game.1959',
+            '2023-01-27_015435_FP_GrayPockets_SP_Matzerotti.log L1011: '
+            'Peregrin (246) Guide Box->Dead Marshes',
+            '2023-02-21_200620_FP_Amroth_SP_Sonnyl.log L929: 245+246 '
+            'group separation Guide Box->Dead Marshes'],
+        'test': 'src/test_companion_dead_marshes.py',
     },
 }
 
@@ -1660,15 +1875,26 @@ def select_files(sample):
 
 
 def compare(census_by_game, parser_by_game, types=None):
+    """Per-row census-vs-parser comparison.  R17-LOGREPLAY: a game the
+    parser crashed on ({'error': ...}) has no count to compare, but it is
+    never dropped silently - each row reports parser_errors (and the
+    files); the triage test counts a crashed game as diverging, so a
+    regression that crashes exactly the diverging games cannot keep a
+    label; and a row with any crash shows PARSER-ERRORS(n; was <label>),
+    since the 2026-08 triage measured no crash."""
     rows = {}
     for name, cget, pget, note in REPORT_ROWS:
         if types and name not in types:
             continue
         per_game = []
         getter_errors = 0
+        error_files = []
         for fn, cs in census_by_game.items():
             ps = parser_by_game.get(fn)
-            if not ps or 'error' in ps:
+            if not ps:
+                continue
+            if 'error' in ps:
+                error_files.append(fn)
                 continue
             try:
                 c = int(cget(cs))
@@ -1677,22 +1903,54 @@ def compare(census_by_game, parser_by_game, types=None):
                 getter_errors += 1
                 continue
             per_game.append((fn, c, p))
-        if not per_game:
+        if not per_game and not error_files:
             continue
+        n_err = len(error_files)
         diffs = [abs(c - p) for (_f, c, p) in per_game]
         div_games = [(f, c, p) for (f, c, p) in per_game if c != p]
         div_games.sort(key=lambda t: -abs(t[1] - t[2]))
+        # verdict: the static triage label only while this run's numbers
+        # are consistent with the measurement it was assigned on (C7-07)
         v = VERDICTS.get(name)
+        base = TRIAGE_BASELINE_DIVERGING.get(name)
+        holds = (None if base is None else
+                 _triage_holds(base, TRIAGE_BASELINE_GAMES,
+                               len(div_games) + n_err,
+                               len(per_game) + n_err,
+                               z=(TRIAGE_Z_MATCH
+                                  if v is not None and v[0] == 'MATCH'
+                                  else TRIAGE_Z)))
+        if n_err:
+            verdict = 'PARSER-ERRORS(%d; was %s)' % (
+                n_err, v[0] if v else 'UNTRIAGED')
+        elif v is None:
+            verdict = 'UNTRIAGED'
+        elif holds is None:
+            verdict = 'NO-BASELINE(was %s)' % v[0]
+        elif holds:
+            verdict = v[0]
+        else:
+            verdict = 'RETRIAGE(was %s)' % v[0]
         rows[name] = {
             'note': note,
-            'verdict': v[0] if v else 'UNTRIAGED',
+            'verdict': verdict,
             'verdict_note': v[1] if v else '',
+            'live_verdict': 'DIVERGES' if div_games or n_err else 'MATCH',
+            'triage_verdict': v[0] if v else 'UNTRIAGED',
+            'triage_holds': holds,
+            'triage_baseline': None if base is None else {
+                'games': TRIAGE_BASELINE_GAMES,
+                'games_diverging': base,
+                'divergence_rate': round(base / TRIAGE_BASELINE_GAMES, 4)},
             'games': len(per_game),
+            'parser_errors': n_err,
+            'parser_error_files': sorted(error_files)[:12],
             'getter_errors': getter_errors,
             'census_total': sum(c for (_f, c, _p) in per_game),
             'parser_total': sum(p for (_f, _c, p) in per_game),
             'games_diverging': len(div_games),
-            'divergence_rate': round(len(div_games) / len(per_game), 4),
+            'divergence_rate': (round(len(div_games) / len(per_game), 4)
+                                if per_game else 0.0),
             'median_abs_divergence': statistics.median(diffs) if diffs else 0,
             'top_offenders': [
                 {'file': f, 'census': c, 'parser': p}
@@ -1708,6 +1966,7 @@ def ring_deep_report(census_by_game, parser_by_game):
     naive_inflated = 0
     tot_fp = tot_col = tot_proven = tot_regrant = 0
     div = []
+    parser_errors = 0           # R17-LOGREPLAY: crashed games, reported
     for fn, cs in census_by_game.items():
         r = cs['ring']
         rn = cs['ring_naive']
@@ -1721,7 +1980,10 @@ def ring_deep_report(census_by_game, parser_by_game):
         if rn['total'] > r['total_loose']:
             naive_inflated += 1
         ps = parser_by_game.get(fn)
-        if not ps or 'error' in ps:
+        if not ps:
+            continue
+        if 'error' in ps:
+            parser_errors += 1
             continue
         p_fp = _sub(ps, 'elven_fp') + _sub(ps, 'discard_ring')
         p_col = _sub(ps, 'elven_collect')
@@ -1756,23 +2018,34 @@ def ring_deep_report(census_by_game, parser_by_game):
         'pct_within_6_strict': round(100.0 * within6_strict / n, 2) if n else 0,
         'pct_within_6_naive': round(100.0 * within6_naive / n, 2) if n else 0,
         'games_naive_inflated': naive_inflated,
+        'parser_errors': parser_errors,
         'divergent_games': len(div),
         'worst_20': div[:20],
     }
 
 
 def print_table(rows):
-    hdr = '%-26s %6s %9s %9s %7s %7s %7s  %s' % (
-        'type', 'games', 'census', 'parser', 'ndiv', 'rate', 'medad',
-        'verdict')
+    hdr = '%-26s %6s %5s %9s %9s %7s %7s %7s %7s  %-8s  %s' % (
+        'type', 'games', 'perr', 'census', 'parser', 'ndiv', 'rate', 'base',
+        'medad', 'live', 'verdict')
     print(hdr)
     print('-' * len(hdr))
     for name in sorted(rows):
         r = rows[name]
-        print('%-26s %6d %9d %9d %7d %6.1f%% %7.1f  %s' % (
-            name, r['games'], r['census_total'], r['parser_total'],
-            r['games_diverging'], 100 * r['divergence_rate'],
-            r['median_abs_divergence'], r.get('verdict', '')))
+        b = r.get('triage_baseline')
+        base = '%6.1f%%' % (100 * b['divergence_rate']) if b else '-'
+        print('%-26s %6d %5d %9d %9d %7d %6.1f%% %7s %7.1f  %-8s  %s' % (
+            name, r['games'], r.get('parser_errors', 0), r['census_total'],
+            r['parser_total'], r['games_diverging'],
+            100 * r['divergence_rate'], base,
+            r['median_abs_divergence'], r.get('live_verdict', ''),
+            r.get('verdict', '')))
+    print('live = this run (MATCH only if no game diverges and the parser '
+          'crashed on none); perr = games the parser crashed on (not in '
+          'games); base = diverging-game rate the 2026-08 triage label was '
+          'assigned on; verdict = that label while rate is consistent with '
+          'base, else RETRIAGE(was <label>), and PARSER-ERRORS(n; was '
+          '<label>) on any crash')
 
 
 def main(argv=None):
@@ -1800,11 +2073,23 @@ def main(argv=None):
             print('  censused %d/%d' % (i + 1, len(files)))
 
     parser_by_game = {}
+    parser_fp = None
+    parser_errors = {}
     if not args.no_parser:
+        parser_fp = parser_fingerprint()
+        print('parser fingerprint %s' % parser_fp)
         parser_by_game = run_parser(files, workers=args.workers,
-                                    refresh=args.refresh_cache)
+                                    refresh=args.refresh_cache,
+                                    fingerprint=parser_fp)
         parser_by_game = {k: v for k, v in parser_by_game.items()
                           if v is not None}
+        # R17-LOGREPLAY: a parser crash is reported, never counted as a
+        # parsed game (compare() and the ring deep dive report it per row)
+        parser_errors = {k: v['error'] for k, v in parser_by_game.items()
+                         if 'error' in v}
+        for fn in sorted(parser_errors):
+            print(('  parser FAILED %s: %s' % (fn, parser_errors[fn]))
+                  .encode('ascii', 'backslashreplace').decode('ascii'))
 
     rows = compare(census_by_game, parser_by_game, types)
     ring = ring_deep_report(census_by_game, parser_by_game)
@@ -1813,12 +2098,17 @@ def main(argv=None):
         'meta': {
             'games': len(census_by_game),
             'sample_arg': args.sample,
-            'parser_games': len(parser_by_game),
+            'parser_games': len(parser_by_game) - len(parser_errors),
+            'parser_errors': len(parser_errors),
+            'parser_error_games': [{'file': fn, 'error': parser_errors[fn]}
+                                   for fn in sorted(parser_errors)],
+            'parser_fingerprint': parser_fp,
             'no_signature_types': NO_SIGNATURE_TYPES,
         },
         'ring_deep_dive': ring,
         'types': rows,
         'parser_defects': PARSER_DEFECTS,
+        'parser_defects_fixed': PARSER_DEFECTS_FIXED,
     }
     _outd = os.path.dirname(args.out)
     if _outd:
@@ -1827,10 +2117,11 @@ def main(argv=None):
         json.dump(report, f, indent=1)
     print('\n=== RING DEEP DIVE ===')
     print('games %d | within-6 strict %.1f%% | naive within-6 %.1f%% | '
-          'naive-inflated games %d | divergent-vs-parser %d'
+          'naive-inflated games %d | divergent-vs-parser %d | '
+          'parser errors %d'
           % (ring['games'], ring['pct_within_6_strict'],
              ring['pct_within_6_naive'], ring['games_naive_inflated'],
-             ring['divergent_games']))
+             ring['divergent_games'], ring['parser_errors']))
     print('strict total distribution: %s'
           % ring['total_strict_distribution'])
     print('naive  total distribution: %s'

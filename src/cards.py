@@ -602,7 +602,13 @@ def can_play_combat_card(card: Card, combat_state: "CombatState",
 
     # Check leader requirement
     if card.requires_leader:
-        if not army.leaders and not combat_state.companions_in_battle:
+        from combat import _combat_leader_side
+        # A physical army entry may retain stranded enemy figures. Only
+        # this role's own participating Leader or Companion satisfies it.
+        if not any(_combat_leader_side(leader) == side
+                   for leader in army.leaders) and not any(
+                       _combat_leader_side(companion) == side
+                       for companion in combat_state.companions_in_battle):
             return False, "No Leader in battle"
 
     # Named character in battle (Gandalf / Strider-Aragorn class).

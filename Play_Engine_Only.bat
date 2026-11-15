@@ -1,5 +1,9 @@
 @echo off
-setlocal EnableExtensions EnableDelayedExpansion
+setlocal EnableExtensions DisableDelayedExpansion
+:: the folder of this file is read while an exclamation mark is an ordinary
+:: character (a folder name may hold one); afterwards every path is a !NAME!
+set "HERE=%~dp0"
+setlocal EnableDelayedExpansion
 :: =====================================================================
 :: Play_Engine_Only.bat -- the engine's OWN board GUI, no Java client.
 :: GENERATED from wotr_bridge\launch_head.py (--write-bat); edit the
@@ -11,7 +15,6 @@ setlocal EnableExtensions EnableDelayedExpansion
 :: =====================================================================
 title AlphaWOTR - engine only (UNTESTED)
 
-set "HERE=%~dp0"
 set "PLAY=!HERE!wotr_bridge\play_client"
 set "BRIDGE=!HERE!wotr_bridge"
 
@@ -70,19 +73,21 @@ if not exist "!PYW!" set "PYW=!PY!"
 echo   Python: "!PY!"
 
 :: certified-path env (CPU pinned; '-1', never an empty string) and the
-:: v41 generation switch (the loader refuses the v41 nets without it)
+:: generation switch WOTR_ACT_GEN=v53 (the loader refuses other generations)
 set "CUDA_VISIBLE_DEVICES=-1"
 set "KMP_DUPLICATE_LIB_OK=TRUE"
 set "KMP_BLOCKTIME=0"
 set "OMP_WAIT_POLICY=PASSIVE"
 set "PYTHONHASHSEED=0"
-set "WOTR_ACT_GEN=v52"
+set "WOTR_ACT_GEN=v53"
 set "WOTR_REWARD_CONTRACT=predecision_profile_v1"
 set "WOTR_NATIVE=0"
 set "WOTR_LIVE_SEARCH_BACKEND=native"
 set "WOTR_LIVE_INFERENCE_THREADS=1"
 set "WOTR_LIVE_INFERENCE_CACHE=1"
 set "WOTR_LIVE_POLICY_THREADS=8"
+set "WOTR_FREE_CANDS=1"
+set "WOTR_FREE_FORCE=12"
 
 echo.
 echo   ================================================================
@@ -95,7 +100,7 @@ if "%SIDE%"=="" set "SIDE=fp"
 if /I "%SIDE%"=="fp" goto guiok
 if /I "%SIDE%"=="sh" goto guiok
 if /I "%SIDE%"=="watch" goto guiok
-echo   [X] side must be fp, sh or watch - got "%SIDE%"
+echo   [X] The side must be fp, sh or watch. The value given was "%SIDE%".
 pause
 exit /b 1
 :guiok
@@ -108,7 +113,7 @@ shift
 goto guirest
 :guirun
 cd /d "!HERE!"
-"!PY!" "!HERE!src\gui.py" --live %SIDE% --net corpus_live%REST%
+"!PY!" "!HERE!src\gui.py" --live %SIDE% --net mc200_fpwin_shwin%REST%
 set "RC=%ERRORLEVEL%"
 if not "%RC%"=="0" pause
 endlocal & exit /b %RC%

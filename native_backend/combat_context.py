@@ -141,7 +141,8 @@ def require_native_context():
     _function(army_participants,'select_forced_attack',None,{'require_leader':False})
     _function(game_logic,'battle',(None,None,False,1,False,None))
     _function(game_logic,'move_army',None,dict(move_units=None,move_elite=None,move_leaders=None,
-        move_nazgul=None,side=None,nation_ok=None,combat_context=None,movement_roster=None,defer_stacking=False))
+        move_nazgul=None,side=None,nation_ok=None,combat_context=None,movement_roster=None,defer_stacking=False,
+        chosen_leaders=None,chosen_units=None))   # E5-01 named figures (R2-E5-01-SURFACE; R5-TDAAN-NATIVE-TWIN-TEST)
     for name in ('army_stack_cap','_check_political_activation_for_entry','_check_companion_activates_nation',
                  'remove_orphaned_leaders','leader_must_follow','_is_saruman','_leader_side',
                  'fellowship_region','is_fp_nation_region','get_or_create_army'):

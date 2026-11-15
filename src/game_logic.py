@@ -21,9 +21,10 @@ MAX_SIEGE_UNITS = 5
 SHADOW_VP_VICTORY = 10
 FP_VP_VICTORY = 4
 
-# Geographic map regions, separate from the Mordor Track (rulebook p. 43).
-# Ordinary Fellowship map travel may enter or cross them; Track entry is
-# checked separately at Minas Morgul or Morannon during the Fellowship phase.
+# Mordor's interior (USER 2026-07-20b, 1.155/1.156): the FELLOWSHIP pawn
+# never region-steps here (track only, after a turn-start gateway
+# declaration); armies may.  Filters fellowship placement/declare menus
+# only - never get_reachable_regions.
 _MORDOR_INTERIOR = frozenset((sanitize('gorgoroth'),
                               sanitize('barad dur'),
                               sanitize('nurn')))
@@ -175,6 +176,11 @@ def _pick_die(state: gs.GameState,
     except IndexError:
         raise RuntimeError("die_idx out of range")
 
+    # R3-LOUD-FAILURES: a legacy waiver flag is refused on EVERY die use
+    # (ring_waiver_active raises), not only when the face is wrong - a
+    # correctly-faced die used to hide it.  Native ring_rules.inc
+    # ring_waiver already rejects it on every action.
+    _waiver = ring_waiver_active(state, side)
     valid = (die.current in wanted) or (
         side is gs.Side.FREE_PEOPLES and die.current == gs.ActionDieFace.WILL_OF_WEST)
     waiver_rescue = False
@@ -183,7 +189,7 @@ def _pick_die(state: gs.GameState,
     # (mirrors ai._consume_die_for_face; GL-2).
     _will_only = set(wanted) == {gs.ActionDieFace.WILL_OF_WEST}
     if not valid and not die.used and not _will_only \
-            and ring_waiver_active(state, side) \
+            and _waiver \
             and ring_waiver_permits(side, die.current):
         # A7: a paid Elven Ring widens which die may fund the action; the
         # waiver is spent ONLY when it actually rescued this consumption.
@@ -298,6 +304,38 @@ def _settle_end_of_turn(state: gs.GameState) -> bool:
     return False
 
 
+# F-2 (USER 2026-07-19): the half-spent Army-die / Muster-die window
+# fields - the same eight ai._safe_next_turn clears at its boundary.
+MULTISTEP_WINDOW_FIELDS = (
+    'pending_army_move_die', 'pending_army_move_from',
+    'pending_army_move_side', 'pending_army_move_preexist',
+    'pending_muster_die', 'pending_muster_first_type',
+    'pending_muster_region', 'pending_muster_side')
+
+
+def open_multistep_windows(state) -> list:
+    """READ-ONLY: one line per half-spent Army/Muster window still open
+    ([] when none).  begin_turn_reset expires them (F-2); the bridge
+    drivers read this first so the expiry is reported, never silent."""
+    out = []
+
+    def _who(side):
+        return getattr(side, 'name', None) or str(side)
+
+    if getattr(state, 'pending_army_move_die', None) is not None:
+        out.append('%s army move die %s (second move from %s)' % (
+            _who(getattr(state, 'pending_army_move_side', None)),
+            state.pending_army_move_die,
+            getattr(state, 'pending_army_move_from', None)))
+    if getattr(state, 'pending_muster_die', None) is not None:
+        out.append('%s muster die %s (first %s at %s)' % (
+            _who(getattr(state, 'pending_muster_side', None)),
+            state.pending_muster_die,
+            getattr(state, 'pending_muster_first_type', None),
+            getattr(state, 'pending_muster_region', None)))
+    return out
+
+
 def begin_turn_reset(state: gs.GameState, new_turn, deal_cards=True,
                      bonus_dice=True):
     """THE TURN BOUNDARY'S RULES, WITH THE TURN NUMBER SUPPLIED BY THE
@@ -305,21 +343,25 @@ def begin_turn_reset(state: gs.GameState, new_turn, deal_cards=True,
     any terminal outcome, before changing the turn, dice, or decks.
 
     ONE implementation of the boundary (A12, 2026-08-19) shared by AUTO
-    (`next_turn`), the parser and the sided bridge; the callers need
+    (`next_turn`) and the sided bridge (the live driver's Recover, the
+    spectator, and turn_bookkeeping's terminal probe on a clone).  The
+    parser no longer calls it (R4-DOC-COMMENTS, 2026-10-23: no call in
+    rendered_extract / log_replay / the corpus chain).  The callers need
     different halves, hence the split:
 
-      * the per-turn RESET            - all three need it;
+      * the per-turn RESET            - both need it;
       * `state.turn += 1`             - **only AUTO may do this**.  In
         sided play the human's marker gesture is the source of truth
-        for the turn number, and the parser takes it from the log.  So
-        the number is a PARAMETER here, never an increment.
-      * the Mordor penalty, which can END THE GAME - all three need it,
+        for the turn number.  So the number is a PARAMETER here, never
+        an increment.
+      * the Mordor penalty, which can END THE GAME - both need it,
         and the boolean is returned rather than acted on, because each
         caller delivers an end-of-game differently.
       * the four turn-start DRAWS and the hand-limit opener - AUTO only.
-        In sided and in replay the CLIENT draws and the log carries it;
+        In sided play the CLIENT draws and the log carries it;
         an engine draw here would double every turn-start card.  Hence
-        `deal_cards`, which is the only behavioural switch.
+        `deal_cards`.  `bonus_dice` is the other switch: the live driver
+        passes False and grows the die pools itself (see its use below).
 
     `enforce_settlement_control` deliberately stays in `next_turn`: it
     is guarded to self-play there ("the teacher keeps its certified
@@ -373,6 +415,16 @@ def begin_turn_reset(state: gs.GameState, new_turn, deal_cards=True,
 
     # Reset Mordor activity tracking for the new turn
     state.fellowship_acted_in_mordor = False
+
+    # F-2 (USER 2026-07-19) at THE shared boundary (R3-BEGIN-TURN-RESET-
+    # WINDOWS): the Army-die double-move / Muster double-recruit windows
+    # die with the turn - a dangling window must never hand the leftover
+    # second half to next turn's first actor (its whole menu would be
+    # that half).  ai._safe_next_turn clears the same eight fields; the
+    # live driver and the spectator report what expired here
+    # (open_multistep_windows, read before this call), loudly.
+    for _f2 in MULTISTEP_WINDOW_FIELDS:
+        setattr(state, _f2, None)
 
     # bonus_dice=False: growing the roster is legal only when the caller also
     # drags the physical die piece; the sided bridge does that itself at
@@ -910,7 +962,13 @@ def army_stack_cap(state: gs.GameState, to_san: str,
     Rulebook p.31: no more than FIVE army units inside a besieged
     stronghold - the 5-cap binds when the destination is besieged
     and the mover JOINS THE GARRISON side (a besieger reinforcing
-    the siege lines outside stays at 10)."""
+    the siege lines outside stays at 10).
+    E1-05 (fix wave 2026-10-21): a siege is ONE entry holding BOTH
+    sides, so the garrison side is the stronghold's controller
+    (combat.garrison_side_for, as event_effects._stack_cap) and the
+    siege is real only while the entry holds the besiegers' units; the
+    old test (every unit the mover's) gave the garrison 10 in a real
+    siege and 5 only for a stale one-sided flag."""
     besieged = getattr(state, 'besieged_strongholds', set())
     to_san = sanitize(str(to_san))
     if to_san in besieged and moving_side is not None:
@@ -920,9 +978,11 @@ def army_stack_cap(state: gs.GameState, to_san: str,
                 dst = a
                 break
         if dst is not None and dst.units:
-            from combat import side_of_nation as _son3
-            if not any(_son3(u.nation) != moving_side
-                       for u in dst.units):
+            from combat import side_of_nation as _son3, \
+                garrison_side_for as _gsf3
+            if (moving_side == _gsf3(state, to_san)
+                    and any(_son3(u.nation) != moving_side
+                            for u in dst.units)):
                 return MAX_SIEGE_UNITS
     return MAX_ARMY_UNITS
 
@@ -939,7 +999,9 @@ def move_army(state: gs.GameState,
               nation_ok: Optional[Callable[[gs.Nation], bool]] = None,
               combat_context: Optional[dict] = None,
               movement_roster=None,
-              defer_stacking: bool = False):
+              defer_stacking: bool = False,
+              chosen_leaders=None,
+              chosen_units=None):
     """
     Move pieces from *fr* to *to*.
 
@@ -955,8 +1017,24 @@ def move_army(state: gs.GameState,
       stay, exactly like the enemy side's figures of a shared entry);
       Companions / Minions / Nazgul are not nation figures.  None (the
       default, retreats / advances / card moves) = no restriction.
+    • *chosen_leaders* / *chosen_units* (E5-01, D5 2026-10-22): the exact
+      non-Nazgul leader figures / units the action names (a ``leader_set``
+      / ``unit_set`` row).  The counts still say how many move; only these
+      figures may fill them, and anything else is a loud RuntimeError.
+      Nazgul stay on *move_nazgul*.  Explicit counts are required.
     """
     b = state.board
+
+    _chosen_lids = _chosen_uids = None
+    if chosen_leaders is not None or chosen_units is not None:
+        if move_units is move_elite is move_leaders is move_nazgul is None:
+            raise ValueError('Chosen army figures require explicit counts')
+        if chosen_leaders is not None:
+            if any(isinstance(l, gs.Nazgul) for l in chosen_leaders):
+                raise ValueError('Nazgul ride on move_nazgul, not chosen_leaders')
+            _chosen_lids = {id(l) for l in chosen_leaders}
+        if chosen_units is not None:
+            _chosen_uids = {id(u) for u in chosen_units}
 
     # Combat advance resolves excess through the caller's existing learned
     # trim window after entry. Ordinary army movement retains its hard cap.
@@ -1160,10 +1238,13 @@ def move_army(state: gs.GameState,
         _held38 = [u for u in _own_units if not nation_ok(u.nation)]
         _own_units = [u for u in _own_units if nation_ok(u.nation)]
 
+    # E5-01: a unit_set row names its units - only they fill the counts
+    _unit_ok = ((lambda u: True) if _chosen_uids is None
+                else (lambda u: id(u) in _chosen_uids))
     m_elite , keep_elite  = take([u for u in _own_units if u.kind is gs.UnitKind.ELITE],
-                                 move_elite)
+                                 move_elite, predicate=_unit_ok)
     m_regular, keep_reg   = take([u for u in _own_units if u.kind is gs.UnitKind.REGULAR],
-                                 move_units)
+                                 move_units, predicate=_unit_ok)
     # Only the moving side's own leaders may travel with the army;
     # Saruman never moves (stays in Orthanc — official rule)
     def _movable_leader(l):
@@ -1176,7 +1257,15 @@ def move_army(state: gs.GameState,
                 # Companions / Minions / Nazgul are not nation figures
                 and (nation_ok is None
                      or not leader_must_follow(l)
-                     or nation_ok(l.nation)))
+                     or nation_ok(l.nation))
+                # E5-01: a leader_set row names its non-Nazgul figures
+                and (_chosen_lids is None or isinstance(l, gs.Nazgul)
+                     or id(l) in _chosen_lids))
+    # E5-01: with named figures the leader COUNT governs exactly those
+    # (never a Nazgul, which only move_nazgul moves)
+    _count_leader = (_movable_leader if _chosen_lids is None else
+                     (lambda l: _movable_leader(l)
+                      and not isinstance(l, gs.Nazgul)))
     if move_leaders:
         # Callers commonly ask for len(src.leaders); immobile (Saruman)
         # and enemy-side figures are not movable — clamp instead of
@@ -1186,7 +1275,7 @@ def move_army(state: gs.GameState,
         if move_nazgul is None:
             move_leaders = min(
                 move_leaders,
-                sum(1 for l in src.leaders if _movable_leader(l)))
+                sum(1 for l in src.leaders if _count_leader(l)))
         else:
             move_leaders = min(
                 move_leaders,
@@ -1205,7 +1294,7 @@ def move_army(state: gs.GameState,
     if move_nazgul is None:
         _chosen9, _ = take(
             _must_first(src.leaders), move_leaders,
-            predicate=_movable_leader)
+            predicate=_count_leader)
         _mid9 = set(map(id, _chosen9))
         m_lead = [l for l in src.leaders if id(l) in _mid9]
         keep_lead = [l for l in src.leaders if id(l) not in _mid9]
@@ -1241,6 +1330,14 @@ def move_army(state: gs.GameState,
         _got_lead = len(m_lead) if move_nazgul is None else len(m_oth9)
         if _got_lead < move_leaders:
             raise RuntimeError("Not enough leaders in stack")
+    # E5-01: the named figures move EXACTLY (never a substitute)
+    if _chosen_uids is not None and \
+            {id(u) for u in m_elite + m_regular} != _chosen_uids:
+        raise RuntimeError("Chosen army units could not all move")
+    if _chosen_lids is not None and \
+            {id(l) for l in m_lead
+             if not isinstance(l, gs.Nazgul)} != _chosen_lids:
+        raise RuntimeError("Chosen leader figures could not all move")
 
     if fr_san == to_san:
         if not (m_elite or m_regular) or _companion_activation_nation(state, to_san, m_lead) is None:
@@ -1370,6 +1467,19 @@ def declare_fellowship(state: gs.GameState, *, region: str):
 
     if region_key not in reachable:
         raise RuntimeError("Region not reachable with current progress")
+
+    # USER RULING 2026-07-20b + FINAL 2026-08-16 (1.155): the pawn never declares
+    # INTO Mordor's interior, and Mordor ENTRY is turn-start only and
+    # positional - checked AFTER the declaration opportunity by the four
+    # turn-start sites (ai._run_single_episode, ai._advance_turn_for_search,
+    # engine_play EngineSession, bridge _eng_declare -> _eng_mordor); a
+    # declaration only PLACES the pawn.  Self-play executor only: the
+    # teacher's logged declares are ground truth.
+    import combat as _cmb_mord
+    if (_cmb_mord.FINAL_HITS_HOOK is None
+            and region_key in _MORDOR_INTERIOR):
+        raise RuntimeError(
+            "Fellowship cannot declare into Mordor's interior (1.155)")
 
     # ---- locate original map key --------------------------------------
     try:
@@ -1903,8 +2013,8 @@ def apply_hunt_damage_simple(state: gs.GameState,
     Apply *dmg* corruption **after** FP has decided how to mitigate.
 
     This is a simpler version for tests. Full damage resolution runs
-    through _settle_hunt_damage / the pending_hunt decision (AI) or
-    gui._resolve_hunt_damage (GUI).
+    through _settle_hunt_damage / the pending_hunt decision (every
+    driver; the legacy GUI too since R18-SRC-TOOLS).
 
     • kill_random  – remove a random companion (not Gollum)
     • kill_guide   – remove current guide (ignored if guide is Gollum)
@@ -2384,7 +2494,9 @@ def reroll_hunt_dice(num_rerolls: int, threshold: int,
 def draw_hunt_tile(state: gs.GameState, hunt_hits: int) -> dict:
     """
     Draw a hunt tile from the pool. Returns tile info without applying
-    damage; the GUI resolves mitigation via gui._resolve_hunt_damage.
+    damage; the caller resolves mitigation.  No production caller since
+    R18-SRC-TOOLS (the legacy GUI's hunt copy was its only one; FSP Move
+    runs the engine's fellowship_move).
     The drawn tile is filed into hunt_discard HERE (drawn = used pile;
     Eyes included — they return to the pool on Mordor entry).
     """
@@ -2482,8 +2594,9 @@ def get_reachable_regions(state: gs.GameState, start: str, max_steps: int,
     return reachable
 
 
-# Internal hunt roll (self-play, card hunts); the GUI uses get_hunt_params +
-# roll_hunt_dice
+# Internal hunt roll (self-play, card hunts, and the legacy GUI's FSP Move
+# since R18-SRC-TOOLS); roll_hunt_dice / reroll_hunt_dice have no
+# production caller left
 def _hunt_roll(state: gs.GameState, num_dice: int, thresh: int,
                fp_modifier: int = 0) -> int:
     """Roll hunt dice with FP modifier. Natural 1 always misses."""
@@ -2545,9 +2658,11 @@ def _auto_sacrifice_companion(state: gs.GameState, dmg: int):
     2026-08-16).  This heuristic RESOLVES A LEARNED FP DECISION
     (corruption vs sacrifice vs which companion).  It may be invoked
     ONLY by an explicit skip_auto_sacrifice=False request from a
-    caller that owns the decision surface (legacy GUI manual play);
-    the decision framework (settle -> pending_hunt -> owning side) is
-    the production path.  test_autoresolver_purge.py pins the caller
+    caller that owns the decision surface; its one production caller
+    (legacy GUI manual play) runs the engine's fellowship_move since
+    R18-SRC-TOOLS, so only tests request it.  The decision framework
+    (settle -> pending_hunt -> owning side) is the production path.
+    test_autoresolver_purge.py pins the caller
     census (exactly two call sites, both behind explicit False).
 
     Heuristic: pick the cheapest companion whose level >= damage for full
@@ -2634,8 +2749,9 @@ def _wwsat_resolve(state: gs.GameState, source, card_id=None):
 
     1.211f: the Shadow chooses the SOURCE - kill a played FP Character
     card from the TABLE, or discard a RANDOM FP Character card from the
-    FP hand, or declines this optional effect. Explicit table targets
-    must still exist; an invalid target must not discard another card.
+    FP hand.  1.210g: the discard is MANDATORY - there is no decline
+    source.  Explicit table targets must still exist; an invalid target
+    must not discard another card.
     source=None is the LEGACY hand-first heuristic
     (hand random if any, else table) EXCEPT a teacher-forced source on
     state._wwsat_forced wins when present (closed_loop faithfulness)."""
@@ -2647,8 +2763,6 @@ def _wwsat_resolve(state: gs.GameState, source, card_id=None):
         if card_id is None:
             card_id = forced.get('card_id')
     state._wwsat_forced = None            # consume any teacher force
-    if source == 'decline':
-        return
     if source not in (None, 'hand', 'table'):
         raise ValueError('Invalid Worn with Sorrow and Toil source: %r' % source)
     hand = state.hands[gs.Side.FREE_PEOPLES].hand
@@ -2686,11 +2800,14 @@ def _wwsat_resolve(state: gs.GameState, source, card_id=None):
 
 def _on_companion_casualty(state: gs.GameState, name: str,
                            casualty: bool = True):
-    """Offer Worn with Sorrow and Toil after a Fellowship HUNT casualty.
+    """Apply Worn with Sorrow and Toil after a Fellowship HUNT casualty.
 
-    The Shadow may discard a random hand Character card, choose a named
-    table Character card, or decline. Ordinary army-combat eliminations
-    and non-Hunt event eliminations must pass casualty=False.
+    The Shadow MUST discard an FP Character card (1.210g: mandatory, no
+    decline path) - randomly from the FP hand OR a named card from the
+    table (1.211f: a LEARNED Shadow SOURCE decision; a lone option is a
+    forced one-option pending, so the live client still performs the
+    random hand discard through the pending path).  Ordinary army-combat
+    eliminations and non-Hunt event eliminations must pass casualty=False.
 
     USER RULING 2026-08-15: SEPARATION-death is legally distinct from
     being taken as a hunt casualty — a hobbit GUIDE absorbing hunt
@@ -2700,7 +2817,7 @@ def _on_companion_casualty(state: gs.GameState, name: str,
     casualty=False = leaves-play cleanup only, no WWSAT.
 
     RECORD-THEN-DRAIN: casualty resolution cannot suspend for a pending,
-    so the optional SELF-PLAY decision is recorded on
+    so the mandatory SELF-PLAY decision is recorded on
     state._wwsat_owed and drained as a learned pending after the action
     (ai._offer_wwsat_discard).  The teacher forces the LOGGED source via
     state._wwsat_forced and resolves inline."""
@@ -2968,10 +3085,15 @@ def _settle_hunt_damage(state: gs.GameState) -> None:
     reveal, else the companion-sacrifice decision, else direct
     corruption. Factored out of the fellowship_move executor
     (2026-07-21) so the Axe/Horn reduction interpose can resume it
-    after the FP's choice. No-op when no damage pends or a decision is
-    already open."""
+    after the FP's choice. No-op while a decision is already open.
+
+    R4-HOBBIT-QUEUE-CLOSURE: a settle that closes the damage WITHOUT a
+    decision (nothing left to confront - e.g. Axe/Horn took the last
+    point - or direct corruption below) drains the hobbit-place queue
+    itself, so no caller can strand a queued Hobbit with no decision
+    owner (native hd_settle mirrors this)."""
     pending_dmg = getattr(state, '_pending_hunt_damage', 0)
-    if pending_dmg <= 0 or state.pending_hunt is not None:
+    if state.pending_hunt is not None:
         return
     protection = getattr(state, 'pending_card_option', None) or {}
     if (protection.get('hunt_reduction')
@@ -2979,6 +3101,9 @@ def _settle_hunt_damage(state: gs.GameState) -> None:
                    for key in ('use_hunt_reduction', 'wizardstaff_prevent', 'mithril_redraw'))):
         # The player must resolve protection before choosing a casualty. The
         # protection executor clears its menu and then resumes this function.
+        return
+    if pending_dmg <= 0:
+        pop_hobbit_place_queue(state)
         return
     if _gollum_reveal_available(state):
         # 1.229: opening a decision CONSUMES the accumulator - from here
@@ -2998,17 +3123,83 @@ def _settle_hunt_damage(state: gs.GameState) -> None:
     else:
         _apply_fellowship_damage(state, pending_dmg)
         state._pending_hunt_damage = 0
+        pop_hobbit_place_queue(state)
+
+
+def hobbit_place_tiles(state: gs.GameState) -> list:
+    """R4-HOBBIT-QUEUE-CLOSURE: the originating Hunt tile of each
+    _hobbit_place_queue entry, aligned with the queue (stored in
+    _hobbit_place_tiles; native hc_place_tiles mirrors).  0 = the Hunt
+    damage chain being resolved; a positive value = a group of its own (a
+    Lure of the Ring / Foul Thing teacher Hobbit, or a chain closed by
+    _finish_hunt_decision before the next tile's damage).  Aligned on the
+    queue's TAIL: an entry without a stored marker (a state that never
+    stored one) reads 0, and a marker whose entry was removed elsewhere (a
+    queue reset) is dropped.  Returns a new list."""
+    n = len(getattr(state, '_hobbit_place_queue', None) or ())
+    tiles = [int(t) for t in (getattr(state, '_hobbit_place_tiles', None)
+                              or ())]
+    if len(tiles) > n:
+        tiles = tiles[len(tiles) - n:]
+    elif len(tiles) < n:
+        tiles = [0] * (n - len(tiles)) + tiles
+    return tiles
+
+
+def queue_hobbit_placement(state: gs.GameState, hob,
+                           own_tile: bool = False) -> None:
+    """Append a Hunt-removed Hobbit to _hobbit_place_queue with its tile
+    marker (the ONE appender; native hc_queue_hobbit mirrors).  Default:
+    he separated in the Hunt damage chain being resolved (marker 0, moves
+    with that chain's other Hobbits).  own_tile: he left on no Hunt tile of
+    that chain (Lure of the Ring, the Foul Thing teacher pick) - a fresh
+    marker, so no other tile's group_destination ever binds him.  The
+    markers are stored only once a non-chain entry needs one."""
+    tiles = hobbit_place_tiles(state)
+    stored = getattr(state, '_hobbit_place_tiles', None) is not None
+    q = getattr(state, '_hobbit_place_queue', None)
+    if q is None:
+        q = state._hobbit_place_queue = []
+    q.append(hob)
+    if own_tile:
+        tiles.append(max(tiles, default=0) + 1)
+        state._hobbit_place_tiles = tiles
+    elif stored:
+        tiles.append(0)
+        state._hobbit_place_tiles = tiles
+
+
+def _close_hobbit_place_group(state: gs.GameState) -> None:
+    """The chain that just closed keeps its own group: its still-queued
+    Hobbits (marker 0) get one fresh marker, so a Hobbit of the NEXT
+    tile's chain never joins them (native hc_close_place_tiles)."""
+    tiles = hobbit_place_tiles(state)
+    if 0 not in tiles:
+        return
+    fresh = max(tiles) + 1
+    state._hobbit_place_tiles = [fresh if t == 0 else t for t in tiles]
 
 
 def pop_hobbit_place_queue(state: gs.GameState) -> None:
     """Open the next queued hobbit_place decision (one per separated
-    hobbit); no-op while another hunt decision is in flight."""
+    hobbit); no-op while another hunt decision is in flight.
+
+    R4-HOBBIT-QUEUE-CLOSURE: 'group_lead' marks a placement whose next
+    queued Hobbit separated on the SAME Hunt tile (equal tile marker);
+    only then does resolve_hunt_decision('hobbit_place') bind that Hobbit
+    to this one's destination (Almanac pp6-7).  Decided here: a Hobbit
+    queued after this pop comes from another source by construction."""
     if getattr(state, 'pending_hunt', None) is not None:
         return
     q = getattr(state, '_hobbit_place_queue', None)
     if not q:
         return
+    tiles = hobbit_place_tiles(state)
+    stored = getattr(state, '_hobbit_place_tiles', None) is not None
     hob = q.pop(0)
+    tile = tiles.pop(0)
+    if stored:
+        state._hobbit_place_tiles = tiles
     state.pending_hunt = {
         'phase': 'hobbit_place',
         'companion': getattr(hob, 'name', str(hob)),
@@ -3016,6 +3207,8 @@ def pop_hobbit_place_queue(state: gs.GameState) -> None:
         'companion_obj': hob,
         'damage': 0,
     }
+    if q and tiles[0] == tile:
+        state.pending_hunt['group_lead'] = True
 
 
 def return_mithril_tile_if_settled(state: gs.GameState) -> bool:
@@ -3049,8 +3242,16 @@ def _finish_hunt_decision(state: gs.GameState) -> None:
     (1.229/1.132), else the hobbit-place queue drains."""
     state.pending_hunt = None
     if getattr(state, '_pending_hunt_damage', 0) > 0:
+        # R4-HOBBIT-QUEUE-CLOSURE: the next tile's damage is confronted
+        # while this chain's Hobbits may still be queued - they keep
+        # their own group (never bound to the next tile's placements)
+        _close_hobbit_place_group(state)
         _settle_hunt_damage(state)
-    else:
+    # R3-HOBBIT-PLACE-STRAND: drain also after a DIRECT settle (nobody to
+    # sacrifice, no Gollum reveal: no decision opens), else the queued
+    # hobbit was stranded with no owner.  A no-op when the settle opened a
+    # decision; skipped while a protection choice still owes the damage.
+    if getattr(state, '_pending_hunt_damage', 0) <= 0:
         pop_hobbit_place_queue(state)
 
 
@@ -3195,10 +3396,7 @@ def resolve_hunt_decision(state: gs.GameState, kind: str, *,
                 except Exception:
                     pass
             else:
-                q = getattr(state, '_hobbit_place_queue', None)
-                if q is None:
-                    q = state._hobbit_place_queue = []
-                q.append(hob)
+                queue_hobbit_placement(state, hob)    # this tile's chain
         change_guide(state, allow_pending=True)
         continue_hunt_chain(state, max(0, int(ph.get('damage', 0)) - 1),
                             casualty_taken=bool(ph.get('casualty_taken')))
@@ -3239,10 +3437,8 @@ def resolve_hunt_decision(state: gs.GameState, kind: str, *,
             absorbed = min(int(dmg), int(victim.level))
             if hobbit_hunt_placement_applies(state, victim.name):
                 remove_hobbit_for_placement(state, victim, absorbed)
-                q = getattr(state, '_hobbit_place_queue', None)
-                if q is None:
-                    q = state._hobbit_place_queue = []
-                q.append(victim)     # learned hobbit_place after the chain
+                # learned hobbit_place after the chain (this tile's chain)
+                queue_hobbit_placement(state, victim)
             else:
                 _apply_fellowship_damage(state, absorbed,
                                          kill_name=victim.name)
@@ -3264,9 +3460,12 @@ def resolve_hunt_decision(state: gs.GameState, kind: str, *,
         if bound is not None and target != bound:
             raise ValueError('Companions separating on one Hunt tile must move together')
         # Almanac pp6-7: all Companions separating on this tile move together.
-        # Public reveal/route drivers drain this queue before placing the
-        # Fellowship or drawing the next tile, so its members share one tile.
-        same_tile = bool(getattr(state, '_hobbit_place_queue', None))
+        # R4-HOBBIT-QUEUE-CLOSURE: only the next queued Hobbit of the SAME
+        # Hunt tile (pop_hobbit_place_queue compared the tile markers and
+        # set group_lead) follows this destination - never a Lure / Foul
+        # Thing Hobbit or one of the next tile's chain.
+        same_tile = (bool(ph.get('group_lead'))
+                     and bool(getattr(state, '_hobbit_place_queue', None)))
         place_separated_companion(state, comp_obj, target)
         _finish_hunt_decision(state)
         if same_tile and (state.pending_hunt or {}).get('phase') == 'hobbit_place':
@@ -3493,6 +3692,15 @@ def _auto_reveal_place(state: gs.GameState):
             place(state, cur)
         return
 
+    # USER RULING 2026-07-20b (trace w5_g2 T9): revealed AT a Mordor
+    # gateway, the pawn STAYS on the gate (progress resets) - it must
+    # never region-step INTO Mordor's interior; entry happens at the
+    # next turn-start Fellowship pre-step (1.155). Self-play only
+    # (teacher placement is log-driven).
+    if learned and cur in (sanitize('morannon'), sanitize('minas morgul')):
+        place(state, cur)
+        return
+
     # USER 2026-07-20 (P2-04): reveal movement is UP TO Progress - place at
     # exactly Progress when legal, else fall back to shorter distances; never
     # inside an unconquered FP city/stronghold.
@@ -3512,6 +3720,13 @@ def _auto_reveal_place(state: gs.GameState):
         out = []
         for region in fr:
             if region == cur:
+                continue
+            # USER RULING 2026-07-20b (w5_g2 T9 Gorgoroth): the pawn
+            # never region-steps into Mordor's interior - that space
+            # is reached only via the Mordor track after a turn-start
+            # gateway declaration (1.155). Armies are NOT affected
+            # (this filter is reveal-placement only). Self-play only.
+            if learned and region in _MORDOR_INTERIOR:
                 continue
             meta = board_mod.regions.get(region, {})
             is_fp_settlement = ((meta.get('is_city')
@@ -3670,8 +3885,9 @@ def move_fellowship(state: gs.GameState,
     Advance Fellowship pawn one region and optionally perform Hunt resolution.
 
     Args:
-        skip_hunt: If True, skip automatic hunt resolution (for GUI to handle
-                   interactively using get_hunt_params(), roll_hunt_dice(), etc.)
+        skip_hunt: If True, skip automatic hunt resolution (the caller
+                   resolves it with get_hunt_params(), roll_hunt_dice(),
+                   etc.; no production caller since R18-SRC-TOOLS)
 
     Returns:
         dict with results: {"success": bool, "message": str, "victory": str or None,
@@ -4164,11 +4380,16 @@ def settle_owed_draw(state: gs.GameState, side: gs.Side,
                      deck: str) -> bool:
     """Consume one unit of declared draw debt (the driver calls this
     when the owed physical draw arrives; grant_draw calls it on a
-    successful retry).  True iff debt existed and was consumed."""
+    successful retry).  True iff debt existed and was consumed.
+    A fully paid key is REMOVED (E1-03): readers test the ledger by
+    truthiness (ai._turn_end_blockers, native st_blockers), so a
+    settled ``{key: 0}`` would read as an outstanding obligation."""
     d = getattr(state, '_owed_draws', None) or {}
     key = (side.name, deck)
     if d.get(key, 0) > 0:
         d[key] -= 1
+        if d[key] == 0:
+            del d[key]
         return True
     return False
 
@@ -4471,6 +4692,13 @@ def transform_gandalf_white(state: gs.GameState, region: str, die_idx: int):
 
     # Add to region (sanitized-key aware)
     get_or_create_army(state, region_san).leaders.append(gandalf_white_companion)
+
+    # Rulebook p.34: a Companion who ENTERS PLAY in a City or Stronghold of
+    # a passive FP nation (not enemy-controlled) activates it - the same
+    # trigger crown_aragorn applies to Gondor.  Only the White figure counts
+    # (E1-06, fix wave 2026-10-21).
+    _check_companion_activates_nation(state, region_san,
+                                      [gandalf_white_companion])
 
     # 1.126: Gandalf the Grey has left play - requires_companion FP table cards
     # keyed on Grey (Wizard's Staff) discard immediately.

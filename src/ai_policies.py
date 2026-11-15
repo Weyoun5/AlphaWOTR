@@ -1,12 +1,18 @@
 """User-selected AI conventions, independent of human game legality.
 
 Project a COMPLETE legal menu. Never generate actions, mutate a state,
-or spend resources. Runtime projection retains supplied Action objects.
+or spend resources. Runtime projection returns supplied Action objects,
+never copies. The combat-victim and Mighty-payer projections keep ONE row,
+chosen by menu index (the first of equal copies), so over `legal + supplied`
+the supplied copy of the kept row is dropped: match a supplied action by
+action_policy_key, not by object identity (live_server._ai_decide,
+R17-LIVE-AIDECIDE). The other projections keep every copy of a kept row.
 Supervised recruitment projection separately records both the literal human
 action and its fixed-kind training target; replay still executes the human action.
 Rule timing belongs to the engine.
 """
 from dataclasses import dataclass
+import os
 from typing import Optional
 
 RECRUIT_ELITE = 'recruit_elite_if_available'
@@ -16,7 +22,25 @@ MIGHTY_PAYER = 'mighty_payer_lowest_leadership'
 DREAD_USEFUL = 'dread_no_excess_forfeit'
 # Move the existing useful-count pruning out of human legality without changing
 # the learned meaning of a count or invalidating the trained policy contract.
-POLICY_VERSION = 'elite_bonus_draw_combat_victim_mighty_v3'
+POLICY_VERSION_V52 = 'elite_bonus_draw_combat_victim_mighty_v3'
+# D6P-POLICY-VERSION (D6 plan 4d / DP-F, 2026-10-23): the A2-05 Ring-twin
+# projection (below) changed the AI menu projection, so the v53 generation
+# carries its own version.  Like the observation/action contracts it is keyed
+# by the encoding generation chosen once from WOTR_ACT_GEN at import (ai.py,
+# action_schema.py and selfplay_actor_critic/contracts.py read the same
+# variable; trace_decisions.current_learning_context refuses a skew).  Every
+# other generation keeps the v3 stamp, so the deployed v52 nets, corpora and
+# checkpoints load unchanged; under v52 the A2-05 dedupe still runs with the
+# v3 stamp, as it has since 2026-10-21.
+POLICY_VERSION_V53 = 'elite_bonus_draw_combat_victim_mighty_ring_twin_v4'
+
+
+def policy_version_for_generation(generation):
+    """AI policy contract stamped under one WOTR_ACT_GEN value."""
+    return POLICY_VERSION_V53 if str(generation).strip().lower() == 'v53' else POLICY_VERSION_V52
+
+
+POLICY_VERSION = policy_version_for_generation(os.environ.get('WOTR_ACT_GEN', ''))
 
 
 def _dread_useful_actions(state, actions):
@@ -138,6 +162,65 @@ def action_policy_key(action):
     return (action.action_type, action.die_idx, _freeze(params))
 
 
+# A2-05 (fix wave 2026-10-21): Elven/Dwarven Ring rows are generated once per
+# unused die, because the live bridge binds the human's physical die by that
+# index (human legality keeps every row).  The dice of one pool are
+# interchangeable and encode_action leaves the die index unencoded (col 22
+# dead), so rows differing ONLY in that index are one choice: repeated, each
+# copy got the same logit (the group's prior times the face multiplicity) and
+# search split visits and candidate slots across the copies.  The AI keeps the
+# lowest die index offered per group - the face dedupe every other die-funded
+# family already gets in get_legal_actions.  Lowest index, not first seen, so
+# `legal + supplied` copies of the kept row both survive on this path (the
+# combat-victim and Mighty-payer projections return before it and keep ONE row
+# by menu index; see the module docstring); a group with one row is untouched.
+# Mirrored in both native ai_policy_projection.inc trees.
+_RING_DIE_FIELD = {'elven_ring': 'target_die_idx', 'dwarven_ring': 'die_idx'}
+
+
+def ring_twin_key(action):
+    """``(group_key, die_index)`` for a die-targeted Ring row, else None."""
+    field = _RING_DIE_FIELD.get(action.action_type)
+    if field is None:
+        return None
+    params = action.params or {}
+    die = params.get(field)
+    if type(die) is not int:
+        return None
+    rest = {k: v for k, v in params.items() if k != field}
+    return (action.action_type, action.die_idx, _freeze(rest)), die
+
+
+def _ring_twin_lowest(actions):
+    lowest = {}
+    for action in actions:
+        twin = ring_twin_key(action)
+        if twin is not None and (twin[0] not in lowest or twin[1] < lowest[twin[0]]):
+            lowest[twin[0]] = twin[1]
+    return lowest
+
+
+def ring_twin_index(legal_actions, human_index, projection):
+    """Menu index of the RETAINED twin of a Ring row the projection dropped.
+
+    The twin has the same faces on an interchangeable die and the same
+    encoding, so it is the same choice (no recruit-style provenance). None
+    when the row is not a dropped Ring twin.
+    """
+    actions = tuple(legal_actions)
+    twin = ring_twin_key(actions[human_index])
+    if twin is None:
+        return None
+    retained_ids = {id(action) for action in projection.actions}
+    if id(actions[human_index]) in retained_ids:
+        return None
+    for index, action in enumerate(actions):
+        other = ring_twin_key(action)
+        if id(action) in retained_ids and other is not None and other[0] == twin[0]:
+            return index
+    return None
+
+
 def project_recruitment_target(legal_actions, human_index, projection):
     """Preserve independent card targets under the user's fixed recruit kind.
 
@@ -250,6 +333,12 @@ def project_ai_actions(state, side, legal_actions):
         for i, score in members:
             if score < best:
                 keep[i] = False
+    # A2-05: one row per Ring twin group (see _RING_DIE_FIELD).
+    ring_lowest = _ring_twin_lowest(actions)
+    for i, action in enumerate(actions):
+        twin = ring_twin_key(action)
+        if twin is not None and twin[1] != ring_lowest[twin[0]]:
+            keep[i] = False
 
     pending = getattr(state, 'pending_card_option', None) or {}
     draw_rows = []

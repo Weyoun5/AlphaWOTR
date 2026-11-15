@@ -3,7 +3,7 @@
 All inference arithmetic is inherited from the existing numeric bridge. This
 component does not enable the still-unported native controller search mode.
 """
-from numeric_bridge import NumericInferenceBridge, OBSERVATION_WIDTH, Operation, integer
+from numeric_bridge import NumericInferenceBridge, Operation, integer, observation_width
 from reply_evaluation import validate_root_context
 
 
@@ -13,7 +13,7 @@ class RootNumericInferenceBridge(NumericInferenceBridge):
         self.ai=ai;self.root_side=root_side;self.root_index=0 if tag=='fp' else 1
         self.own_net=own_net
         self.nets=(own_net,None) if self.root_index==0 else (None,own_net)
-        self.feature_dim=OBSERVATION_WIDTH
+        self.feature_dim=observation_width(ai)   # R3-V53-FOLLOWONS: 4647 v52 / 4745 v53
         self.action_dim=ai.ACTION_ENCODING_DIM;self.region_count=ai.NUM_REGIONS
 
     def run(self, request):

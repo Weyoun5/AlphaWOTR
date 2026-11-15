@@ -15,6 +15,12 @@ _ROUTES = {'fp': frozenset(('military', 'ring_destroyed')),
            'sh': frozenset(('military', 'ring_corruption'))}
 _TARGET = {('fp', 'ring'): 'ring_destroyed', ('fp', 'military'): 'military',
            ('sh', 'corruption'): 'ring_corruption', ('sh', 'military'): 'military'}
+# Off-target win weights (1.225b, USER 2026-08-03 "zero off mission for fp but keep it for shadow").
+OFF_TARGET = {'fp': 0.0, 'sh': 0.2}
+# A league net is searched by its own reward table (hpc league lgcommon.OBJECTIVES; USER 2026-10-30 "SH-CORRUPTION:
+# +1 corruption win, 0 military win, -1 FP win", "FP-MILITARY: +1 FP military win, 0 Ring destroyed, -1 SH win"):
+# the off-target win weight of the objective its checkpoint's 'league' record names (SEARCHCOR 2026-11-01).
+LEAGUE_OFF_TARGET = {'fp_military': 0.0, 'sh_corruption': 0.0}
 
 
 def current_contract():
@@ -49,12 +55,24 @@ def validate_net_profile(net, side, profile):
                          % (side, recorded, profile))
 
 
-def profile_terminal(side, profile, victory_type, won):
+def league_off_target(side, league):
+    """The off-target win weight of a league checkpoint's reward table (its 'league' record), or None (not a
+    league net, or an objective whose off-target route is on-target: the contract weights apply)."""
+    objective = league.get('objective') if isinstance(league, dict) else None
+    if objective not in LEAGUE_OFF_TARGET:
+        return None
+    if not objective.startswith(side + '_'):
+        raise ValueError('League objective %r does not belong to side %r' % (objective, side))
+    return LEAGUE_OFF_TARGET[objective]
+
+
+def profile_terminal(side, profile, victory_type, won, off_target=None):
     """Fixed versioned mission weights; losses remain worse than any win.
 
     The off-target win weights preserve the existing diagnostic objectives.
     No environment-dependent shaping, microdecision cost, closeness bonus,
-    or turn decay is part of this contract.
+    or turn decay is part of this contract.  off_target: the searching net's
+    own off-target win weight (league_off_target); None keeps OFF_TARGET.
     """
     validate_profile(side, profile)
     winner = side if won else ('sh' if side == 'fp' else 'fp')
@@ -64,7 +82,12 @@ def profile_terminal(side, profile, victory_type, won):
         return -1.0
     if profile == 'mixed' or victory_type == _TARGET.get((side, profile)):
         return 1.0
-    return 0.0 if side == 'fp' else 0.2
+    if off_target is None:
+        return OFF_TARGET[side]
+    off_target = float(off_target)
+    if not -1.0 < off_target <= 1.0:
+        raise ValueError('Off-target win weight must lie in (-1, 1]: %r' % (off_target,))
+    return off_target
 
 
 def trace_contract(trace):

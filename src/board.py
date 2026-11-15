@@ -126,8 +126,14 @@ def parse_polygon(path: str, W: int, H: int):
 # ╭───────────────────────────────────────────────────────────╮
 # │  3.  LOAD BOARD + JSON                                   │
 # ╰───────────────────────────────────────────────────────────╯
-board_img = Image.open(BOARD_PATH)
-W, H      = board_img.size
+# R4-FILE-HANDLE-LEAKS: only the pixel SIZE is needed at import (the
+# region polygons are percentages of it).  Image.open is lazy and kept
+# the file handle open for the life of every importing process; read the
+# header inside a with-block so the handle closes here.  The drawing
+# block under __main__ opens its own copy.
+with Image.open(BOARD_PATH) as _board_header:
+    W, H  = _board_header.size
+del _board_header
 
 with open(MAP_JSON, "r", encoding="utf-8") as f:
     factions = json.load(f)
@@ -369,7 +375,8 @@ if __name__ == '__main__':
     from PIL import ImageDraw, ImageFont
     import matplotlib.pyplot as plt
 
-    canvas = board_img.copy()
+    with Image.open(BOARD_PATH) as board_img:   # R4-FILE-HANDLE-LEAKS
+        canvas = board_img.copy()
     draw   = ImageDraw.Draw(canvas, "RGBA")
 
     try:

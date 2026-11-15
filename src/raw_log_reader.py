@@ -41,7 +41,9 @@ def decode_raw_log(data, source=None):
                 if (b'<' in speaker or b'>' in speaker or b'~' in speaker
                         or speaker.lower() in _RESERVED):
                     detail = 'undecodable_reserved_or_malformed_chat'
-                elif (b'<~' in body or re.search(rb'\b(?:controls|game|scribe|talker|interpreter)\.', body, re.I)):
+                # C8-04: protocol ids are always Name.<digits> (<~Game.2038~>,
+                # <~Scribe.141~>); a bare sentence-final 'game.' is English chat.
+                elif (b'<~' in body or re.search(rb'\b(?:controls|game|scribe|talker|interpreter)\.\d', body, re.I)):
                     detail = 'undecodable_protocol_looking_chat'
                 elif any(byte < 32 or byte == 127 for byte in body):
                     detail = 'undecodable_chat_control_byte'

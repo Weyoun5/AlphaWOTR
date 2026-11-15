@@ -51,7 +51,9 @@ import numpy as np
 
 SRC = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(SRC)
-sys.path.insert(0, SRC)
+# insert only when absent (one copy per process; src/ module names are unique on sys.path)
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
 os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', '-1')
 os.environ.setdefault('PYTHONHASHSEED', '0')
@@ -393,6 +395,11 @@ class _HandLedger:
         #                           played face-up (the play's disposal)
         self.n_undone_kills = 0   # W1-002 reverted 'undoes ... kills' lines
         self.n_undone_draws = 0   # W1-024 reverted 'undoes ... draws' lines
+        self.n_undone_rand = 0    # C1-02 reverted 'undoes ... randomly
+        #                           discards' lines
+        self.n_redone = 0         # C1-02 re-applied 'redoes ...' lines
+        self.n_deck_ret = 0       # C1-02 resolved generic hand->deck returns
+        self.n_deck_in = 0        # C1-02 resolved generic deck->hand moves
         self.n_soft_desync = 0
         self.n_views = 0
         self.enabled = True
@@ -686,6 +693,73 @@ def _build_hand_ledger(rendered_path, stem):
     # over the 24 card-cover games, undone draws included) and the next
     # draw of that deck is a new raw command naming its own card.
     draw_done = {'fp': [], 'sh': []}
+    # C1-02: per-side stack of (line, cid, deck letter, removed?, hand
+    # position) random discards honoured so far, so an 'undoes last
+    # action : %X randomly discards ...' returns THAT card (it fell
+    # through the move-only undo branch: 2023-01-11 Fojtu/MacDadd L363
+    # discard, L366 undo, the #HAND oracle keeps The Grey Company).  The
+    # raw Controls.452 pointer is NOT rewound: every rendered random
+    # discard line, undone or not, has its own raw command (rendered ==
+    # raw counts per hand over all 62 corpus games with such an undo).
+    rd_done = {'fp': [], 'sh': []}
+    # C1-02 (gap exposed by the redo fix): an identity-less hand -> deck
+    # return ('moves Shadow Strategy Card from Shadow Hand to SA Strategy
+    # Deck', 327 corpus lines / 143 games) removed NOTHING, leaving a
+    # phantom card (2023-02-22 BluPickle/Krechet L66: The Last Battle
+    # stays in the ledger hand, absent from every later #HAND oracle).
+    # The raw Scribe.141 hand -> deck move names the pid; every rendered
+    # hand -> deck line (named or generic, undone or not) has exactly one
+    # (rendered == raw counts per hand in 147/147 corpus games), so a
+    # per-hand FIFO resolves it like the W1-003 Casualties drag.  Stack
+    # entries: (line, cid, deck letter, removed?, hand position, deck
+    # token).  The mirror gesture - a generic deck -> hand move taking such
+    # a card back (2024-03-12 Julianis/sharpz L714 -> L719) - is named by a
+    # raw CardBuffet.3 (or Scribe.141) deck -> hand command (rendered ==
+    # raw per hand in all 9 corpus games that have one); stack entries:
+    # (line, cid, deck letter, added?, deck token).  The deck token is the
+    # R17-CORPUS-EXTRACT row 9 DeckHistory booking (_deck_in / _deck_out).
+    def _raw_deck_moves(pattern):
+        # per-hand FIFO; group1 = pid list, group2 = hand 45/46.  A
+        # multi-pid command keeps its slot but is unresolvable (None,
+        # None), so the later entries stay aligned.
+        out = {'45': [], '46': []}
+        path = _raw_log_path(stem)
+        if dec is None or not path or not os.path.exists(path):
+            return out
+        with open(path, encoding='utf-8', errors='ignore') as f:
+            blob = f.read()
+        for m in re.finditer(pattern, blob):
+            pids = m.group(1).split()
+            out[m.group(2)].append(_decode_hand_pid(dec, int(pids[0]))
+                                   if len(pids) == 1 else (None, None))
+        return out
+    deckret = _raw_deck_moves(
+        r'<~Scribe\.141~>([\d ]+?)\s*<~Scribe\.142~><~Controls\.(45|46)~>'
+        r'<~Scribe\.143~><~Game\.200[4-7]~>')
+    deckret_ptr = {'45': 0, '46': 0}
+    deckret_done = {'fp': [], 'sh': []}
+    deckin = _raw_deck_moves(
+        r'<~(?:Scribe\.141|CardBuffet\.3)~>([\d ]+?)\s*'
+        r'<~(?:Scribe\.142|CardBuffet\.4)~><~Game\.200[4-7]~>'
+        r'<~(?:Scribe\.143|CardBuffet\.5)~><~Controls\.(45|46)~>')
+    deckin_ptr = {'45': 0, '46': 0}
+    deckin_done = {'fp': [], 'sh': []}
+    # C1-02: undo/redo pairing that mirrors rendered_replay.
+    # resolve_undo_redo (the LIFO netting parse_game builds every batch
+    # from, amendment 1.216).  Each 'undoes last action' pushes ONE entry
+    # [quoted label, what the ledger reverted or None]; a 'redoes last
+    # action' pops the top entry and RE-APPLIES it.  The ledger had no
+    # redo branch, so draw -> undo -> redo left the card OUT of the hand
+    # (2023-01-30 Franatleti L929 draw, L941 undo, L947 redo: Shadows
+    # Gather missing while '#HAND SA 966' holds it) and play -> undo ->
+    # redo left the played card IN the hand.  A new snapshot gesture
+    # truncates the redo history exactly as resolve_undo_redo does.  A
+    # redo has NO raw command, so no raw FIFO pointer moves.
+    redo_stack = []
+    _snapshot_ops = ('move', 'kill', 'flip', 'draw', 'alloc_eye', 'add_eye')
+    _rand_snapshot_re = re.compile(
+        r'\S+ randomly discards a (?:Free|Shadow) (?:Character|Strategy) '
+        r'Card\.')
     led = _HandLedger()
 
     with open(rendered_path, encoding='utf-8', errors='ignore') as f:
@@ -704,12 +778,74 @@ def _build_hand_ledger(rendered_path, stem):
         return None
 
     def _deck_zone_code(zone):
-        text = _norm_zone(zone)
-        if 'deck' not in text:
+        # R17-CORPUS-EXTRACT row 9: the VASSAL deck code of an event-card
+        # deck zone as the client renders it ('FP Strategy Deck', 'SA
+        # Character Deck'; the corpus has no other spelling), else None.
+        # The former reader knew only 'free'/'shadow', so no hand -> deck
+        # return ever reached DeckHistory: the deck stayed one card short
+        # and the card's redraw made every later deck prefix unproven.
+        m = re.match(r'^(fp|sa|free peoples|free|shadow)\s+'
+                     r'(character|strategy)\s+deck$', _norm_zone(zone))
+        if m is None:
             return None
-        side = 'free' if 'free' in text else ('shadow' if 'shadow' in text else None)
-        kind = 'character' if 'character' in text else ('strategy' if 'strategy' in text else None)
-        return _DECK_CODE.get(f'{side} {kind} card') if side and kind else None
+        side = 'shadow' if m.group(1) in ('sa', 'shadow') else 'free'
+        return _DECK_CODE.get('%s %s card' % (side, m.group(2)))
+
+    def _is_card_deck(zone):
+        # C1-02: an event-card deck zone
+        return _deck_zone_code(zone) is not None
+
+    # R17-CORPUS-EXTRACT row 9: DeckHistory bookings of a card a hand puts
+    # into a deck or takes out of one by a drag (a 'draws' line books its
+    # own draw).  Each returns a token for an exact undo.  An unresolved
+    # card leaves that deck unproven.  A move whose end state the history
+    # already holds books nothing: an undone draw has already put the card
+    # back (2025-09-14 Stella Rossa/Meldar L289 'undoes ... draws', L293
+    # the raw return names that same card).  A card put into a deck it
+    # does not belong to (2024-03-12 Julianis/sharpz L714: a Shadow
+    # Strategy card dropped on the FP Strategy Deck, taken back at L719)
+    # leaves that deck unproven until the same card is taken out again.
+    deck_foreign = {code: [] for code in _DECK_CODE.values()}
+
+    def _deck_in(code, cid, line_no):
+        if cid is not None and cid not in led.decks.catalogues[code]:
+            deck_foreign[code].append(cid)
+            led.decks.return_card(code, cid, line_no)        # unproven
+            return ('in', code, cid, 'foreign')
+        if cid is not None and cid in led.decks.remaining[code]:
+            return ('in', code, cid, 'held')
+        led.decks.return_card(code, cid, line_no)
+        return ('in', code, cid, 'unknown' if cid is None else 'known')
+
+    def _deck_out(code, cid, line_no):
+        if cid is not None and cid in deck_foreign[code]:
+            deck_foreign[code].remove(cid)
+            # the foreign card left again: its unproven booking reverts
+            led.decks.undo_draw((code, None, False), line_no)
+            return ('out', code, cid, 'foreign')
+        if (cid is not None and cid in led.decks.catalogues[code]
+                and cid not in led.decks.remaining[code]):
+            return ('out', code, cid, 'held')
+        known = led.decks.draw(code, cid, line_no)[2]
+        return ('out', code, cid, 'known' if known else 'unknown')
+
+    def _deck_undo(token, line_no):
+        # the exact reversal of one _deck_in / _deck_out booking (None: the
+        # move booked nothing)
+        if token is None or token[3] == 'held':
+            return
+        way, code, cid, kind = token
+        if way == 'in' and kind == 'known':
+            led.decks.draw(code, cid, line_no)
+        elif way == 'in':
+            if kind == 'foreign' and cid in deck_foreign[code]:
+                deck_foreign[code].remove(cid)
+            led.decks.undo_draw((code, None, False), line_no)
+        elif kind == 'foreign':
+            deck_foreign[code].append(cid)
+            led.decks.return_card(code, cid, line_no)
+        else:
+            led.decks.undo_draw((code, cid, kind == 'known'), line_no)
 
     def _deck_letter(text):
         t = str(text).lower()
@@ -728,6 +864,127 @@ def _build_hand_ledger(rendered_path, stem):
             return ('N', cid)
         return ('G', _deck_letter(piece))
 
+    def _undo_label(text):
+        # C1-02: the quoted gesture of an undo/redo line, normalized like
+        # rendered_replay.resolve_undo_redo's label()
+        value = str(text or '').strip().lstrip('%$')
+        for old, new in rr.COMMA_NAME_FIX:
+            value = value.replace(old, new)
+        return value.replace('<auto>', 'auto>')
+
+    def _hand_pos(side_tag, cid):
+        hand = led._fp if side_tag == 'fp' else led._sh
+        return hand.index(cid) if cid is not None and cid in hand else None
+
+    def _restore_card(side_tag, cid, pos, line_no):
+        # C1-02: an undone exit puts the card back in its OWN hand slot
+        # (the netted view never saw the exit)
+        led.add(side_tag, cid, line_no)
+        hand = led._fp if side_tag == 'fp' else led._sh
+        if pos is not None and pos < len(hand) - 1 and hand[-1] == cid:
+            hand.insert(pos, hand.pop())
+            led._record(line_no)
+
+    def _deck_ret_out(side_tag, cid, line_no):
+        # C1-02: a hand -> deck return is neither a play (face-up) nor a
+        # discard (face-down): the card simply leaves the hand.  Returns
+        # its former hand position, None when it is not in the hand.
+        pos = _hand_pos(side_tag, cid)
+        if pos is not None:
+            del (led._fp if side_tag == 'fp' else led._sh)[pos]
+            led._record(line_no)
+        return pos
+
+    def _redo_hand_action(act, line_no):
+        """C1-02: re-apply the hand effect one undo reverted.  The redone
+        gesture keeps its ORIGINAL line in the netted batch view, so its
+        discard decisions / ambiguity windows go back under that line and
+        it is pushed back on its undo stack (a later undo reverts it)."""
+        kind = act[0]
+        if kind == 'move':
+            _k, sub = act
+            if sub is not None:
+                _redo_hand_action(sub, line_no)
+        elif kind == 'kill':
+            _k, uside, k_line, k_done, k_sig = act
+            redone = []
+            for pkind, payload in k_done:
+                if pkind == 'card':
+                    if led.remove_named(uside, payload, line_no):
+                        led.discard_events.append((uside, k_line, payload))
+                        redone.append(('card', payload))
+                    else:
+                        redone.append(('skip', payload))
+                elif pkind == 'amb':
+                    if payload:
+                        led.mark_deck_ambiguous(uside, payload, k_line)
+                    led.discard_events.append((uside, k_line, None))
+                    redone.append(('amb', payload))
+                else:
+                    redone.append((pkind, payload))
+            kill_done[uside].append((k_line, redone, k_sig))
+        elif kind == 'draw':
+            _k, uside, d_line, d_cid, d_code, found = act
+            token = led.decks.draw(d_code, d_cid, line_no)
+            if found:
+                led.add(uside, d_cid, line_no)
+            draw_done[uside].append((d_line, d_cid, d_code, token))
+        elif kind == 'cas':
+            _k, frm, d_line, d_cid = act
+            if led.remove_named(frm, d_cid, line_no):
+                led.discard_events.append((frm, d_line, d_cid))
+                cas_done[frm].append((d_line, d_cid))
+        elif kind == 'play':
+            _k, frm, cid, to_norm = act
+            pub = bool(to_norm in _PLAY_AREA_DEST
+                       or _BOARD_DEST_RE.match(to_norm))
+            led.remove_named(frm, cid, line_no, face_up=pub)
+            if pub:
+                led.slot[to_norm] = cid
+        elif kind == 'return':
+            _k, to, cid = act
+            led.add(to, cid, line_no)
+        elif kind == 'rand':
+            _k, side_tag, r_line, r_cid, r_dl, removed, _pos = act
+            if removed:
+                pos = _hand_pos(side_tag, r_cid)
+                if led.remove_random(side_tag, r_cid, line_no, r_dl):
+                    rd_done[side_tag].append(
+                        (r_line, r_cid, r_dl, True, pos))
+                else:
+                    # remove_random opened the window at line_no
+                    rd_done[side_tag].append(
+                        (line_no, r_cid, r_dl, False, None))
+            else:
+                if r_dl:
+                    led.mark_deck_ambiguous(side_tag, r_dl, r_line)
+                rd_done[side_tag].append((r_line, r_cid, r_dl, False, None))
+        elif kind == 'deckret':
+            _k, side_tag, r_line, r_cid, r_dl, removed, _pos, d_tok = act
+            pos = _deck_ret_out(side_tag, r_cid, line_no) if removed else None
+            # R17-CORPUS-EXTRACT row 9: the deck takes the same card back
+            d_tok = _deck_in(d_tok[1], d_tok[2], line_no) if d_tok else None
+            if pos is not None:
+                deckret_done[side_tag].append(
+                    (r_line, r_cid, r_dl, True, pos, d_tok))
+            else:
+                w_line = line_no if removed else r_line
+                if r_dl:
+                    led.mark_deck_ambiguous(side_tag, r_dl, w_line)
+                deckret_done[side_tag].append(
+                    (w_line, r_cid, r_dl, False, None, d_tok))
+        elif kind == 'deckin':
+            _k, side_tag, r_line, r_cid, r_dl, added, d_tok = act
+            if added:
+                led.add(side_tag, r_cid, line_no)
+            elif r_dl:
+                led.mark_deck_ambiguous(side_tag, r_dl, r_line)
+            # R17-CORPUS-EXTRACT row 9: the same card leaves the deck again
+            d_tok = _deck_out(d_tok[1], d_tok[2], line_no) if d_tok else None
+            deckin_done[side_tag].append((r_line, r_cid, r_dl, added, d_tok))
+        else:
+            raise ValueError('C1-02: unknown redo action %r' % (kind,))
+
     for i, raw in enumerate(raw_lines, 1):
         s = raw.strip()
         if not s.startswith('%'):
@@ -739,6 +996,11 @@ def _build_hand_ledger(rendered_path, stem):
         if rec is None:
             continue
         op = rec.get('op')
+        # C1-02: a NEW snapshot gesture truncates the redo history (the
+        # resolve_undo_redo snapshot set, random discards included)
+        if op in _snapshot_ops or (op == 'other'
+                                   and _rand_snapshot_re.fullmatch(body)):
+            redo_stack.clear()
         # ---- view anchor -------------------------------------------------
         if op == 'other' and _RENDERED_VIEW_RE.match(body):
             led.n_views += 1
@@ -784,7 +1046,10 @@ def _build_hand_ledger(rendered_path, stem):
             cid = seq[ptr][0] if ptr < len(seq) else None
             disc_ptr[hand_code] = ptr + 1
             led.n_rand_disc += 1
-            led.remove_random(side_tag, cid, i, dl)
+            _rd_pos = _hand_pos(side_tag, cid)                  # C1-02
+            _rd_ok = led.remove_random(side_tag, cid, i, dl)
+            rd_done[side_tag].append(
+                (i, cid, dl, _rd_ok, _rd_pos if _rd_ok else None))
             continue
         # ---- excess-hand discard: 'kills <deck> Card in <side> Hand' ------
         # generic (identity-less, face-DOWN) removal when hand > 6; resolved
@@ -863,11 +1128,52 @@ def _build_hand_ledger(rendered_path, stem):
             frm = _hand_side_of(rec.get('from', ''))
             to = _hand_side_of(rec.get('to', ''))
             obj = rec.get('obj', '')
-            returned_deck = _deck_zone_code(rec.get('to', ''))
-            if returned_deck:
-                led.decks.return_card(returned_deck, _title_to_cid(obj), i)
+            ret_raw = None                                      # C1-02
+            to_deck = frm is not None and _is_card_deck(rec.get('to', ''))
+            if to_deck:
+                # every hand -> deck line, named or generic, owns one raw
+                # Scribe.141 command: advance the per-hand pointer
+                _dr_code = '45' if frm == 'fp' else '46'
+                _dr_seq = deckret.get(_dr_code, [])
+                if deckret_ptr[_dr_code] < len(_dr_seq):
+                    ret_raw = _dr_seq[deckret_ptr[_dr_code]]
+                    deckret_ptr[_dr_code] += 1
             if frm is not None and to != frm:
                 cid = _title_to_cid(obj)
+                if to_deck:
+                    # C1-02: hand -> deck return.  A GENERIC one is resolved
+                    # by the raw FIFO; unresolved / deck mismatch / not in
+                    # the hand -> that (side, deck) goes ambiguous (drop
+                    # beats wrong), never a silent phantom.
+                    # R17-CORPUS-EXTRACT row 9: a NAMED one names its own
+                    # card (it rode the play path, which filed the card as
+                    # a face-down discard; a return is neither, C1-02), and
+                    # DeckHistory takes the resolved card back into the
+                    # deck - an unresolved return leaves that deck
+                    # unproven.  A marker dropped from the hand zone is no
+                    # card (2023-11-18 LuckyRuds/PrincePhocs L1233).
+                    if cid is not None:
+                        dl = 'C' if 'Character' in str(cid) else 'S'
+                        rcid, rdl = cid, dl
+                    else:
+                        dl = _deck_letter(obj)
+                        rcid, rdl = ret_raw if ret_raw else (None, None)
+                    resolved = rcid is not None and not (dl and rdl
+                                                         and dl != rdl)
+                    pos = _deck_ret_out(frm, rcid, i) if resolved else None
+                    d_tok = (_deck_in(_deck_zone_code(rec.get('to', '')),
+                                      rcid if resolved else None, i)
+                             if dl is not None else None)
+                    if pos is not None:
+                        led.n_deck_ret += 1
+                        deckret_done[frm].append(
+                            (i, rcid, dl, True, pos, d_tok))
+                    else:
+                        if dl:
+                            led.mark_deck_ambiguous(frm, dl, i)
+                        deckret_done[frm].append(
+                            (i, rcid, dl, False, None, d_tok))
+                    continue
                 if cid is None and to_raw in _CAS_ZONES:
                     # W1-003: identity-less hand->Casualties DRAG = a
                     # hand-limit discard whose card the raw Controls.281
@@ -914,6 +1220,42 @@ def _build_hand_ledger(rendered_path, stem):
                     led.slot[to_raw] = cid
             elif to is not None and frm != to:
                 cid = _title_to_cid(obj)
+                if _is_card_deck(rec.get('from', '')):
+                    # C1-02: deck -> hand move: one raw command per line
+                    # (named or generic); a GENERIC one takes the raw
+                    # identity, unresolved -> that (side, deck) goes
+                    # ambiguous (the hand holds a card the ledger lacks)
+                    _di_code = '45' if to == 'fp' else '46'
+                    _di_seq = deckin.get(_di_code, [])
+                    _di_raw = None
+                    if deckin_ptr[_di_code] < len(_di_seq):
+                        _di_raw = _di_seq[deckin_ptr[_di_code]]
+                        deckin_ptr[_di_code] += 1
+                    # R17-CORPUS-EXTRACT row 9: a NAMED deck -> hand move
+                    # names its own card; either way DeckHistory books the
+                    # card out of the deck (an unresolved one leaves the
+                    # deck unproven: which card left it is unknown)
+                    if cid is not None:
+                        dl = 'C' if 'Character' in str(cid) else 'S'
+                        icid, idl = cid, dl
+                    else:
+                        dl = _deck_letter(obj)
+                        icid, idl = _di_raw if _di_raw else (None, None)
+                    d_code = (_deck_zone_code(rec.get('from', ''))
+                              if dl is not None else None)   # a card
+                    if icid is not None and not (dl and idl and dl != idl):
+                        led.add(to, icid, i)
+                        led.n_deck_in += 1
+                        deckin_done[to].append(
+                            (i, icid, dl, True,
+                             _deck_out(d_code, icid, i) if d_code else None))
+                    else:
+                        if dl:
+                            led.mark_deck_ambiguous(to, dl, i)
+                        deckin_done[to].append(
+                            (i, None, dl, False,
+                             _deck_out(d_code, None, i) if d_code else None))
+                    continue
                 if cid is None:
                     cid = led.slot.get(frm_raw)   # generic return from a slot
                 if cid is not None:
@@ -921,9 +1263,30 @@ def _build_hand_ledger(rendered_path, stem):
                     led.n_named_in += 1
                     led.slot.pop(frm_raw, None)
             continue
+        # ---- redo of an undone gesture (C1-02) ---------------------------
+        if op == 'redo':
+            r_label = _undo_label(rec.get('inner'))
+            if not redo_stack or redo_stack[-1][0] != r_label:
+                # parse_game refuses such a history (resolve_undo_redo's
+                # quoted-target check); the ledger must not guess either
+                if led.desync is None:
+                    led.desync = ('gate3_hand_desync',
+                                  {'line': i, 'redo_unpaired': r_label[:60],
+                                   'redo_top': (redo_stack[-1][0][:60]
+                                                if redo_stack else None)})
+                break
+            _r_label, r_act = redo_stack.pop()
+            if r_act is not None:
+                _redo_hand_action(r_act, i)
+                led.n_redone += 1
+            continue
         # ---- undo of a hand-affecting move -------------------------------
         if op == 'undo':
             inner = rr.parse_line(rec.get('inner', '') or '')
+            # C1-02: ONE redo entry per undo; u_entry[1] records what the
+            # ledger reverted (None = nothing hand-related to re-apply)
+            u_entry = [_undo_label(rec.get('inner')), None]
+            redo_stack.append(u_entry)
             if inner and inner.get('op') == 'kill':
                 # W1-002: undo of an in-hand KILL.  The last honoured kill
                 # of that side with the same deck signature is reverted:
@@ -943,6 +1306,8 @@ def _build_hand_ledger(rendered_path, stem):
                             continue
                         del stack[k]
                         led.n_undone_kills += 1
+                        u_entry[1] = ('kill', uside, k_line, k_done,
+                                      k_sig)                    # C1-02
                         for kind, payload in reversed(k_done):
                             if kind == 'card':
                                 led.add(uside, payload, i)
@@ -977,12 +1342,47 @@ def _build_hand_ledger(rendered_path, stem):
                         del stack[k]
                         led.decks.undo_draw(deck_token, i)
                         hand = led._fp if uside == 'fp' else led._sh
+                        d_found = False                         # C1-02
                         for h in range(len(hand) - 1, -1, -1):
                             if hand[h] == d_cid:
                                 del hand[h]
+                                d_found = True
                                 break
                         led._record(i)
                         led.n_undone_draws += 1
+                        u_entry[1] = ('draw', uside, d_line, d_cid, d_code,
+                                      d_found)                  # C1-02
+                        break
+                continue
+            u_txt = str(rec.get('inner', '') or '').strip()
+            if (inner and inner.get('op') == 'other'
+                    and _G2_RANDDISC_RE.match(u_txt)):
+                # C1-02: undo of a RANDOM discard - the last honoured
+                # random discard of that (side, deck) is reverted: the
+                # card goes back to its own hand slot (the netted view
+                # never saw the discard) or the ambiguity window it
+                # opened closes as if never opened.  Same deck-phrase
+                # side rule as the forward branch.
+                _rd_mu = re.search(
+                    r'randomly\s+discards\s+an?\s+(free|shadow)\b',
+                    u_txt, re.I)
+                if _rd_mu:
+                    rside = ('fp' if _rd_mu.group(1).lower() == 'free'
+                             else 'sh')
+                    udl = _deck_letter(u_txt.lower())
+                    stack = rd_done[rside]
+                    for k in range(len(stack) - 1, -1, -1):
+                        r_line, r_cid, r_dl, r_removed, r_pos = stack[k]
+                        if r_dl != udl:
+                            continue
+                        del stack[k]
+                        if r_removed:
+                            _restore_card(rside, r_cid, r_pos, i)
+                        elif r_dl:
+                            led.unmark_deck_ambiguous(rside, r_dl, r_line)
+                        led.n_undone_rand += 1
+                        u_entry[1] = ('rand', rside, r_line, r_cid, r_dl,
+                                      r_removed, r_pos)
                         break
                 continue
             if not inner or inner.get('op') != 'move':
@@ -990,9 +1390,56 @@ def _build_hand_ledger(rendered_path, stem):
             frm = _hand_side_of(str(inner.get('from', '')))
             to = _hand_side_of(str(inner.get('to', '')))
             cid = _title_to_cid(inner.get('obj', ''))
-            returned_deck = _deck_zone_code(inner.get('to', ''))
-            if returned_deck:
-                led.decks.draw(returned_deck, cid, i)
+            u_sub = None                                        # C1-02
+            if (frm is not None and to != frm
+                    and _is_card_deck(inner.get('to', ''))):
+                # C1-02: undo of a hand -> deck return - the last honoured
+                # return of that (side, deck) comes back to its hand slot,
+                # or the window it opened closes.  R17-CORPUS-EXTRACT row
+                # 9: a named return is matched by its card, and the deck
+                # gives the card up again (the exact DeckHistory reversal)
+                udl = _deck_letter(inner.get('obj', ''))
+                stack = deckret_done[frm]
+                for k in range(len(stack) - 1, -1, -1):
+                    r_line, r_cid, r_dl, r_removed, r_pos, r_tok = stack[k]
+                    if (r_cid != cid) if cid is not None else (r_dl != udl):
+                        continue
+                    del stack[k]
+                    if r_removed:
+                        _restore_card(frm, r_cid, r_pos, i)
+                    elif r_dl:
+                        led.unmark_deck_ambiguous(frm, r_dl, r_line)
+                    _deck_undo(r_tok, i)
+                    u_sub = ('deckret', frm, r_line, r_cid, r_dl,
+                             r_removed, r_pos, r_tok)
+                    break
+                if u_sub is not None:
+                    u_entry[1] = ('move', u_sub)
+                continue
+            if (to is not None and frm != to
+                    and _is_card_deck(inner.get('from', ''))):
+                # C1-02: undo of a deck -> hand move - the card it added
+                # leaves the hand again (or its window closes).  R17 row
+                # 9: named moves matched by card; the deck takes it back
+                udl = _deck_letter(inner.get('obj', ''))
+                stack = deckin_done[to]
+                for k in range(len(stack) - 1, -1, -1):
+                    r_line, r_cid, r_dl, r_added, r_tok = stack[k]
+                    if (r_cid != cid) if cid is not None else (r_dl != udl):
+                        continue
+                    del stack[k]
+                    if r_added:
+                        if _deck_ret_out(to, r_cid, i) is None:
+                            r_added = False       # nothing left to re-add
+                    elif r_dl:
+                        led.unmark_deck_ambiguous(to, r_dl, r_line)
+                    _deck_undo(r_tok, i)
+                    u_sub = ('deckin', to, r_line, r_cid, r_dl, r_added,
+                             r_tok)
+                    break
+                if u_sub is not None:
+                    u_entry[1] = ('move', u_sub)
+                continue
             if (frm is not None and to != frm and cid is None
                     and _norm_zone(str(inner.get('to', ''))) in _CAS_ZONES):
                 # W1-003: undo of a GENERIC drag -> the last honoured drag
@@ -1004,6 +1451,9 @@ def _build_hand_ledger(rendered_path, stem):
                     ev = (frm, d_line, d_cid)
                     if ev in led.discard_events:
                         led.discard_events.remove(ev)
+                    u_sub = ('cas', frm, d_line, d_cid)         # C1-02
+                if u_sub is not None:
+                    u_entry[1] = ('move', u_sub)
                 continue
             if frm is not None and to != frm and cid is not None:
                 # undo a PLAY -> card returns to hand; the play's slot
@@ -1011,12 +1461,17 @@ def _build_hand_ledger(rendered_path, stem):
                 # that slot would re-add the undone card's identity)
                 led.add(frm, cid, i)
                 led.slot.pop(_norm_zone(str(inner.get('to', ''))), None)
+                u_sub = ('play', frm, cid,
+                         _norm_zone(str(inner.get('to', ''))))  # C1-02
             elif to is not None and frm != to and cid is not None:
                 # undo a RETURN -> card leaves hand again
                 hand = led._fp if to == 'fp' else led._sh
                 if cid in hand:
                     hand.remove(cid)
                     led._record(i)
+                    u_sub = ('return', to, cid)                 # C1-02
+            if u_sub is not None:                               # C1-02
+                u_entry[1] = ('move', u_sub)
             continue
         if led.desync is not None:
             break
@@ -1078,7 +1533,8 @@ def _install_ledger_hands(st, batch, at_line=None):
     # combat family rides rc._state_from_snapshot directly): menus must
     # see true ring counts before get_legal_actions runs
     if not getattr(st, '_rx_rings_stamped', False):
-        _rg9 = (batch.get('_rx_rings') or {}).get('post')
+        # C1-04: the decision view, never the end-of-batch 'post'
+        _rg9 = (batch.get('_rx_rings') or {}).get('decision')
         if _rg9 is not None:
             _stamp_rings(st, _rg9)
     # W1-025: the FP hero flags for the same outside-_recon_state states
@@ -1102,6 +1558,27 @@ def _install_ledger_hands(st, batch, at_line=None):
     st.hands[Side.FREE_PEOPLES].hand = list(_LEDGER.hand_at('fp', line))
     st.hands[Side.SHADOW].hand = list(_LEDGER.hand_at('sh', line))
     _install_ledger_discards(st, line)
+
+
+def _install_row_hands(st, batch, stats, at_line=None):
+    """R17-CORPUS-EXTRACT row 10: _install_ledger_hands for ONE row of a
+    game-level emitter (eye allocations, passes, discards, guides,
+    declarations, reveal placements, card-hunt arms).  Those emitters walk
+    the whole game and return their rows only at the end, so an unproven
+    deck prefix (rendered_history.HistoryUnproven, e.g. after an undecoded
+    draw) raised here unwound the emitter: extract_one counted ONE
+    'eye_exc' / 'pass_exc' / ... and every row of that family already built
+    for the game was thrown away, the proven earlier turns included.  The
+    CE-04 contract refuses only the affected row, counted as _emit_sample
+    counts its own per-row exclusion ('fixed_policy:<reason>').  Returns
+    True when the hands are installed."""
+    from rendered_history import HistoryUnproven
+    try:
+        _install_ledger_hands(st, batch, at_line=at_line)
+    except HistoryUnproven as error:
+        stats['drop_reasons']['fixed_policy:' + str(error)] += 1
+        return False
+    return True
 
 
 # ==========================================================================
@@ -1218,24 +1695,23 @@ class _TableLedger:
 def _build_table_ledger(rendered_path):
     """Walk the rendered %-lines in order, tracking each tracked persistent
     card's ON/OFF transitions.  Returns a _TableLedger (empty when nothing
-    tracked was ever played)."""
+    tracked was ever played).
+
+    C1-01: the walk runs over the UNDO-NETTED records - the same
+    rr._parse_all + rr.resolve_undo_redo netting parse_game builds the
+    batches from (amendment 1.216).  An undone table play / undone kill
+    never happened (it used to stay ON / count as a hunt-card USE for the
+    rest of the game); a redone one keeps its original line."""
     import rendered_replay as rr
     led = _TableLedger()
     try:
-        with open(rendered_path, encoding='utf-8', errors='ignore') as f:
-            raw_lines = [ln.rstrip('\n') for ln in f]
-    except Exception:
+        records, _n_lines = rr._parse_all(rendered_path)
+    except OSError:
         return led
-    for i, raw in enumerate(raw_lines, 1):
-        s = raw.strip()
-        if not s.startswith('%'):
+    for rec in rr.resolve_undo_redo(records):
+        if str(rec.get('body', '')).startswith('<'):
             continue
-        body = s[1:].strip()
-        if body.startswith('<'):
-            continue
-        rec = rr.parse_line(body)
-        if rec is None:
-            continue
+        i = rec['line']
         op = rec.get('op')
         if op == 'move':
             pt = _title_to_ptype(rec.get('obj', ''))
@@ -1445,6 +1921,7 @@ def _conservation_ok(snap):
     (ok, detail)."""
     per_nat = {}                # nation -> {REGULAR,ELITE,LEADER}
     nazgul = 0
+    named = Counter()           # R3-EXTRACT-FIGURE-LEDGER: piece -> copies
     for _key, (units, leaders) in snap['armies'].items():
         for (nat, kind) in units:
             per_nat.setdefault(nat, Counter())[kind] += 1
@@ -1453,6 +1930,10 @@ def _conservation_ok(snap):
                 per_nat.setdefault(ld[1], Counter())['LEADER'] += 1
             elif ld[0] == 'NAZGUL':
                 nazgul += 1
+            elif ld[0] == 'NAMED':
+                named[_named_piece(ld[1])] += 1
+    for name in (snap.get('fel') or {}).get('comps') or ():
+        named[_named_piece(name)] += 1
     if nazgul > _MAX_NAZGUL:
         return False, 'nazgul %d>%d' % (nazgul, _MAX_NAZGUL)
     for nat, counts in snap.get('fpc', {}).items():
@@ -1469,7 +1950,35 @@ def _conservation_ok(snap):
         for kind in ('REGULAR', 'ELITE', 'LEADER'):
             if d.get(kind, 0) > cap.get(kind, 0):
                 return False, '%s.%s %d>%d' % (nat, kind, d[kind], cap[kind])
+    # R3-EXTRACT-FIGURE-LEDGER: every named figure is ONE physical piece -
+    # its board copies plus Fellowship membership hold it at most once
+    # (Strider and Aragorn are one piece, Gandalf the Grey and the White one)
+    for piece in sorted(named):
+        if named[piece] > 1:
+            return False, 'named %s %d>1' % (piece, named[piece])
+    # R4-EXTRACT-MIRROR-TRUTH (b): an army stands only in a board region (a
+    # group parked on the Victory Points track or a deck was a pseudo-army
+    # until rendered_replay.zone_kind called such zones 'offboard')
+    import board as _board
+    for key in sorted(snap['armies']):
+        if key not in _board.regions:
+            return False, 'army_off_board:%s' % key
     return True, None
+
+
+# R3-EXTRACT-FIGURE-LEDGER: the two figures that replace one another in play
+_NAMED_ONE_PIECE = {'Strider': 'Strider/Aragorn', 'Aragorn': 'Strider/Aragorn',
+                    'Gandalf the Grey': 'Gandalf', 'Gandalf the White': 'Gandalf'}
+
+
+def _named_piece(name):
+    """Gate 6: the physical piece a mirror NAMED figure / companion name is
+    (aliases folded through rendered_replay.COMP_ALIAS / NAMED_MINIONS)."""
+    import rendered_replay as rr
+    text = str(name)
+    low = text.strip().lower()
+    canon = rr.COMP_ALIAS.get(low) or rr.NAMED_MINIONS.get(low) or text
+    return _NAMED_ONE_PIECE.get(canon, canon)
 
 
 def _z_from_csv_board(final_snap, meta):
@@ -1572,8 +2081,11 @@ _COMP_LEVELS = {'gandalf the grey': (3, 1), 'strider': (3, 1),
 
 
 def _retype_companions(st):
-    """Census-recon army leaders are plain Leader objects; re-type named
-    COMPANIONS with the engine's own class (RB-02 sibling, ONE
+    """Re-type plain named Leader objects that are COMPANIONS with the
+    engine's own class.  Since C7-06 the census recon (rendered_census.
+    _state_from_snapshot) already builds gs.Companion for canonical
+    companion names, so this loop now fires only for non-canonical aliases
+    (e.g. 'Merry') and other callers' states (RB-02 sibling, ONE
     implementation for _recon_state and the combat drive).  A
     Companion's leadership equals a plain Leader's, so combat math is
     unchanged - typing only enables the Companion-dispatched paths
@@ -1662,9 +2174,10 @@ def _recon_state(snap, turn=None):
     _tk9 = snap.get('_rx_tokens') if isinstance(snap, dict) else None
     if _tk9 is not None:
         _stamp_tokens(st, _tk9)
-    # RB-02: the census recon
-    # types named minions as plain Leaders, but the engine dispatches on
-    # type name 'Minion' (nazgul-chain include_wk hops, WK-army
+    # RB-02: the census recon typed named minions as plain Leaders (since
+    # C7-06 it builds game_logic.Minion / gs.Companion itself, so this
+    # loop now fires only for non-canonical names), but the engine
+    # dispatches on type name 'Minion' (nazgul-chain include_wk hops, WK-army
     # followups, Saruman immobility, minion sweeps).  Re-type in place
     # with the engine's own class so every minion path enumerates.
     # GAME19 T3 (crown): separated COMPANIONS get the same treatment -
@@ -1731,6 +2244,111 @@ _RX_EYEROLL = None
 # sample under a pre-v43 tag unless the caller acknowledges it.
 _RX_ALIAS_V41 = None
 
+# R3-EXTRACT-HUNTBOX-RECON (fix round 3, 2026-10-23): (turn, line) while a
+# batch-scoped emitter runs (_fp_huntbox_batch_scope); _emit_sample then
+# tops the emitted state's Hunt Box up to the FP dice of the turn's
+# Fellowship moves settled before that line.  None everywhere else.
+_RX_FP_BOX_CUT = None
+
+
+def _topup_fp_huntbox(st, turn, line):
+    """R3-EXTRACT-HUNTBOX-RECON: bring the FP dice in st.hunt_box up to the
+    turn's FP Hunt Box deposits logged strictly before `line` (the same
+    count _seed_fp_huntbox seeds).  Rulebook p.40: they stay in the box
+    until the end of the turn; it is public.  Idempotent and never removes
+    a die, so a state that already holds them (seeded at construction, or
+    a hunt drive's physical rebuild) is unchanged, while an ai.apply_action
+    clone - ai.clone_state keeps only box dice that sit in state.dice, so a
+    free-standing seeded die never survives one - or a fresh _recon_state
+    (which never fills hunt_box) gets them back.  Returns the dice added."""
+    import game_state as gs
+    from game_state import Side
+    want = sum(1 for (ln, tn) in _FP_HUNTBOX_IDX
+               if tn == turn and ln < (line or 0))
+    have = sum(1 for d in (st.hunt_box or ())
+               if d.side is Side.FREE_PEOPLES)
+    for _ in range(want - have):
+        d = gs.ActionDie(gs.FP_FACES, Side.FREE_PEOPLES)
+        d.current = gs.ActionDieFace.CHARACTER
+        d.used = True
+        st.hunt_box.append(d)
+    return max(0, want - have)
+
+
+def _fp_huntbox_batch_scope(emitter):
+    """R3-EXTRACT-HUNTBOX-RECON: decorate a per-batch battle emitter
+    `emitter(batch, ...)` so every row it emits encodes the FP Hunt Box
+    dice of the turn's Fellowship moves settled before the batch's start
+    line (its die stage).  A battle neither spends nor deposits a
+    Fellowship die, and every earlier move of the turn has settled before
+    the next die is staged, so that count holds for each of its rows.
+    Encoding only: _emit_sample applies it after the menu is enumerated."""
+    import functools
+
+    @functools.wraps(emitter)
+    def scoped(batch, *args, **kwargs):
+        global _RX_FP_BOX_CUT
+        previous = _RX_FP_BOX_CUT
+        _RX_FP_BOX_CUT = (batch.get('turn'),
+                          int(batch.get('start_line') or 0))
+        try:
+            return emitter(batch, *args, **kwargs)
+        finally:
+            _RX_FP_BOX_CUT = previous
+    return scoped
+
+
+class _fp_huntbox_cut(object):
+    """R4-EXTRACT-HUNTBOX-REMAINING: `with _fp_huntbox_cut(turn, line):`
+    sets _RX_FP_BOX_CUT for the rows emitted inside the block - the
+    per-batch / per-row form of _fp_huntbox_batch_scope for game-level
+    emitters (_emit_cardhunt_arms, _emit_discards).  turn None sets no cut.
+    Restores the caller's cut on every exit.  Encoding only, as above."""
+
+    def __init__(self, turn, line):
+        self.cut = None if turn is None else (turn, int(line or 0))
+        self.previous = None
+
+    def __enter__(self):
+        global _RX_FP_BOX_CUT
+        self.previous = _RX_FP_BOX_CUT
+        _RX_FP_BOX_CUT = self.cut
+        return self
+
+    def __exit__(self, *exc):
+        global _RX_FP_BOX_CUT
+        _RX_FP_BOX_CUT = self.previous
+        return False
+
+
+def _discard_fp_box_cut(batches, host, record, line):
+    """R4-EXTRACT-HUNTBOX-REMAINING: the (turn, line) cut for a hand-limit
+    discard row's FP Hunt Box, or (None, None) when the box holds none.
+
+    Inside the turn's action phase the box holds the FP dice of the turn's
+    Fellowship moves settled before the discard line (rulebook p.40).  A
+    discard after the host turn's LAST action - no die staged at the
+    record, no later die stage in that turn - is the end-of-turn / next
+    Phase 1 hand-limit discard (p.21): the batch window runs to the next
+    staging, so a turn's last batch also carries the dice recovery and both
+    sides' Phase 1 draws, and the turn change empties the Hunt Box (p.13,
+    CL-170; the engine clears it).  Those rows hold none (2023-02-21 Erland
+    T7 L778, 2025-11-29 Compote_Andros L490 / L749).  Without the record's
+    staging annotation the phase is unproven and nothing is added."""
+    staged = (record or {}).get('_rx_staged')
+    if (host.get('_phase_only') or not host.get('die_side')
+            or not isinstance(staged, dict)):
+        return None, None
+    turn = host.get('turn')
+    start = int(host.get('start_line') or 0)
+    later = any(b.get('turn') == turn and b.get('die_side')
+                and not b.get('_phase_only')
+                and int(b.get('start_line') or 0) > start for b in batches)
+    if not later and not any(staged.get(s) for s in ('FREE_PEOPLES',
+                                                      'SHADOW')):
+        return None, None
+    return turn, line
+
 
 def _mk_state_with_die(batch, install_hands=False):
     """Reconstruct the engine state at the batch's rendered truth-before
@@ -1791,6 +2409,25 @@ def _mk_state_with_die(batch, install_hands=False):
     st._rx_full_pools = batch.get('_rx_pools')
     _MM_FACE, _MM_SIDE, _MM_STATE = face, side, st
     if install_hands:
+        # INV-PASS-2 (fix wave 2026-10-21): the OPPONENT's real dice (the
+        # same annotation _emit_sample encodes the row with) sit on the
+        # menu state.  With an empty opponent pool the engine's turn-order
+        # pass gate (fewer unused Action dice, rulings 1.166 / 1.223(b))
+        # never held, so 66% of fewer-dice ordinary rows stored no 'pass'
+        # beside the human's choice.  The drive path (install_hands=False)
+        # stays byte-identical.
+        _opp = Side.FREE_PEOPLES if side == Side.SHADOW else Side.SHADOW
+        if isinstance(st._rx_full_pools, dict):
+            st.dice[_opp] = _install_full_pools(st._rx_full_pools)[_opp]
+        # INV-PASS-3 (fix wave 2026-10-21): the FP dice the turn's earlier
+        # Fellowship moves left in the Hunt Box (public, rulebook p.40)
+        # are on every EMITTED row's state, as on the live engine's.  They
+        # were seeded on the hunt-drive path only, so play_event / muster /
+        # army / hide rows read n_fp_in_box = 0 after a Fellowship move;
+        # _emit_one_pass seeds the pass rows the same way.  No menu reads
+        # FP Hunt Box dice; the drive path (install_hands=False, seeded by
+        # its caller) stays byte-identical.
+        _seed_fp_huntbox(st, batch)
         _install_ledger_hands(st, batch)
         # TABLE STATE ON EVERY EMITTED SAMPLE (USER 2026-08-20: "we
         # need to make sure that we consider every action that occurs
@@ -1876,11 +2513,8 @@ def _annotate_remaining_pools(batches, pools, eye_counts=None):
     from collections import Counter as _C
     eye_counts = eye_counts or {}
     import rendered_replay as _rr
-    u2side = {}
-    for b in batches:
-        for r in b['records']:
-            if r.get('op') == 'move' and r.get('die_stage'):
-                u2side[r.get('player')] = r['die_stage'][0]
+    # C1-03: a roll's side comes from its physical dice, never the user.
+    roll_side = _roll_side_resolver(batches)
     LEAVE_PLAY = ('reinforcements', 'hunt pool')
 
     def _dz(z):
@@ -1898,9 +2532,29 @@ def _annotate_remaining_pools(batches, pools, eye_counts=None):
     def _ca(z):
         return str(z or '').strip().lower() == 'current action'
 
+    def _recovery_zone(z):
+        z = str(z or '').strip().lower()
+        return 'casualties' in z or 'hunt for the ring' in z
+
+    # R4B-EOT-DISCARD-SHADOW-BOX: players usually recover their dice, draw
+    # the Phase 1 cards and discard to the hand limit BEFORE they advance
+    # the turn marker, so those records sit in the previous turn's LAST die
+    # batch (batches close at die stages and turn markers).  The first die
+    # recovery there (Hunt Box / Casualties -> SA/FP Dice) after the batch's
+    # die stage, made while no die is staged (checked in pass 2), starts
+    # the next turn: later records of the batch get its number
+    # (`_rx_turn`) and a fresh per-turn state -
+    # Hunt not started, so empty pools and box - until that turn's own
+    # allocation or roll is logged (rulebook p.13-14: the turn change
+    # empties the Hunt Box and the dice are recovered, not rolled; p.21).
+    last_die = {}
+    for i, b in enumerate(batches):
+        if b.get('die_side') and not b.get('_phase_only'):
+            last_die[b['turn']] = i
+
     # ---- pass 1: per turn, the ordered die-gesture event stream ---------
     # ev = (kind, side, face, extra); kinds: roll / leave / enter / change /
-    # snap (batch index)
+    # snap (batch index) / rollover (next turn) / next_hunt
     turns = {}
     hunt_started = {}
     order = []
@@ -1912,6 +2566,12 @@ def _annotate_remaining_pools(batches, pools, eye_counts=None):
             order.append(t)
         ev = turns[t]
         lead_lines = None
+        next_turn = None
+        if last_die.get(t) == i:
+            next_turn = next((x['turn'] for x in batches[i + 1:]
+                              if x['turn'] != t), None)
+            if next_turn is None or next_turn <= t:
+                next_turn = t + 1
         for r in b['records']:
             if isinstance(r.get('decision_truth'), dict):
                 r['_rx_before_hunt_allocation'] = not hunt_started[t]
@@ -1923,8 +2583,11 @@ def _annotate_remaining_pools(batches, pools, eye_counts=None):
             op = r.get('op')
             if op in ('alloc_eye', 'add_eye', 'roll_dice') or r.get('die_stage'):
                 hunt_started[t] = True
+                if next_turn is not None:
+                    # R4B: counts for the next turn only after its rollover
+                    ev.append(('next_hunt', None, None, None))
             if op == 'roll_dice':
-                sd = u2side.get(r.get('player'))
+                sd = roll_side(r)
                 if sd is not None:
                     partial = r.get('_rx_partial_roll')
                     if partial is not None:
@@ -1933,6 +2596,18 @@ def _annotate_remaining_pools(batches, pools, eye_counts=None):
                             ev.append(('partial_roll_staged', sd, partial[0], (partial[1], zone)))
                         else:
                             ev.append(('partial_roll', sd, partial[0], partial[1]))
+                    elif r.get('_rx_partial_dice'):
+                        # R18-CORPUS row 4 (_annotate_partial_rolls): only
+                        # the named dice change; the rest of the pool stays
+                        for change in r['_rx_partial_dice']:
+                            if change.get('allocated_eye'):
+                                continue
+                            if change.get('old') is None:
+                                if change.get('zone') == _OWN_DICE_ZONE[sd]:
+                                    ev.append(('add_die', sd, change['new'], None))
+                            else:
+                                ev.append(('reroll', sd, change['old'],
+                                           (change['new'], change.get('zone'))))
                     else:
                         ev.append(('roll', sd,
                                    [str(x).upper() for x in r.get('faces', [])],
@@ -1964,6 +2639,13 @@ def _annotate_remaining_pools(batches, pools, eye_counts=None):
                         ev.append(('leave', sd, f, (book, _ca(to))))
                 elif _dz(to) and not _dz(frm):
                     if _setup_zone(frm) and not r.get('_rx_physical_die_restore'):
+                        if (next_turn is not None and _recovery_zone(frm)
+                                and int(r.get('line', -1))
+                                > int(b.get('start_line') or 0)):
+                            # R4B: the next turn's Phase 1 dice recovery
+                            # (after the batch's own die stage: the turn's
+                            # own setup, prepended to its first batch, is not)
+                            ev.append(('rollover', None, None, next_turn))
                         continue        # turn-setup return: the roll resets
                     for sd, f in toks:
                         ev.append(('enter', sd, f, _ca(frm)))
@@ -2015,6 +2697,8 @@ def _annotate_remaining_pools(batches, pools, eye_counts=None):
         rolled = {s: False for s in SIDES}
         lowest = {s: _C() for s in SIDES}     # running minimum per face
         snaps = []                # (batch idx, {side: (pool, out, parked)})
+        nxt = None                # R4B: the next turn reached in this one
+        nxt_hunt = False          # ... and its Hunt allocation / roll seen
 
         def _track(s):
             for f, n in pool[s].items():
@@ -2022,7 +2706,18 @@ def _annotate_remaining_pools(batches, pools, eye_counts=None):
                     lowest[s][f] = n
 
         for kind, sd, f, ex in turns[t]:
+            if kind == 'rollover':
+                if nxt is None and not any(n > 0 for s in SIDES
+                                           for n in staged[s].values()):
+                    nxt = ex
+                continue
+            if kind == 'next_hunt':
+                nxt_hunt = nxt_hunt or nxt is not None
+                continue
             if kind in ('snap', 'snap_record'):
+                if kind == 'snap_record' and nxt is not None:
+                    ex[1]['_rx_turn'] = nxt
+                    ex[1]['_rx_before_hunt_allocation'] = not nxt_hunt
                 snaps.append((kind, ex, {s: (_C(pool[s]), list(out[s]),
                                        _C(parked[s]), _C(staged[s])) for s in SIDES}))
                 continue
@@ -2046,6 +2741,38 @@ def _annotate_remaining_pools(batches, pools, eye_counts=None):
                                       {'detail': 'reroll_original_not_unused'})
                 pool[sd][f] -= 1
                 pool[sd][ex] += 1
+                continue
+            if kind == 'add_die':
+                # R18-CORPUS row 4: a die rolled on its own joins the pool
+                pool[sd][f] += 1
+                continue
+            if kind == 'reroll':
+                # R18-CORPUS row 4: one die of this turn's roll rerolled
+                # where the raw moves put it: in the pool, staged in Current
+                # Action or parked on a Current card.  Anywhere else (the
+                # Hunt Box) it is no action die yet; the gesture that brings
+                # it back books its new face.
+                new, zone = ex
+                if zone == _OWN_DICE_ZONE[sd]:
+                    if pool[sd][f] <= 0:
+                        raise _Quarantine('coverage_partial_roll_unproven',
+                                          {'detail': 'reroll_original_not_unused',
+                                           'side': sd, 'face': f, 'new': new})
+                    pool[sd][f] -= 1
+                    pool[sd][new] += 1
+                elif zone == _CURRENT_ACTION_ZONE and staged[sd][f] > 0:
+                    staged[sd][f] -= 1
+                    if new != 'E':
+                        staged[sd][new] += 1
+                    if f in out[sd]:
+                        j = len(out[sd]) - 1 - out[sd][::-1].index(f)
+                        if new == 'E':
+                            del out[sd][j]
+                        else:
+                            out[sd][j] = new
+                elif zone in _CURRENT_CARD_ZONES and parked[sd][f] > 0:
+                    parked[sd][f] -= 1
+                    parked[sd][new] += 1
                 continue
             if kind == 'roll':
                 pool[sd] = _C(f)
@@ -2150,8 +2877,10 @@ def _annotate_remaining_pools(batches, pools, eye_counts=None):
                         unused = sorted(unused + [bl])
                 used = sorted(used)
                 if s == 'SHADOW':
+                    # R4B: a record in the next turn holds that turn's Eyes
+                    et = t if record is None else record.get('_rx_turn', t)
                     try:
-                        used = used + ['E'] * int(eye_counts.get(t, 0) or 0)
+                        used = used + ['E'] * int(eye_counts.get(et, 0) or 0)
                     except Exception:
                         pass
                 rem[s] = {'unused': unused, 'used': used}
@@ -2253,7 +2982,29 @@ def _annotate_ring_ledger(batches):
     truth snapshots â€” the primary die-spend decision follows any
     in-batch ring gesture; the elven_ring emitter overrides with 'pre'
     (the use decision itself still holds the ring).  Returns audit
-    counters for the per-game manifest."""
+    counters for the per-game manifest.
+    C1-04 (2026-10-22): 'post' is the physical END-of-batch inventory
+    and still goes into 'truth'; truth_before (and the batch-level
+    backstops) take batch['_rx_rings']['decision'] = 'pre' + the ACTING
+    side's own in-batch gestures.  An opponent gesture rendered inside
+    the batch (the W3-005 pre-staging drag after the die kill, a glued
+    render) is that opponent's later action - the old 'post' stamp put
+    it into this side's decision state and menu (phantom Shadow
+    elven_ring options, fp_used True before FP used Narya).  Each ring
+    record also carries r['_rx_ring_pre'] (the full inventory just
+    before it) for the W3-005 carry's 'pre'.
+    R2-RS-C1-PASSES (round 2, 2026-10-22): batch['_rx_rings']['slot'] is
+    the inventory at the turn-order slot right after the batch (where
+    _emit_passes builds the skipped side's pass row): the full ledger
+    minus every ring gesture rendered after the batch's last action-die
+    kill (the "tail") for a ring that has a USE in that tail - a
+    pre-staging drag for the NEXT action, by either side, together with
+    any back-and-forth of that ring around it (a use then take-back, or
+    a take-back then re-use, nets to the at-kill state).  Tail gestures
+    of a ring with no tail use - bookkeeping that completes a use made
+    BEFORE the kill (an FP LIMBO pass completed by a Casualties -> Dark
+    Ring drag after the sweep) - still apply.  With no tail use, 'slot'
+    equals 'post'."""
     ring_st = {nm: 'FP' for nm in _RING_NAMES}
     # per-ring states: FP (Elven Rings box) / SH (Dark Ring box) /
     # LIMBO (FP-use staged through a Current/Board slot, pass to the
@@ -2263,92 +3014,143 @@ def _annotate_ring_ledger(batches):
     # by a Casualties -> Dark Ring drag); SH use = Dark Ring slot ->
     # anything non-ring (classic Casualties drop, or Current-slot
     # staging + kill); backward moves are take-backs and uncount.
-    fp_used = sh_used = False
+    used = {'fp': False, 'sh': False}
     prev_turn = None
     audit = {'fp_uses': 0, 'sh_uses': 0, 'anom_fp': 0, 'anom_sh': 0,
              'anom_turn_dup': 0}
 
-    def _snap9():
-        vals = list(ring_st.values())
+    def _snap9(st9=None, used9=None):
+        st9 = ring_st if st9 is None else st9
+        used9 = used if used9 is None else used9
+        vals = list(st9.values())
         return {'fp': vals.count('FP'), 'sh': vals.count('SH'),
-                'fp_used': fp_used, 'sh_used': sh_used}
+                'fp_used': used9['fp'], 'sh_used': used9['sh']}
+
+    def _step(r, st9, used9, aud, own=None):
+        # ONE record -> (st9, used9).  own=None: the full ledger.  own=
+        # 'fp'/'sh' (C1-04): the acting side's decision view - only that
+        # side's gestures apply, plus a LIMBO pass completion (bookkeeping
+        # for an FP use the view already holds).
+        fp_ok, sh_ok = own in (None, 'fp'), own in (None, 'sh')
+        if r.get('op') == 'kill' and \
+                'dark ring' in str(r.get('zone', '')).lower():
+            # W3-016: 'kills Narya in Dark Ring N' = a Shadow use
+            # rendered as a kill instead of a Casualties drop
+            if not sh_ok:
+                return
+            for nm in [str(x).strip().lower()
+                       for x in (r.get('pieces') or [])]:
+                if nm not in _RING_NAMES:
+                    continue
+                if st9[nm] == 'SH':
+                    aud['sh_uses'] += 1
+                else:
+                    aud['anom_sh'] += 1
+                st9[nm] = 'GONE'
+                if used9['sh']:
+                    aud['anom_turn_dup'] += 1
+                used9['sh'] = True
+            return
+        if r.get('op') != 'move':
+            return
+        nm = str(r.get('obj', '')).strip().lower()
+        if nm not in _RING_NAMES:
+            return
+        frm = str(r.get('from', '')).lower()
+        to = str(r.get('to', '')).lower()
+        f_er, f_dr = 'elven ring' in frm, 'dark ring' in frm
+        t_er, t_dr = 'elven ring' in to, 'dark ring' in to
+        s9 = st9[nm]
+        if f_er and not t_er:                    # FP use
+            if fp_ok:
+                if s9 == 'FP':
+                    aud['fp_uses'] += 1
+                else:
+                    aud['anom_fp'] += 1
+                st9[nm] = 'SH' if t_dr else 'LIMBO'
+                if used9['fp']:
+                    aud['anom_turn_dup'] += 1
+                used9['fp'] = True
+        elif f_dr and t_er:                      # FP-use take-back
+            if fp_ok and s9 == 'SH':
+                aud['fp_uses'] = max(0, aud['fp_uses'] - 1)
+                st9[nm] = 'FP'
+                used9['fp'] = False
+        elif f_dr and not t_dr:                  # SH use
+            if sh_ok:
+                if s9 == 'SH':
+                    aud['sh_uses'] += 1
+                else:
+                    aud['anom_sh'] += 1
+                st9[nm] = 'GONE'
+                if used9['sh']:
+                    aud['anom_turn_dup'] += 1
+                used9['sh'] = True
+        elif t_dr and not f_dr and not f_er:     # completion/take-back
+            if s9 == 'LIMBO':
+                st9[nm] = 'SH'                   # FP pass completes
+            elif s9 == 'GONE' and sh_ok:
+                aud['sh_uses'] = max(0, aud['sh_uses'] - 1)
+                st9[nm] = 'SH'
+                used9['sh'] = False
+        elif t_er and not f_er and not f_dr:     # back to the FP box
+            if s9 == 'LIMBO' and fp_ok:
+                aud['fp_uses'] = max(0, aud['fp_uses'] - 1)
+                st9[nm] = 'FP'
+                used9['fp'] = False
 
     for b in batches:
         if b['turn'] != prev_turn:
             prev_turn = b['turn']
-            fp_used = sh_used = False
+            used['fp'] = used['sh'] = False
         pre = _snap9()
+        # C1-04: the batch's side decides before the opponent's next
+        # action, so the opponent's gestures inside this batch stay out
+        # of the decision view (a side-less tail batch keeps them all)
+        own = {'SHADOW': 'sh', 'FREE_PEOPLES': 'fp'}.get(b.get('die_side'))
+        dec_st, dec_used = dict(ring_st), dict(used)
+        dec_aud = dict.fromkeys(audit, 0)        # view-only, discarded
+        # R2-RS-C1-PASSES: the pass-slot view (see docstring) - the full
+        # ledger minus every tail gesture (after the batch's last action-
+        # die kill, the W3-005 carry's kill scan) of a ring USED in the tail
+        slot_st, slot_used = dict(ring_st), dict(used)
+        slot_aud = dict.fromkeys(audit, 0)       # view-only, discarded
+        slot_kill = None
+        for r in b['records']:
+            if r.get('op') == 'kill' and any(
+                    'Action Die' in str(x) for x in (r.get('pieces') or ())):
+                slot_kill = r.get('line')
+
+        def _tail_rings(r):
+            # ring names of a tail ring gesture, else the empty set
+            if (slot_kill is None or _ring_rec_kind(r) is None
+                    or (r.get('line') or 0) <= slot_kill):
+                return set()
+            return _RING_NAMES & (
+                {str(r.get('obj', '')).strip().lower()}
+                | {str(x).strip().lower() for x in (r.get('pieces') or [])})
+
+        tail_used = set()
+        for r in b['records']:
+            if (_ring_rec_kind(r) or '').endswith('_use'):
+                tail_used |= _tail_rings(r)
         for r in b['records']:
             if isinstance(r.get('decision_truth'), dict):
                 r['decision_truth']['_rx_rings'] = _snap9()
-            if r.get('op') == 'kill' and \
-                    'dark ring' in str(r.get('zone', '')).lower():
-                # W3-016: 'kills Narya in Dark Ring N' = a Shadow use
-                # rendered as a kill instead of a Casualties drop
-                for nm in [str(x).strip().lower()
-                           for x in (r.get('pieces') or [])]:
-                    if nm not in _RING_NAMES:
-                        continue
-                    if ring_st[nm] == 'SH':
-                        audit['sh_uses'] += 1
-                    else:
-                        audit['anom_sh'] += 1
-                    ring_st[nm] = 'GONE'
-                    if sh_used:
-                        audit['anom_turn_dup'] += 1
-                    sh_used = True
-                continue
-            if r.get('op') != 'move':
-                continue
-            nm = str(r.get('obj', '')).strip().lower()
-            if nm not in _RING_NAMES:
-                continue
-            frm = str(r.get('from', '')).lower()
-            to = str(r.get('to', '')).lower()
-            f_er, f_dr = 'elven ring' in frm, 'dark ring' in frm
-            t_er, t_dr = 'elven ring' in to, 'dark ring' in to
-            s9 = ring_st[nm]
-            if f_er and not t_er:                    # FP use
-                if s9 == 'FP':
-                    audit['fp_uses'] += 1
-                else:
-                    audit['anom_fp'] += 1
-                ring_st[nm] = 'SH' if t_dr else 'LIMBO'
-                if fp_used:
-                    audit['anom_turn_dup'] += 1
-                fp_used = True
-            elif f_dr and t_er:                      # FP-use take-back
-                if s9 == 'SH':
-                    audit['fp_uses'] = max(0, audit['fp_uses'] - 1)
-                    ring_st[nm] = 'FP'
-                    fp_used = False
-            elif f_dr and not t_dr:                  # SH use
-                if s9 == 'SH':
-                    audit['sh_uses'] += 1
-                else:
-                    audit['anom_sh'] += 1
-                ring_st[nm] = 'GONE'
-                if sh_used:
-                    audit['anom_turn_dup'] += 1
-                sh_used = True
-            elif t_dr and not f_dr and not f_er:     # completion/take-back
-                if s9 == 'LIMBO':
-                    ring_st[nm] = 'SH'               # FP pass completes
-                elif s9 == 'GONE':
-                    audit['sh_uses'] = max(0, audit['sh_uses'] - 1)
-                    ring_st[nm] = 'SH'
-                    sh_used = False
-            elif t_er and not f_er and not f_dr:     # back to the FP box
-                if s9 == 'LIMBO':
-                    audit['fp_uses'] = max(0, audit['fp_uses'] - 1)
-                    ring_st[nm] = 'FP'
-                    fp_used = False
+            if _ring_rec_kind(r) is not None:
+                r['_rx_ring_pre'] = _snap9()     # W3-005 carry 'pre'
+            _step(r, ring_st, used, audit)
+            _step(r, dec_st, dec_used, dec_aud, own)
+            if not (_tail_rings(r) & tail_used):
+                _step(r, slot_st, slot_used, slot_aud)
         post = _snap9()
-        b['_rx_rings'] = {'pre': pre, 'post': post}
-        for kk in ('truth_before', 'truth'):
+        dec = _snap9(dec_st, dec_used)
+        b['_rx_rings'] = {'pre': pre, 'post': post, 'decision': dec,
+                          'slot': _snap9(slot_st, slot_used)}
+        for kk, rg9 in (('truth_before', dec), ('truth', post)):
             sn = b.get(kk)
             if isinstance(sn, dict):
-                sn['_rx_rings'] = post
+                sn['_rx_rings'] = rg9
     return audit
 
 
@@ -2366,9 +3168,9 @@ def _annotate_ring_carry(batches):
     batch's own side, and whose predecessor's records AFTER its last
     action-die kill carry the batch side's ring USE (not taken back in
     that tail), stamp batch['_rx_ring_carry'] = those records and
-    restore the decision-time inventory ('pre') of the carried side to
-    the predecessor's (the ring still in hand when the use was
-    decided).  _ring_counter_used reads the carry; the predecessor
+    restore the decision-time inventory ('pre') to the full inventory
+    just before the first carried record (the ring still in hand when
+    the use was decided; C1-04).  _ring_counter_used reads the carry; the predecessor
     keeps its records (its own die side still wins there).  Returns
     the number of carries."""
     n = 0
@@ -2408,10 +3210,10 @@ def _annotate_ring_carry(batches):
         p['_rx_ring_carried_out'] = True
         rg_b, rg_p = b.get('_rx_rings'), p.get('_rx_rings')
         if isinstance(rg_b, dict) and isinstance(rg_p, dict):
-            pre = dict(rg_b['pre'])
-            pre[own] = rg_p['pre'].get(own, pre.get(own))
-            pre[own + '_used'] = rg_p['pre'].get(own + '_used', False)
-            rg_b['pre'] = pre
+            # C1-04: the WHOLE inventory just before the carried use (the
+            # ledger's per-record stamp).  Restoring only the carried
+            # side left the pass already done: fp 3 + sh 1 = 4 rings.
+            rg_b['pre'] = dict(carry[0]['_rx_ring_pre'])
         n += 1
     return n
 
@@ -2550,6 +3352,22 @@ def _token_kinds(text):
             for m in _TOKEN_PIECE_RE.findall(str(text or ''))]
 
 
+def _is_token_stage(rec):
+    """True when a net record STAGES an FP action token: a token piece
+    moved from FP Dice into ANY Current slot ('Current Action', 'Current
+    FP Card', or 'Current SA Card' - some clients stage the token there and
+    kill it 'in Current Action', 2025-04-14 Cheekz L108/L110).  The ONE
+    stage predicate shared by the token ledger (_annotate_token_ledger),
+    the token-use emitter (_emit_token_uses) and the 1.223 pass walk
+    (_pass_token_slots), so a use the ledger counts always takes its FP
+    turn-order slot (R2-RS-v032-C4-01: the walk's narrower regex missed
+    the SA Card stages and minted phantom FP passes)."""
+    return (isinstance(rec, dict) and rec.get('op') == 'move'
+            and bool(_token_kinds(rec.get('obj')))
+            and 'fp dice' in str(rec.get('from', '')).lower()
+            and 'current' in str(rec.get('to', '')).lower())
+
+
 def _annotate_token_ledger(batches):
     """Stamp every batch with the FP token holdings at its decision point:
     batch['_rx_tokens'] = {'pre': {'political': n, 'card': n, 'used':
@@ -2585,7 +3403,7 @@ def _annotate_token_ledger(batches):
             if 'fp dice' in to and 'current' not in frm:
                 for k in kinds:
                     grants.append((ln, k))
-            elif 'current' in to and 'fp dice' in frm:
+            elif _is_token_stage(rec):        # shared with the pass walk
                 for k in kinds:
                     staged[k] = (ln, turn)
             elif 'fp dice' in to and 'current' in frm:
@@ -2788,7 +3606,15 @@ def _emit_sample(st, side, legal, hidx, phase, turn):
             hidx = target_index
             _alt9 = []
         else:
-            policy_exclusion = 'expert_action_outside_fixed_policy'
+            # A2-05: an expert Ring row on a higher die of its face is the
+            # retained twin's choice (interchangeable die, same encoding).
+            from ai_policies import ring_twin_index
+            twin = ring_twin_index(legal, hidx, projection)
+            if twin is not None:
+                hidx = twin
+                _alt9 = [i for i in _alt9 if i != twin]
+            else:
+                policy_exclusion = 'expert_action_outside_fixed_policy'
     if policy_exclusion is None:
         remap = {old: new for new, old in enumerate(kept_indices)}
         hidx = remap[hidx]
@@ -2833,6 +3659,12 @@ def _emit_sample(st, side, legal, hidx, phase, turn):
                    or getattr(st, '_declare_phase', False)
                    or getattr(st, '_eye_allocation_phase', False)
                    or getattr(st, '_rx_before_hunt_allocation', False))
+    if _RX_FP_BOX_CUT is not None and not before_hunt:
+        # R3-EXTRACT-HUNTBOX-RECON: a battle-family row (drive clones and
+        # fresh recovery states alike) carries the FP Hunt Box dice the
+        # turn's settled Fellowship moves left (encoding only; the menu was
+        # already enumerated and no menu reads FP Hunt Box dice).
+        _topup_fp_huntbox(st, *_RX_FP_BOX_CUT)
     if _RX_EYEALLOC is not None and not before_hunt and \
             not getattr(st, '_rx_eyes_stamped', False):
         import game_state as _gse
@@ -2843,13 +3675,18 @@ def _emit_sample(st, side, legal, hidx, phase, turn):
             pass
         _alloc9 = int(_RX_EYEALLOC.get(_t9, 0) or 0)
         _roll9 = int((_RX_EYEROLL or {}).get(_t9, 0) or 0)
-        if (_alloc9 or _roll9) and not getattr(st, 'hunt_box', None):
+        # INV-PASS-3: stamp when the box holds no SHADOW die; the FP
+        # Hunt Box dice seeded on pass / ordinary rows stay beside them
+        # (an FP-only box used to suppress the Eyes entirely).
+        _held9 = list(getattr(st, 'hunt_box', None) or ())
+        if (_alloc9 or _roll9) and not any(
+                _d9.side is _gse.Side.SHADOW for _d9 in _held9):
             _box9 = []
             for _ in range(_alloc9 + _roll9):
                 _d9 = _gse.ActionDie(_gse.SH_FACES, _gse.Side.SHADOW)
                 _d9.current = _gse.ActionDieFace.EYE
                 _box9.append(_d9)
-            st.hunt_box = _box9
+            st.hunt_box = _box9 + _held9
         st.eyes_allocated = _alloc9
         st._rx_eyes_stamped = True
     # v30: encode the STATE under the reconstructed full dice pools
@@ -2864,6 +3701,11 @@ def _emit_sample(st, side, legal, hidx, phase, turn):
             _RX_HUNT_HISTORY.observation(st, phase, legal[hidx])
     with encoding_pool(st, hunt_pool, hunt_discard):
         _fullp = getattr(st, '_rx_full_pools', None)
+        if _fullp is None:
+            # C3-01: combat-family rows ride states that never carry the
+            # pools; _emit_combat_family scopes the batch's post-launch
+            # pools here (None outside a combat batch)
+            _fullp = _RX_COMBAT_POOLS
         if (_fullp is not None
                 and getattr(st, '_fellowship_move_die_pending', None) is None):
             _saved_dice = st.dice
@@ -2946,6 +3788,13 @@ def _emit_sample(st, side, legal, hidx, phase, turn):
         # W4-032 sponsor condition: the row trains an action the v41
         # encoder aliases with a plain twin - stamped, never hidden
         _smp9['alias_v41'] = True
+    # R3-V53-FOLLOWONS: the row has an encoding twin the v53 action tail
+    # tells apart (E5-01 / A1-01 / E3-02) - stamped for pack_npz's v53
+    # alias guard (always [] under v53, where twins share the tail)
+    from extract_corpus import v53_alias_classes
+    _a53 = v53_alias_classes(ai, st, side, legal, hidx, _smp9['encs'], _smp9['regs'])
+    if _a53:
+        _smp9['alias_v53'] = _a53
     return _smp9
 
 
@@ -3085,21 +3934,37 @@ def _combat_target_sample(batch, stats):
         rr.sanitize(str(a.params.get('from', ''))) == atk and
         rr.sanitize(str(a.params.get('to', a.params.get('to_region', '')))) ==
         dfn)
-    if hidx is None and not _cardint9:
-        hidx = _match_index(
-            legal, lambda a: a.action_type == 'army_attack' and
-            rr.sanitize(str(a.params.get('to',
-                            a.params.get('to_region', '')))) == dfn)
     if hidx is None:
         # A battle gesture proves an outcome, not an executable root action
         # or its payment. Card interiors need their actual continuation menu.
+        # R2-RS-v031-C3-09 (round 2, 2026-10-22): never fall back to another
+        # army_attack into dfn from a different source region - army_attack
+        # encodes its source, so that row names an attack the human never
+        # made (2024-03-23 HeresJim L892: plan westemnet -> helm s deep, the
+        # leaderless Westemnet army is not offered, the only attack into
+        # dfn is the Character-die sortie helm s deep -> helm s deep).  The
+        # combat drive dropped the same guess in C3-09
+        # (cc_plan_attack_not_offered); mirror its metering.
+        _into9 = (not _cardint9) and any(
+            a.action_type == 'army_attack'
+            and rr.sanitize(str(a.params.get(
+                'to', a.params.get('to_region', '')))) == dfn
+            and rr.sanitize(str(a.params.get('from', ''))) != atk
+            for a in legal) and not any(
+            a.action_type == 'army_attack'
+            and rr.sanitize(str(a.params.get('from', ''))) == atk
+            and rr.sanitize(str(a.params.get(
+                'to', a.params.get('to_region', '')))) == dfn
+            for a in legal)
         stats['drop_reasons'][('attack_card_interior_unmatched' if _cardint9
+                               else 'attack_plan_not_offered' if _into9
                                else 'attack_recovery_not_in_public_menu')] += 1
         return None
     stats['kinds_emit']['army_attack'] += 1
     return _emit_sample(st, side, legal, hidx, 'army_attack', batch['turn'])
 
 
+@_fp_huntbox_batch_scope    # R3-EXTRACT-HUNTBOX-RECON: rollless clones
 def _emit_chat_battle(batch, stats):
     """Zero-kill battle family (truth rows T4-8..T4-11, Pelargir): a battle
     whose rounds produced NO casualties never classifies 'combat'
@@ -3272,6 +4137,16 @@ def _emit_chat_battle(batch, stats):
         # is just a card play whose effect moved units (GAME19 T5 TSL
         # into besieged Lorien) - no battle
         return None
+    if _corsairs_landing(batch) is not None:
+        # R2-RS-v029-C3-04: a Corsairs of Umbar battle is the event's own
+        # CO-LOCATED battle (the force moved in first; attacker_no_retreat;
+        # no victor advance), never an attack from Umbar - this gesture
+        # path built attacker_region 'umbar' pendings that offered
+        # combat_cease (2025-03-14 webbely T4 L246).  Not ours: the card /
+        # bookkeeping lane owns the batch and labels its play.  A ROUTING
+        # tick (C2-006), metered in `detected`.
+        stats['detected']['zk_corsairs_card_battle'] += 1
+        return None
     atk = adv_srcs.get(dfn)
     if atk is None:
         stats['drop_reasons']['zk_no_attacker'] += 1
@@ -3307,13 +4182,27 @@ def _emit_chat_battle(batch, stats):
             batch, st, legal[hidx], side, dside, atk, dfn,
             ret_moves, reg_moves, stats))
         return out
+    # R2-RS-C3-BATTLE-ROWS: every row below is a POST-launch decision.  The
+    # engine spends the launching die in apply_action(army_attack) before
+    # the battle forms (_consume_die_for_face), so encode them under the
+    # same post-launch pools C3-01 gives the main combat family; st still
+    # carried the pre-action pools the army_attack row (correctly) used.
+    # Encoding only: the menus below are enumerated on st as before.  The
+    # rollless branch above emits from apply_action clones (post-launch
+    # dice of their own) and is untouched.
+    st._rx_full_pools = _combat_encoding_pools(batch, stats,
+                                               counter_prefix='zk_pools')
     # 2) round-1 combat-card commit/decline, attacker then defender ------
     try:
-        cc_atk, cc_dfn = rc._combat_cards(batch)
-    except Exception:
-        cc_atk = cc_dfn = None
-    for (stage, s_en, cid) in (('attacker_combat_card', side, cc_atk),
-                               ('defender_combat_card', dside, cc_dfn)):
+        cc_atk, cc_dfn = _combat_cards_by_owner(batch)
+        cc_stages = (('attacker_combat_card', side, cc_atk),
+                     ('defender_combat_card', dside, cc_dfn))
+    except Exception as e:
+        # an unreadable card reading proves neither a commit nor a
+        # decline: no card row (it used to store both sides as declines)
+        stats['drop_reasons']['zk_cc_read_exc:%s' % type(e).__name__] += 1
+        cc_stages = ()
+    for (stage, s_en, cid) in cc_stages:
         st.pending_combat = {
             'phase': stage, 'attacker_region': atk,
             'defender_region': dfn, 'attacker_side': side,
@@ -3343,11 +4232,18 @@ def _emit_chat_battle(batch, stats):
     # Scouts-class pre-combat retreat leaves no continue decision) ----
     wins_n = len(_combat_round_windows(batch))
     if wins_n >= 1 and (ret_moves or wins_n >= 2):
+        # R2-RS-C3-BATTLE-ROWS (C3-06 sibling): the engine increments
+        # rounds_fought before attacker_continue opens (encode_state reads
+        # it as combat_ctx[9]).  With a retreat the observed continue is the
+        # one right before it, after round wins_n; without one the battle
+        # ended with a cease after round wins_n, so the last continue came
+        # after round wins_n - 1 (>= 1: the gate needs wins_n >= 2 then).
         st.pending_combat = {
             'phase': 'attacker_continue', 'attacker_region': atk,
             'defender_region': dfn, 'attacker_side': side,
             'defender_side': dside, 'deciding_side': side,
-            'is_siege': False}
+            'is_siege': False,
+            'rounds_fought': wins_n if ret_moves else wins_n - 1}
         try:
             la = ai.get_legal_actions(st, side)
         except Exception:
@@ -3385,7 +4281,9 @@ def _emit_chat_battle(batch, stats):
             'phase': 'defender_retreat', 'attacker_region': atk,
             'defender_region': dfn, 'attacker_side': side,
             'defender_side': dside, 'deciding_side': dside,
-            'is_siege': False}
+            'is_siege': False,
+            # R2-RS-C3-BATTLE-ROWS: the continue executor keeps the count
+            'rounds_fought': wins_n}
         try:
             la = ai.get_legal_actions(st, dside)
         except Exception:
@@ -3416,14 +4314,16 @@ def _emit_chat_battle(batch, stats):
     # net out a split-back (GAME02 T4: the WK group advances into Dale,
     # then 1 regular is moved BACK to garrison Woodland Realm)
     _rev9 = _moved_group_composition(batch, dfn, atk)
-    for _k9 in ('reg', 'elite', 'leaders', 'nazgul'):
-        comp[_k9] = max(0, comp[_k9] - _rev9[_k9])
+    _net_comp(comp, _rev9)      # E5-01: counts AND figure keys
     if comp['reg'] + comp['elite'] + comp['leaders'] + comp['nazgul'] > 0:
         st.pending_combat = {
             'phase': 'victor_advance', 'attacker_region': atk,
             'defender_region': dfn, 'attacker_side': side,
             'defender_side': dside, 'deciding_side': side,
-            'is_siege': False}
+            'is_siege': False,
+            # R2-RS-C3-BATTLE-ROWS: the engine's victor_advance copies the
+            # battle's rounds_fought (ai.py post-retreat opener)
+            'rounds_fought': wins_n}
         try:
             la = ai.get_legal_actions(st, side)
         except Exception:
@@ -3524,8 +4424,7 @@ def _emit_rollless_public_retreat(batch, state, attack, side, dside,
         st = apply_without_rng(st, menu[index])
         comp = _moved_group_composition(batch, atk, dfn)
         reverse = _moved_group_composition(batch, dfn, atk)
-        for key in ('reg', 'elite', 'leaders', 'nazgul'):
-            comp[key] = max(0, comp[key] - reverse[key])
+        _net_comp(comp, reverse)    # E5-01: counts AND figure keys
         menu = ai.get_legal_actions(st, side)
         index = _match_army_move(menu, st, side, atk, dfn, comp, atype='victor_advance')
         if index is not None and len(menu) >= 2:
@@ -3618,9 +4517,13 @@ def _moved_group_composition(batch, frm, to, lo=0, hi=None):
     batch (one army move renders as several unit/leader/split lines that all
     share one (from,to)).  Returns dict(reg, elite, leaders, nazgul).
     Optional [lo, hi) line window restricts to a combat-round segment
-    (victor-advance evidence must not count the pre-battle approach)."""
+    (victor-advance evidence must not count the pre-battle approach).
+    E5-01 (D5 2026-10-22): also 'leader_keys' / 'unit_keys', Counters of
+    the moved figures' army_card_cargo keys, so _match_army_move can tell
+    the engine's which-figure rows (leader_set / unit_set) apart."""
     import rendered_replay as rr
-    comp = {'reg': 0, 'elite': 0, 'leaders': 0, 'nazgul': 0}
+    comp = {'reg': 0, 'elite': 0, 'leaders': 0, 'nazgul': 0,
+            'leader_keys': Counter(), 'unit_keys': Counter()}
     for r in batch['records']:
         if r.get('op') != 'move':
             continue
@@ -3645,6 +4548,8 @@ def _moved_group_composition(batch, frm, to, lo=0, hi=None):
                     comp['reg'] += p[3]
                 elif p[2] == 'ELITE':
                     comp['elite'] += p[3]
+                if p[2] in ('REGULAR', 'ELITE'):
+                    comp['unit_keys'][('unit', str(p[1]), p[2])] += p[3]
             elif p[0] == 'nazgul':
                 comp['nazgul'] += p[3]
             elif p[0] in ('leader', 'named'):
@@ -3656,6 +4561,19 @@ def _moved_group_composition(batch, frm, to, lo=0, hi=None):
                 if p[0] == 'named' and 'saruman' in str(p[1]).lower():
                     continue
                 comp['leaders'] += p[3]
+                comp['leader_keys'][(p[0], str(p[1]), '')] += p[3]
+    return comp
+
+
+def _net_comp(comp, back):
+    """E5-01: net a split-back drag `back` out of `comp` (both shaped like
+    _moved_group_composition), the counts AND the figure-key Counters, so
+    the identities stay consistent with the counts."""
+    for k in ('reg', 'elite', 'leaders', 'nazgul'):
+        comp[k] = max(0, comp[k] - back[k])
+    for k in ('leader_keys', 'unit_keys'):
+        if k in comp:
+            comp[k] = comp[k] - back.get(k, Counter())
     return comp
 
 
@@ -3675,20 +4593,25 @@ def _piece_key(tok):
 
 def _comp_of_keys(keys):
     """dict(reg, elite, leaders, nazgul) of a piece-key Counter (same
-    shape as _moved_group_composition; named figures count as leaders)."""
-    comp = {'reg': 0, 'elite': 0, 'leaders': 0, 'nazgul': 0}
+    shape as _moved_group_composition; named figures count as leaders;
+    E5-01: with the 'leader_keys' / 'unit_keys' figure Counters)."""
+    comp = {'reg': 0, 'elite': 0, 'leaders': 0, 'nazgul': 0,
+            'leader_keys': Counter(), 'unit_keys': Counter()}
     for (kind, _nat, sub), n in keys.items():
         if kind == 'unit':
             if sub == 'REGULAR':
                 comp['reg'] += n
             elif sub == 'ELITE':
                 comp['elite'] += n
+            if sub in ('REGULAR', 'ELITE'):
+                comp['unit_keys'][('unit', str(_nat), sub)] += n
         elif kind == 'nazgul':
             comp['nazgul'] += n
         else:
             if kind == 'named' and 'saruman' in str(_nat).lower():
                 continue                # W2-033: Saruman never moves
             comp['leaders'] += n
+            comp['leader_keys'][(kind, str(_nat), '')] += n
     return comp
 
 
@@ -3859,9 +4782,13 @@ def _net_batch_flows(batch, lo=0, hi=None, keep_empty=False, through=False):
         f_reg = fk[0] in ('region', 'stronghold')
         t_reg = tk[0] in ('region', 'stronghold')
         if not (f_reg and t_reg):
-            src = ('__card__' if fk[0] == 'card' else
+            # R4B-OFFBOARD-SLOT-RECOGNIZERS: an off-board zone (Victory
+            # Points N, a deck: zone_kind 'offboard' since R4) parks a
+            # placed figure exactly like a card slot (2023-03-22
+            # Terminatorhenk L408-L412 via 'Victory Points 8')
+            src = ('__card__' if fk[0] in ('card', 'offboard') else
                    fk[1] if f_reg else None)
-            dst = ('__card__' if tk[0] == 'card' else
+            dst = ('__card__' if tk[0] in ('card', 'offboard') else
                    tk[1] if t_reg else None)
             if fk[0] == 'reinf' and dst is not None:
                 for t in _group_tokens(obj):
@@ -4049,6 +4976,26 @@ def _match_army_move(legal, st, side, frm, to, comp, atype='army_move'):
             break
     want_ldr = comp['leaders']
     want_naz = comp['nazgul']
+    # E5-01 (D5 2026-10-22): the engine's which-figure rows name their
+    # figures ('leader_set' = non-Nazgul leader figures, 'unit_set' = the
+    # nation mix of the units, army_card_cargo keys).  They are matched on
+    # the human's moved figure keys whenever the composition carries
+    # identities consistent with its counts; otherwise such a row stays a
+    # plain count candidate and any ambiguity drops (purity).
+    from army_card_cargo import decode as _cargo_decode
+    _want_lk = comp.get('leader_keys')
+    if _want_lk is not None:
+        _want_lk = +Counter(_want_lk)
+        if sum(_want_lk.values()) != want_ldr:
+            _want_lk = None
+    _want_uk = comp.get('unit_keys')
+    if _want_uk is not None:
+        _want_uk = +Counter(_want_uk)
+        if sum(n for k, n in _want_uk.items() if k[2] == 'REGULAR') \
+                != comp['reg'] or \
+                sum(n for k, n in _want_uk.items() if k[2] == 'ELITE') \
+                != comp['elite']:
+            _want_uk = None
     matches = []
     for i, a in enumerate(legal):
         if a.action_type != atype:
@@ -4059,6 +5006,12 @@ def _match_army_move(legal, st, side, frm, to, comp, atype='army_move'):
             continue
         if int(p.get('n_regular', 0)) != comp['reg'] or \
                 int(p.get('n_elite', 0)) != comp['elite']:
+            continue
+        if p.get('leader_set') is not None and _want_lk is not None \
+                and _cargo_decode(p['leader_set']) != _want_lk:
+            continue
+        if p.get('unit_set') is not None and _want_uk is not None \
+                and _cargo_decode(p['unit_set']) != _want_uk:
             continue
         take = bool(p.get('take_leaders', False))
         if p.get('n_leaders') is not None:
@@ -4204,16 +5157,24 @@ def _muster_placements(batch):
                 continue
             else:
                 continue
+            # R4B-OFFBOARD-SLOT-RECOGNIZERS: an off-board zone (Victory
+            # Points N, a deck: zone_kind 'offboard' since R4) is a parking
+            # slot exactly like a card zone (2023-03-22 Terminatorhenk
+            # L408-L412: Gondor Leader + Regular via 'Victory Points 8' and
+            # Current FP Card).  A parked figure is placed only on its
+            # slot->region leg; one left on the slot is never a placement.
+            f_slot = fk[0] in ('card', 'offboard')
+            t_slot = tk[0] in ('card', 'offboard')
             if fk[0] == 'reinf' and t_reg:
                 _add(key, tk[1], n)
-            elif fk[0] == 'reinf' and tk[0] == 'card':
+            elif fk[0] == 'reinf' and t_slot:
                 # W4-026: parked on a card zone first (2023-03-03 L468
                 # 3 Isengard regulars via Current SA Card, 2023-08-15
                 # L273 via Current FP Card) - they arrive at their
                 # region on the card->region leg below
                 d = placed.setdefault(key, {})
                 d['__card__'] = d.get('__card__', 0) + n
-            elif fk[0] == 'card' and t_reg and \
+            elif f_slot and t_reg and \
                     placed.get(key, {}).get('__card__', 0) > 0:
                 m = min(n, placed[key]['__card__'])
                 placed[key]['__card__'] -= m
@@ -4223,7 +5184,7 @@ def _muster_placements(batch):
                 placed[key][fk[1]] -= m
                 if t_reg:
                     _add(key, tk[1], m)
-                elif tk[0] == 'card':
+                elif t_slot:
                     d = placed[key]
                     d['__card__'] = d.get('__card__', 0) + m
                 # back to Reinforcements: un-placed
@@ -4387,6 +5348,7 @@ def _nazgul_flows(batch, pre_nz):
     return flows, info
 
 
+@_fp_huntbox_batch_scope    # R4-EXTRACT-HUNTBOX-REMAINING: chain-leg clones
 def _emit_nazgul_flights(batch, st, side, legal, stats, turn):
     """W4-004: Shadow Character-die flights of nazgul-class figures.
 
@@ -4403,8 +5365,22 @@ def _emit_nazgul_flights(batch, st, side, legal, stats, turn):
     as nazgul is one more leg of the chain (W4-027, USER ruling 1.262:
     the die-seeded chain offers the Mouth's include_mouth legs; before
     W4-027 the chain enumerated Nazgul sources only and the batch was
-    dropped as nazchain_mouth_unsupported).  A Mouth-only batch is ONE
-    mouth_move origin -> final region."""
+    dropped as nazchain_mouth_unsupported).
+
+    Leg order on the die is FREE (USER decision CR-D6-fix-01,
+    2026-10-22: "it doesn't matter who moves first. they both move with
+    the same die"; Codex A010 kept - the engine also lets a mouth_move
+    open the '__nazgul_moves__' chain for the Nazgul).  Both orders reach
+    the same positions, so this labeller deliberately CANONICALISES a
+    mixed batch to Nazgul-first whatever order the human dragged in:
+    nazgul_move, the Nazgul / Witch-king legs, then the Mouth's
+    include_mouth leg.  A Mouth-only batch is ONE mouth_move origin ->
+    final region; the chain's '_naz_done' terminator is never labelled
+    (same as after a Nazgul-only nazgul_move).  Corpus consequence: no
+    row carries the after-mouth_move chain context ('__mo__' with no
+    Nazgul arrivals).  Card-funded flights (The Ringwraiths Are Abroad /
+    The Black Captain Commands / Nazgul Search / Strike!) never move the
+    Mouth and are labelled elsewhere (_nazgul_hops ignores him)."""
     import rendered_replay as rr
     from game_state import Nazgul as _Nz
     pre = {}
@@ -4657,19 +5633,25 @@ def _companion_card_gesture(batch, after_line=0):
 def _crown_transform_flip(batch):
     """('crown', region) / ('transform', region) from a Will-of-West flip
     gesture ('flips Aragorn in R' = crowning; 'flips Gandalf the White in R' =
-    transformation), or None."""
+    transformation), or None.  The region is the board key from
+    rr.zone_kind (C2-07): rr.sanitize kept the display article and the
+    garrison-box suffix ('the grey havens', 'lorien stronghold'), which
+    matches none of the engine's transform_gandalf regions."""
     import rendered_replay as rr
     for r in batch['records']:
         if r.get('op') != 'flip':
             continue
         ol = str(r.get('obj', '')).strip().lower()
         reg = r.get('region')
-        if not reg or rr.zone_kind(reg)[0] not in ('region', 'stronghold'):
+        if not reg:
+            continue
+        zk = rr.zone_kind(reg)
+        if zk[0] not in ('region', 'stronghold'):
             continue
         if ol == 'aragorn':
-            return ('crown', rr.sanitize(reg))
+            return ('crown', zk[1])
         if ol.startswith('gandalf the white'):
-            return ('transform', rr.sanitize(reg))
+            return ('transform', zk[1])
     return None
 
 
@@ -4678,15 +5660,91 @@ def _nation_name(action):
     return n.name if hasattr(n, 'name') else str(n).upper()
 
 
+# R4-EXTRACT-EVENT-BATTLE-CLAIMS (b): the masked card back VASSAL renders
+# for a card taken back to its hand ('Shadow Strategy Card'), by deck
+_CARD_BACK_DECK_RE = re.compile(
+    r'^(free(?: peoples)?|shadow) (strategy|character) card$')
+
+
+def _retracted_card_plays(batch):
+    """R4-EXTRACT-EVENT-BATTLE-CLAIMS (b, fix round 4): the acting side's
+    hand exits into a Current FP/SA Card slot that were TAKEN BACK - the
+    card goes from that slot back to the same hand before the batch's first
+    roll (anywhere when the batch rolls none) - as {take-back line: exit
+    line}.  A take-back pairs the LATEST card this batch put in that slot
+    and that is still there: the named title, or for the masked card back
+    ('Shadow Strategy Card') the latest card of that deck.  A card that
+    already left the slot (to a Board slot, a discard) is no longer there;
+    a back that matches no card this batch put in the slot (a stale card,
+    the other deck) pairs nothing, and a move to the opponent's hand is no
+    take-back.  2023-03-02 Redscare68 L373-376: The Fighting Uruk-hai into
+    Current FP Card, the 'Shadow Strategy Card' back to the Shadow Hand,
+    The Ringwraiths are Abroad played instead; 2025-02-05 Julianis
+    L702-704: Gwaihir the Windlord, the 'Free Character Card' back, The
+    Ents Awake: Entmoot played."""
+    want = (_HAND_ZONE_FP if batch.get('die_side') == 'FREE_PEOPLES'
+            else _HAND_ZONE_SH)
+    rolls = [int(c.get('line') or 0) for c in batch.get('rng') or []
+             if c.get('kind') == 'roll_num']
+    first_roll = min(rolls) if rolls else None
+    slots = {}
+    out = {}
+    previous_move = None
+    for r in batch.get('records') or []:
+        move = ((str(r.get('player', '')),
+                 str(r.get('obj', '')).strip().casefold(),
+                 _zone_norm(r.get('from', '')), _zone_norm(r.get('to', '')))
+                if r.get('op') == 'move' else None)
+        repeated = move is not None and move == previous_move
+        previous_move = move
+        if move is None:
+            continue
+        obj, src, dst = move[1], move[2], move[3]
+        line = int(r.get('line') or 0)
+        if src == want and dst in _PLAY_AREA_DEST:
+            if not repeated:        # _card_play_titles' one settled play
+                slots.setdefault(dst, []).append(
+                    (line, str(r.get('obj', '')).strip()))
+            continue
+        stack = slots.get(src)
+        if not stack:
+            continue
+        back = _CARD_BACK_DECK_RE.match(obj)
+        if back is not None:
+            if dst != want:
+                continue
+            deck = (('fp_' if back.group(1).startswith('free') else 'sh_')
+                    + back.group(2))
+            idx = next((i for i in range(len(stack) - 1, -1, -1)
+                        if _title_to_cid(stack[i][1])
+                        and _cid_deck_key(_title_to_cid(stack[i][1])) == deck),
+                       None)
+        else:
+            idx = next((i for i in range(len(stack) - 1, -1, -1)
+                        if stack[i][1].casefold() == obj), None)
+        if idx is None:
+            continue
+        exit_line, _title = stack.pop(idx)
+        if dst in _PLAY_AREA_DEST:          # slot -> slot: still in play
+            slots.setdefault(dst, []).append((exit_line, _title))
+        elif dst == want and (first_roll is None or line < first_roll):
+            out[line] = exit_line
+    return out
+
+
 def _card_play_titles(batch):
     """EVERY event/table card TITLE the acting side played this batch, in
     line order â€” moves FROM the acting side's Hand to a PLAY AREA (Current
     FP/SA Card or BoardN) as (line, title) pairs.  The play-area gate
     excludes end-of-turn excess discards (which go to a discard / casualties
     zone, not a play slot) and combat-card discards.  The FIRST entry is the
-    die-bought play; later entries are free chained plays (Ents Awake)."""
+    die-bought play; later entries are free chained plays (Ents Awake).
+    R4-EXTRACT-EVENT-BATTLE-CLAIMS (b): an exit taken back to the hand
+    before the first roll (_retracted_card_plays) was no play, so the real
+    play is the die-bought one."""
     want = (_HAND_ZONE_FP if batch['die_side'] == 'FREE_PEOPLES'
             else _HAND_ZONE_SH)
+    retracted = set(_retracted_card_plays(batch).values())
     out = []
     previous_move = None
     for r in batch['records']:
@@ -4715,6 +5773,8 @@ def _card_play_titles(batch):
             # another card, or any intervening record remains distinct.
             if repeated:
                 continue
+            if int(r.get('line') or 0) in retracted:
+                continue        # R4-EXTRACT-EVENT-BATTLE-CLAIMS (b)
             out.append((r.get('line', 0), r.get('obj')))
     return out
 
@@ -4784,21 +5844,17 @@ _MANDATORY_ROUND_NAMES = ('Grond, Hammer of the Underworld',
 _MANDATORY_ROUND_CIDS = None
 
 
-def _mandatory_siege_rounds(batch, cards):
-    """3 when the batch's Shadow actor PLAYED Grond / The Fighting Uruk-hai
-    as its EVENT this batch - a hand exit into a play area whose card is
-    NOT one of the rounds' committed combat cards (`cards` from
-    _round_cards: the same title committed as Onslaught / Dread and
-    Despair is that round's combat card, never the event) - else 0.
-    Drop beats wrong: an ambiguous exit (the only Shadow card in its
-    round window) keeps today's combat-card reading."""
+def _mandatory_siege_event(batch, cards):
+    """The card id (str) of the Grond / The Fighting Uruk-hai the batch's
+    Shadow actor PLAYED as its EVENT this batch (the reading documented on
+    _mandatory_siege_rounds), else None."""
     global _MANDATORY_ROUND_CIDS
     if _MANDATORY_ROUND_CIDS is None:
         _MANDATORY_ROUND_CIDS = frozenset(
             str(c) for c in (_title_to_cid(n) for n in _MANDATORY_ROUND_NAMES)
             if c)
     if not _MANDATORY_ROUND_CIDS or batch.get('die_side') != 'SHADOW':
-        return 0
+        return None
     committed = set()
     for cr in (cards or []):
         for slot in ('fp', 'sh'):
@@ -4808,8 +5864,378 @@ def _mandatory_siege_rounds(batch, cards):
         cid = _title_to_cid(title)
         if cid and str(cid) in _MANDATORY_ROUND_CIDS \
                 and str(cid) not in committed:
-            return 3
-    return 0
+            return str(cid)
+    return None
+
+
+def _mandatory_siege_rounds(batch, cards):
+    """3 when the batch's Shadow actor PLAYED Grond / The Fighting Uruk-hai
+    as its EVENT this batch - a hand exit into a play area whose card is
+    NOT one of the rounds' committed combat cards (`cards` from
+    _round_cards: the same title committed as Onslaught / Dread and
+    Despair is that round's combat card, never the event) - else 0.
+    Drop beats wrong: an ambiguous exit (the only Shadow card in its
+    round window) keeps today's combat-card reading."""
+    return 3 if _mandatory_siege_event(batch, cards) else 0
+
+
+# C3-04 (fix wave 2026-10-21): the combat drive opens such an event siege
+# with a plain army_attack from the reconstructed menu, never with the event
+# play.  The engine's event play (event_effects _effect_grond /
+# _effect_fighting_uruk_hai + play_event_card) does two things before any
+# combat decision that the army_attack path lacks; these helpers restore
+# them on the drive / recovery states.
+def _apply_mandatory_event_play(st, event_cid):
+    """The played event card leaves the Shadow hand for its face-up discard
+    pile (play_event_card: hand.remove + discard_face_up append).  The drive
+    installs the batch-start ledger hand, which still holds it - the Shadow
+    round-1 menu offered the card as a combat card.  Returns False when the
+    card is not in the installed hand (nothing to remove)."""
+    from game_state import Side
+    hand = st.hands[Side.SHADOW].hand
+    if event_cid not in hand:
+        return False
+    hand.remove(event_cid)
+    dfu = getattr(st, 'discard_face_up', None)
+    key = _cid_deck_key(event_cid)
+    if isinstance(dfu, dict) and key in dfu and event_cid not in dfu[key]:
+        dfu[key].append(event_cid)
+    return True
+
+
+def _mandatory_event_pending_keys(rounds):
+    """The event pending's own keys: `rounds` mandatory rounds and the
+    round-1 Free Peoples combat-card block unless a Companion is in the
+    battle (ai._maybe_combat_card_phase; encode_state combat_ctx)."""
+    return {'mandatory_rounds': rounds,
+            'no_def_card_r1_unless_companion': True}
+
+
+def _mandatory_r1_def_card_blocked(st, pc):
+    """True when the engine skips the defender's combat-card phase of this
+    pending's round as a FORCED decline.  Asks ai._maybe_combat_card_phase
+    itself on a probe copy (attacker already committed), so the gate - the
+    round-1 flag and the Companion test - stays the engine's."""
+    import ai
+    probe = dict(pc)
+    probe['atk_combat_card'] = None
+    probe.pop('def_combat_card', None)
+    return not ai._maybe_combat_card_phase(st, probe)
+
+
+# R2-RS-v029-C3-04 (fix round 2, 2026-10-22): Corsairs of Umbar.  The engine
+# (event_effects._effect_corsairs_of_umbar, USER 1.210(b); USER D9 2026-10-22
+# = Almanac A10(ii)) MOVES the force from Umbar INTO the coastal Gondor region
+# first, then runs a CO-LOCATED battle there whose pending carries
+# 'attacker_no_retreat': (not pre_siege or relief) - ai.get_legal_actions
+# then never offers combat_cease.  The extractor's battle paths start from the
+# batch-start board (the force still at Umbar, which is adjacent to no
+# landing region); _corsairs_landing lets them recognise the battle.  (Fix
+# round 3, R3-EXTRACT-CORSAIRS-REBUILD: the combat family now rebuilds that
+# pending by playing the landing through the engine effect -
+# _open_event_battle; fix round 4, R4-DEAD-CODE-2, retired the extractor-side
+# copy of the no-retreat formula: the engine pending carries the key.)
+_CORSAIRS_LANDING_REGIONS =('anfalas', 'dol amroth', 'lamedon', 'pelargir')
+
+
+def _corsairs_landing(batch):
+    """None unless the batch's Shadow actor PLAYED Corsairs of Umbar as its
+    event: the title's hand exit and the card moved to a Board table slot
+    (the process_batch _pt9 reading), AND - when the batch rolls dice and
+    shows no move from Umbar - the card still lies on the Board at the
+    first roll.  A card misdropped on the Board and moved on to a Current
+    card slot before the first roll of a battle with no Umbar move is a
+    Deadly Strife combat-card commit (2023-03-31 SolidSnake v CircleDakkon
+    T11 L1222-1224, the Minas Tirith siege), not the event.
+    Then a 1-tuple (landing,): the single coastal Gondor region
+    (event_effects' target set) that Shadow units moved INTO from Umbar this
+    batch, or (None,) when the log shows no such move or more than one."""
+    if batch.get('die_side') != 'SHADOW':
+        return None
+    cid = _title_to_cid('Corsairs of Umbar')
+    titles = [t for (_ln, t) in _card_play_titles(batch)
+              if cid and _title_to_cid(t) == cid]
+    if not titles:
+        return None
+    recs = batch.get('records') or []
+    moves = [r for r in recs if r.get('op') == 'move']
+    card_moves = sorted(
+        (r for r in moves if any(t in str(r.get('obj', '')) for t in titles)),
+        key=lambda r: int(r.get('line') or 0))
+    if not any(str(r.get('to', '')).startswith('Board') for r in card_moves):
+        return None
+    import rendered_replay as rr
+    lands = set()
+    for r in moves:
+        fk = rr.zone_kind(str(r.get('from', '')))
+        tk = rr.zone_kind(str(r.get('to', '')))
+        if fk[0] not in ('region', 'stronghold') or fk[1] != 'umbar' \
+                or tk[0] not in ('region', 'stronghold') \
+                or tk[1] not in _CORSAIRS_LANDING_REGIONS:
+            continue
+        for tok in _group_tokens(str(r.get('obj', ''))):
+            p = rr.parse_piece(tok)
+            if p and p[0] == 'unit' and _unit_side_str(p[1]) == 'SHADOW':
+                lands.add(tk[1])
+                break
+    first_roll = min((int(r.get('line') or 0) for r in recs
+                      if r.get('op') == 'roll_num'), default=None)
+    if first_roll is not None and not lands:
+        pre = [r for r in card_moves if int(r.get('line') or 0) < first_roll]
+        if not pre or not str(pre[-1].get('to', '')).startswith('Board'):
+            return None
+    return (next(iter(lands)) if len(lands) == 1 else None,)
+
+
+# R3-EXTRACT-CORSAIRS-REBUILD (fix round 3, 2026-10-23): EVENT-opened
+# battles.  Corsairs of Umbar and Help Unlooked For open their battle through
+# the event (event_effects), never through an army_attack, and their pending
+# carries keys no army_attack pending has.  The combat family now opens such
+# a battle through the event itself, and _recovery_context copies these keys
+# from that opened pending onto every reconstructed phase: ai.get_legal_actions
+# reads attacker_no_retreat (no combat_cease), partition_battle_army reads the
+# A10(ii) relief garrison, encode_state's combat_ctx reads the dice
+# reductions, and stronghold_region is the event's own value.
+_EVENT_BATTLE_PC_KEYS = ('attacker_no_retreat', 'corsairs_relief_garrison',
+                         'atk_dice_reduction', 'def_dice_reduction',
+                         'stronghold_region')
+
+
+def _table_play_on_board(batch, title):
+    """True when `title`, a card moved to a Board slot in this batch, is a
+    TABLE event play; False when it is a combat card that only transited a
+    Board slot.  A table play lies on its Board slot at the batch's first
+    roll (or the batch rolls no dice).  A card that sits in a Current-card
+    slot at the first roll (or reached the Board only after it) stays a play
+    only on the batch's own event evidence:
+      * Corsairs of Umbar with its Umbar landing (_corsairs_landing);
+      * an Event die ('P', which cannot fund an attack) whose FIRST played
+        title it is (2024-03-21 Wirbelwind v Mirdain T4 L312: The
+        Ringwraiths are Abroad staged in Current SA Card, dragged to Board6
+        and back by the opponent before the roll).
+    2023-03-31 SolidSnake v CircleDakkon T11 L1218: Army die, 'Corsairs of
+    Umbar/Deadly Strife' Shadow Hand -> Board6 (L1222) -> Current SA Card
+    (L1224), first roll L1225, no Umbar move, a Minas Tirith siege: the
+    Deadly Strife combat card, not the Corsairs event."""
+    recs = batch.get('records') or []
+    moves = sorted((r for r in recs if r.get('op') == 'move'
+                    and str(title) in str(r.get('obj', ''))),
+                   key=lambda r: int(r.get('line') or 0))
+    if not any(str(r.get('to', '')).startswith('Board') for r in moves):
+        return False
+    first_roll = min((int(r.get('line') or 0) for r in recs
+                      if r.get('op') == 'roll_num'), default=None)
+    if first_roll is None:
+        return True
+    pre = [r for r in moves if int(r.get('line') or 0) < first_roll]
+    if pre and str(pre[-1].get('to', '')).startswith('Board'):
+        return True
+    cid = _title_to_cid(title)
+    if cid and cid == _title_to_cid('Corsairs of Umbar') \
+            and _corsairs_landing(batch) is not None:
+        return True
+    plays = _card_play_titles(batch)
+    if str(batch.get('die_face') or '').upper() == 'P' and plays \
+            and str(plays[0][1]) == str(title) \
+            and int(plays[0][0] or 0) < first_roll:
+        return True
+    return False
+
+
+def _shadow_units_in(st, region):
+    """Shadow Army units at `region` (field entry and stronghold box)."""
+    from board import sanitize
+    from combat import side_of_nation
+    from game_state import Side
+    want = sanitize(region)
+    return sum(1 for k, a in st.armies.items()
+               if sanitize(k) in (want, want + ' stronghold')
+               for u in a.units if side_of_nation(u.nation) == Side.SHADOW)
+
+
+def _corsairs_rebuild(batch, st, read_landing):
+    """The engine inputs of this batch's Corsairs landing on batch-start
+    board `st`: (landing, cargo, None), or (None, None, drop_reason).
+    landing: the region read from the log's Umbar move (_corsairs_landing),
+    else the single coastal Gondor region whose Shadow units grew over the
+    batch (the force dragged via a Board / card slot: 2024-12-08 Webbely T7
+    L738-749).  cargo (army_card_cargo format): every Shadow figure that
+    left Umbar this batch (batch-start minus batch-end inventory) - figures
+    that sailed and then died in the battle, wherever the log parked them,
+    are part of it (2025-12-02 Compote_Andros T4 L257: [2]S&E Regular
+    Umbar -> Board6 as casualties)."""
+    import army_card_cargo as acc
+    try:
+        st_after = _recon_state(batch['truth'], batch.get('turn'))
+    except Exception:
+        return None, None, 'cf_event_open_corsairs_recon'
+    landing = read_landing
+    if landing is None:
+        grown = [r for r in _CORSAIRS_LANDING_REGIONS
+                 if _shadow_units_in(st_after, r) > _shadow_units_in(st, r)]
+        landing = grown[0] if len(grown) == 1 else None
+    if landing not in _CORSAIRS_LANDING_REGIONS:
+        return None, None, 'cf_event_open_corsairs_landing_unread'
+    try:
+        before = acc.inventory(st, 'umbar')
+    except ValueError:
+        return None, None, 'cf_event_open_corsairs_no_umbar_army'
+    try:
+        after = acc.inventory(st_after, 'umbar')
+    except ValueError:
+        after = Counter()
+    left = before - after
+    if not any(k[0] == 'unit' and n for k, n in left.items()):
+        return None, None, 'cf_event_open_corsairs_cargo_unread'
+    return landing, acc.freeze(left), None
+
+
+def _corsairs_landing_logged(batch, landing, cargo):
+    """True when the log's own Umbar -> `landing` moves before the first roll
+    carry exactly the cargo's units and as many non-unit figures: the
+    gesture recovery's batch-start reconstructions then land the force
+    through _apply_window_casualties' move-in branch (2023-01-02 GenericPie
+    v Sirrus233 T9 L1128).  A landing logged after the roll or dragged via a
+    Board / card slot is not reproduced there."""
+    import rendered_replay as rr
+    first_roll = min((int(r.get('line') or 0) for r in batch['records']
+                      if r.get('op') == 'roll_num'), default=10 ** 9)
+    units, figures = Counter(), 0
+    for r in batch['records']:
+        if r.get('op') != 'move' or int(r.get('line') or 0) >= first_roll:
+            continue
+        fk = rr.zone_kind(str(r.get('from', '')))
+        tk = rr.zone_kind(str(r.get('to', '')))
+        if fk != ('region', 'umbar') or tk[0] not in ('region', 'stronghold') \
+                or tk[1] != landing:
+            continue
+        for tok in _group_tokens(str(r.get('obj', ''))):
+            p = rr.parse_piece(tok)
+            if p and p[0] == 'unit':
+                units[('unit', p[1], p[2])] += int(p[3])
+            elif p and p[0] in ('nazgul', 'named', 'leader'):
+                figures += int(p[3]) if p[0] == 'nazgul' else 1
+    want_units = Counter({(k, n, s): c for k, n, s, c in cargo if k == 'unit'})
+    want_figures = sum(c for k, _n, _s, c in cargo if k != 'unit')
+    return units == want_units and figures == want_figures
+
+
+def _event_card_out_of_hand(st, side, cid):
+    """The played event card leaves `side`'s installed batch-start hand for
+    its face-up discard (play_event_card), as _apply_mandatory_event_play
+    does for the Shadow siege events; False when the hand lacks it."""
+    hand = st.hands[side].hand
+    if cid not in hand:
+        return False
+    hand.remove(cid)
+    dfu = getattr(st, 'discard_face_up', None)
+    key = _cid_deck_key(cid)
+    if isinstance(dfu, dict) and key in dfu and cid not in dfu[key]:
+        dfu[key].append(cid)
+    return True
+
+
+def _corsairs_apply_trim(st, trim):
+    """R4-EXTRACT-COVERAGE-DROPS (R3-EXTRACT-CORSAIRS-REBUILD FU2): resolve
+    the Corsairs landing's pre-battle overstack removal (corsairs_landing.
+    begin's pending_card_option, one unit per pick) on `st` IN PLACE through
+    the engine's own card_option menu, with the units the log removed in the
+    trim window (`trim`: _overstack_returns Counter).  The order of the
+    picks cannot change the board the battle opens on, so each pick takes
+    the first offered (region, nation, kind) the log still owes.  Returns
+    None when the engine's trim consumed exactly the logged removals and
+    opened the battle, else a drop reason."""
+    import ai
+    import rendered_replay as rr
+    from game_state import Side
+    left = Counter(trim)
+    for _ in range(sum(left.values()) + 1):
+        pco = getattr(st, 'pending_card_option', None)
+        if not pco:
+            break
+        picks = []
+        for action in ai.get_legal_actions(st, Side.SHADOW):
+            ch = action.params.get('choices') or {}
+            if action.action_type != 'card_option' \
+                    or '_corsairs_landing_pc' not in ch:
+                continue
+            spec = ch.get('overstack_remove') or {}
+            key = (rr.sanitize(str(spec.get('region', ''))),
+                   _nat_key(spec.get('nation')),
+                   str(spec.get('kind', '')).lower())
+            if left.get(key, 0) >= 1:
+                picks.append((action, key))
+        if not picks:
+            # the engine wants another removal: none logged (too few), or
+            # the logged unit is not one it offers
+            return ('cf_event_open_corsairs_trim_unmatched' if +left
+                    else 'cf_event_open_corsairs_trim_unproven')
+        left[picks[0][1]] -= 1
+        ai._execute_action(st, picks[0][0])
+    if getattr(st, 'pending_card_option', None) or +left:
+        # the logged removals are not the engine's trim (too few / too many)
+        return 'cf_event_open_corsairs_trim_unproven'
+    return None
+
+
+def _open_event_battle(st, cid, choices, atk, dfn, trim=None):
+    """Play the battle-opening event `cid` through its engine effect on `st`
+    (the combat family's prepared batch-start state) so the ENGINE moves the
+    figures and builds the pending: _effect_corsairs_of_umbar lands the
+    cargo and opens the co-located battle (attacker_no_retreat, A10),
+    _effect_help_unlooked_for opens the field battle with
+    def_dice_reduction.  The teacher hook (FINAL_HITS_HOOK) gates both
+    battle-opens, so it is held off for the call.  The choice must be one
+    the engine itself offers for the card (card_options): the effects do
+    not re-check it (Help Unlooked For takes any attack_from - a planned
+    co-located sortie is not its adjacent relief attack, 2023-10-20 Bishop
+    v Rizino1 T7 L456).  `trim` (R4-EXTRACT-COVERAGE-DROPS): the Corsairs
+    landing's logged pre-battle removals (_corsairs_apply_trim), None when
+    the log does not prove them.  Returns None when the engine opened the
+    pending at (atk, dfn), else a drop reason."""
+    import card_options
+    import combat
+    import event_effects as ee
+    from cards import get_card
+    from game_state import Side
+    effect = {'SHADOW_Strategy_Corsairs_of_Umbar':
+              ee._effect_corsairs_of_umbar,
+              'FREE_PEOPLES_Strategy_Help_Unlooked_For':
+              ee._effect_help_unlooked_for}[cid]
+    tag = 'corsairs' if cid.startswith('SHADOW_') else 'huf'
+    owner = Side.SHADOW if tag == 'corsairs' else Side.FREE_PEOPLES
+    offered = card_options.get_card_options(st, owner, get_card(cid).card_name)
+    if {k: v for k, v in choices.items() if k != 'cargo'} not in offered:
+        return 'cf_event_open_%s_choice_not_offered' % tag
+    previous = combat.FINAL_HITS_HOOK
+    combat.FINAL_HITS_HOOK = None
+    try:
+        effect(st, get_card(cid), dict(choices))
+        if (tag == 'corsairs' and trim is not None
+                and getattr(st, 'pending_card_option', None)):
+            # R4-EXTRACT-COVERAGE-DROPS: the landing overstacked; the log's
+            # trim-window removals resolve the engine's own trim picks
+            why9 = _corsairs_apply_trim(st, trim)
+            if why9:
+                return why9
+    except ValueError as error:
+        # the engine refused the move itself (army_card_cargo: the cargo
+        # is not the Umbar inventory / cannot enter) - no battle opened
+        return 'cf_event_open_%s_refused:%s' % (tag, str(error)[:28])
+    finally:
+        combat.FINAL_HITS_HOOK = previous
+    if getattr(st, 'pending_card_option', None):
+        # the landing overstacked (> 10 Shadow units) and the log does not
+        # prove the Shadow's pre-battle removal (no trim reading)
+        return 'cf_event_open_%s_pending_card_option' % tag
+    pc = getattr(st, 'pending_combat', None)
+    if pc is None:
+        return 'cf_event_open_%s_no_battle' % tag
+    from board import sanitize
+    if (sanitize(str(pc.get('attacker_region'))),
+            sanitize(str(pc.get('defender_region')))) != (atk, dfn):
+        return 'cf_event_open_%s_other_battle' % tag
+    return None
 
 
 def _batch_actor(batch):
@@ -4860,6 +6286,120 @@ def _card_strike(batch):
                 and _zone_norm(r.get('to', '')) in _PLAY_AREA_DEST:
             return False
     return True
+
+
+def _event_die_battle_play(batch, title):
+    """R3-EXTRACT-BATTLE-OPEN-BOUGHT (fix round 3, 2026-10-23): True when
+    `title`, the acting side's FIRST hand exit into a play area on a combat
+    batch (_card_play_title), is PROVEN to be the die-bought play of a
+    BATTLE-OPENING event although the card stayed in its Current FP/SA Card
+    slot (no Board slot) and is no card strike.  2024-03-23 HeresJim
+    L892-893: Free Peoples Event die, Help Unlooked For/No Quarter into
+    Current FP Card before the first roll - the play_event row was lost and
+    the card's battle read as a root army_attack die spend.
+
+    An Event die cannot fund an army attack (rendered_event_battle.
+    funded_event_line reads Help Unlooked For the same way), and the battle
+    in the batch is the card's own only for a battle-opening title.  ALL of:
+      (1) _title_class(title) == 'open';
+      (2) the staged die is an Event die ('P') and stays one: no 'changes'
+          line re-faces it (_lead_change_lines) and no Elven Ring use of
+          EITHER slot sits in the batch (a ring re-faces a die with no
+          'changes' line, and _ring_counter_used names the ring's slot, not
+          the player: 2023-01-05 FateevVV L541, P die + Nenya, then a
+          Mumakil COMMIT; 2023-11-28 LuckyRuds L733, the Shadow moved Nenya
+          out of an Elven Ring slot);
+      (3) the exit is the hand owner's own drag: a '(chosen)' exit is the
+          combat-card dialog (2024-03-22 p0tayto L1222-1223, Deadly Strife
+          against Kindred of Glorfindel, both chosen);
+      (4) the exit precedes the batch's first roll (an event opens its
+          battle; a later exit is a later round's commit);
+      (5) no opponent hand exit into a Current-card slot precedes it (an
+          event-opened battle never renders the opponent's commit first,
+          as _commit_in_missed_battle's E1 reads it);
+      (6) no card goes back from a Current-card slot to the actor's hand
+          before the first roll (a retracted first exit is no play:
+          2023-03-02 Redscare68 L373-376, Fighting Uruk-hai taken back,
+          The Ringwraiths are Abroad played instead);
+      (7) no other card leaves a Current-card or Board slot before the exit
+          (an event already in play was bought in a restaged tail:
+          2025-02-12 FoxBrother L771-778).
+    Neither proof suffices alone: a battle-opening title on an Army /
+    Character / Muster / Will die is often the same card's combat face
+    (Grond, Hammer of the Underworld/Dread and Despair on an H die after the
+    Free Peoples' commit), and a P die beside a non-opening title in a
+    combat batch is a restaged or glued batch (2023-10-30 Bhilly L645-655:
+    Grond played before the C -> P restage, then the Cruel as Death commit)
+    - drop beats wrong.
+    R4-EXTRACT-EVENT-BATTLE-CLAIMS (b): a take-back that
+    _retracted_card_plays pairs with an EARLIER exit of this batch is that
+    exit's retraction - _card_play_titles already dropped it, so the
+    replacement is the real first play - and trips neither (6) nor (7); any
+    other take-back still refuses."""
+    if title is None or _title_class(title) != 'open':
+        return False
+    if str(batch.get('die_face') or '').upper() != 'P':
+        return False
+    if str(_lead_change_lines(batch)[0] or '').upper() != 'P':
+        return False
+    if _ring_counter_used(batch) is not None:
+        return False
+    plays = _card_play_titles(batch)
+    if not plays or plays[0][1] != title:
+        return False
+    exit_line = int(plays[0][0] or 0)
+    own = (_HAND_ZONE_FP if batch.get('die_side') == 'FREE_PEOPLES'
+           else _HAND_ZONE_SH)
+    other = (_HAND_ZONE_SH if batch.get('die_side') == 'FREE_PEOPLES'
+             else _HAND_ZONE_FP)
+    recs = batch.get('records') or []
+    exits = [r for r in recs if r.get('op') == 'move'
+             and int(r.get('line') or 0) == exit_line
+             and str(r.get('obj', '')) == str(title)
+             and _zone_norm(r.get('from', '')) == own]
+    if not exits or any('(chosen)' in str(r.get('from', '')).lower()
+                        for r in exits):
+        return False
+    rolls = [int(c.get('line') or 0) for c in batch.get('rng') or []
+             if c.get('kind') == 'roll_num']
+    first_roll = min(rolls) if rolls else None
+    if first_roll is not None and exit_line >= first_roll:
+        return False
+    # R4-EXTRACT-EVENT-BATTLE-CLAIMS (b): take-backs of earlier, dropped
+    # exits (the replacement above is the real first play)
+    retractions = {ln for ln, ex in _retracted_card_plays(batch).items()
+                   if ex < exit_line}
+    for r in recs:
+        if r.get('op') != 'move':
+            continue
+        ln = int(r.get('line') or 0)
+        if ln in retractions:
+            continue
+        src = _zone_norm(r.get('from', ''))
+        dst = _zone_norm(r.get('to', ''))
+        if ln < exit_line and src == other and dst in _PLAY_AREA_DEST:
+            return False                                   # (5)
+        if (first_roll is None or ln < first_roll) \
+                and src in _PLAY_AREA_DEST and dst == own:
+            return False                                   # (6)
+        if ln < exit_line and '/' in str(r.get('obj', '')) \
+                and (src in _PLAY_AREA_DEST or _BOARD_DEST_RE.match(src)):
+            return False                                   # (7)
+    return True
+
+
+def _event_die_battle_exit(batch):
+    """R4-EXTRACT-EVENT-BATTLE-CLAIMS (a, fix round 4): (exit line, title)
+    of the acting side's first hand exit when _event_die_battle_play proves
+    it the Event die's battle-opening play, else None.  That exit is the
+    EVENT (process_batch emits its play_event row), so _round_cards never
+    reads it as a round commit and the combat family's batch-start hand no
+    longer holds the card (2023-02-19 Messor L336-337: The Ringwraiths are
+    Abroad was also read as the Shadow's round-1 Words of Power)."""
+    plays = _card_play_titles(batch)
+    if not plays or not _event_die_battle_play(batch, plays[0][1]):
+        return None
+    return int(plays[0][0] or 0), plays[0][1]
 
 
 def _commit_in_missed_battle(batch):
@@ -4928,6 +6468,27 @@ _CHAT_BODY_RE = re.compile(r'^<([^>]+)>\s*(.+?)\s*$')
 # region words too generic to identify a region on their own
 _REGION_STOPWORDS = {'north', 'south', 'east', 'west', 'the', 'of', 'old',
                      'far', 'near'}
+# C2-05: ordinary CHAT words that equal / prefix a distinctive region word or
+# spell a region's initials - such a chat token never names a region on its
+# own (only the full region name does).  'captain of the west' named
+# Westemnet (prefix 'west') and _plan_combat shipped the army_attack row
+# from Westemnet instead of Folde (corpus 2023-02-10 andre_crc/FLOX2 T9
+# L944); 'pass' named High Pass, 'have' Grey Havens, 'of' Old Ford.
+_CHAT_COMMON_TOKENS = frozenset(_REGION_STOPWORDS) | frozenset({
+    # function words, interjections, contraction stems ("haven't")
+    'and', 'for', 'fore', 'with', 'wit', 'have', 'haven', 'even', 'eve',
+    'nor', 'am', 'em', 'eh', 'er',
+    # ordinary words
+    'pass', 'part', 'par', 'card', 'car', 'down', 'min', 'field', 'high',
+    'dead', 'glad', 'real', 'loss', 'lame', 'heat', 'fold', 'bar', 'dim',
+    'gun', 'fan', 'bro', 'woo', 'land', 'hill', 'narrow', 'road',
+    'mountain', 'mountains',
+    # game names: Gandalf the Grey, Radagast the Brown, Black Gate, Mount
+    # Doom, Dark Tower, Cruel Weather, The Eagles are Coming!
+    'grey', 'brown', 'gate', 'mount', 'tower', 'weather', 'eagle', 'eagles',
+    # directional adjectives, as generic as north/south/east/west
+    'northern', 'southern', 'eastern', 'western',
+})
 
 
 def _build_chat_index(rendered_path):
@@ -4956,10 +6517,30 @@ def _batch_chats(batch):
     return [t for (ln, t) in _CHAT_INDEX if lo <= ln < hi]
 
 
+_MULTIWORD_REGION_RE = None
+
+
+def _multiword_region_re():
+    """Word-bounded alternation of every MULTI-word board region name,
+    longest first (C2-05)."""
+    global _MULTIWORD_REGION_RE
+    if _MULTIWORD_REGION_RE is None:
+        import board
+        names = sorted((n for n in board.regions if ' ' in n),
+                       key=len, reverse=True)
+        _MULTIWORD_REGION_RE = re.compile(
+            r'\b(?:%s)\b' % '|'.join(re.escape(n) for n in names))
+    return _MULTIWORD_REGION_RE
+
+
 def _chat_names_region(reg, chats):
     """True when any chat line plausibly names sanitized region `reg`:
     full name, word-initial abbreviation ('NI' = north ithilien), or a
-    >=3-char prefix of a DISTINCTIVE (non-stopword) region word."""
+    >=3-char prefix of a DISTINCTIVE (non-stopword) region word.  An
+    ordinary chat word (_CHAT_COMMON_TOKENS) is never an abbreviation or a
+    prefix naming, and the words of ANOTHER region's full multi-word name
+    name that region only (C2-05: 'western brown lands' must not name
+    Eastern Brown Lands by 'lands')."""
     words = [w for w in str(reg).split() if w]
     if not words:
         return False
@@ -4968,7 +6549,9 @@ def _chat_names_region(reg, chats):
     for t in chats:
         if reg in t:
             return True
-        toks = re.findall(r'[a-z]+', t)
+        toks = [tok for tok in
+                re.findall(r'[a-z]+', _multiword_region_re().sub(' ', t))
+                if tok not in _CHAT_COMMON_TOKENS]
         if len(words) > 1 and abbr in toks:
             return True
         for w in dwords:
@@ -4986,17 +6569,25 @@ def _table_kill_title(batch):
     a play-on-table card dragged OFF its Board slot into the ACTOR's
     Current-Card zone, paid for with a die (+ two hand discards for the
     Shadow arm, a Will die / Elven Ring for the FP arm).  The payment
-    is not tested here: the ENGINE's menu already encodes who may pay
-    what, and _match_index only matches when the engine offered the
-    action - so an unpaid drag simply finds no match and is dropped,
-    which is the low-false-positive doctrine.
+    is not tested here: the ENGINE's menu encodes who CAN pay what, but
+    it offers discard_table_card from the payment capacity alone (an
+    Army + a Character card in the Shadow hand; a Will die or an Elven
+    Ring for the FP), whatever the human did - so the menu does NOT
+    reject an unpaid drag (C2-04).
+
+    C2-04: a card that is only SHOWN - dragged off its slot and moved
+    back onto a Board slot later in the same batch (2023-05-25 Wems/
+    oiml1988 T7 L618-619, chat "Don't want to use the card I have") -
+    never left the table and is no removal; the scan goes on, so a later
+    drag of the same card that IS the paid removal still counts.
 
     Distinguished from the OWNER shuffling his own card between slots
     (destination must NOT be another Board slot) and from the seat that
     PLAYS a card (that moves hand -> slot, the opposite direction, and
     _card_play_title claims it first)."""
     import rendered_replay as rr
-    for r in batch['records']:
+    records = batch['records']
+    for i, r in enumerate(records):
         if r.get('op') != 'move':
             continue
         frm = str(r.get('from', '')).strip().lower()
@@ -5009,8 +6600,35 @@ def _table_kill_title(batch):
             continue                      # must land in a card area
         obj = str(r.get('obj', ''))
         if '/' in obj:
+            if _table_card_returned(records, i, obj):
+                continue                  # C2-04: shown, then put back
             return obj
     return None
+
+
+def _table_card_returned(records, i, obj):
+    """C2-04: True when the table card(s) of `obj`, dragged off a Board
+    slot at records[i], are moved back onto a Board slot later in the
+    batch and are NOT killed anywhere later in the batch (a
+    show-and-return: the card never left the table).  A kill of the card
+    after the exit - in Current Action, or on its slot after the return
+    ('kills A Power Too Great/No Quarter in Board2') - means it left
+    play in this batch, so that is no show-and-return."""
+    want = set(t.strip().lower() for t in _group_tokens(obj))
+    returned = False
+    for r in records[i + 1:]:
+        op = r.get('op')
+        if op == 'kill':
+            if want & set(str(p).strip().lower()
+                          for p in (r.get('pieces') or ())):
+                return False
+        elif op == 'move' and not returned:
+            if not _BOARD_DEST_RE.match(str(r.get('to', '')).strip().lower()):
+                continue
+            if want & set(t.strip().lower()
+                          for t in _group_tokens(str(r.get('obj', '')))):
+                returned = True
+    return returned
 
 
 def _emit_table_kill(batch, st, side, legal, title, stats):
@@ -5044,11 +6662,13 @@ def _emit_table_kill(batch, st, side, legal, title, stats):
         stats['drop_reasons']['tablekill_saruman_autodiscard'] += 1
         return None
     if not _table_kill_die_spend(batch):
-        # THE GENERAL DISCRIMINATOR, and the one log_replay already
-        # trusts for this act ("the removal is provably die-PAID"):
-        # every deliberate 1.149 removal spends an action die; every
-        # automatic one (siege end, Saruman elimination, effect expiry,
-        # turn-boundary tidy) spends nothing.
+        # The one log_replay already trusts for this act ("the removal
+        # is provably die-PAID"): every deliberate 1.149 removal spends
+        # an action die; an automatic one outside a die window
+        # (turn-boundary tidy) spends nothing.  C2-04: it is NOT a
+        # general discriminator - every die batch opens with its own
+        # staging record, so inside a die batch it always passes.  The
+        # show-and-return drag is rejected by _table_kill_title instead.
         stats['drop_reasons']['tablekill_not_die_paid'] += 1
         return None
     cid = _title_to_cid(title)
@@ -5105,6 +6725,7 @@ def _emit_table_kill(batch, st, side, legal, title, stats):
     return kill_smp
 
 
+@_fp_huntbox_batch_scope    # R4-EXTRACT-HUNTBOX-REMAINING: apply_action clone
 def _emit_table_kill_payment_row(batch, st, legal, hidx, paid, stats):
     """EX-8 (P0-b): apply the matched kill on a clone - the learned-path
     executor opens the payment pending - then match the ledger-named
@@ -5196,7 +6817,10 @@ def _batch_dice_spent(batch, faces):
 def _table_kill_die_spend(batch):
     """True when the acting side put an action die into Current Action
     this batch - the mark of a PAID removal.  Automatic discards
-    (siege end, Saruman death, effect expiry) spend no die."""
+    (siege end, Saruman death, effect expiry) spend no die.
+    C2-04: every die batch's own staging record satisfies this, so it
+    only separates die batches from die-less windows; it cannot tell a
+    paid removal from an unpaid drag inside a die batch."""
     for r in batch['records']:
         if r.get('op') != 'move':
             continue
@@ -5394,7 +7018,7 @@ def _paid_hunt_restage_return(batch):
             or face in (pool.get('used') or [])):
         return None
     tail = [record for record in records[stage_index + 1:]
-            if record.get('op') != 'chat']
+            if not _inert_chat(record)]       # R17-CORPUS-EXTRACT row 13
     if len(tail) < 3:
         return None
     outgoing, movement, returned = tail[:3]
@@ -6016,13 +7640,14 @@ def _annotate_fellowship_dice(batches):
     uncertain_hunt_turns = set()
     staged_hunt_turns = set()
     conversions = {}
-    die_players = {r.get('player'): r['die_stage'][0]
-                   for b in batches for r in b['records'] if r.get('die_stage')}
+    # C1-03: a roll's side comes from its physical dice, never the user.
+    roll_side = _roll_side_resolver(batches)
     rolled_prefixes = {}
     for b in batches:
         for record in b['records']:
-            if record.get('op') == 'roll_dice' and record.get('player') in die_players:
-                key = (b['turn'], die_players[record['player']])
+            side = roll_side(record) if record.get('op') == 'roll_dice' else None
+            if side is not None:
+                key = (b['turn'], side)
                 rolled_prefixes.setdefault(key, []).append(
                     (int(record.get('line') or 0), record.get('_rx_roll_pool_faces', record.get('faces')) or []))
     for b in batches:
@@ -6088,6 +7713,33 @@ def _is_paid_fellowship_move(batch):
     return False
 
 
+def _cancelled_fellowship_drags(drags, cut):
+    """Lines of Fellowship drags that a later drag back cancels before `cut`.
+
+    R6-FELLOWSHIP-RING-PREFIX-REVERSED-DRAG: a drag back is the same object
+    with from and to swapped; it pairs with the latest still-open drag, and
+    both lines must precede `cut` (the ring use's payment line).  Game 00056
+    batch @675: the attempt L678 (Mordor 2 -> 3) and the opponent's drag back
+    L687 (3 -> 2) cancel before the Nenya use at L691; L693 is the paid move.
+    """
+    def key(record):
+        return tuple(str(record.get(name, '')).strip().lower() for name in ('obj', 'from', 'to'))
+
+    cancelled, open_drags = set(), []
+    for record in sorted(drags, key=lambda r: int(r.get('line') or 0)):
+        line = int(record.get('line') or 0)
+        if line >= cut:
+            break
+        obj, frm, to = key(record)
+        for index in range(len(open_drags) - 1, -1, -1):
+            if open_drags[index][1] == (obj, to, frm):
+                cancelled.update((open_drags.pop(index)[0], line))
+                break
+        else:
+            open_drags.append((line, (obj, frm, to)))
+    return cancelled
+
+
 def _fellowship_ring_prefix(batch):
     """Prove a non-Character staged die's actual Ring conversion to Character."""
     import ai
@@ -6095,14 +7747,22 @@ def _fellowship_ring_prefix(batch):
     if not _is_paid_fellowship_move(batch) or _ring_counter_used(batch) != 'fp':
         return None
     history = list(batch.get('_rx_ring_carry_context') or batch.get('_rx_ring_carry') or []) + list(batch['records'])
-    advances = [int(r.get('line') or 0) for r in batch['records'] if r.get('op') == 'move'
-                and int(r.get('line') or 0) >= int(batch.get('start_line') or 0)
-                and ('fellowship' in str(r.get('obj', '')).lower()
-                     or str(r.get('obj', '')).strip().lower() == 'fsp')]
-    if not advances:
+    drags = [r for r in batch['records'] if r.get('op') == 'move'
+             and int(r.get('line') or 0) >= int(batch.get('start_line') or 0)
+             and ('fellowship' in str(r.get('obj', '')).lower()
+                  or str(r.get('obj', '')).strip().lower() == 'fsp')]
+    if not drags:
         return None
+
+    def precedes_every_live_drag(payment):
+        # R6-FELLOWSHIP-RING-PREFIX-REVERSED-DRAG: a drag pair reversed before
+        # the ring use is no advance; the use must precede every other drag.
+        cancelled = _cancelled_fellowship_drags(drags, payment)
+        advances = [int(r.get('line') or 0) for r in drags if int(r.get('line') or 0) not in cancelled]
+        return bool(advances) and payment < min(advances)
+
     records = [r for r in history if _ring_rec_kind(r) == 'fp_use'
-               and float(r.get('_rx_fellowship_payment_line', r.get('line') or 0)) < min(advances)
+               and precedes_every_live_drag(float(r.get('_rx_fellowship_payment_line', r.get('line') or 0)))
                and _ring_use_is_settled(r, history)]
     if len(records) != 1:
         return None
@@ -6120,6 +7780,36 @@ def _fellowship_ring_prefix(batch):
                for a in legal):
         return None
     return records[0]['decision_truth']['_rx_rings']
+
+
+def _own_shadow_conversions(dice, shadow, conversions):
+    """This turn's earlier Shadow Eye conversions (a batch's
+    '_rx_shadow_conversions') join the Hunt Box Eyes `shadow` as Shadow dice
+    of `dice` (the used Shadow pool).  The public pool walk removes an
+    explicitly refaced Eye ('changes Shadow Action Die (X) to E' before its
+    deposit: already_refaced) from the old-face used list, so its proved
+    deposit is a fresh used Eye, separate from this turn's allocated /
+    rolled Eyes; any other conversion turns one used die still showing its
+    old face.  Returns False when that die is missing (callers refuse with
+    their own reason).  R17-CORPUS-EXTRACT row 43: the one implementation
+    for _prepare_fellowship_dice and _emit_shadow_hunt_ring, whose copy
+    lacked the already_refaced branch (rendered_nazgul_hunt.
+    RecordedNazgulHunt.initialize keeps an equivalent copy)."""
+    import game_state as gs
+    for conversion in conversions:
+        if conversion.get('already_refaced'):
+            die = gs.ActionDie(gs.SH_FACES, gs.Side.SHADOW)
+            die.current, die.used = gs.ActionDieFace.EYE, True
+            dice.append(die)
+        else:
+            face = _letter2face().get(conversion['face'])
+            die = next((d for d in dice if d.used and d.current is face
+                        and all(d is not item for item in shadow)), None)
+            if die is None:
+                return False
+            die.current = gs.ActionDieFace.EYE
+        shadow.append(die)
+    return True
 
 
 def _prepare_fellowship_dice(st, batch, pending=False, advance=False):
@@ -6188,24 +7878,9 @@ def _prepare_fellowship_dice(st, batch, pending=False, advance=False):
         shadow.append(d)
     for d in shadow:
         d.used = True
-    for conversion in batch.get('_rx_shadow_conversions', []):
-        if conversion.get('already_refaced'):
-            # The public pool walk removes an explicitly refaced Eye from
-            # the old-face used list. Its proved deposit is separate from
-            # this turn's allocated/rolled Eyes and remains an owned die.
-            converted = gs.ActionDie(gs.SH_FACES, sh)
-            converted.current = gs.ActionDieFace.EYE
-            converted.used = True
-            dice[sh].append(converted)
-            shadow.append(converted)
-            continue
-        old_face = _letter2face().get(conversion['face'])
-        converted = next((d for d in dice[sh] if d.used and d.current is old_face
-                          and all(d is not item for item in shadow)), None)
-        if converted is None:
-            refuse('shadow_converted_die_missing_from_used_pool')
-        converted.current = gs.ActionDieFace.EYE
-        shadow.append(converted)
+    if not _own_shadow_conversions(
+            dice[sh], shadow, batch.get('_rx_shadow_conversions', [])):
+        refuse('shadow_converted_die_missing_from_used_pool')
     box.extend(shadow)
     st.dice, st.hunt_box = dice, box
     st.eyes_allocated = int(_RX_EYEALLOC.get(turn, 0))
@@ -6428,7 +8103,10 @@ def _ring_face_analysis(batch):
     never produces Will - C is the only face."""
     global _RING_PROBE, _MM_FACE, _MM_SIDE, _MM_STATE
     cached = batch.get('_rx_ringfaces')
-    if cached is not None:
+    # R3-TOOLS-MISC: the cache is valid only under the hand ledger it was computed with (the probes install deck
+    # prefixes from _LEDGER): a result computed without the ledger (every probe 'deck_prefix_ledger_missing' ->
+    # faces []) was reused after the per-game ledger was installed.  Within one game _LEDGER is one object.
+    if cached is not None and batch.get('_rx_ringfaces_ledger') == id(_LEDGER):
         return cached
     import ai
     import rendered_census as rc
@@ -6474,11 +8152,14 @@ def _ring_face_analysis(batch):
     draw_faces = []
     saved = (_MM_FACE, _MM_SIDE, _MM_STATE)
     # The probe must leave NO trace: the per-game random.seed(0) stream
-    # is the hunt/combat drivers' fallback on roll exhaustion (a re-roll
-    # the log carries as a SECOND roll line draws from it), so a probe
+    # was the hunt/combat drivers' fallback on roll exhaustion (a re-roll
+    # the log carries as a SECOND roll line drew from it), so a probe
     # that consumed it shifted every later fallback draw (2023-11-26 Mol
     # T12 L998: the re-roll fallback flipped from a miss to a hit and a
-    # phantom hunt_gollum row appeared).  Save/restore both generators.
+    # phantom hunt_gollum row appeared).  Since C7-01 the hunt drives are
+    # RNG-neutral and skip on exhaustion; only rendered_census.
+    # _drive_card_effect_combat's _served fallback still draws live.
+    # Save/restore both generators (kept as a guard).
     import random as _rnd9p
     _rng9 = (_rnd9p.getstate(), np.random.get_state())
     try:
@@ -6525,10 +8206,10 @@ def _ring_face_analysis(batch):
                           and a.die_idx == 0 and _to9(a) == dfn
                           and rr.sanitize(str(a.params.get('from', '')))
                           == atk]
-                    if not ok:
-                        ok = [a for a in legal
-                              if a.action_type == 'army_attack'
-                              and a.die_idx == 0 and _to9(a) == dfn]
+                    # R2-RS-v031-C3-09: no any-source fallback - an attack
+                    # into dfn from another region is a different battle
+                    # and proves nothing about this face (mirrors
+                    # _combat_target_sample, which no longer labels it)
                     if ok:
                         hits.append(('army_attack', 'army_attack', 0))
                 else:
@@ -6602,6 +8283,7 @@ def _ring_face_analysis(batch):
         res['reason'] = 'ambiguous'
         res['mirror'] = faces[0]
     batch['_rx_ringfaces'] = res
+    batch['_rx_ringfaces_ledger'] = id(_LEDGER)     # R3-TOOLS-MISC: the ledger this result is valid under
     return res
 
 
@@ -6682,6 +8364,7 @@ def _saruman_ability_shape(batch, recruits, eff_letter, st):
     return None
 
 
+@_fp_huntbox_batch_scope    # R4-EXTRACT-HUNTBOX-REMAINING: leg-2 / chain clones
 def _emit_bookkeeping(batch, st, side, legal, stats):
     """Match the human's PRIMARY die-usage in a bookkeeping batch against the
     (board-only, faithfully reconstructed) legal set and emit ONE BC sample.
@@ -7701,53 +9384,416 @@ def _own_die_draws(batch):
     return out
 
 
+_EYE_BOX_ZONE = 'the hunt for the ring'
+_EYE_SH_DIE_RE = re.compile(r'(?:\[(\d+)\])?Shadow Action Die(?:\s*\(([A-Z])\))?')
+
+
+def _shadow_dice_named(text, non_eye=False):
+    """Shadow Action Dice named in a move object / kill piece list, every
+    group multiplier counted ('Shadow Action Die (E), [2]Shadow Action Die
+    (C)' = 3 dice).  non_eye=True counts only dice showing a face other
+    than E (a die with no face shown is not counted)."""
+    return sum(int(m.group(1) or 1)
+               for m in _EYE_SH_DIE_RE.finditer(str(text or ''))
+               if not non_eye or (m.group(2) and m.group(2) != 'E'))
+
+
+# C2-02: 'Jaymanen changes Shadow Action Die (P) to E' (face set by hand)
+_EYE_FACE_SET_RE = re.compile(
+    r'^\S+\s+changes\s+Shadow\s+Action\s+Die\s+\(([A-Z])\)\s+to\s+([A-Z])\b')
+_EYE_DROP_DIE_RE = re.compile(r'(?:\[(\d+)\])?Shadow Action Die \(([A-Z])\)')
+
+
+def _held_allocation_drops(records, i, surviving):
+    """C2-02 (fix wave 2026-10-21): records[i] is a surviving die staging
+    made BEFORE the turn's Shadow action roll (the caller checks both).  It
+    is a pre-roll ALLOCATION through Current Action, not the turn's first
+    action, when it is a Shadow die that a later surviving move takes out of
+    Current Action into the Hunt Box, with the face it was staged with.
+    Current Action is followed from records[i] on: further Shadow dice
+    staged before any roll join it (2023-12-16 Messor/Jan T5: three E
+    staged one by one, dropped as one die and a [2] group; 2024-03-19
+    MrM0th T7: two staged, one [2] drop), a face set by hand before any
+    roll ('Jaymanen changes Shadow Action Die (P) to E', 2024-07-08
+    Sirrus233/Jaymanen T2) re-faces a held die, and every die a drop names
+    must be a held die of that face (first staged first).  The run ends at
+    the turn's end, a Free die or post-roll staging, a kill in Current
+    Action, a move out of Current Action to anywhere but the box (2025-06-18
+    Compote_Andros T1: two E staged and taken back to SA Dice), or a drop
+    that does not match what is held.  The drop may come before the roll
+    ('moves Shadow Action Die (E) from SA Dice to Current Action' / '...
+    from Current Action to The Hunt For The Ring', 2023-01-03
+    Franatleti/Bubba T2) or after it, the die held out of the roll
+    ('<GenericPie> sorry that eye was meant to be in the box', 2023-02-24
+    T1).  Either seat may drop it (attribution by zone, never $nick).  A
+    face changed by a ROLL means the staged die was rolled on its own
+    (2024-02-21 Ituralde T4 'rolls E .'): that is a rolled Eye, not an
+    allocation.  The echo is the other seat's rendering of the same drop on
+    the very next surviving record (2024-10-09 KoMap4ik T6 L451-452: one die
+    staged, two drops; the Hunt roll shows one allocated die): a die cannot
+    leave Current Action twice, so the echo is neither counted nor matched.
+    Returns {index of every staging in the run: (box record, echo record or
+    None) when its die was dropped in the box, else None}."""
+    stage = records[i].get('die_stage')
+    if not stage or stage[0] != 'SHADOW':
+        return {i: None}
+    held = [(i, str(stage[1]).upper())]     # in Current Action, staging order
+    plan = {i: None}
+    rolled = False
+    skip = None
+    for j in range(i + 1, len(records)):
+        if not held:
+            break
+        q = records[j]
+        op = q.get('op')
+        if op == 'turn':
+            break
+        if id(q) not in surviving or j == skip:
+            continue
+        nxt = q.get('die_stage')
+        if nxt:
+            if rolled or nxt[0] != 'SHADOW':
+                break
+            held.append((j, str(nxt[1]).upper()))
+            plan[j] = None
+            continue
+        if op == 'roll_dice':
+            rolled = True
+            continue
+        if op == 'other':
+            m = (None if rolled
+                 else _EYE_FACE_SET_RE.match(str(q.get('body') or '')))
+            if m:
+                k = next((n for n, h in enumerate(held)
+                          if h[1] == m.group(1).upper()), None)
+                if k is not None:
+                    held[k] = (held[k][0], m.group(2).upper())
+            continue
+        if (op == 'kill'
+                and str(q.get('zone', '')).strip().lower() == 'current action'):
+            break
+        if (op != 'move'
+                or str(q.get('from', '')).strip().lower() != 'current action'):
+            continue
+        if str(q.get('to', '')).strip().lower() != _EYE_BOX_ZONE:
+            break
+        obj = str(q.get('obj') or '').strip()
+        group = re.fullmatch(r'group \((.*)\)', obj)
+        faces = []
+        for part in (group.group(1) if group else obj).split(', '):
+            die = _EYE_DROP_DIE_RE.fullmatch(part.strip())
+            if die is None:
+                return plan
+            faces.extend([die.group(2).upper()] * int(die.group(1) or 1))
+        rest, taken = list(held), []
+        for face in faces:
+            k = next((n for n, h in enumerate(rest) if h[1] == face), None)
+            if k is None:
+                return plan
+            taken.append(rest.pop(k)[0])
+        held = rest
+        m = next((m for m in range(j + 1, len(records))
+                  if id(records[m]) in surviving), None)
+        echo = records[m] if m is not None else None
+        if not (echo is not None and echo.get('op') == 'move'
+                and echo.get('player') != q.get('player')
+                and str(echo.get('obj') or '').strip() == obj
+                and str(echo.get('from', '')).strip().lower() == 'current action'
+                and str(echo.get('to', '')).strip().lower() == _EYE_BOX_ZONE):
+            echo = None
+        else:
+            skip = m
+        for s in taken:
+            plan[s] = (q, echo)
+    return plan
+
+
 def _turn_eye_counts(rendered_path, batches=None):
-    """{turn: N} Shadow PRE-ROLL eye allocation = the COUNT of
-    'allocates an eye' gesture lines before that turn's first die-staging.
-    USER truth-table fix #2 (game01_verification.md): the old source line
+    """{turn: N} Shadow PRE-ROLL eye allocation: the dice the Shadow put in
+    the Hunt Box this turn ('allocates an eye' gestures, or Shadow dice
+    moved into the box - GAME19 dialect, every group multiplier counted)
+    that are still there AT the turn's played Shadow action roll.  Turns
+    with none = 0 (absence-is-the-choice).
+    USER truth-table fix #2 (game01_verification.md): the source line
     'adds N eyes to the hunt' is the POST-ROLL rolled-Eyes RNG result, NOT
     the allocation decision - it made the count wrong in 5/9 GAME01 turns
-    (T4 real 1 vs 0; T7 real 3 'allocates' lines vs 1).  Turns with zero
-    allocate-lines = 0 (absence-is-the-choice)."""
+    (T4 real 1 vs 0; T7 real 3 'allocates' lines vs 1).
+
+    C2-01 (fix wave 2026-10-21): the old raw-text substring scan up to the
+    first die staging counted an undo line (it quotes the line it undoes)
+    as one more allocation, counted rolled Eyes dragged into the box after
+    the roll and allocations re-made before a re-roll, never subtracted a
+    die taken back out, and read only a group's first multiplier.  Now:
+      - each turn is cut at its LAST played Shadow action roll before its
+        first surviving die staging: the client's 'adds N eyes to the hunt'
+        line follows that roll; with no such line, the last roll that is
+        the Shadow's (an E face, or a player who stages only SA dice -
+        attribution by zone, never $nick; a roll with a W face is the Free
+        dice).  The last roll is the played one: a re-roll after a mis-roll
+        replaces it (_roll_pools keeps the last roll for the same reason).
+        No roll -> the first staging; no staging -> the turn's end;
+      - the count is taken on the undo-netted records BEFORE that cut
+        (rr.resolve_undo_redo, the netting parse_game builds batches from):
+        an undone allocation or staging never happened, and an undo issued
+        after the roll cannot change what was in the box when it was rolled;
+      - a Shadow die leaving the box takes back this turn's allocation only
+        when the box holds no other die (last turn's dice and rolled Eyes
+        are tracked through the whole game and go first);
+      - after the played roll and before the first staging, the forgotten
+        mandatory allocation made late counts ('<priceg335> i think i had
+        to allocate 1 ... so last dice becomes allocated', 2024-02-17
+        BigMac/priceg335 T5): a die rolled to a NON-Eye face put in the box,
+        an 'allocates an eye' click (R2: 2024-07-12 Franatleti/Mirdain T3)
+        or an E die moved in from SA Dice after a hand re-face X->E (R2:
+        2025-04-19 gus833/MoosetheLesser T3).  A rolled Eye dragged in by
+        hand does not, nor a click after a Shadow die rolled alone after
+        the cut (2023-01-12 FLOX2 T7: it places that rolled Eye).  Checked
+        against the size of the turn's first Hunt roll (= allocated + rolled
+        Eyes, max 5): on the 927 corpus turns where the variants disagree
+        it matches 849 times (old code 113; without the late rule 754); the
+        R2 take-back/refill rules are at the end of this docstring.
+    Proved pre-roll stage folds in `batches` (_rx_pre_roll_returns /
+    _rx_pre_roll_allocations) stay exempt from the staging cut; a proved
+    allocation's box line is a Shadow die entering the box.
+    C2-02 (fix wave 2026-10-21): a pre-roll allocation made THROUGH Current
+    Action (_held_allocation_drops) is not a staging either, proved or
+    not: the fold proof accepts only tight raw-log shapes, and 306 corpus
+    turns were cut at the staging and undercounted (e.g. 2023-01-20
+    Yekdo/CircleDakkon T3, two draws before the roll: shipped 0, true 1;
+    several dice staged, or a face set by hand, before the drop: 8 of
+    them).  Its drop counts as allocated before or after the roll (the die
+    was never rolled), the other seat's echo of that drop never counts, and
+    in such a turn a die that leaves the box after the roll is taken back
+    from the late count (2025-02-04 Gotti16850 T3: eight rolled dice into
+    the box and straight out).  Checked against the Shadow's first roll
+    after a Free die enters the box (the Hunt roll): of the 306 changed
+    turns 202 match only the new count, 1 only the old (2023-02-08
+    SolidSnake T5, where the rolled Eye's add was undone).
+    R2-RS-C2-01 (fix round 2, 2026-10-22), the same post-roll window in
+    every turn: a Shadow die leaving the box takes back a late die first
+    (parked: it counts again if an E die re-enters, the re-face-and-reseat
+    pattern of 2023-11-09 AngryBird T7 and 2024-05-01 SeanW/Polijuna T4;
+    2023-02-24 Magic Geek/GenericPie T7, an H in and out, now 0); any
+    other die leaving was in the box at the roll and leaves a slot that
+    the next click or E die refills with no credit (2025-05-13
+    igforce77/gus833 T1, 2024-08-01 GenericPie/Adobim T2, 2024-05-24
+    Polijuna/RompSteel T7); an E die leaving drops a pending re-face credit
+    (the re-faced die was the box die: 2023-03-04 LewisK/Lancer T2); the
+    Eyes of a cut roll with no 'adds N eyes' line are placed first by the
+    next click or E die (2023-12-29 LuckyRuds/Pompatus6478 T2); a click
+    made while this turn's pre-roll box record stands undone by a post-roll
+    undo rebuilds the box, no credit (2026-01-11 SlowCobra/hrafhraf T5).
+    Hunt-roll check on the whole corpus (fix-wave count vs this one): 37
+    turns change; of the 21 with a Hunt roll the new count matches 19, the
+    old 1, neither 1 (a five-die Hunt with no rolled Eye).  Known residual:
+    an 'allocates an eye' misclick by either seat left in the box until
+    after the first staging counts (2024-02-10 Gileforn/Cisseas T7, the
+    old-only turn); the log cannot tell it from a real late click
+    (2024-08-01 GenericPie/Adobim T4) at the cut."""
     import rendered_replay as rr
     ignored_stages = {int(proof['stage_line']) for batch in (batches or [])
                       for proof in list(batch.get('_rx_pre_roll_returns', [])) + list(batch.get('_rx_pre_roll_allocations', []))}
-    allocated_lines = {int(proof['box_line']) for batch in (batches or [])
-                       for proof in batch.get('_rx_pre_roll_allocations', [])}
-    counts = {}
-    staged = set()
+    records, _n_lines = rr._parse_all(rendered_path)
+    netted = any(r.get('op') in ('undo', 'redo') for r in records)
+    surviving = {id(r) for r in (rr.resolve_undo_redo(records) if netted
+                                 else records)}
+    stager_sides = {}
+    for r in records:
+        if r.get('die_stage') and id(r) in surviving:
+            stager_sides.setdefault(r.get('player'), set()).add(
+                r['die_stage'][0])
+
+    def _shadow_roll(rec):
+        faces = {str(f).upper() for f in rec.get('faces') or ()}
+        if 'W' in faces:
+            return False
+        return ('E' in faces
+                or stager_sides.get(rec.get('player')) == {'SHADOW'})
+
+    cut, end, last_add, last_roll = {}, {}, {}, {}
+    # C2-02: drops of held pre-roll allocations and their echoes;
+    # {id(staging): (drop, echo) or None} from _held_allocation_drops
+    held_box, held_echo = set(), set()
+    held_plan = {}
+
+    def _close(t, index):
+        cut[t] = last_add.get(t, last_roll.get(t, index))
+        end[t] = index
+
     turn = 1
-    with open(rendered_path, encoding='utf-8', errors='ignore') as f:
-        for line_number, raw in enumerate(f, 1):
-            s = raw.strip()
-            if not s.startswith('%'):
+    for i, r in enumerate(records):
+        op = r.get('op')
+        if op == 'turn':
+            if r['turn'] != turn and turn not in cut:
+                _close(turn, i)
+            turn = r['turn']
+            continue
+        if turn in cut:
+            continue
+        if (op == 'move' and id(r) in surviving
+                and rr._DIE_STAGE_RE.match(r['body'])
+                and int(r['line']) not in ignored_stages):
+            held = None
+            if turn not in last_roll:
+                # C2-02: one Current Action run plans every staging in it,
+                # so a later staging of the run reuses its drop (or None)
+                if id(r) not in held_plan:
+                    for s, drop in _held_allocation_drops(
+                            records, i, surviving).items():
+                        held_plan.setdefault(id(records[s]), drop)
+                held = held_plan.get(id(r))
+            if held is None:
+                _close(turn, i)
+            else:
+                held_box.add(id(held[0]))
+                if held[1] is not None:
+                    held_echo.add(id(held[1]))
+        elif op == 'add_eye':
+            last_add[turn] = i
+        elif op == 'roll_dice' and _shadow_roll(r):
+            last_roll[turn] = i
+    if turn not in cut:
+        _close(turn, len(records))
+    counts = {}
+    for t, k in cut.items():
+        prefix = records[:k]
+        if netted and any(r.get('op') in ('undo', 'redo') for r in prefix):
+            prefix = rr.resolve_undo_redo(prefix)
+        box = alloc = 0
+        cur = 1
+        for r in prefix:
+            op = r.get('op')
+            if op == 'turn':
+                cur = r['turn']
                 continue
-            body = s[1:].strip()
-            mt = rr._TURN_RE.match(body)
-            if mt:
-                turn = int(mt.group(1))
+            if op == 'alloc_eye':
+                box += 1
+                if cur == t:
+                    alloc += 1
+            elif op == 'add_eye':
+                box += int(r.get('n') or 0)
+            elif op == 'move' and id(r) not in held_echo:
+                n = _shadow_dice_named(r.get('obj'))
+                into = str(r.get('to', '')).strip().lower() == _EYE_BOX_ZONE
+                out = str(r.get('from', '')).strip().lower() == _EYE_BOX_ZONE
+                if n and into and not out:
+                    box += n
+                    if cur == t:
+                        alloc += n
+                elif n and out and not into:
+                    box = max(0, box - n)
+                    alloc = min(alloc, box)
+            elif (op == 'kill'
+                  and str(r.get('zone', '')).strip().lower() == _EYE_BOX_ZONE):
+                n = _shadow_dice_named(', '.join(
+                    str(p) for p in r.get('pieces') or ()))
+                if n:
+                    box = max(0, box - n)
+                    alloc = min(alloc, box)
+        # R2-RS-C2-01: the window after the played roll (docstring).  late =
+        # late allocations now in the box; parked = late dice taken back out;
+        # slots = dice that were in the box AT the roll and were taken out;
+        # refaced = post-roll hand re-faces X->E not yet matched by an E die
+        # moved in from SA Dice; rerolled = a Shadow die rolled after the cut;
+        # unplaced = Eyes of a cut ROLL that no 'adds N eyes' line placed:
+        # the next click or E die places one, no credit (2023-12-29
+        # LuckyRuds/Pompatus6478 T2: '2eyes? yea', 'rolls E .', the click)
+        late = parked = slots = refaced = unplaced = 0
+        rerolled = False
+        at_roll = box               # dice in the box when it was rolled ...
+        if k < len(records) and records[k].get('op') == 'add_eye':
+            at_roll += int(records[k].get('n') or 0)    # ... + the cut's add
+        elif k < len(records) and records[k].get('op') == 'roll_dice':
+            unplaced = sum(1 for f in records[k].get('faces') or ()
+                           if str(f).upper() == 'E')
+        # a click made while this turn's pre-roll box record (allocation,
+        # add, die moved in) stands undone by an undo AFTER the roll is the
+        # box being rebuilt by hand, no credit (2026-01-11 SlowCobra/hrafhraf
+        # T5: a re-roll, its add and the click undone, then seven clicks
+        # re-create 1 allocated + 6 rolled Eyes); an undo that is redone
+        # first changes nothing (2024-01-03 Rizino1/sampson T7)
+        boxed = set()
+        if netted and any(q.get('op') == 'undo' for q in records[k + 1:end[t]]):
+            cur = 1
+            for q in prefix + records[k:k + 1]:
+                qop = q.get('op')
+                if qop == 'turn':
+                    cur = q['turn']
+                elif cur == t and (
+                        qop == 'alloc_eye'
+                        or (qop == 'add_eye' and int(q.get('n') or 0) > 0)
+                        or (qop == 'move' and _shadow_dice_named(q.get('obj'))
+                            and str(q.get('to', '')).strip().lower() == _EYE_BOX_ZONE
+                            and str(q.get('from', '')).strip().lower() != _EYE_BOX_ZONE)):
+                    boxed.add(id(q))
+
+        def _rebuilding(i):
+            return bool(boxed) and bool(boxed - {
+                id(q) for q in rr.resolve_undo_redo(records[:i])})
+
+        for i, r in enumerate(records[k + 1:end[t]], k + 1):
+            op = r.get('op')
+            if id(r) not in surviving:
                 continue
-            if rr._DIE_STAGE_RE.match(body) and line_number not in ignored_stages:
-                staged.add(turn)
+            if op == 'roll_dice':
+                rerolled = rerolled or _shadow_roll(r)
                 continue
-            if turn in staged:
+            if op == 'alloc_eye':
+                if slots:
+                    slots -= 1          # refills a slot, no credit
+                elif parked:
+                    parked -= 1         # a late die put back
+                    late += 1
+                elif unplaced:
+                    unplaced -= 1       # places a rolled Eye, no credit
+                elif not rerolled and not _rebuilding(i):
+                    late += 1           # the forgotten allocation
                 continue
-            if line_number in allocated_lines:
-                counts[turn] = counts.get(turn, 0) + 1
+            if op == 'other':
+                face = _EYE_FACE_SET_RE.match(str(r.get('body') or ''))
+                if face and face.group(1) != 'E' and face.group(2) == 'E':
+                    refaced += 1
                 continue
-            if 'allocates an eye' in body:
-                counts[turn] = counts.get(turn, 0) + 1
+            if op != 'move' or id(r) in held_echo:
                 continue
-            # GAME19 client dialect: the allocation is the pre-roll
-            # DIE MOVE into the box ('Shadow Action Die (X) from SA
-            # Dice to The Hunt For The Ring'), no 'allocates' line -
-            # honor the group multiplier ('[2]Shadow Action Die (E)'
-            # in ONE line = 2 eyes)
-            if 'Shadow Action Die' in body \
-                    and 'from SA Dice to The Hunt For The Ring' in body:
-                _mm = re.search(r'\[(\d+)\]Shadow Action Die', body)
-                counts[turn] = counts.get(turn, 0) + \
-                    (int(_mm.group(1)) if _mm else 1)
+            obj = str(r.get('obj') or '')
+            n = _shadow_dice_named(obj)
+            if not n:
+                continue
+            eyes = sum(int(m.group(1) or 1) for m in _EYE_SH_DIE_RE.finditer(obj)
+                       if m.group(2) == 'E')
+            into = str(r.get('to', '')).strip().lower() == _EYE_BOX_ZONE
+            out = str(r.get('from', '')).strip().lower() == _EYE_BOX_ZONE
+            if into and not out:
+                if id(r) in held_box:
+                    # C2-02: a held allocation's drop counts whatever its face
+                    late += n
+                    continue
+                late += _shadow_dice_named(obj, non_eye=True)
+                use = min(slots, eyes)      # E dice refill slots first
+                slots -= use
+                eyes -= use
+                use = min(parked, eyes)     # then re-seat parked late dice
+                parked -= use
+                late += use
+                eyes -= use
+                use = min(unplaced, eyes)   # then place rolled Eyes
+                unplaced -= use
+                eyes -= use
+                if str(r.get('from', '')).strip().lower() == 'sa dice':
+                    use = min(refaced, eyes)
+                    refaced -= use
+                    late += use
+            elif out and not into:
+                back = min(late, n)         # late dice leave first
+                late -= back
+                parked += back
+                slots = min(at_roll, slots + n - back)
+                # the re-faced die was the one in the box (Lancer T2)
+                refaced = max(0, refaced - eyes)
+        alloc += late
+        if alloc:
+            counts[t] = alloc
     return counts
 
 
@@ -7756,13 +9802,23 @@ def _emit_eye_allocations(batches, eye_counts, stats):
     eye-phase menu range(min_eyes, max_eyes+1) is INVARIANT to the exact Shadow
     die count whenever unused >= companions â€” always true pre-roll (>=7 dice,
     <=7 companions) â€” so staging max(companions,1) fresh unused dice reproduces
-    the true menu exactly.  min_eyes defaults to 0 (the dominant case); the +1
-    hunt-box-retrieval exception is not reconstructable from the snapshot and
-    would only add a spurious count=0 NEGATIVE, never a mislabel (the human's
-    choice is matched by count VALUE, so its index is always correct)."""
+    the true menu exactly.  C2-08: min_eyes is the engine's own (rulebook
+    p.17 / ruling 1.271: 1 when an FP die sat in the Hunt Box at the end of
+    the previous turn - game_logic.begin_turn_reset sets
+    _fp_used_hunt_box_last_turn from the box).  The flag is rebuilt from
+    _FP_HUNTBOX_IDX, the per-turn FP Hunt Box deposits that
+    _annotate_fellowship_dice records from these batches; a human count below
+    the engine's minimum is not a legal action in that state and is dropped
+    (eye_below_min), never shipped."""
     import ai
     import game_state as gs
     from game_state import Side, ActionDieFace
+    if any('_rx_paid_hunt_restage' not in b for b in batches):
+        # C2-08: without the annotation _FP_HUNTBOX_IDX is empty or another
+        # game's; never fall back to 'no FP die in the box'
+        raise RuntimeError('_emit_eye_allocations needs '
+                           '_annotate_fellowship_dice(batches) first')
+    fp_box_turns = {tn for (_ln, tn) in _FP_HUNTBOX_IDX}
     out = []
     first = {}
     for b in batches:
@@ -7791,12 +9847,15 @@ def _emit_eye_allocations(batches, eye_counts, stats):
             pool.append(d)
         st.dice = {Side.FREE_PEOPLES: [], Side.SHADOW: pool}
         st._eye_allocation_phase = True
-        st._fp_used_hunt_box_last_turn = False
+        # C2-08: an FP die went into the Hunt Box last turn and stayed there
+        # until the turn reset (undone moves are already netted out)
+        st._fp_used_hunt_box_last_turn = (turn - 1) in fp_box_turns
         boundaries = [int(r['line']) for r in b['records']
                       if r.get('op') in ('alloc_eye', 'roll_dice')
                       and 0 < int(r.get('line', 0)) < int(b['start_line'])]
         boundary = min(boundaries) if boundaries else None
-        _install_ledger_hands(st, b, at_line=boundary)
+        if not _install_row_hands(st, b, stats, at_line=boundary):
+            continue                 # R17-CORPUS-EXTRACT row 10: this row only
         # Unknown pre-roll timing remains policy-only, never sorted after actions.
         st._rx_decision_time = (boundary, 0) if boundary is not None else None
         st._rx_decision_scope = 'explicit'
@@ -7808,7 +9867,12 @@ def _emit_eye_allocations(batches, eye_counts, stats):
         hidx = _match_index(legal, lambda a: a.action_type == 'eye_allocate'
                             and int(a.params.get('count', -1)) == n)
         if hidx is None:
-            stats['drop_reasons']['eye_unmatched'] += 1
+            counts = [int(a.params.get('count', -1)) for a in legal
+                      if a.action_type == 'eye_allocate']
+            # C2-08: below the engine's mandatory minimum (1.271) = a rules
+            # slip or an undercounted allocation; metered apart
+            stats['drop_reasons']['eye_below_min' if counts and n < min(counts)
+                                  else 'eye_unmatched'] += 1
             continue
         stats['kinds_emit']['eye_allocate'] += 1
         out.append(_emit_sample(st, Side.SHADOW, legal, hidx, 'eye_allocate',
@@ -8825,15 +10889,254 @@ def _annotate_dwarven_physical_rolls(batches, rendered_path, raw_path=None):
             or change_i != len(rendered_changes)):
         refuse('incomplete_physical_transport')
     _validate_unpaid_eye_transport(batches, raw)
-def _roll_pools(batches):
-    """{(turn, side_str): [face_letters]} from the latest complete roll prefix of
-    each side each turn (username->side inferred from that side's die-staging
-    records).  Used to reconstruct the elven-ring which-die menu."""
-    u2side = {}
+
+
+# C1-03: the faces each side's physical action die can show.
+_ROLL_SIDE_ALPHABET = {'FREE_PEOPLES': frozenset('WCPMH'),
+                       'SHADOW': frozenset('MHACPE')}
+
+
+def _annotate_physical_roll_sides(batches, rendered_path, raw_path=None):
+    """Stamp every rendered action roll with the side of its physical dice.
+
+    C1-03: a rendered '<user> rolls ...' line names only the user who
+    clicked, and one user can roll or stage the other side's dice (a late
+    drag of the opponent's die, hot-seat, assistance).  The paired raw roll
+    names the rolled die pieces, which belong to exactly one side.  Rendered
+    and raw rolls pair 1:1 in order with the same user and faces; anything
+    else quarantines instead of guessing the side from the user ($nick).
+    """
+    import log_census as lc
+    if raw_path is None:
+        raw_path = _raw_log_path(os.path.basename(str(rendered_path)).replace('.rendered.txt', ''))
+
+    def refuse(detail, **extra):
+        raise _Quarantine('coverage_roll_side_unproven', dict(extra, detail=detail))
+
+    if not raw_path or not os.path.isfile(raw_path):
+        refuse('raw_identity_missing')
+    try:
+        raw_text = read_raw_log_text(raw_path)
+    except RawLogEncodingError as error:
+        raise _Quarantine(error.reason, error.detail) from error
+    raw = _paired_physical_raw_view(batches, raw_text)
+    dice = {'FREE_PEOPLES': lc.BASE_FP_DIE_PIDS | lc.KNOWN_BONUS_FP,
+            'SHADOW': lc.BASE_SH_DIE_PIDS | lc.KNOWN_BONUS_SH}
+    raw_rolls = []
+    for raw_line, line in enumerate(raw, 1):
+        roll = lc.ROLL_RE.search(line)
+        if roll is None:
+            continue
+        if line.startswith('%'):
+            # Not a '$' command: the client's local echo of a secure roll,
+            # superseded by the confirmed '$' roll that the rendered log
+            # shows (27 lines in 6 raw logs).  The face check below proves
+            # each kept pairing.
+            continue
+        ids = roll.group(1).split()
+        # One value per die, then a 'null' or 6-hex checksum trailer; the
+        # ROLL_RE digit class can swallow a checksum's leading digit
+        # ('... 10 13 9EE63F'), so read the values by the die count.
+        tail = line[roll.start(2):].split()
+        nums, trailer = tail[:len(ids)], tail[len(ids):]
+        side = next((s for s in dice if ids and set(ids) <= dice[s]), None)
+        if (side is None or len(set(ids)) != len(ids) or len(nums) != len(ids)
+                or not all(n.isdigit() for n in nums) or len(trailer) > 1
+                or (trailer and not re.fullmatch(r'null|[0-9A-Fa-f]{6}', trailer[0]))):
+            refuse('raw_roll_identity', raw_line=raw_line)
+        values = [int(n) for n in nums]
+        if side == 'FREE_PEOPLES' and all(v in range(5) for v in values):
+            faces = ['WCPMH'[v] for v in values]
+        elif side == 'SHADOW' and all(v in (*range(6), *range(10, 16)) for v in values):
+            faces = ['MHACPE'[v % 10] for v in values]
+        else:
+            refuse('raw_roll_face_value', raw_line=raw_line)
+        raw_rolls.append((raw_line, line.split('<~', 1)[0].lstrip('$'), side, faces, ids))
+    # One rendered roll line may sit in more than one record list after a
+    # fold; group by its rendered line.  _annotate_dwarven_physical_rolls
+    # renames a physical Eye display roll, which still consumes a raw roll.
+    rendered = {}
+    for b in batches:
+        for r in b['records']:
+            if r.get('op') in ('roll_dice', 'allocated_eye_display'):
+                rendered.setdefault(int(r.get('line') or 0), []).append(r)
+    if len(rendered) != len(raw_rolls):
+        refuse('roll_transport_count', rendered=len(rendered), raw=len(raw_rolls))
+    for line_no, (raw_line, user, side, faces, ids) in zip(sorted(rendered), raw_rolls):
+        for record in rendered[line_no]:
+            if record.get('player') != user:
+                refuse('roll_transport_user', line=line_no, raw_line=raw_line)
+            if [str(x).upper() for x in record.get('faces', [])] != faces:
+                refuse('roll_transport_faces', line=line_no, raw_line=raw_line)
+            record['_rx_roll_side'] = side
+            # R18-CORPUS row 4: the rolled die pieces and their raw position
+            # (_annotate_partial_rolls tells a partial roll from a whole one)
+            record['_rx_roll_ids'] = list(ids)
+            record['_rx_roll_raw_index'] = raw_line
+
+
+# R18-CORPUS row 4: physical die zones read from the raw piece moves.
+_OWN_DICE_ZONE = {'FREE_PEOPLES': 'Game.2042', 'SHADOW': 'Game.2043'}
+_HUNT_BOX_ZONE = 'Game.1997'
+_CURRENT_ACTION_ZONE = 'Game.2035'
+_CURRENT_CARD_ZONES = ('Game.2036', 'Game.2037')
+
+
+def _annotate_partial_rolls(batches, rendered_path, raw_path=None):
+    """R18-CORPUS row 4: a roll of only SOME of a side's dice after its turn
+    roll changes those dice, never the whole pool.
+
+    Players roll a die on its own after the turn's letter roll: a forgotten
+    Mouth / Witch-king die brought in from reinforcements (2023-01-16
+    GJB/Lancer T13 L1352 'rolls M .', chat 'i forgot to add my mouth dice'),
+    a die the roll button missed (2023-01-22 Franatleti/Yekdo T3 L169 and
+    2023-01-12 Yurdin/FLOX2 T7 L589 'rolls E .', die 100 not in the main
+    roll), an Eye taken back out of the Hunt Box and rerolled (2023-09-25
+    Vayze/GJB T9 L763).  The rendered roll record looks like any other, so
+    _roll_pools ('last roll wins') and _annotate_remaining_pools (a roll
+    resets the pool) made that one die the side's whole pool for the rest of
+    the turn: menus without the other dice, a wrong opponent pool on the pass
+    gate, and too few rolled Eyes in the Hunt Box.  The Dwarven Ring walk
+    (_annotate_dwarven_physical_rolls) certifies such rolls from the raw
+    piece ids in ring games and refuses the rest; games it does not walk
+    reach here.
+
+    The raw roll names its die pieces (_rx_roll_ids, stamped by
+    _annotate_physical_roll_sides).  Per side and turn, a roll is WHOLE when
+    the side has no roll of 2+ dice yet this turn, rolls at least as many
+    dice as its last whole roll, rerolls every die rolled so far, or rolls
+    every die the raw moves leave in the side's dice pool (a re-roll after a
+    mis-roll; the next turn's roll when the turn marker was never advanced,
+    2023-07-25 Mistakentuna/Terminatorhenk L819): it resets the pool as
+    before.  Any other roll is partial: each die rolled
+    earlier this turn is REROLLED (old face -> new face, at the zone the raw
+    moves put it in), each new die is ADDED; an allocated Hunt Box die
+    rolled to show its Eye is no action die.  Partial rolls carry
+    _rx_partial_dice and the turn's per-die faces in _rx_roll_pool_faces
+    (the same field the ring walk stamps), which _roll_pools,
+    _annotate_fellowship_dice (rolled Eyes) and _annotate_remaining_pools
+    read."""
+    import log_census as lc
+    records = [r for b in batches for r in b['records']]
+    if any(r.get('_rx_roll_physical') is not None or r.get('_rx_partial_roll') is not None
+           for r in records):
+        return                  # the Dwarven Ring walk certified every roll
+    rolls = {}
+    for r in records:
+        if r.get('op') == 'roll_dice' and r.get('_rx_roll_ids'):
+            rolls.setdefault(int(r['_rx_roll_raw_index']), []).append(r)
+    if not rolls:
+        return
+    if raw_path is None:
+        raw_path = _raw_log_path(os.path.basename(str(rendered_path)).replace('.rendered.txt', ''))
+    try:
+        raw_text = read_raw_log_text(raw_path)
+    except RawLogEncodingError as error:
+        raise _Quarantine(error.reason, error.detail) from error
+    raw = _paired_physical_raw_view(batches, raw_text)
+    zones = {pid: _OWN_DICE_ZONE['FREE_PEOPLES'] for pid in lc.BASE_FP_DIE_PIDS}
+    zones.update({pid: _OWN_DICE_ZONE['SHADOW'] for pid in lc.BASE_SH_DIE_PIDS})
+    last_face = {}
+    allocated = set()
+    rolled = {}             # side -> {die id: face} rolled this turn
+    whole = {}              # side -> die count of its last whole roll
+    for raw_line, line in enumerate(raw, 1):
+        if re.search(r'<~Game\.7~>\d+\b', line):
+            rolled, whole, allocated = {}, {}, set()
+        eye = lc.EYE_BTN_RE.search(line)
+        if eye:
+            zones[eye.group(1)] = _HUNT_BOX_ZONE
+            allocated.add(eye.group(1))
+        move = lc.MOVE_RE.search(line)
+        if move:
+            for pid in move.group(1).split():
+                zones[pid] = move.group(3)
+        kill = lc.KILL_RE.search(line)
+        if kill:
+            for pid in kill.group(1).split():
+                zones[pid] = 'killed'
+        eyes = re.search(r'<~Controls\.350~>([\d ]+)', line)
+        if eyes:
+            for pid in eyes.group(1).split():
+                if last_face.get(pid) == 'E':
+                    zones[pid] = _HUNT_BOX_ZONE
+        group = rolls.get(raw_line)
+        if not group:
+            continue
+        side = group[0].get('_rx_roll_side')
+        ids = [str(pid) for pid in group[0]['_rx_roll_ids']]
+        faces = [str(face).upper() for face in group[0].get('faces', [])]
+        before = rolled.setdefault(side, {})
+        size = whole.get(side, 0)
+        in_pool = {pid for pid, zone in zones.items() if zone == _OWN_DICE_ZONE.get(side)}
+        if (size < 2 or len(ids) >= size or set(ids) >= set(before)
+                or (in_pool and set(ids) >= in_pool)):
+            rolled[side] = dict(zip(ids, faces))
+            whole[side] = len(ids)
+        else:
+            changes = []
+            for pid, face in zip(ids, faces):
+                zone = zones.get(pid)
+                if pid in before:
+                    changes.append({'die': pid, 'old': before[pid], 'new': face, 'zone': zone})
+                    before[pid] = face
+                elif pid in allocated and zone == _HUNT_BOX_ZONE and face == 'E':
+                    changes.append({'die': pid, 'old': None, 'new': face, 'zone': zone,
+                                    'allocated_eye': True})
+                else:
+                    changes.append({'die': pid, 'old': None, 'new': face, 'zone': zone})
+                    before[pid] = face
+            for record in group:
+                record['_rx_partial_dice'] = [dict(change) for change in changes]
+                record['_rx_roll_pool_faces'] = list(before.values())
+        last_face.update(zip(ids, faces))
+
+
+def _roll_side_resolver(batches):
+    """C1-03: return record -> side of an action roll, or None.
+
+    The physical stamp `_rx_roll_side` (raw die pieces) is the authority;
+    extract_one stamps every roll.  A raw-less literal log may fall back to
+    the rolling user's staging seat only when it is unambiguous: that user
+    staged dice of exactly one side and no other user staged that side.  A
+    user who staged no die leaves the roll unattributed, as before.  Faces
+    outside the side's die alphabet quarantine either way.
+    """
+    staged = {}
     for b in batches:
         for r in b['records']:
             if r.get('op') == 'move' and r.get('die_stage'):
-                u2side[r.get('player')] = r['die_stage'][0]
+                staged.setdefault(r.get('player'), set()).add(r['die_stage'][0])
+    seat_users = {}
+    for user, sides in staged.items():
+        for side in sides:
+            seat_users.setdefault(side, set()).add(user)
+
+    def side_of(record):
+        side = record.get('_rx_roll_side')
+        if side is None:
+            sides = staged.get(record.get('player'))
+            if not sides:
+                return None
+            if len(sides) != 1 or len(seat_users[next(iter(sides))]) != 1:
+                raise _Quarantine('coverage_roll_side_unproven', {
+                    'detail': 'rendered_user_seat_ambiguous',
+                    'line': record.get('line'), 'user': record.get('player')})
+            side = next(iter(sides))
+        faces = {str(x).upper() for x in record.get('faces', [])}
+        if not faces <= _ROLL_SIDE_ALPHABET[side]:
+            raise _Quarantine('coverage_roll_side_unproven', {
+                'detail': 'roll_face_alphabet', 'line': record.get('line'),
+                'side': side, 'faces': sorted(faces)})
+        return side
+    return side_of
+
+
+def _roll_pools(batches):
+    """{(turn, side_str): [face_letters]} from the latest complete roll prefix of
+    each side each turn (side proved by the roll's physical dice, C1-03).
+    Used to reconstruct the elven-ring which-die menu."""
+    roll_side = _roll_side_resolver(batches)
     # W4-018 (2026-09-02): the turn-start letter roll PRECEDES the turn's
     # first die-staging, so parse_game files it under the batch's RECORDS
     # (pending_pre) and never under its 'rng' list - the old rng-only scan
@@ -8842,13 +11145,16 @@ def _roll_pools(batches):
     # elven-ring menu was enumerated on a single die).  Scan the records;
     # the LAST roll of a side in a turn wins (a second letter roll is a
     # re-roll after a mis-roll - 2023-01-24 L641/L646, 2023-03-24
-    # L1187/L1201 - the first one was never played).
+    # L1187/L1201 - the first one was never played).  A PARTIAL roll (some
+    # dice rolled again or added on their own, R18-CORPUS row 4) carries the
+    # turn's per-die faces in _rx_roll_pool_faces (_annotate_partial_rolls),
+    # so it never stands in for the whole pool.
     pools = {}
     for b in batches:
         for r in b['records']:
             if r.get('op') != 'roll_dice':
                 continue
-            side = u2side.get(r.get('player'))
+            side = roll_side(r)
             if side is None:
                 continue
             pools[(b['turn'], side)] = [str(x).upper()
@@ -8965,7 +11271,8 @@ def _emit_token_uses(batch, stats):
     line and the piece's kill (never a later political move of the
     same batch); a stage returned to FP Dice is a retraction (no row).
 
-    Decision state = truth_before + the ledger's holdings at the stage
+    Decision state = the board at the stage line (the stage record's
+    decision_truth; C2-06) + the ledger's holdings at the stage
     line (BOTH tokens when both are held) + the TRUE remaining dice of
     both sides at that moment (batch pools, minus the host batch's own
     die when it was spent before the token) - so the menu is the full
@@ -8981,10 +11288,7 @@ def _emit_token_uses(batch, stats):
     recs = sorted((r for r in batch.get('records') or []
                    if isinstance(r, dict) and r.get('line')),
                   key=lambda r: r.get('line', 0))
-    stages = [r for r in recs
-              if r.get('op') == 'move' and _token_kinds(r.get('obj'))
-              and 'fp dice' in str(r.get('from', '')).lower()
-              and 'current' in str(r.get('to', '')).lower()]
+    stages = [r for r in recs if _is_token_stage(r)]   # ledger/walk twin
     for sr in stages:
         kind = _token_kinds(sr.get('obj'))[0]
         sline = sr.get('line', 0)
@@ -9026,22 +11330,34 @@ def _emit_token_uses(batch, stats):
                 stats['drop_reasons']['token_pol_no_nation'] += 1
                 continue
         else:
+            # R18-CORPUS row 34: the label is the FP's OWN deck draw inside
+            # the stage..kill window.  The old fallback took the host
+            # batch's first rng deck draw of either side at any line, even
+            # for a token spent on a Political Track move (2024-02-19
+            # branstonpickle/Raupenbolle L493 -> 'strategy' from the Shadow's
+            # L492 draw); no such draw is no evidence (token_no_draw).
             for r in window:
-                if r.get('op') == 'draw':
+                if r.get('op') == 'draw' and \
+                        str(r.get('what', '')).strip().lower().startswith('free'):
                     deck = _deck_type(r.get('what'))
                     if deck:
                         break
             if deck is None:
-                for it in batch.get('rng') or []:
-                    if it.get('kind') == 'draw_deck':
-                        deck = _deck_type(it.get('value'))
-                        if deck:
-                            break
-            if deck is None:
                 stats['drop_reasons']['token_no_draw'] += 1
                 continue
+        # C2-06: the board at the token's OWN stage line (record-time mirror
+        # snapshot, rendered_replay token_stage), so the host action's moves
+        # made before the token are in X and in the menu state.  A modern
+        # batch without that snapshot is refused by name, never encoded on
+        # the host's pre-action board; legacy (unversioned) batches keep
+        # truth_before as the ring/discard emitters do.
+        snapshot = sr.get('decision_truth')
+        if snapshot is None and batch.get('record_truth_version'):
+            stats['drop_reasons']['token_missing_record_context'] += 1
+            continue
         try:
-            st = _recon_state(batch['truth_before'], batch.get('turn'))
+            st = _recon_state(snapshot if snapshot is not None
+                              else batch['truth_before'], batch.get('turn'))
         except Exception:
             stats['drop_reasons']['token_recon'] += 1
             continue
@@ -9075,6 +11391,11 @@ def _emit_token_uses(batch, stats):
             d = gs.ActionDie(gs.FP_FACES, Side.FREE_PEOPLES)
             d.used = False
             st.dice = {Side.FREE_PEOPLES: [d], Side.SHADOW: []}
+        # R2-RS-v034-INV-PASS-3: the FP dice already in the Hunt Box from
+        # this turn's earlier Fellowship moves (public, rulebook p.40), as
+        # on the pass / ordinary die-action rows this slot competes with -
+        # deposits strictly before the token's own stage line.
+        _seed_fp_huntbox(st, {'turn': batch['turn'], 'start_line': sline})
         _install_ledger_hands(st, batch, at_line=sline)
         # the draw-token enumeration requires non-empty decks (the
         # DECK CHOICE is the decision; contents are irrelevant)
@@ -9166,6 +11487,21 @@ def _ring_decision_state(batch, side, stats, record=None):
         return None
 
 
+def _ring_fp_box_line(batch, record):
+    """R3-EXTRACT-HUNTBOX-RECON: the line an Elven Ring row's FP Hunt Box
+    is read at - the ring's own decision.  A witnessed Fellowship payment
+    (stage -> advance -> early drag -> counter) is decided before the
+    advance (_rx_fellowship_payment_line), so the paying die is not yet in
+    the box (ruling 1.244: it enters only after that move's Hunt).  Any
+    other use is decided at its counter line, after the earlier moves of
+    the turn (and their Hunts) settled.  No record: the batch start, the
+    line _ring_decision_state reads the hands at."""
+    if record is None:
+        return batch.get('start_line') or 0
+    pay = record.get('_rx_fellowship_payment_line')
+    return pay if pay is not None else (record.get('line') or 0)
+
+
 def _ring_use_is_settled(record, records):
     """A later manual return cancels this use just as a native undo does."""
     kind = _ring_rec_kind(record)
@@ -9228,13 +11564,11 @@ def _emit_shadow_hunt_ring_preserving_prefix(batch, stats):
         die = gs.ActionDie(gs.SH_FACES,gs.Side.SHADOW);die.current=gs.ActionDieFace.EYE
         state.dice[gs.Side.SHADOW].append(die);shadow.append(die)
     for die in shadow:die.used=True
-    for prior in batch.get('_rx_shadow_conversions',[]):
-        die=next((d for d in state.dice[gs.Side.SHADOW] if d.used
-                  and d.current==_letter2face().get(prior['face'])
-                  and all(d is not old for old in shadow)),None)
-        if die is None:
-            raise _Quarantine('coverage_fellowship_die_unproven', {'reason':'ring_prior_shadow_conversion'})
-        die.current=gs.ActionDieFace.EYE;shadow.append(die)
+    # R17-CORPUS-EXTRACT row 43: an explicitly refaced prior conversion is a
+    # fresh used Eye, never an unrelated die spent with its old face
+    if not _own_shadow_conversions(state.dice[gs.Side.SHADOW], shadow,
+                                   batch.get('_rx_shadow_conversions', [])):
+        raise _Quarantine('coverage_fellowship_die_unproven', {'reason':'ring_prior_shadow_conversion'})
     state.hunt_box=box+shadow
     state.eyes_allocated=int(_RX_EYEALLOC.get(batch['turn'],0))
     state._rx_full_pools=None;state._rx_eyes_stamped=True
@@ -9247,6 +11581,50 @@ def _emit_shadow_hunt_ring_preserving_prefix(batch, stats):
     stats['kinds_emit']['elven_ring']+=1
     stats['detected']['elven_ring_hunt_counter']+=1
     return [_emit_sample(state,gs.Side.SHADOW,legal,matches[0],'elven_ring',batch['turn'])]
+
+
+def _compose_ring_changes(steps):
+    """C2-03: the net (old, new) face letters of ONE counter use's ordered
+    rendered changes, or None when the steps do not chain (each step must
+    start from the face the previous one set; otherwise which line was the
+    Ring is unproven).  A mis-click fix 'M to P' / 'P to C' is the Ring
+    decision M->C; the intermediate P was never the ring's result."""
+    for prev, step in zip(steps, steps[1:]):
+        if step[0] != prev[1]:
+            return None
+    return (steps[0][0], steps[-1][1])
+
+
+def _mirror_played_before_counter(records, anchor):
+    """C2-03: True when the nearest card play earlier in the die-spend that
+    holds this counter record (back to its die stage) is Mirror of
+    Galadriel, whose effect turns a Character die to Will
+    (event_effects._effect_mirror_of_galadriel).  The Ring never produces
+    Will (ai._get_elven_ring_actions), so a closing 'C to W' after such a
+    counter is the card's effect, not the Ring's."""
+    idx = next((i for i, r in enumerate(records) if r is anchor), None)
+    if idx is None:
+        return False
+    for r in reversed(records[:idx]):
+        if _is_card_play_move(r):
+            return 'mirror of galadriel' in str(r.get('obj', '')).lower()
+        if _is_die_stage_move(r):
+            break
+    return False
+
+
+def _hunt_ring_owned_line(batch):
+    """R4-EXTRACT-EVENT-BATTLE-CLAIMS (c, fix round 4): the counter line of
+    the Shadow Elven Ring use to an Eye that the batch's elven_ring_eye
+    proof (_shadow_hunt_conversion) hands to _emit_shadow_hunt_ring, else
+    None.  That emitter owns the use's one row; the process loop skips
+    _emit_elven_rings whole only on Shadow batches, so on a Free Peoples
+    batch whose tail carries the use _emit_elven_rings skips just this use
+    (2023-04-09 yurdin v Uthoroc T9 L869-871 was emitted twice)."""
+    proof = batch.get('_rx_shadow_hunt_effect') or {}
+    if proof.get('kind') != 'elven_ring_eye' or proof.get('ring_line') is None:
+        return None
+    return int(proof['ring_line'])
 
 
 def _emit_elven_rings(batch, pools, stats):
@@ -9268,6 +11646,7 @@ def _emit_elven_rings(batch, pools, stats):
     out = []
     explicit_action_change = False
     recs = batch['records']
+    ring_uses = []   # C2-03: [(counter record, side, [(old, new) letters])]
     for k, r in enumerate(recs):
         if r.get('op') != 'other':
             continue
@@ -9295,6 +11674,48 @@ def _emit_elven_rings(batch, pools, stats):
         if not _ring_use_is_settled(ring_record, ring_history):
             stats['drop_reasons']['ring_retracted'] += 1
             continue
+        # C2-03 (2026-10-22): every change after one counter move resolves
+        # to the SAME anchor (_nearest_gesture_is_ring stops only at a
+        # take-back, a ring use, a card play or a die stage).  Emitting per
+        # change shipped the intermediate face of a mis-click fix (priceg335
+        # T2 'M to P' / 'P to C' -> row M->P) and extra rows for one use
+        # (GandalfTheBlue T7 P->C->M->H -> rows P->C and M->H).  Collect the
+        # changes per counter use; ONE row per use below.
+        step = (m.group(2).upper(), m.group(3).upper())
+        for use in ring_uses:
+            if use[0] is ring_record:
+                use[2].append(step)
+                break
+        else:
+            ring_uses.append((ring_record, ch_side, [step]))
+    _owned9 = _hunt_ring_owned_line(batch)
+    for ring_record, ch_side, steps in ring_uses:
+        if _owned9 is not None and ch_side == Side.SHADOW \
+                and int(ring_record.get('line') or 0) == _owned9:
+            # R4-EXTRACT-EVENT-BATTLE-CLAIMS (c): _emit_shadow_hunt_ring's use
+            stats['detected']['elven_ring_owned_by_shadow_hunt'] += 1
+            continue
+        if len(steps) > 1:
+            stats['detected']['elven_ring_multi_change'] += 1
+            # change lines folded into this use's single row/drop (census
+            # non-decision key: det 'elven_ring' still counts every line)
+            stats['detected']['elven_ring_chain_step'] += len(steps) - 1
+            # Mirror of Galadriel played before the counter (Carrillo/
+            # Jorrick L276-284, SilmarillWill/GJB L403-406): Ring M->C, then
+            # the card's C->W.  The Ring's result is the chain before it.
+            if steps[-1] == ('C', 'W') and \
+                    _mirror_played_before_counter(recs, ring_record):
+                steps = steps[:-1]
+                stats['detected']['elven_ring_mirror_tail'] += 1
+        net = _compose_ring_changes(steps)
+        if net is None:
+            stats['drop_reasons']['ring_multi_change_unchained'] += 1
+            continue
+        if len(steps) > 1 and net[0] == net[1]:
+            stats['drop_reasons']['ring_multi_change_noop'] += 1
+            continue
+        of = _letter2face()[net[0]]
+        nf = _letter2face()[net[1]]
         st = _ring_decision_state(batch, ch_side, stats, ring_record)
         if st is None:
             continue
@@ -9310,6 +11731,11 @@ def _emit_elven_rings(batch, pools, stats):
         if not matches:
             stats['drop_reasons']['ring_unmatched'] += 1
             continue
+        # R3-EXTRACT-HUNTBOX-RECON: the fresh ring state's FP Hunt Box
+        # (after the menu; seeding inside _ring_decision_state would break
+        # _shadow_hunt_conversion's apply_action box-count check).
+        _topup_fp_huntbox(st, batch['turn'],
+                          _ring_fp_box_line(batch, ring_record))
         stats['kinds_emit']['elven_ring'] += 1
         out.append(_emit_sample(st, ch_side, legal, matches[0], 'elven_ring',
                                 batch['turn']))
@@ -9409,6 +11835,9 @@ def _emit_elven_rings(batch, pools, stats):
                     _restore9s()
                     return out
                 _alts9.append(_m9[0])
+            # R3-EXTRACT-HUNTBOX-RECON: as for the explicit-change rows
+            _topup_fp_huntbox(st, batch['turn'],
+                              _ring_fp_box_line(batch, ring_record))
             stats['kinds_emit']['elven_ring'] += 1
             global _RX_ALT_HIDX
             _RX_ALT_HIDX = _alts9 or None
@@ -9585,12 +12014,20 @@ def _table_card_kill_cids(batch):
     return out
 
 
-def _nazgul_hops(batch):
+def _nazgul_hops(batch, mouth_drags=None):
     """Ordered per-figure nazgul flights this batch: [(from, to, is_wk)].
     A '[N] Nazgul' group token expands to N single-figure hops (the engine
-    chain moves one figure per decision).  WK ALWAYS distinct (spec 1.216)."""
+    chain moves one figure per decision).  WK ALWAYS distinct (spec 1.216).
+    R4-EXTRACT-COVERAGE-DROPS (R3-MOUTH-EXECUTOR FU2): the Mouth of Sauron is
+    never a hop (USER CR-D6-fix-01: "the mouth of sauron does NOT move with
+    ringwraths / black captain commands").  When *mouth_drags* is a list,
+    each logged Mouth flight - a region->region drag carrying the Mouth and
+    no Army unit, along an edge no Army unit moved this batch (a Minion
+    riding an Army move is that Army's movement) - is appended to it as
+    {'from', 'to', 'line'} so the caller can count that illegal move."""
     import rendered_replay as rr
     hops = []
+    mouth9, unit_edges9 = [], set()
     for r in batch['records']:
         if r.get('op') != 'move':
             continue
@@ -9599,14 +12036,23 @@ def _nazgul_hops(batch):
         if fk[0] not in ('region', 'stronghold') or \
                 tk[0] not in ('region', 'stronghold') or fk[1] == tk[1]:
             continue
-        for t in _group_tokens(r.get('obj', '')):
-            p = rr.parse_piece(t)
+        parsed9 = [rr.parse_piece(t) for t in _group_tokens(r.get('obj', ''))]
+        for p in parsed9:
             if not p:
                 continue
             if p[0] == 'nazgul':
                 hops.extend([(fk[1], tk[1], False)] * p[3])
             elif p[0] == 'named' and p[1] == 'Witch King':
                 hops.append((fk[1], tk[1], True))
+        if any(p and p[0] == 'unit' for p in parsed9):
+            unit_edges9.add((fk[1], tk[1]))
+        elif any(p and p[0] == 'named' and p[1] == 'Mouth of Sauron'
+                 for p in parsed9):
+            mouth9.append({'from': fk[1], 'to': tk[1],
+                           'line': int(r.get('line', 0) or 0)})
+    if mouth_drags is not None:
+        mouth_drags.extend(m for m in mouth9
+                           if (m['from'], m['to']) not in unit_edges9)
     return hops
 
 
@@ -9862,8 +12308,12 @@ def _card_followup_attack_index(state, side, legal, batch):
     import rendered_replay as rr
     from game_state import Side
     owner = 'SHADOW' if side == Side.SHADOW else 'FREE_PEOPLES'
-    boundaries = [r.get('line', 0) for r in batch['records']
-                  if r.get('op') == 'choose' or r.get('kind') == 'roll_num']
+    # C3-11: a roll record carries op=='roll_num'; only the batch's RNG item
+    # carries kind=='roll_num' (rendered_replay.parse_game), as read by
+    # _card_movement_prefix.  The RNG stream holds this batch's rolls only.
+    boundaries = [r.get('line', 0) for r in batch['records'] if r.get('op') == 'choose']
+    boundaries.extend(r.get('line', 0) for r in batch.get('rng', [])
+                      if r.get('kind') == 'roll_num')
     if not boundaries:
         return None
     first = min(boundaries)
@@ -9960,6 +12410,7 @@ def _card_guide_index(state, batch, legal):
     return matches[0], evidence
 
 
+@_fp_huntbox_batch_scope    # R4-EXTRACT-HUNTBOX-REMAINING: post-play clones
 def _emit_card_interiors(batch, stats):
     """Attribution-principle interior-decision emitter for a card-play batch.
     Additive + independent (its own reconstruction, drops on any failure), so
@@ -9975,6 +12426,26 @@ def _emit_card_interiors(batch, stats):
         return []
     movement = cid in {_title_to_cid(name) for name in _CARD_MOVEMENT_NAMES}
     prefix = _card_movement_prefix(batch, title) if movement else batch
+    if str(title).split('/')[0].strip().lower() in (
+            'the ringwraiths are abroad', 'the black captain commands'):
+        # R4-EXTRACT-COVERAGE-DROPS (R3-MOUTH-EXECUTOR FU2): a logged Mouth
+        # of Sauron flight inside the card's movement window is illegal
+        # (CR-D6-fix-01) and is never labelled (_nazgul_hops leaves it out
+        # of the hops); count how often the logs contain it, once per play
+        # whose Mouth ENDS away from its start (2023-01-11 edoude v Hybris93
+        # L916-919: four drags, Dol Guldur -> Dale); drags that return the
+        # Mouth to its start are a correction, counted apart (2023-02-19
+        # Jaratam v Komap4uk L1020/L1022).  Diagnostic only: no row, no
+        # drop.  (Nazgul Search / Strike! are counted on the census route
+        # as 'nazgul_card_mouth_drag'.)
+        _mouth9 = []
+        _nazgul_hops(prefix, mouth_drags=_mouth9)
+        if _mouth9:
+            _mouth9.sort(key=lambda m: m['line'])
+            stats['detected'][
+                'nazgul_card_mouth_drag_traa_bcc'
+                if _mouth9[0]['from'] != _mouth9[-1]['to']
+                else 'nazgul_card_mouth_drag_traa_bcc_undone'] += 1
     if batch['kind'] in ('combat', 'combat?') and not _card_strike(batch):
         # An Event may open this battle. Its prior movement is still a
         # card decision, but an actual combat commit has no Event interior.
@@ -10019,10 +12490,16 @@ def _emit_card_interiors(batch, stats):
                  and (cid not in ('SHADOW_Character_Nazgûl_Search', 'SHADOW_Character_Nazgûl_Strike!')
                       or a.die_idx == 0)), None)
     if play is None:
-        # play unmatched (effect-pruned class): the overstack trim can
-        # still be gesture-proven (T9-14 Cirdan's) - probe on the raw
-        # recon with the musters brute-applied
-        return _trim_probe(batch, st, side, stats, brute=True)
+        # C3-08 (fix wave 2026-10-21): the reconstructed engine does not
+        # offer this play (hand-ledger gap or engine illegality), so the
+        # engine never executed it and no interior decision exists on any
+        # engine-produced state.  The old brute path appended the
+        # reinf->besieged musters straight into s2.armies (no engine call,
+        # no pool / stacking check), hand-built a siege_trim pending and
+        # emitted a row: state forcing (I1, engine-driven resolution).
+        # Count the drop instead.
+        stats['drop_reasons']['cardint_play_unmatched'] += 1
+        return []
     staged_plan = None
     from rendered_companion_chain import literal_plan as companion_literal_plan, Unproven as CompanionUnproven
     try:
@@ -10177,15 +12654,13 @@ def _emit_card_interiors(batch, stats):
             _tsd = _pct.get('deciding_side')
             _tstr = ('SHADOW' if _tsd == Side.SHADOW
                      else 'FREE_PEOPLES')
-            eb, _rb, _tc = _window_trim(batch, _treg, _tstr)
+            eb, _rb, _tc, _tu = _window_trim(batch, _treg, _tstr, with_units=True)
             try:
                 la_t = ai.get_legal_actions(s2, _tsd)
             except Exception:
                 stats['drop_reasons']['cardint_trim_legal_exc'] += 1
                 break
-            h_t = _match_index(la_t, lambda a: a.action_type ==
-                               'siege_trim' and
-                               int(a.params.get('elites_back', -1)) == eb)
+            h_t = _match_index(la_t, lambda a: _trim_row_matches(a, eb, _tu))
             if h_t is None:
                 stats['drop_reasons']['cardint_trim_unmatched'] += 1
                 break
@@ -10387,15 +12862,17 @@ def _emit_card_interiors(batch, stats):
     # the pending never opens.  Detect the trim GESTURE (killed-then-
     # returned pieces after the play) and build the pending on the box
     # army key directly.
-    out.extend(_trim_probe(batch, s2, side, stats, brute=False))
+    out.extend(_trim_probe(batch, s2, side, stats))
     return out
 
 
-def _trim_probe(batch, s2, side, stats, brute):
-    """T9-14 helper: emit the overstack siege_trim on state s2.  With
-    brute=True (pruned-play path: the engine never applied the play) the
-    play's reinf->besieged-region musters are brute-applied first so the
-    trim menu holds the true garrison."""
+@_fp_huntbox_batch_scope    # R4-EXTRACT-HUNTBOX-REMAINING: post-play clone
+def _trim_probe(batch, s2, side, stats):
+    """T9-14 helper: emit the overstack siege_trim on state s2, the ENGINE
+    state after the play was applied.  C3-08: the garrison is never edited
+    here (the old brute=True musters-from-gestures path is gone; an
+    unmatched play emits nothing), the hand-built pending is restored on
+    every exit, and a failure is counted, never swallowed."""
     import ai
     import rendered_replay as rr
     from game_state import Side
@@ -10411,6 +12888,7 @@ def _trim_probe(batch, s2, side, stats, brute):
             # misses the box kill + off-board correction
             import game_state as _gs9t
             eb9 = _rb9 = 0
+            _tu9 = Counter()
             _kill_ok = False
             for r9 in batch['records']:
                 if r9.get('op') == 'kill':
@@ -10432,6 +12910,8 @@ def _trim_probe(batch, s2, side, stats, brute):
                                 eb9 += p9[3]
                             else:
                                 _rb9 += p9[3]
+                            _tu9[(p9[1], 'ELITE' if p9[2] == 'ELITE'
+                                  else 'REGULAR')] += p9[3]
             if not _kill_ok or (eb9 + _rb9) <= 0:
                 continue
             _key9 = None
@@ -10443,30 +12923,7 @@ def _trim_probe(batch, s2, side, stats, brute):
                     break
             if _key9 is None:
                 continue
-            if brute:
-                # pruned-play path: the engine never executed the
-                # muster - apply the reinf->region gestures so the trim
-                # menu enumerates the TRUE (overstacked) garrison
-                for r9 in batch['records']:
-                    if r9.get('op') != 'move':
-                        continue
-                    fk9 = rr.zone_kind(r9.get('from', ''))
-                    tk9 = rr.zone_kind(r9.get('to', ''))
-                    if fk9[0] != 'reinf' or tk9[0] not in (
-                            'region', 'stronghold') or tk9[1] != _reg9:
-                        continue
-                    for t9 in _group_tokens(r9.get('obj', '')):
-                        p9 = rr.parse_piece(t9)
-                        if p9 and p9[0] == 'unit' and \
-                                ai._side_of_nation(
-                                    _gs9t.Nation[p9[1]]) == side:
-                            for _ in range(p9[3]):
-                                s2.armies[_key9].units.append(
-                                    _gs9t.Unit(
-                                        _gs9t.Nation[p9[1]],
-                                        _gs9t.UnitKind.ELITE
-                                        if p9[2] == 'ELITE' else
-                                        _gs9t.UnitKind.REGULAR))
+            _prev_pc9 = s2.pending_combat
             s2.pending_combat = {
                 'phase': 'siege_trim', 'trim_region': _key9,
                 'attacker_region': _reg9, 'defender_region': _key9,
@@ -10475,20 +12932,24 @@ def _trim_probe(batch, s2, side, stats, brute):
                                   Side.FREE_PEOPLES else
                                   Side.FREE_PEOPLES),
                 'defender_side': side, 'is_siege': True}
-            la_t = [a for a in ai.get_legal_actions(s2, side)
-                    if a.action_type == 'siege_trim']
-            h_t = _match_index(la_t, lambda a: int(
-                a.params.get('elites_back', -1)) == eb9)
-            if h_t is not None and len(la_t) >= 2:
-                stats['kinds_emit']['siege_trim'] += 1
-                out.append(_emit_sample(s2, side, la_t, h_t,
-                                        'siege_trim', batch['turn']))
-            else:
-                stats['drop_reasons']['cardint_trim_unmatched'] += 1
-            s2.pending_combat = None
+            try:
+                la_t = [a for a in ai.get_legal_actions(s2, side)
+                        if a.action_type == 'siege_trim']
+                h_t = _match_index(la_t, lambda a: _trim_row_matches(
+                    a, eb9, _tu9))
+                if h_t is not None and len(la_t) >= 2:
+                    out.append(_emit_sample(s2, side, la_t, h_t,
+                                            'siege_trim', batch['turn']))
+                    stats['kinds_emit']['siege_trim'] += 1
+                else:
+                    stats['drop_reasons']['cardint_trim_unmatched'] += 1
+            finally:
+                s2.pending_combat = _prev_pc9
             break
-    except Exception:
-        pass
+    except Exception as e:
+        # C3-08: loud, counted drop (was `except Exception: pass`)
+        stats['drop_reasons']['cardint_trim_exc:%s' % type(e).__name__] += 1
+        return []
     return out
 
 
@@ -10951,7 +13412,12 @@ def _match_interior(pco, copts, ctx, batch, stats, first, *, state=None):
                 overstack_batch = corsairs_trim_window(batch, choices0['overstack_remove']['region'])
             except Unproven as error:
                 return None, 'cardint_' + str(error)
-        gest9 = _overstack_returns(overstack_batch)
+        # R4-EXTRACT-COVERAGE-DROPS: the Corsairs trim window (after the
+        # landing, before any commit or roll) also reads the Shadow's
+        # 'kills ...' rendering of the trim
+        gest9 = _overstack_returns(
+            overstack_batch,
+            shadow_kills='_corsairs_landing_pc' in choices0)
         used9 = ctx.setdefault('ovs_used', Counter())
         m9 = []
         for i, a in copts:
@@ -10973,8 +13439,9 @@ def _match_interior(pco, copts, ctx, batch, stats, first, *, state=None):
     # text: "After the Shadow player draws a Hunt tile, you may discard
     # Mithril Coat and Sting to force him to replace the tile").
     # Evidence = the hunt-tile draws of the batch after the play: ONE
-    # tile and the table card still on the table = kept (False); a
-    # SECOND tile draw or the table card leaving BoardN = redraw (True).
+    # tile and the table card still on the table = kept (False); the
+    # table card leaving BoardN between the first and a SECOND tile draw
+    # = redraw (True); anything else is unproven (R18-CORPUS row 5).
     if fam == 'mithril_redraw':
         red9, why9 = _mithril_redraw_evidence(ctx, batch)
         if red9 is None:
@@ -11062,7 +13529,7 @@ def _match_interior(pco, copts, ctx, batch, stats, first, *, state=None):
     # single-move menu; the terminator matches when the drags exhaust
     # (spec 1.216: teleport-chain hop attribution).
     if fam == 'teleport':
-        return _teleport_chain_match(copts, ctx, batch, stats)
+        return _teleport_chain_match(copts, ctx, batch, stats, state=state)
     # ---- generic attribution-principle matching (PRE/POST delta) -------
     matches = [i for i, a in copts
                if _option_matches(a.params.get('choices', {}) or {}, delta,
@@ -11076,11 +13543,114 @@ def _match_interior(pco, copts, ctx, batch, stats, first, *, state=None):
 _TELEPORT_TERM_KEYS = ('_tsim_done', '_tsl_done')
 
 
-def _teleport_chain_match(copts, ctx, batch, stats):
+def _tdaan_capture_gestures(batch, vias, title=None):
+    """R3-EXTRACT-NAMED-ARMY-MATCH (E3-02 follow-up): the intermediates in
+    `vias` whose control-marker gestures in this batch (after the play line
+    of `title`, when that line is in the batch) net to a CAPTURE by the
+    walking FP army: a Shadow Control Marker leaving the settlement (moved
+    off it, or killed in it - the recapture of an FP settlement) or a Free
+    Control Marker placed on it (the capture of a Shadow settlement,
+    2024-01-07 Mistakentuna v GJB L1013-1016).  A marker taken off and put
+    back nets to nothing.  Returns a set of sanitized region keys."""
+    import rendered_replay as rr
+    lo = None
+    if title:
+        lo = next((r.get('line', 0) for r in batch['records']
+                   if r.get('op') == 'move' and r.get('obj') == title), None)
+    net = Counter()
+    for r in batch['records']:
+        if lo is not None and r.get('line', 0) <= lo:
+            continue
+        if r.get('op') == 'move':
+            fk = rr.zone_kind(str(r.get('from', '')))
+            tk = rr.zone_kind(str(r.get('to', '')))
+            src = fk[1] if fk[0] in ('region', 'stronghold') else None
+            dst = tk[1] if tk[0] in ('region', 'stronghold') else None
+            if src == dst:
+                continue
+            toks = _group_tokens(str(r.get('obj', '')))
+        elif r.get('op') == 'kill':
+            zk = rr.zone_kind(str(r.get('zone', '')))
+            src = zk[1] if zk[0] in ('region', 'stronghold') else None
+            dst = None
+            toks = r.get('pieces') or []
+        else:
+            continue
+        for t in toks:
+            p = rr.parse_piece(str(t))
+            if not p or p[0] != 'ctrlmarker':
+                continue
+            # +1 = capture direction: a Shadow marker leaving, a Free
+            # marker arriving
+            sign = (1 if p[1] == 'SHADOW' else -1) * int(p[3] or 1)
+            if src in vias:
+                net[src] += sign
+            if dst in vias:
+                net[dst] -= sign
+    return {v for v, n in net.items() if n > 0}
+
+
+def _card_move_row_units(state, action, frm):
+    """R4-EXTRACT-COMBAT-ROUND-KEYS (c): the unit figures, a Counter of
+    ('unit', NATION, KIND), that executing the card-move row `action` moves
+    out of `frm` on the pending `state` - the ENGINE's answer: the row is
+    applied to a clone of the state it was offered on and the source army is
+    diffed (no second copy of the movement rules).  Returns (Counter, None);
+    (None, 'staged') when the row moved nothing yet and opened a
+    figure-selection stage (a Shadow cargo pick, '_cargo_index' options)
+    whose later choice sets the composition; (None, 'refused:<error>') when
+    the engine refuses the row."""
+    import ai
+    from event_effects import _find_army_key
+
+    def _units(st9):
+        army9 = st9.armies.get(_find_army_key(st9, frm))
+        return Counter(('unit', u.nation.name, u.kind.name)
+                       for u in (army9.units if army9 else []))
+    before = _units(state)
+    try:
+        after = ai.apply_action(ai.clone_state(state), action)
+    except Exception as error:
+        return None, 'refused:' + type(error).__name__
+    moved = +(before - _units(after))
+    if not moved:
+        pco = getattr(after, 'pending_card_option', None) or {}
+        if any('_cargo_index' in (o or {}) for o in pco.get('options') or ()):
+            return None, 'staged'
+    return moved, None
+
+
+def _card_move_row_leaders(state, action, frm):
+    """R4B-WOSES-SPLIT-ROWS: the Leaders / Companions, a Counter of
+    army_card_cargo keys (('leader', NATION, '') / ('named', NAME, '')), that
+    executing the card-move row `action` moves out of `frm` on the pending
+    `state` - the ENGINE's answer (the row applied to a clone, the source
+    army diffed; Nazgul excluded).  None when the engine refuses the row."""
+    import ai
+    from army_card_cargo import key as _ckey
+    from event_effects import _find_army_key
+
+    def _leaders(st9):
+        army9 = st9.armies.get(_find_army_key(st9, frm))
+        return Counter(k for k in (_ckey(l) for l in
+                                   (army9.leaders if army9 else []))
+                       if k[0] != 'nazgul')
+    before = _leaders(state)
+    try:
+        after = ai.apply_action(ai.clone_state(state), action)
+    except Exception:
+        return None
+    return +(before - _leaders(after))
+
+
+def _teleport_chain_match(copts, ctx, batch, stats, state=None):
     """One chained army-move menu: the next un-consumed drag (from,to) picks
     the option; among same-(from,to) split variants the EXACT moved
     composition decides (the bare option IS the whole-army move â€” the split
-    grid excludes the full stack, so bare matches iff no split does)."""
+    grid excludes the full stack, so bare matches iff no split does).
+    `state` = the pending state the menu was read from (the Through a Day
+    and a Night route evidence consults the engine's walk-through
+    predicate on it)."""
     if ctx.get('_staged_army_plan') is not None:
         from rendered_staged_movement import match_plan
         return match_plan(copts, ctx)
@@ -11093,7 +13663,64 @@ def _teleport_chain_match(copts, ctx, batch, stats):
         return None, 'cardint_teleport_no_term'
     frm, to, leg1 = chains[ti]
     comp = _moved_group_composition(batch, frm, leg1)
-    exact = bare = None
+    # R2-E3-02 (decision D5, 2026-10-22): Through a Day and a Night offers
+    # one row per intermediate (via_region) when the routes differ in
+    # consequence.  A rendered two-hop drag frm -> leg1 -> to NAMES the
+    # route: only that intermediate's rows label it.
+    _vias9 = {_opt_region(a.params.get('choices', {}) or {}, 'via_region')
+              for _i, a in copts
+              if _opt_region(a.params.get('choices', {}) or {},
+                             'from_region') == frm
+              and _opt_region(a.params.get('choices', {}) or {},
+                              'to_region') == to}
+    _via9 = leg1 if leg1 != to and leg1 in _vias9 else None
+    # R3-EXTRACT-NAMED-ARMY-MATCH (E3-02 follow-up, 2026-10-23): the rows
+    # that move the human's composition are collected first (a full-army
+    # via row moves its route's legal pool, event_effects._tdaan_routes,
+    # which the border rule can make smaller than the army), then the route
+    # is chosen among THEIR intermediates.  A direct drag (leg1 == to) names
+    # no route; the walked-through settlement's control-marker gesture does
+    # (_tdaan_capture_gestures): one capturing gesture = that route; none =
+    # the walk that captures nothing, by the engine's own predicate
+    # (event_effects._tdaan_walk_effects) on the pending state.  A drag or a
+    # composition the marker contradicts, two capture gestures, or an
+    # absence the engine cannot resolve DROP (purity; the old
+    # first-row-in-sorted-order pick labelled routes the board never
+    # showed).  Rows without via_region (no route choice) are never
+    # filtered by route evidence.
+    _routes9 = {v for v in _vias9 if v is not None}
+    _full9 = _eff9 = None
+    if _routes9 and state is not None:
+        from event_effects import (_tdaan_routes, _tdaan_walk_effects,
+                                   _find_army_key, FP_NATIONS)
+        _eff9 = {v: _tdaan_walk_effects(state, v) for v in _routes9}
+        _src9 = state.armies.get(_find_army_key(state, frm))
+        _fpu9 = [u for u in (_src9.units if _src9 else [])
+                 if u.nation in FP_NATIONS]
+        # via -> the unit figures that route's full-army row moves
+        _full9 = {_m9: Counter(('unit', u.nation.name, u.kind.name)
+                               for u in _pool9)
+                  for _m9, _pool9, _l9 in _tdaan_routes(state, frm, to,
+                                                        _fpu9)}
+    # the human's moved unit figures, when consistent with the counts
+    _want9 = +Counter(comp.get('unit_keys') or {})
+    if sum(n for k, n in _want9.items() if k[2] == 'REGULAR') \
+            != comp['reg'] or \
+            sum(n for k, n in _want9.items() if k[2] == 'ELITE') \
+            != comp['elite']:
+        _want9 = None
+
+    def _full_row_moves_comp9(v):
+        pool = _full9.get(v)
+        if pool is None:
+            return False
+        if _want9 is not None:
+            return +pool == _want9
+        return (sum(n for k, n in pool.items() if k[2] != 'ELITE'),
+                sum(n for k, n in pool.items() if k[2] == 'ELITE')) \
+            == (comp['reg'], comp['elite'])
+
+    exact, bare = [], []
     for i, a in copts:
         ch = a.params.get('choices', {}) or {}
         if any(ch.get(k) for k in _TELEPORT_TERM_KEYS):
@@ -11101,14 +13728,148 @@ def _teleport_chain_match(copts, ctx, batch, stats):
         if _opt_region(ch, 'from_region') != frm or \
                 _opt_region(ch, 'to_region') != to:
             continue
+        _rv9 = _opt_region(ch, 'via_region')
         if ch.get('n_regular') is not None or ch.get('n_elite') is not None:
             if int(ch.get('n_regular') or 0) == comp['reg'] and \
-                    int(ch.get('n_elite') or 0) == comp['elite'] and \
-                    exact is None:
-                exact = i
-        elif bare is None:
-            bare = i
-    pick = exact if exact is not None else bare
+                    int(ch.get('n_elite') or 0) == comp['elite']:
+                exact.append((i, _rv9))
+        else:
+            bare.append((i, _rv9))
+    if _full9 is not None:
+        # a full-army via row moves its route's pool: it is a candidate
+        # exactly when that pool is the human's moved group (the split
+        # grid skips a composition a full-army route row already
+        # represents, so such a row can stand beside the split rows)
+        cands = sorted(exact + [(i, v) for i, v in bare if v is not None
+                                and _full_row_moves_comp9(v)]) \
+            or [(i, v) for i, v in bare if v is None]
+    else:
+        cands = exact or bare
+    if not cands:
+        return None, 'cardint_teleport_hop_unmatched'
+    # R4-TDAAN-SPLIT-UNIT-IDENTITY (D5 E3-02: WHICH units take the move is
+    # the FP's choice): a Through a Day and a Night split row may NAME its
+    # units ('unit_set', when several distinct unit sets fill its counts).
+    # A split row is the label only when the units it moves are the human's
+    # moved units: a unit_set row is read directly, and with the pending
+    # state every Through a Day and a Night split row's moved units are the
+    # ENGINE's answer (_card_move_row_units: the row applied to a clone).
+    # A named row the batch's figure identities cannot prove drops
+    # (_unproven); no row moving the human's units drops (_mismatch) - the
+    # old count match took the first row, which could move other figures.
+    _acts9n = dict(copts)
+    _split9 = [i for i, v in cands if (i, v) in exact]
+    _named9 = [i for i in _split9 if (_acts9n[i].params.get('choices')
+                                      or {}).get('unit_set') is not None]
+    if _named9 and _want9 is None:
+        return None, 'cardint_teleport_units_unproven'
+    if _split9 and _want9 is not None:
+        _badn9 = set()
+        for i in _split9:
+            _us9 = (_acts9n[i].params.get('choices') or {}).get('unit_set')
+            if _us9 is not None and +Counter(
+                    {tuple(r[:3]): int(r[3]) for r in _us9}) != _want9:
+                _badn9.add(i)
+                continue
+            # R4B-WOSES-SPLIT-ROWS: the Paths of the Woses split grid (one
+            # row per count, unit_set rows where several sets fill it) is
+            # proven by the engine the same way
+            if state is not None and _acts9n[i].params.get('card_id') in (
+                    'FREE_PEOPLES_Strategy_Through_a_Day_and_a_Night',
+                    'FREE_PEOPLES_Strategy_Paths_of_the_Woses'):
+                _mv9n, _why9n = _card_move_row_units(state, _acts9n[i], frm)
+                if _why9n is not None or _mv9n != _want9:
+                    _badn9.add(i)
+        cands = [(i, v) for i, v in cands if i not in _badn9]
+        if not cands:
+            return None, 'cardint_teleport_units_mismatch'
+    # R4-EXTRACT-COMBAT-ROUND-KEYS (c), R3-EXTRACT-NAMED-ARMY-MATCH FU3: a
+    # PLAIN full-army row (no via_region, no n_regular / n_elite) moves the
+    # source's whole legal pool (event_effects._direct_army_move, with the
+    # 1.222(b) border rule), which need not be the human's group: a split
+    # the menu has no row for (Paths of the Woses offered no split grid
+    # before R4B-WOSES-SPLIT-ROWS), a
+    # figure the border rule holds back (the pool's other figure), a drag
+    # the source army cannot hold.  It is the label only when the units it
+    # moves - the engine's answer, _card_move_row_units - are the human's
+    # moved units; otherwise drop (drop beats wrong).  Without the pending
+    # state the engine cannot be asked: unproven.
+    _plain9 = [(i, v) for i, v in cands if v is None and (i, v) in bare]
+    if _plain9:
+        if state is None:
+            return None, 'cardint_teleport_full_comp_unproven'
+
+        def _units_are_comp9(pool):
+            if _want9 is not None:
+                return +pool == _want9
+            return (sum(n for k, n in pool.items() if k[2] != 'ELITE'),
+                    sum(n for k, n in pool.items() if k[2] == 'ELITE')) \
+                == (comp['reg'], comp['elite'])
+        _acts9 = dict(copts)
+        _bad9, _refused9 = set(), False
+        for i, _v in _plain9:
+            moved9, why9 = _card_move_row_units(state, _acts9[i], frm)
+            if why9 == 'staged':
+                continue
+            if why9 is not None:
+                _refused9 = True
+                _bad9.add(i)
+            elif not _units_are_comp9(moved9):
+                _bad9.add(i)
+        cands = [(i, v) for i, v in cands if i not in _bad9]
+        if not cands:
+            return None, ('cardint_teleport_full_comp_unproven' if _refused9
+                          else 'cardint_teleport_full_comp_mismatch')
+    # R4B-WOSES-SPLIT-ROWS: a Paths of the Woses row (whole army or split)
+    # moves EVERY eligible Leader / Companion with its group
+    # (event_effects._direct_move_pick) - the menu has no row that leaves
+    # one behind.  A logged play that kept a Leader or Companion at the
+    # source therefore has no exact row: drop (purity; the units-only match
+    # would label a move the board never showed), never the nearest row.
+    _woses9 = [i for i, _v in cands if _acts9n[i].params.get('card_id')
+               == 'FREE_PEOPLES_Strategy_Paths_of_the_Woses']
+    if _woses9 and state is not None:
+        _wantl9 = +Counter(comp.get('leader_keys') or {})
+        _badl9 = {i for i in _woses9
+                  if _card_move_row_leaders(state, _acts9n[i], frm) != _wantl9}
+        cands = [(i, v) for i, v in cands if i not in _badl9]
+        if not cands:
+            return None, 'cardint_teleport_leaders_mismatch'
+    _cv9 = {v for _i, v in cands if v is not None}
+    _allowed9 = None
+    if _routes9:
+        _cap9 = _tdaan_capture_gestures(batch, _routes9,
+                                        ctx.get('play_title'))
+        if _eff9 is not None:
+            # a marker gesture where the walk captures nothing is no
+            # route evidence
+            _cap9 = {v for v in _cap9 if _eff9[v][0]}
+        if _via9 is not None and _cv9 and _via9 not in _cv9:
+            return None, 'cardint_teleport_route_conflict'
+        if len(_cv9) == 1:
+            # the moved composition admits one route only
+            if _cap9 and _cap9 != _cv9:
+                return None, 'cardint_teleport_route_conflict'
+        elif _cv9:
+            if _via9 is not None:
+                if _cap9 and _cap9 != {_via9}:
+                    return None, 'cardint_teleport_route_conflict'
+                _allowed9 = {_via9}
+            elif len(_cap9) > 1:
+                return None, 'cardint_teleport_route_ambiguous'
+            elif _cap9:
+                if not _cap9 <= _cv9:
+                    return None, 'cardint_teleport_route_conflict'
+                _allowed9 = set(_cap9)
+            elif _eff9 is None:
+                return None, 'cardint_teleport_route_unproven'
+            else:
+                _quiet9 = {v for v in _cv9 if not _eff9[v][0]}
+                if not _quiet9 or len({_eff9[v] for v in _quiet9}) != 1:
+                    return None, 'cardint_teleport_route_unproven'
+                _allowed9 = _quiet9
+    pick = next((i for i, v in cands
+                 if _allowed9 is None or v is None or v in _allowed9), None)
     if pick is None:
         return None, 'cardint_teleport_hop_unmatched'
     ctx['tm_i'] = ti + 1
@@ -11221,13 +13982,31 @@ def _palantir_deck_evidence(ctx, batch):
     return decks[0], None
 
 
-def _overstack_returns(batch):
+def _overstack_returns(batch, shadow_kills=False):
     """Counter{(region_san, NATION_KEY, 'regular'|'elite'): n} of the
     units the human sent from a region / stronghold box back to a
-    reinforcements zone this batch (the __overstack__ return gesture)."""
+    reinforcements zone this batch (the __overstack__ return gesture).
+    R4-EXTRACT-COVERAGE-DROPS (R3-EXTRACT-CORSAIRS-REBUILD FU2):
+    shadow_kills=True also reads 'kills <Shadow unit> in <region>' records -
+    the client's other rendering of a Shadow unit going back to its
+    reinforcements (2024-09-25 GoldOak v PouDaddy T8 L706 'kills group
+    ([2]Sauron Regular) in Dol Amroth': the Corsairs landing's pre-battle
+    trim).  Only for a window that holds no battle loss (the Corsairs trim
+    window, rendered_staged_movement.corsairs_trim_window); a Free Peoples
+    kill is a casualty, never a return."""
     import rendered_replay as rr
     out = Counter()
     for r in batch['records']:
+        if shadow_kills and r.get('op') == 'kill':
+            zk = rr.zone_kind(str(r.get('zone', '') or ''))
+            if zk[0] in ('region', 'stronghold'):
+                for raw in r.get('pieces') or []:
+                    for t in _group_tokens(str(raw)):
+                        p = rr.parse_piece(t)
+                        if (p and p[0] == 'unit'
+                                and _unit_side_str(p[1]) == 'SHADOW'):
+                            out[(zk[1], p[1], str(p[2]).lower())] += p[3]
+            continue
         if r.get('op') != 'move':
             continue
         fk = rr.zone_kind(r.get('from', ''))
@@ -11245,39 +14024,124 @@ def _mithril_redraw_evidence(ctx, batch):
     """(True | False, None) for the FP Mithril Coat and Sting decision on a
     card-drawn hunt tile: hunt-tile draws after the play (deck draws are
     not tiles) and the table card's exit from BoardN; (None, reason)
-    when the batch shows no tile at all."""
+    when the batch shows no tile at all.
+
+    R18-CORPUS row 5: 'a SECOND tile draw or the table card leaving
+    BoardN = redraw' read a Worn with Sorrow and Toil table discard after a
+    kept tile, and any second draw, as the redraw.  The decision is the
+    FIRST tile's, read by the shared rule (_mithril_redraw_choice)."""
     import rendered_replay as rr
     pl = _play_line(ctx, batch)
-    tiles = 0
-    left_table = False
+    tiles = []
+    records = []
     for r in batch['records']:
         if r.get('op') == 'turn':
             break
         ln = int(r.get('line', 0) or 0)
         if ln <= pl:
             continue
+        records.append(r)
         if r.get('op') == 'draw':
             what = str(r.get('what', '')).strip()
             if what.lower() in _DECK_CODE:
                 continue
             p = rr.parse_piece(what)
             if p and p[0] == 'tile':
-                tiles += 1
-            continue
-        pieces = []
-        if r.get('op') == 'move':
-            if _BOARD_DEST_RE.match(_zone_norm(r.get('from', ''))):
-                pieces = _group_tokens(str(r.get('obj', '')))
-        elif r.get('op') == 'kill':
-            if _BOARD_DEST_RE.match(_zone_norm(r.get('zone', ''))):
-                pieces = list(r.get('pieces') or [])
-        if any('mithril coat' in str(t).lower() for t in pieces):
-            left_table = True
-    if tiles == 0:
+                tiles.append((ln, what))
+    if not tiles:
         return None, 'cardint_mithril_no_tile'
-    if tiles >= 2 or left_table:
-        return True, None
-    return False, None
+    choice = _mithril_redraw_choice(records, tiles, 0, pl, 10 ** 9)
+    if isinstance(choice, str):
+        return None, 'cardint_' + choice
+    return choice, None
+
+
+def _mithril_board_moves(records, after_line):
+    """R18-CORPUS row 5: Mithril Coat and Sting's Board-slot transitions after
+    `after_line`, in line order: (line, True) onto a BoardN slot, (line,
+    False) off it (moved from its BoardN slot to any other zone, or killed).
+    Moving it into a Current card zone is how players spend it (the table
+    ledger counts those zones as table, so its kill-only reading misses the
+    common shape below)."""
+    out = []
+    for r in records:
+        ln = int(r.get('line') or 0)
+        if ln <= after_line:
+            continue
+        if r.get('op') == 'move':
+            if not any('mithril coat' in str(t).lower()
+                       for t in _group_tokens(str(r.get('obj', '')))):
+                continue
+            frm = bool(_BOARD_DEST_RE.match(_zone_norm(r.get('from', ''))))
+            to = bool(_BOARD_DEST_RE.match(_zone_norm(r.get('to', ''))))
+            if frm != to:
+                out.append((ln, to))
+        elif r.get('op') == 'kill':
+            if any('mithril coat' in str(t).lower() for t in r.get('pieces') or ()):
+                out.append((ln, False))
+    return sorted(out)
+
+
+def _mithril_redraw_choice(records, tiles, index, after_line, upper):
+    """R18-CORPUS row 5: the FP Mithril Coat and Sting decision on drawn tile
+    `index` of `tiles` ([(line, name)], line order), from the card leaving
+    its Board slot (card text: discard it 'to force him to replace the tile
+    just drawn ... then return the first tile to the Hunt Pool').
+
+    Returns True (redraw), False (kept) or a drop reason.  The card starts
+    on its Board slot; its last departure (it never comes back before
+    `upper`) is the discard:
+      - in this tile's window (before the next draw): redraw, which needs
+        that next draw - none is 'mithril_replacement_unproven' (a Worn
+        with Sorrow and Toil table discard after a kept tile, 2023-01-07
+        juakinaki/Spartako L888 tile, L891-L892 Spartako takes Mithril);
+      - in a later window that has its own next draw: this tile was kept;
+      - after the last draw: a redraw logged late only when this tile goes
+        back to the Hunt Pool after the next draw (2023-02-08 Magic Geek/
+        Chosen L709-L716), else 'mithril_unclosed_discard'.
+    Off its slot at the next draw but back later is 'mithril_unclosed_
+    discard'; already off at this tile is 'mithril_left_before_tile'.  The
+    common dialect - tile, card moved to a Current card zone, replacement
+    tile, first tile back to the pool, card killed (616 corpus kills) - is
+    a redraw."""
+    moves = _mithril_board_moves(records, after_line)
+
+    def on_board(line):
+        state = True
+        for ln, on in moves:
+            if ln >= line:
+                break
+            state = on
+        return state
+    lines = [int(ln) for ln, _name in tiles]
+    here = lines[index]
+    following = lines[index + 1] if index + 1 < len(lines) else None
+    if not on_board(here):
+        return 'mithril_left_before_tile'
+    if on_board(upper):
+        if following is not None and not on_board(following):
+            return 'mithril_unclosed_discard'
+        return False
+    start = None
+    for ln, on in moves:
+        if ln >= upper:
+            break
+        if not on and start is None:
+            start = ln
+        elif on:
+            start = None
+    window = max(k for k, ln in enumerate(lines) if ln < start)
+    if window == index:
+        return True if following is not None else 'mithril_replacement_unproven'
+    if window < len(lines) - 1:
+        return False
+    name = str(tiles[index][1]).strip().lower()
+    returned = any(r.get('op') == 'move' and int(r.get('line') or 0) > following
+                   and str(r.get('to', '')).strip().lower() == 'hunt pool'
+                   and any(str(t).strip().lower() == name
+                           for t in _group_tokens(str(r.get('obj', ''))))
+                   for r in records)
+    return True if returned else 'mithril_unclosed_discard'
 
 
 def _fuzzy_interior_match(copts, ctx, card_lname, batch, stats):
@@ -11430,14 +14294,74 @@ def _battle_leadership(st, atk, dfn, atk_str):
     return out
 
 
+def _commit_owner_tag(cid, origin, dest):
+    """R17-CORPUS-EXTRACT row 2: 'fp' / 'sh', the side that OWNS a card
+    moved into a Current-card slot.  VASSAL players often stage their own
+    card in the opponent's Current slot (42,434 'from Shadow Hand ... to
+    Current FP Card' corpus moves, 14,141 the other way; 2023-02-06
+    SolidSnake/Amroth L311 Rage of the Dunlendings/Relentless Assault ->
+    Current FP Card in a Shadow siege), so the destination alone names the
+    wrong side.  The registry id's side prefix names the owner; an
+    unresolved title falls back to the hand zone it left, then to the
+    destination slot."""
+    s = str(cid or '')
+    if s.startswith('FREE_PEOPLES_'):
+        return 'fp'
+    if s.startswith('SHADOW_'):
+        return 'sh'
+    origin = _zone_norm(origin)
+    if origin in (_HAND_ZONE_FP, _HAND_ZONE_SH):
+        return 'fp' if origin == _HAND_ZONE_FP else 'sh'
+    dest = str(dest or '').lower()
+    return 'fp' if ('fp' in dest or 'free' in dest) else 'sh'
+
+
+def _combat_cards_by_owner(batch):
+    """R17-CORPUS-EXTRACT row 2: rendered_census._combat_cards (the last
+    '/'-titled card moved into a Current-card slot, per side) keyed by the
+    card's OWNER (_commit_owner_tag), never by the slot it was dropped into:
+    (attacker_card_id, defender_card_id).  The census reader read 2023-02-09
+    RompSteel/P0404 L200 Kindred of Glorfindel, Free Peoples Hand -> Current
+    SA Card, as the Shadow attacker's card, and _emit_chat_battle stored an
+    FP 'decline' row.  R18-CORPUS row 32: rendered_census._combat_cards (the
+    census combat drive's cards) now reads this function too."""
+    import rendered_census as rc
+    lk = rc._card_lookup()
+    found = {'fp': None, 'sh': None}
+    for r in batch['records']:
+        if r.get('op') != 'move':
+            continue
+        to = str(r.get('to', '')).lower()
+        if 'card' not in to or 'current' not in to:
+            continue
+        title = r.get('obj', '')
+        if '/' not in str(title):
+            continue
+        cid = rc._lookup_cid(lk, title)
+        if cid is None:
+            continue
+        found[_commit_owner_tag(cid, r.get('from'), to)] = cid
+    if batch.get('die_side') == 'SHADOW':
+        return found['sh'], found['fp']
+    return found['fp'], found['sh']
+
+
 def _round_cards(batch, wins):
-    """Per-round combat-card commits keyed by CURRENT-slot side: cards[r] =
-    {'fp': cid|None, 'sh': cid|None}.  A play is round r's commit iff its
-    line sits after round r-1's last chunk and before round r's first chunk
-    (pre-roll commitment order).  Returns (cards, n_unassigned)."""
+    """Per-round combat-card commits keyed by the card OWNER's side
+    (_commit_owner_tag; R17-CORPUS-EXTRACT row 2 - never the Current slot it
+    was dropped into): cards[r] = {'fp': cid|None, 'sh': cid|None}.  A play
+    is round r's commit iff its line sits after round r-1's last chunk and
+    before round r's first chunk (pre-roll commitment order).  Returns
+    (cards, n_unassigned, sides with an unassigned play)."""
     import rendered_census as rc
     from rendered_event_battle import funded_event_line
     help_event_line = funded_event_line(batch)
+    # R4-EXTRACT-EVENT-BATTLE-CLAIMS (a): the Event-die battle-opening play
+    # (The Ringwraiths are Abroad, The Black Captain Commands, Corsairs, The
+    # Fighting Uruk-hai closing after the roll) is the event, never the
+    # round-1 Words of Power / Foul Stench / Deadly Strife / Onslaught
+    _evd9 = _event_die_battle_exit(batch)
+    event_die_line = _evd9[0] if _evd9 else None
     lk = rc._card_lookup()
     cards = [{'fp': None, 'sh': None} for _ in wins]
     anom = 0
@@ -11447,6 +14371,9 @@ def _round_cards(batch, wins):
     # as a combat card. Bind only its initiating action, never every copy
     # of that title or every card killed before a roll. The native event
     # protocol commits the staged die before the battle's first roll.
+    # Either Current slot qualifies: commits are filed by the card's owner
+    # (_commit_owner_tag), so a Shadow event dropped into Current FP Card
+    # would otherwise read as the Shadow's round-1 combat card.
     siege_event_line = uncertain_siege_event_line = None
     event_faces = {
         'SHADOW_Character_Grond_Hammer_of_the_Underworld': {'C', 'P'},
@@ -11481,12 +14408,11 @@ def _round_cards(batch, wins):
                         cid = rc._lookup_cid(lk, play.get('obj', ''))
                         if (face in event_faces.get(cid, ())
                                 and play.get('player') in (actor, 'auto')
-                                and _zone_norm(play.get('from')) == 'shadow hand'
-                                and _zone_norm(play.get('to')) == 'current sa card'):
+                                and _zone_norm(play.get('from')) == 'shadow hand'):
                             discarded = [r for r in prefix if r.get('op') == 'kill'
                                 and play['line'] < r.get('line', 0) <= closed
                                 and r.get('player') == actor
-                                and _zone_norm(r.get('zone')) in ('current action', 'current sa card')
+                                and _zone_norm(r.get('zone')) in ('current action', _zone_norm(play.get('to')))
                                 and any(rc._lookup_cid(lk, str(p).removeprefix('[1]').strip()) == cid
                                         for p in r.get('pieces', ()))]
                             returned = any(r.get('op') in ('undo', 'redo') or (r.get('op') == 'move'
@@ -11509,6 +14435,26 @@ def _round_cards(batch, wins):
         if r.get('op') == 'move' and '/' in str(r.get('obj', '')) \
                 and str(r.get('to', '')).startswith('Board'):
             _table_titles.add(str(r.get('obj', '')))
+    # R3-EXTRACT-CORSAIRS-REBUILD: a title that only TRANSITED a Board slot
+    # (not on it at the first roll, no event evidence: _table_play_on_board)
+    # is a combat card - the move that put it into a Current-card slot
+    # before the roll is its commit (2023-03-31 SolidSnake T11 L1224:
+    # Deadly Strife Board6 -> Current SA Card).  Later moves of it stay out.
+    _misdrop_lines = set()
+    _first_roll9 = min((int(r.get('line') or 0) for r in batch['records']
+                        if r.get('op') == 'roll_num'), default=None)
+    if _first_roll9 is not None:
+        for _t9 in _table_titles:
+            if _table_play_on_board(batch, _t9):
+                continue
+            _pre9 = sorted((r for r in batch['records']
+                            if r.get('op') == 'move'
+                            and str(r.get('obj', '')) == _t9
+                            and int(r.get('line') or 0) < _first_roll9),
+                           key=lambda r: int(r.get('line') or 0))
+            if _pre9 and 'current' in str(_pre9[-1].get('to', '')).lower() \
+                    and 'card' in str(_pre9[-1].get('to', '')).lower():
+                _misdrop_lines.add(_pre9[-1].get('line', 0))
     for r in batch['records']:
         if r.get('op') != 'move':
             continue
@@ -11518,11 +14464,14 @@ def _round_cards(batch, wins):
         title = r.get('obj', '')
         if '/' not in str(title):
             continue
-        if str(title) in _table_titles:
+        if str(title) in _table_titles \
+                and r.get('line', 0) not in _misdrop_lines:
             continue
         line = r.get('line', 0)
         if line == help_event_line or line == siege_event_line:
             continue
+        if event_die_line is not None and line == event_die_line:
+            continue                # R4-EXTRACT-EVENT-BATTLE-CLAIMS (a)
         if line == uncertain_siege_event_line:
             anom += 1
             anom_slots.add('sh')
@@ -11534,7 +14483,8 @@ def _round_cards(batch, wins):
             if prev_last < line < w['first']:
                 ridx = j
                 break
-        slot = 'fp' if ('fp' in to or 'free' in to) else 'sh'
+        cid = rc._lookup_cid(lk, title)
+        slot = _commit_owner_tag(cid, r.get('from'), to)
         if ridx is None:
             # pass 2 (T9 Grond): a leading attacker-only pseudo chunk
             # (WCtK post roll) can open a window EARLY, displacing the
@@ -11553,15 +14503,58 @@ def _round_cards(batch, wins):
             anom += 1                      # post-roll play: not a commit
             anom_slots.add(slot)
             continue
-        cid = rc._lookup_cid(lk, title)
         if cid is None:
             anom += 1
             anom_slots.add(slot)
         else:
             commits.setdefault((ridx, slot), []).append(
                 (cid, line, '(chosen)' in str(r.get('from', '')).lower()))
+    # R2-TR-test-audit0829-DFX: VASSAL lets a player take a revealed combat
+    # card back ('Current FP Card -> Free Peoples Hand' / 'Current SA Card
+    # -> Shadow Hand'; the object is the masked card back, no '/') and
+    # commit another one before the roll (VAYZE T7: Entmoot '(chosen)' ->
+    # back -> A Power Too Great; DoctorBoson T10: Orcs Multiplying Again ->
+    # back -> Many Kings).  A retraction after the slot's earliest commit
+    # and before the next roll voids every commit up to it: exactly one
+    # distinct card committed after it and before that roll binds,
+    # '(chosen)' or not; none or several mark the slot ambiguous +
+    # retracted (drive drop cc_commit_retracted) - never the retracted
+    # card, never a guessed decline.  A commit after that roll (a later
+    # round the segmenter folded into this window: DoctorBoson T10's
+    # round-2 Orcs Multiplying Again) never stands in for the
+    # replacement.  Matched on the zone pair only (I3: attribution by
+    # zone, never by nick).  R17-CORPUS-EXTRACT row 2: either Current slot
+    # back to the OWNER's hand (a card staged in the opponent's slot is
+    # taken back from there).
+    _retract_zones = {'fp': _HAND_ZONE_FP, 'sh': _HAND_ZONE_SH}
+    _roll_lines = sorted(int(c.get('line', 0) or 0)
+                         for c in batch.get('rng', ())
+                         if c.get('kind') == 'roll_num')
     for (ridx, slot), observed in commits.items():
         if cards[ridx].get(slot + '_ambiguous'):
+            continue
+        _lo = min(entry[1] for entry in observed)
+        _hi = next((ln for ln in _roll_lines if ln > _lo), 10 ** 9)
+        if _lo < wins[ridx]['first']:
+            _hi = min(_hi, wins[ridx]['first'])
+        _dst = _retract_zones[slot]
+        _retracts = [int(r.get('line', 0) or 0) for r in batch['records']
+                     if r.get('op') == 'move'
+                     and _lo < int(r.get('line', 0) or 0) < _hi
+                     and _zone_norm(r.get('from')) in _PLAY_AREA_DEST
+                     and _zone_norm(r.get('to')) == _dst]
+        if _retracts:
+            _later = [entry for entry in observed
+                      if max(_retracts) < entry[1] < _hi]
+            if len({entry[0] for entry in _later}) != 1:
+                anom += 1
+                anom_slots.add(slot)
+                cards[ridx][slot + '_ambiguous'] = True
+                cards[ridx][slot + '_retracted'] = True
+                continue
+            cid, line, _ = _later[0]
+            cards[ridx][slot] = cid
+            cards[ridx][slot + '_ln'] = line
             continue
         # The client's revealed chosen card identifies its combat commit.
         # A prior Event can occupy the same Current slot before the battle.
@@ -11577,6 +14570,21 @@ def _round_cards(batch, wins):
         cards[ridx][slot] = cid
         cards[ridx][slot + '_ln'] = line
     return cards, anom, anom_slots
+
+
+def _first_commit_line(cards, r, lo, hi):
+    """R2-RS-C3-02: the first combat-card commit line of 0-based round `r`
+    (a _round_cards entry's fp_ln / sh_ln) inside the open line interval
+    (lo, hi), else `hi`.  Every decision that precedes round r's card
+    commit (round r-1's press / continue / retreat, round r's own card
+    choices) is reconstructed from the gestures BEFORE this line: a
+    Relentless Assault-family card parks its pre-roll self-hits after its
+    commit (ruling 1.9 'Before the Combat roll'; combat.
+    apply_relentless_assault), never as a loss of the round before."""
+    if not 0 <= r < len(cards):
+        return hi
+    lines = [cards[r].get(key) for key in ('fp_ln', 'sh_ln')]
+    return min([hi] + [ln for ln in lines if ln and lo < ln < hi])
 
 
 def _combat_commit_board_matches(state, batch, line):
@@ -11627,18 +14635,20 @@ def _confirmed_current_casualty(record, batch):
     return True
 
 
-def _apply_window_casualties(st, batch, regs, upto_line):
+def _apply_window_casualties(st, batch, regs, upto_line, skip=()):
     """Brute-apply casualty gestures (kills / parked-to-cas moves /
     downgrade replacement returns) with line < upto_line to the recon
     state's battle-region armies - a mirror-derived MID-BATTLE state for
     the gesture-driven round emitter (menus only need honest unit
-    counts)."""
+    counts).  `skip` = records (by identity) left unapplied: a siege
+    press payment made AFTER the decision being reconstructed (C3-02)."""
     import rendered_replay as rr
     import combat as _cmb
     import game_state as gs
+    _skip_ids = {id(s) for s in skip}
     for r in batch['records']:
         ln = r.get('line', 0)
-        if ln >= upto_line:
+        if ln >= upto_line or id(r) in _skip_ids:
             continue
         toks, reg = [], None
         if r.get('op') == 'kill':
@@ -11653,7 +14663,11 @@ def _apply_window_casualties(st, batch, regs, upto_line):
             if fk[0] in ('region', 'stronghold') and fk[1] in regs \
                     and (tk[0] == 'cas'
                          or (tk[0] == 'reinf' and upto_line > 0)
-                         or ('current' in str(r.get('to', '')).lower()
+                         or (('current' in str(r.get('to', '')).lower()
+                              # R4B-OFFBOARD-SLOT-RECOGNIZERS: or an off-
+                              # board zone (Victory Points N) - proven by
+                              # its cleanup exactly like a Current slot
+                              or tk[0] == 'offboard')
                              and _confirmed_current_casualty(r, batch))):
                 # kills-as-returns dialect: region->REINF inside the
                 # battle = a casualty (GAME19 MM garrison)
@@ -11663,6 +14677,21 @@ def _apply_window_casualties(st, batch, regs, upto_line):
                     tk[0] in ('region', 'stronghold') and tk[1] in regs:
                 # replacement Regular return (downgrade completion)
                 _k2, _a2 = _cmb._army_entry(st, tk[1])
+                # R2-RS-C6-01: a compound 'reinforcements(R)/casualties(C)'
+                # origin (zone_kind calls it 'reinf') takes C figures out of
+                # the FP casualty box - the same shared allocation the
+                # Mirror applies (rr.compound_casualty_plan), so this window
+                # agrees with the next snapshot.  A share the box cannot
+                # supply fails loudly, like the pure-box branch below.
+                _mcp2 = rr._COMPOUND_POOL_RE.match(str(r.get('from') or ''))
+                if _mcp2 and _a2 is not None:
+                    _plan2, _left2, _fp2 = rr.compound_casualty_plan(
+                        r.get('obj', ''), int(_mcp2.group(2)),
+                        lambda _n, _k: (st.fp_casualties.get(gs.Nation[_n]) or {}).get(_k, 0))
+                    if _fp2 and _left2 > 0:
+                        raise ValueError('compound replacement missing FP casualty figure')
+                    for _n2, _k2c, _c2 in _plan2:
+                        st.fp_casualties[gs.Nation[_n2]][_k2c] -= _c2
                 for t in _group_tokens(r.get('obj', '')):
                     p = rr.parse_piece(t)
                     if p and p[0] == 'unit' and p[2] == 'REGULAR' \
@@ -11675,6 +14704,18 @@ def _apply_window_casualties(st, batch, regs, upto_line):
                                     raise ValueError('recovery replacement missing FP casualty figure')
                                 st.fp_casualties[nation]['regular'] -= 1
                             _a2.units.append(gs.Unit(nation, gs.UnitKind.REGULAR))
+                    elif _mcp2 and _a2 is not None and p and (
+                            (p[0] == 'unit' and p[2] == 'ELITE') or p[0] == 'leader'):
+                        # R3-EXTRACT-FIGURE-LEDGER: a compound drag places
+                        # every figure it names (the Mirror adds them all);
+                        # the box share above already took Elites / Leaders
+                        # out of fp_casualties, so they join the army too
+                        for _ in range(p[3]):
+                            nation = gs.Nation[p[1]]
+                            if p[0] == 'leader':
+                                _a2.leaders.append(gs.Leader(nation))
+                            else:
+                                _a2.units.append(gs.Unit(nation, gs.UnitKind.ELITE))
                 continue
             elif fk[0] == 'region' and fk[1] not in regs \
                     and tk[0] in ('region', 'stronghold') \
@@ -11758,6 +14799,56 @@ class _CasualtyGestureError(ValueError):
     """The rendered record cannot establish an exact casualty decision."""
 
 
+def _offboard_parking_cleared(records, line, end, parked_at, pieces, cleanup_used):
+    """R4B-OFFBOARD-SLOT-RECOGNIZERS: True when the owner's figures parked
+    at `line` on the off-board zone `parked_at` (zone_kind 'offboard': a
+    Victory Points box, a deck, ...) are all killed later in (line, end) -
+    in that zone, or in a Current slot after being moved on to it - before
+    any of them is dragged from that zone or a Current slot back onto the
+    board.  The Current-card rule of _casualty_gesture_operations, with one
+    difference: a parking that crosses back or is never cleaned up is not a
+    refused loss but no loss at all (the corpus drags armies over the
+    Victory Points track: region -> 'Victory Points N' -> region).  Kills
+    are consumed from the shared `cleanup_used` only when the parking is
+    cleared, so a kill confirms one parked figure at most."""
+    import rendered_replay as rr
+    outstanding = Counter(pieces)
+    if not outstanding:
+        return False
+    used = Counter()
+
+    def _slot(zone):
+        text = str(zone or '').strip().lower()
+        return text == parked_at or 'current' in text
+
+    for later in records:
+        if not line < later.get('line', 0) < end:
+            continue
+        if later.get('op') == 'move' and _slot(later.get('from', '')):
+            moved = [rr.parse_piece(t) for t in _group_tokens(later.get('obj', ''))]
+            if any(p and p[0] == 'unit' and outstanding.get((p[1], p[2]), 0) > 0 for p in moved):
+                if rr.zone_kind(later.get('to', ''))[0] in ('region', 'stronghold'):
+                    return False
+        if later.get('op') != 'kill' or not _slot(later.get('zone', '')):
+            continue
+        cleanup = Counter()
+        for raw in later.get('pieces') or []:
+            for token in _group_tokens(str(raw)):
+                piece = rr.parse_piece(token)
+                if piece and piece[0] == 'unit':
+                    cleanup[(piece[1], piece[2])] += int(piece[3])
+        for figure, count in cleanup.items():
+            if outstanding.get(figure, 0) > 0:
+                key = (later.get('line', 0), *figure)
+                take = min(outstanding[figure], max(0, count - cleanup_used[key] - used[key]))
+                outstanding[figure] -= take
+                used[key] += take
+        if all(count <= 0 for count in outstanding.values()):
+            cleanup_used.update(used)
+            return True
+    return False
+
+
 def _casualty_gesture_operations(batch, owner, regs, lo, hi, *, with_evidence_end=False,
                                  cleanup_hi=None):
     """Ordered physical loss evidence; no nation or within-group order guesses.
@@ -11774,6 +14865,7 @@ def _casualty_gesture_operations(batch, owner, regs, lo, hi, *, with_evidence_en
         if not lo <= line < hi:
             continue
         tokens, direction, staged = [], None, False
+        parked_at = None    # R4B-OFFBOARD-SLOT-RECOGNIZERS
         if record.get('op') == 'kill':
             zone = rr.zone_kind(str(record.get('zone', '') or ''))
             if zone[0] in ('region', 'stronghold') and zone[1] in regs:
@@ -11788,6 +14880,13 @@ def _casualty_gesture_operations(batch, owner, regs, lo, hi, *, with_evidence_en
                     direction = 'loss'
                 elif 'current' in str(record.get('to', '')).lower():
                     direction, staged = 'loss', True
+                elif dest[0] == 'offboard':
+                    # R4B-OFFBOARD-SLOT-RECOGNIZERS: parked on an off-board
+                    # zone (2024-08-29 buondiavolo L740 'Victory Points 5',
+                    # killed there L743) - a loss only once its cleanup is
+                    # proven below
+                    direction = 'loss'
+                    parked_at = str(record.get('to', '')).strip().lower()
             elif origin[0] in ('cas', 'reinf') and dest[0] in ('region', 'stronghold') and dest[1] in regs:
                 direction = 'replacement'
             if direction:
@@ -11799,6 +14898,14 @@ def _casualty_gesture_operations(batch, owner, regs, lo, hi, *, with_evidence_en
             piece = rr.parse_piece(token)
             if piece and piece[0] == 'unit' and _unit_side_str(piece[1]) == owner:
                 pieces.extend([(piece[1], piece[2])] * int(piece[3]))
+        if parked_at is not None and not _offboard_parking_cleared(
+                records, line, hi if cleanup_hi is None else cleanup_hi,
+                parked_at, pieces, cleanup_used):
+            # R4B-OFFBOARD-SLOT-RECOGNIZERS: an off-board drop that crosses
+            # back to the board (a drag over the Victory Points track) or
+            # is never cleaned up is no loss - the reading these records
+            # had before R4 named the zone
+            continue
         if len(set(pieces)) > 1 and not (direction == 'loss' and all(kind == 'REGULAR' for _, kind in pieces)):
             raise _CasualtyGestureError('group_order_ambiguous')
         if staged and pieces:
@@ -11843,6 +14950,28 @@ def _casualty_gesture_operations(batch, owner, regs, lo, hi, *, with_evidence_en
     result, index = [], 0
     while index < len(events):
         event = events[index]
+        # R4-EXTRACT-COVERAGE-DROPS (R3-EXTRACT-CORSAIRS-REBUILD FU5): a GROUP
+        # swap - one record losing N Elites of a nation next to one record
+        # placing N Regulars of that nation (either order) - is N Elite
+        # reductions.  The single-pair rule below read '[2]Sauron Elite'
+        # killed + '[2]Sauron Regular' placed (2023-03-02 Isildur v
+        # Redscare68 T7 L657-658) as loss, reduce, unpaired replacement.
+        # Equal counts only: unequal runs stay the literal reading below.
+        run = 1
+        while (index + run < len(events)
+               and events[index + run][:3] == event[:3]):
+            run += 1
+        if run >= 2 and event[2] in ('loss_elite', 'replacement'):
+            other = 'replacement' if event[2] == 'loss_elite' else 'loss_elite'
+            tail = events[index + run:index + 2 * run]
+            if (len(tail) == run and all(t[:3] == tail[0][:3] for t in tail)
+                    and tail[0][1] == event[1] and tail[0][2] == other
+                    and (index + 2 * run == len(events)
+                         or events[index + 2 * run][:3] != tail[0][:3])):
+                result.extend([(event[0], event[1], 'reduce_elite') +
+                               ((tail[0][0],) if with_evidence_end else ())] * run)
+                index += 2 * run
+                continue
         if index + 1 < len(events):
             after = events[index + 1]
             if event[1] == after[1] and {event[2], after[2]} == {'loss_elite', 'replacement'}:
@@ -11947,11 +15076,122 @@ def _drive_card_casualty_gestures(state, events):
     return current, rows
 
 
-def _drive_casualty_gestures(state, side, events, *, known_hits=True):
+class _RetreatTrimTail:
+    """R17-CORPUS-EXTRACT row 12: the defender's siege trim inside a round
+    window that ends with its retreat into its own Stronghold.
+
+    The trim (the garrison above game_logic.MAX_SIEGE_UNITS dragged back to
+    REINFORCEMENTS, ruling 2026-07-20) is the same physical gesture as a
+    casualty drag (region or box -> Reinforcements / Casualties) and lies in
+    the same last round window, so the defender's casualty events read it
+    as extra losses: the drive's allocation raised extra_owner_losses and
+    the defender's casualty_alloc and siege_trim rows were lost.  In the
+    engine the trim opens only after the retreat (and the attacker's
+    advance), so it is the TAIL of the owner's removals (C3-07,
+    _fought_trim_tail).  A tail is accepted as the trim only when every
+    event is a whole-unit loss carried by such a drag and its size is
+    exactly the engine's excess once the allocation is complete; `excess`
+    then records it for the recovery rows."""
+
+    def __init__(self, batch, region, side_str, lo, hi):
+        import rendered_replay as rr
+        self.excess = None
+        self.lines = set()
+        for r in batch['records']:
+            line = int(r.get('line', 0) or 0)
+            if r.get('op') != 'move' or not lo <= line < hi:
+                continue
+            fk = rr.zone_kind(r.get('from', ''))
+            tk = rr.zone_kind(r.get('to', ''))
+            if (fk[0] in ('region', 'stronghold') and fk[1] == region
+                    and tk[0] in ('reinf', 'cas')
+                    and any(p and p[0] == 'unit'
+                            and _unit_side_str(p[1]) == side_str
+                            for p in (rr.parse_piece(t) for t in
+                                      _group_tokens(r.get('obj', ''))))):
+                self.lines.add(line)
+
+    @classmethod
+    def of_window(cls, batch, region, side_str, lo, hi):
+        """The trim reader of a window whose defender retreats into its
+        Stronghold, else None."""
+        if _window_retreat(batch, region, side_str, lo, hi)[0] != 'siege':
+            return None
+        return cls(batch, region, side_str, lo, hi)
+
+    def __call__(self, state, region, side, leftover):
+        import ai
+        import game_logic
+        if not leftover or any(event[2] not in ('loss_regular', 'loss_elite')
+                               or event[0] not in self.lines
+                               for event in leftover):
+            return False
+        garrison = ai._alloc_side_units(state, region, side)
+        if len(leftover) != len(garrison) - game_logic.MAX_SIEGE_UNITS:
+            return False
+        self.excess = len(leftover)
+        return True
+
+
+def _trim_tail_records(batch, region, side_str, excess, lo, hi):
+    """R17-CORPUS-EXTRACT row 12: the records carrying the LAST `excess`
+    defender units removed from `region` (or its box) in [lo, hi) - the
+    siege trim, by _fought_trim_tail's reading - as whole records, so a
+    decision that precedes the trim can leave them unapplied
+    (_apply_window_casualties skip=).  None when a record would split
+    between casualties and trim."""
+    import rendered_replay as rr
+    removals = []
+    for r in sorted(batch['records'], key=lambda rec: rec.get('line', 0)):
+        line = int(r.get('line', 0) or 0)
+        if r.get('op') != 'move' or not lo <= line < hi:
+            continue
+        fk = rr.zone_kind(r.get('from', ''))
+        tk = rr.zone_kind(r.get('to', ''))
+        if fk[0] not in ('region', 'stronghold') or fk[1] != region \
+                or tk[0] not in ('reinf', 'cas'):
+            continue
+        n = 0
+        for t in _group_tokens(r.get('obj', '')):
+            p = rr.parse_piece(t)
+            if p and p[0] == 'unit' and _unit_side_str(p[1]) == side_str:
+                n += int(p[3])
+        if n:
+            removals.append((r, n))
+    picked, need = [], int(excess)
+    for r, n in reversed(removals):
+        if need <= 0:
+            break
+        if n > need:
+            return None
+        picked.append(r)
+        need -= n
+    return picked if need == 0 else None
+
+
+def _window_trim_skip(batch, region, side_str, lo, hi, excess):
+    """R17-CORPUS-EXTRACT row 12: the trim records a recovery row that
+    precedes a retreat-into-siege trim leaves unapplied.  () when the window
+    holds no defender drag that could be the trim or the proved excess is 0;
+    None when the trim is unproven (no allocation proved its size, or a
+    record splits between casualties and trim)."""
+    tail = _RetreatTrimTail(batch, region, side_str, lo, hi)
+    if not tail.lines or excess == 0:
+        return ()
+    if excess is None:
+        return None
+    return _trim_tail_records(batch, region, side_str, excess, lo, hi)
+
+
+def _drive_casualty_gestures(state, side, events, *, known_hits=True,
+                             trim_tail=None):
     """Follow literal operations and validate engine-forced tails atomically.
 
     Returns final state and predecision (state, menu, chosen index) rows.
     Callers emit rows only after the complete owner sequence validates.
+    `trim_tail` (R17-CORPUS-EXTRACT row 12, a _RetreatTrimTail): once the
+    owner's allocation is complete, a remaining tail it accepts is the
+    retreat's siege trim, not an extra loss.
     """
     import ai
     from rendered_casualty_groups import consume as consume_group, annotate
@@ -11978,6 +15218,9 @@ def _drive_casualty_gestures(state, side, events, *, known_hits=True):
     while cursor < len(events):
         pc = current.pending_combat or {}
         if pc.get('phase') != 'casualty_allocation' or pc.get('deciding_side') != side or pc.get('alloc_stage') != stage:
+            if trim_tail is not None and trim_tail(current, region, side,
+                                                   events[cursor:]):
+                break               # R17-CORPUS-EXTRACT row 12: the trim
             raise _CasualtyGestureError('extra_owner_losses')
         hits = int(pc.get('atk_hits' if stage == 'attacker' else 'def_hits', 0))
         event = events[cursor]
@@ -12078,6 +15321,91 @@ def _drive_onslaught_ordinary_prefix(state, batch, regs, lo, post_line):
     return current, rows, boundary
 
 
+def _side_unit_gestures(batch, regs, after_line, hi, side_str):
+    """R2-RS-C3-05: yield (kind, own_units) for each record after
+    `after_line` and before `hi` that moves or kills units of `side_str` in
+    the battle regions, in line order.  kind: 'replacement' (casualties /
+    reinforcements -> battle region), 'removal' (a kill in a battle region,
+    or battle region -> casualties / reinforcements), 'other'."""
+    import rendered_replay as rr
+    for record in sorted(batch.get('records', ()), key=lambda r: int(r.get('line', 0))):
+        line = int(record.get('line', 0))
+        if not after_line < line < hi:
+            continue
+        op = record.get('op')
+        if op == 'kill':
+            zone = rr.zone_kind(str(record.get('zone', '') or ''))
+            if zone[0] not in ('region', 'stronghold') or zone[1] not in regs:
+                continue
+            pieces = [rr.parse_piece(token) for text in (record.get('pieces') or ())
+                      for token in _group_tokens(str(text))]
+            kind = 'removal'
+        elif op == 'move':
+            origin = rr.zone_kind(record.get('from', ''))
+            target = rr.zone_kind(record.get('to', ''))
+            if origin[1] not in regs and target[1] not in regs:
+                continue
+            pieces = [rr.parse_piece(token) for token in _group_tokens(record.get('obj', ''))]
+            if (origin[0] in ('cas', 'reinf')
+                    and target[0] in ('region', 'stronghold') and target[1] in regs):
+                kind = 'replacement'
+            elif (origin[0] in ('region', 'stronghold') and origin[1] in regs
+                    and target[0] in ('cas', 'reinf')):
+                kind = 'removal'
+            else:
+                kind = 'other'
+        else:
+            continue
+        own = [tuple(p) for p in pieces
+               if p and p[0] == 'unit' and _unit_side_str(p[1]) == side_str]
+        if own:
+            yield kind, own
+
+
+def _cleanup_replacement_refusal(batch, regs, last_line, decision_hi, side_str,
+                                 elites_at_last):
+    """R2-RS-C3-05: why the commuting cleanup's reading of one side's losses
+    is unproven, else None.  `last_line` = the line of that side's last
+    removal the cleanup costed (its next unit gesture is necessarily after
+    the cleanup's boundary), `elites_at_last` = {nation: Elites removed
+    there as 2-hit eliminations}.  Only that side's NEXT unit gesture
+    before `decision_hi` (the battle's decision evidence) is read; when it
+    brings units back from casualties / reinforcements:
+      - Regulars of a Nation with an Elite removed at `last_line`: those
+        Elites were DOWNGRADED (1 hit each), not eliminated ->
+        'commuting_cleanup_elite_downgrade', unless the board is the same:
+        r <= the Elites of that Nation, Regulars of that Nation only, and
+        the side's next gesture removes exactly r Regulars of that Nation
+        only (r downgrades + r Regular losses = the eliminations' hits and
+        board);
+      - anything else is a take-back of a loss the cleanup counted (the
+        player corrected the allocation) -> 'commuting_cleanup_takeback'.
+    Either way the cleanup's board is not the board the decisions after it
+    were taken on, although the round's hit counts can still agree."""
+    gestures = _side_unit_gestures(batch, regs, last_line, decision_hi, side_str)
+    first = next(gestures, None)
+    if first is None or first[0] != 'replacement':
+        return None
+    nations = {p[1] for p in first[1] if p[2] == 'REGULAR' and elites_at_last.get(p[1])}
+    if not nations:
+        return 'commuting_cleanup_takeback'
+    if len(nations) == 1:
+        nation = next(iter(nations))
+
+        def regulars_of_nation_only(units):
+            if any(p[1] != nation or p[2] != 'REGULAR' for p in units):
+                return None
+            return sum(int(p[3]) for p in units)
+
+        replaced = regulars_of_nation_only(first[1])
+        second = next(gestures, None)
+        if (replaced is not None and 0 < replaced <= elites_at_last[nation]
+                and second is not None and second[0] == 'removal'
+                and regulars_of_nation_only(second[1]) == replaced):
+            return None
+    return 'commuting_cleanup_elite_downgrade'
+
+
 def _drive_commuting_ordinary_cleanup(state, batch, regs, lo, hi):
     """Recover a later decision after reversed, independent direct removals.
 
@@ -12155,6 +15483,37 @@ def _drive_commuting_ordinary_cleanup(state, batch, regs, lo, hi):
             break
     if boundary is None:
         raise _CasualtyGestureError('commuting_cleanup_incomplete')
+    # R2-RS-C3-05: the scan stops at the line whose cost first completes
+    # both needs and never reads past it, so it cannot see what a side does
+    # right after its last costed loss: bring the Regular of a just-killed
+    # Elite back (a 1-hit downgrade the scan costed as a 2-hit elimination:
+    # corpus 2025-03-31 Stella Rossa v SecondBrekfast T8 L746, 2024-05-05
+    # Bishop v Disgruntled Veteran T7 L711, 2023-08-23 raginhari v
+    # quickbeam T3 L230) or take a counted loss back and pay differently
+    # (2024-06-23 Columbo v Vayze T7 L516: [2]Sauron Regular back, a Sauron
+    # Elite killed instead, then 'stop').  The drive would go on from a
+    # board the player never decided on while the round's hit counts still
+    # agree, so the per-round verifier would keep its rows.  Read up to the
+    # battle's decision evidence: the window end, or the attacking Action
+    # Die's kill (a correction made after it, 2023-12-14 Ace_xD v jan T8
+    # L758, did not change the board the decisions were taken on).
+    # (r downgrades + r same-Nation Regular losses are the same board as
+    # the eliminations and stay accepted: 2024-01-14 priceg335 v Hybris93
+    # T9 L854.)
+    decision_hi = min([hi] + [
+        int(r.get('line', 0)) for r in batch.get('records', ())
+        if r.get('op') == 'kill' and boundary < int(r.get('line', 0)) < hi
+        and any('Action Die' in str(x) for x in (r.get('pieces') or ()))])
+    for role, side in sides.items():
+        if not groups[role]:
+            continue
+        last_line = max(e[0] for e in groups[role])
+        elites_at_last = Counter(e[1] for e in groups[role]
+                                 if e[0] == last_line and e[2] == 'loss_elite')
+        refusal = _cleanup_replacement_refusal(batch, regs, last_line, decision_hi,
+                                               side.name, elites_at_last)
+        if refusal is not None:
+            raise _CasualtyGestureError(refusal)
     if any(lo <= int(chunk.get('line', 0)) <= boundary for chunk in batch.get('rng', ())):
         raise _CasualtyGestureError('commuting_cleanup_intervening_random_event')
     nations = [{e[1] for e in groups[role]} for role in ('attacker', 'defender')]
@@ -12207,7 +15566,11 @@ def _recovery_allocation_lines(batch, regs, lo, hi, attacker_str):
             origin = rr.zone_kind(record.get('from', ''))
             dest = rr.zone_kind(record.get('to', ''))
             outward = (origin[0] in ('region', 'stronghold') and origin[1] in regs
-                       and (dest[0] in ('cas', 'reinf') or 'current' in str(record.get('to', '')).lower()))
+                       and (dest[0] in ('cas', 'reinf') or 'current' in str(record.get('to', '')).lower()
+                            # R4B-OFFBOARD-SLOT-RECOGNIZERS: a proven off-
+                            # board parking (cleaned up, never crossed back)
+                            or (dest[0] == 'offboard'
+                                and _confirmed_current_casualty(record, batch))))
             replacement = (origin[0] in ('cas', 'reinf')
                            and dest[0] in ('region', 'stronghold') and dest[1] in regs)
             if outward or replacement:
@@ -12249,6 +15612,125 @@ def _window_replacements(batch, side_str, regs, lo=0, hi=None):
                 if s == side_str:
                     n += p[3]
     return n
+
+
+def _press_payment_records(batch, attacker_str, regs, lo, hi):
+    """C3-02: the siege-press PAYMENT gestures within [lo, hi) - the
+    attacker's LAST replacement Regular (cas/reinf -> battle region) and
+    the LAST removal (kill, or move to cas/reinf) of an attacker Elite of
+    that same Nation.  The press decision precedes its own downgrade, so
+    the decision state leaves exactly these two records unapplied (an
+    earlier same-Nation downgrade in the window is the round's casualty;
+    either pair yields the same figures).  Returns (removal, replacement),
+    or None when the window cannot prove ONE single-figure downgrade (a
+    multi-figure record, or no matching Elite removal)."""
+    import rendered_replay as rr
+
+    def _in_window(record):
+        return lo <= record.get('line', 0) < hi
+
+    def _pieces(tokens):
+        return [rr.parse_piece(t) for t in tokens]
+
+    replacement = None
+    for record in batch['records']:
+        if record.get('op') != 'move' or not _in_window(record):
+            continue
+        origin = rr.zone_kind(record.get('from', ''))
+        dest = rr.zone_kind(record.get('to', ''))
+        if origin[0] not in ('cas', 'reinf') or \
+                dest[0] not in ('region', 'stronghold') or dest[1] not in regs:
+            continue
+        pieces = _pieces(_group_tokens(record.get('obj', '')))
+        if any(p and p[0] == 'unit' and p[2] == 'REGULAR'
+               and _unit_side_str(p[1]) == attacker_str for p in pieces):
+            replacement = (record, pieces)
+    if replacement is None:
+        return None
+    replacement_record, pieces = replacement
+    if len(pieces) != 1 or not pieces[0] or pieces[0][0] != 'unit' \
+            or pieces[0][2] != 'REGULAR' or pieces[0][3] != 1:
+        return None
+    nation = pieces[0][1]
+    removal = None
+    for record in batch['records']:
+        if not _in_window(record):
+            continue
+        tokens = []
+        if record.get('op') == 'kill':
+            zone = rr.zone_kind(str(record.get('zone', '') or ''))
+            if zone[0] in ('region', 'stronghold') and zone[1] in regs:
+                for piece in (record.get('pieces') or []):
+                    tokens.extend(_group_tokens(str(piece)))
+        elif record.get('op') == 'move':
+            origin = rr.zone_kind(record.get('from', ''))
+            dest = rr.zone_kind(record.get('to', ''))
+            if origin[0] in ('region', 'stronghold') and origin[1] in regs \
+                    and dest[0] in ('cas', 'reinf'):
+                tokens = _group_tokens(record.get('obj', ''))
+        pieces = _pieces(tokens)
+        if any(p and p[0] == 'unit' and p[1] == nation and p[2] == 'ELITE'
+               for p in pieces):
+            removal = (record, pieces)
+    if removal is None:
+        return None
+    removal_record, pieces = removal
+    if len(pieces) != 1 or pieces[0][3] != 1:
+        return None
+    return removal_record, replacement_record
+
+
+def _press_payment_skip(batch, attacker_str, regs, lo, cut, hi):
+    """R2-RS-C3-02: the press payment pair the press row leaves unapplied.
+    The payment precedes round r+1's combat-card commit (`cut`, from
+    _first_commit_line), so when the attacker replaced a figure before the
+    cut the pair is searched in [lo, cut) only - an Elite downgraded as a
+    Relentless Assault cost after the commit is round r+1's pre-roll cost,
+    never the payment.  With no attacker replacement before the cut the
+    whole [lo, hi) window is searched, as before.  Returns () when the
+    window holds no attacker replacement, else _press_payment_records'
+    (removal, replacement) or None (ambiguous)."""
+    if _window_replacements(batch, attacker_str, regs, lo, hi) <= 0:
+        return ()
+    if cut < hi and _window_replacements(batch, attacker_str, regs,
+                                         lo, cut) > 0:
+        return _press_payment_records(batch, attacker_str, regs, lo, cut)
+    return _press_payment_records(batch, attacker_str, regs, lo, hi)
+
+
+def _attacker_press_declared(batch, lo, hi, chats):
+    """R2-RS-C3-02: siege-press chat evidence for the gesture-recovery press
+    row.  True iff the ATTACKER's own player declared 'press' in a chat row
+    (line, text, speaker) with lo < line <= hi (_COMBAT_CHAT_INDEX rows).
+    The attacker is the die's stager (rendered_census._combat_atk_player);
+    a battle whose rolls show no second player cannot tell the seats apart
+    and binds no chat.  A question ('press or stop?') or an either/or is
+    never a declaration - an opponent's question is not the attacker's
+    choice (combat_choice_evidence: never reinterpret an opponent's
+    suggestion).  Rows without a speaker are never accepted."""
+    import rendered_census as rc
+    attacker = str(rc._combat_atk_player(batch) or '').strip().casefold()
+    if not attacker or attacker == 'auto':
+        return False
+    others = {str(c.get('player') or '').strip().casefold()
+              for c in batch.get('rng', ()) if c.get('kind') == 'roll_num'}
+    others -= {attacker, '', 'auto'}
+    if not others:
+        return False
+    for row in chats:
+        if len(row) != 3:
+            continue
+        line, text, speaker = row
+        if not lo < line <= hi:
+            continue
+        if str(speaker or '').strip().casefold() != attacker:
+            continue
+        text = str(text)
+        if '?' in text or re.search(r'\bor\b', text, re.I):
+            continue
+        if re.match(r'^\s*press\b', text, re.I):
+            return True
+    return False
 
 
 def _unit_side_str(nat):
@@ -12454,13 +15936,16 @@ def _correct_regular_retreat(batch, state, region, side_str, lo, hi):
     return fixed, None
 
 
-def _window_trim(batch, region, side_str, lo=0, hi=None):
+def _window_trim(batch, region, side_str, lo=0, hi=None, with_units=False):
     """Siege-trim evidence: units of `side_str` sent from `region` (or its
     stronghold box) back to REINFORCEMENTS â€” or, mistakes, to CASUALTIES
-    (spec: tolerate + flag).  Returns (elites_back, regulars_back, to_cas)."""
+    (spec: tolerate + flag).  Returns (elites_back, regulars_back, to_cas);
+    with_units=True appends the Counter of the moved units by (NATION, KIND)
+    (R17-ENG-SIEGETRIM: _trim_row_matches)."""
     import rendered_replay as rr
     eb = rb = 0
     to_cas = False
+    units = Counter()
     for r in batch['records']:
         if r.get('op') != 'move':
             continue
@@ -12480,9 +15965,98 @@ def _window_trim(batch, region, side_str, lo=0, hi=None):
                     eb += p[3]
                 else:
                     rb += p[3]
+                units[(p[1], 'ELITE' if p[2] == 'ELITE' else 'REGULAR')] += p[3]
                 if tk[0] == 'cas':
                     to_cas = True
-    return eb, rb, to_cas
+    return (eb, rb, to_cas, units) if with_units else (eb, rb, to_cas)
+
+
+def _fought_trim_tail(batch, region, side_str, excess, lo=0, with_units=False):
+    """C3-07 (fix wave 2026-10-21): siege-trim evidence AFTER fought rounds.
+
+    The battle's casualty removals and the trim are the same physical
+    gesture (`region` or its stronghold box -> REINFORCEMENTS / CASUALTIES),
+    and the trim follows the casualties (it opens only once the defender has
+    retreated into the siege).  The trim is therefore the LAST `excess`
+    defender units removed at or after line `lo`; earlier removals are the
+    casualties the drive already allocated.  Returns (elites_back,
+    regulars_back, to_cas), or None when the removals cannot account for
+    exactly `excess` units: too few, or a group record that would split
+    casualties from trim while mixing Elites and Regulars (which of its
+    units were trimmed is unrecorded).  with_units=True appends the Counter
+    of the trimmed units by (NATION, KIND) (R17-ENG-SIEGETRIM:
+    _trim_row_matches), or None for it when a split group mixes nations of
+    one kind (which nation's units were trimmed is unrecorded)."""
+    import rendered_replay as rr
+    removals = []
+    for r in sorted(batch['records'], key=lambda rec: rec.get('line', 0)):
+        if r.get('op') != 'move' or r.get('line', 0) < lo:
+            continue
+        fk = rr.zone_kind(r.get('from', ''))
+        tk = rr.zone_kind(r.get('to', ''))
+        if fk[0] not in ('region', 'stronghold') or fk[1] != region \
+                or tk[0] not in ('reinf', 'cas'):
+            continue
+        pieces = []
+        for t in _group_tokens(r.get('obj', '')):
+            p = rr.parse_piece(t)
+            if p and p[0] == 'unit' and _unit_side_str(p[1]) == side_str:
+                pieces.extend([(p[1], 'ELITE' if p[2] == 'ELITE' else 'REGULAR')]
+                              * int(p[3]))
+        if pieces:
+            removals.append((pieces, tk[0] == 'cas'))
+    eb = rb = 0
+    to_cas = False
+    units = Counter()
+    need = int(excess)
+    for pieces, cas in reversed(removals):
+        if need <= 0:
+            break
+        kinds = [kind for _nation, kind in pieces]
+        if len(kinds) > need and len(set(kinds)) > 1:
+            return None
+        if len(pieces) > need and len(set(pieces)) > 1:
+            units = None
+        take = kinds[:need]
+        eb += take.count('ELITE')
+        rb += take.count('REGULAR')
+        if units is not None:
+            units.update(pieces[:need])
+        to_cas = to_cas or cas
+        need -= len(take)
+    if need != 0:
+        return None
+    return (eb, rb, to_cas, units) if with_units else (eb, rb, to_cas)
+
+
+def _trim_row_matches(action, elites_back, units):
+    """R17-ENG-SIEGETRIM (ruling 1.181, the owner chooses WHICH units return):
+    a siege_trim row naming its returned units ('unit_set', one row per
+    (nation, kind) set when a count fills more than one way) matches only the
+    logged composition `units` (Counter of (NATION, KIND), None = unknown);
+    a plain row matches on elites_back alone, as before."""
+    if action.action_type != 'siege_trim' \
+            or int(action.params.get('elites_back', -1)) != elites_back:
+        return False
+    unit_set = action.params.get('unit_set')
+    if unit_set is None:
+        return True
+    return units is not None and +units == Counter(
+        {(nation, kind): count for _unit, nation, kind, count in unit_set})
+
+
+def _trim_elites_settled(s2, truth, region, side_str):
+    """C3-07: the trim executor removes exactly `excess` units whatever
+    elites_back is, so _combat_final_ok's per-side TOTALS can never see a
+    wrong k.  After the trim the driven garrison at `region` must also hold
+    the client's settled ELITE count (nations are not compared: the trim
+    action does not choose them)."""
+    import rendered_census as rc
+    eng = rc._eng_side_units(s2, region, side_str)
+    tru = rc._snap_side_units(truth, region, side_str)
+    return (len(eng) == len(tru)
+            and sum(1 for _n, k in eng if k == 'ELITE')
+            == sum(1 for _n, k in tru if k == 'ELITE'))
 
 
 def _combat_final_ok(s2, truth, regions):
@@ -12733,6 +16307,39 @@ def _onslaught_park_k(batch, owner_str, regs, lo, hi):
     return None, 'no_roll'
 
 
+def _onslaught_roll_backcalc(batch, wins, r_i, owner, owner_str, regs,
+                             round_roll_hits, counts_legal):
+    """R2-RS-C3-05: the drive's Onslaught kills-minus-roll back-calculation
+    (spec 1.216 item 5) for a post-stage Onslaught choice, reached after the
+    park route found no park and no Onslaught roll ('no_park').
+
+    rounds_fought (`r_i`) is already incremented when the deferred Onslaught
+    opens (ai._open_deferred_onslaught after the round's allocation), so the
+    round just fought is the 1-based round r_i: its rendered window is
+    wins[r_i - 1] (the window the park route reads) and the owner's engine
+    roll hits are keyed (r_i, owner) by the drive.  The former inline code
+    read wins[r_i] (the NEXT round's window for a non-last round) and, with
+    (r_i, owner) missing, borrowed (r_i - 1, owner) or the latest captured
+    key - K = window hits - roll hits then mixed two wrong rounds and could
+    still land in the legal counts (a wrong label).  Only the round's own
+    window and key are used; anything else is a counted drop.
+
+    Returns (k, reason): (k, 'backcalc') with k in counts_legal, or
+    (None, 'no_window' | 'no_hits' | 'unclean')."""
+    if not 0 < r_i <= len(wins):
+        return None, 'no_window'
+    roll_hits = round_roll_hits.get((r_i, owner))
+    if roll_hits is None:
+        return None, 'no_hits'
+    window = wins[r_i - 1]
+    total = _window_owner_hits(batch, owner_str, regs,
+                               window['first'], window['next_first'])
+    k = total - int(roll_hits)
+    if k in counts_legal:
+        return k, 'backcalc'
+    return None, 'unclean'
+
+
 def _alloc_downgrades_ordered(batch, side_str, regs, lo, hi, hits):
     """W2-008: the allocation `side_str` chose for the round's roll HITS
     when the same window also holds its Onslaught self-sacrifice (a
@@ -12823,38 +16430,18 @@ def _alloc_downgrades_ordered(batch, side_str, regs, lo, hi, hits):
 
 def _effect_target_pick(batch, ec, la, owner_str, lo, hi, stats):
     """1.254 target-bearing combat_effect_choice matcher (DET census
-    P1-a).  ec['targets'] (WoP/BB/BoW: which enemy figure) or
-    ec['pairs'] (Heroic Death: (count, own figure)).  The victim is
+    P1-a).  ec['targets'] (WoP/BB/BoW: which enemy figure).  The victim is
     NAMED in the batch's kill lines (any zone - region, guide box,
     cleanup group); 'leader' = a plain-Leader kill.  Unique evidence ->
     the la index of the target-carrying action; None (counted)
-    otherwise - never a guess."""
-    import rendered_census as rc
+    otherwise - never a guess.  (Heroic Death's former (count, figure)
+    'pairs' menu has no producer since its choice moved into the round
+    cursor - combat.heroic_death_choices.)"""
     import rendered_replay as rr
 
     def _norm(n):
         return str(n or '').strip().lower().replace('-', ' ')
 
-    if ec.get('pairs'):
-        # Heroic Death: the sacrificed OWN figure (leaders + companions
-        # of owner_str, in-window)
-        n_leader, comps = _owner_figure_deaths(batch, owner_str, lo, hi)
-        if comps:
-            if len(set(comps)) > 1:
-                stats['drop_reasons']['cf_effect_target_unresolved'] += 1
-                return None
-            nm = comps[0]
-            want = (min(3, rc._COMP_LEVEL.get(nm, 1)), _norm(nm))
-        elif n_leader >= 1:
-            want = (1, 'leader')
-        else:
-            want = (0, None)
-        return _match_index(
-            la, lambda a: a.action_type == 'combat_effect_choice'
-            and int(a.params.get('count', -2)) == want[0]
-            and ((_norm(a.params.get('target')) == want[1])
-                 if want[1] is not None
-                 else a.params.get('target') is None))
     # targets menu (WoP/BB/BoW): the named victim among the offered
     offered = {_norm(a.params.get('target'))
                for a in la
@@ -13119,7 +16706,98 @@ def _observed_round_choice_lower(batch, wins, cards, round_index):
     return max([previous] + [int(current.get(slot + '_ln') or 0) for slot in ('fp', 'sh')])
 
 
+# C3-01 (fix wave 2026-10-21): the dice context every combat-family row is
+# encoded under, set by _emit_combat_family for the duration of ONE batch and
+# read by _emit_sample when the emitted state carries no _rx_full_pools of its
+# own.  The drive states (ai.apply_action clones of a _recon_state root with a
+# single staged ARMY die) and the gesture-recovery states (fresh _recon_state
+# copies, faceless setup dice) never carry one, so every combat_card /
+# casualty_alloc / siege_press / victor_advance / ... row was encoded with
+# 0 unused dice for BOTH sides.  Encoding only: the menus are enumerated on
+# the drive state exactly as before.
+_RX_COMBAT_POOLS = None
+
+
+def _combat_encoding_pools(batch, stats, counter_prefix='cf_pools'):
+    """Both sides' dice at the batch's combat decisions: the annotated
+    pre-action pool with the die that launched the battle moved from unused
+    to used.  A battle neither spends nor rolls an Action die, so this holds
+    for every round and every recovery row of the batch.  Returns None when
+    the batch has no pool annotation (the row then encodes as before).
+    `counter_prefix` keeps each caller's `detected` meters apart (the
+    zero-kill family, R2-RS-C3-BATTLE-ROWS, meters as 'zk_pools_*')."""
+    import copy
+    pools = batch.get('_rx_pools')
+    if not isinstance(pools, dict):
+        stats['detected'][counter_prefix + '_missing'] += 1
+        return None
+    pools = copy.deepcopy(pools)
+    own = str(batch.get('die_side') or '')
+    face = str(batch.get('die_face') or '').upper()
+    info = pools.get(own)
+    if not face or not isinstance(info, dict):
+        stats['detected'][counter_prefix + '_no_host_die'] += 1
+        return pools
+    unused = list(info.get('unused') or [])
+    if face in unused:
+        unused.remove(face)
+        info['unused'] = unused
+        info['used'] = list(info.get('used') or []) + [face]
+    else:
+        # annotation already lacks the launching die: encode what it says
+        # remains, metered (never a guessed face)
+        stats['detected'][counter_prefix + '_host_die_absent'] += 1
+    return pools
+
+
+def _zero_kill_corsairs_battle(batch):
+    """R4-EXTRACT-COVERAGE-DROPS (R3-EXTRACT-CORSAIRS-REBUILD FU3): a
+    Corsairs of Umbar landing battle whose round(s) killed nothing never
+    classifies 'combat' (classify_batch keys on kill records), and
+    _emit_chat_battle leaves it to the card / bookkeeping lane for its play
+    (zk_corsairs_card_battle), so its battle decisions went unlabelled
+    (2024-04-29 Wems v Elessar T9 L757, 2025-03-14 webbely v Faux T4 L246).
+    True for such a batch: not a combat kind, no Hunt tile, no unit killed in
+    a battle region, both players rolled (a fought round - a roll-less
+    Scouts-class battle keeps _emit_chat_battle's own rules) and the Shadow
+    played Corsairs with its landing (_corsairs_landing)."""
+    import rendered_replay as rr
+    if batch.get('kind') in ('combat', 'combat?') \
+            or batch.get('die_side') != 'SHADOW':
+        return False
+    rng = batch.get('rng') or ()
+    if any(r.get('kind') == 'draw_tile' for r in rng):
+        return False
+    if len({r.get('player') for r in rng if r.get('kind') == 'roll_num'}) < 2:
+        return False
+    if rr._battle_regions(batch):
+        return False
+    return _corsairs_landing(batch) is not None
+
+
+@_fp_huntbox_batch_scope    # R3-EXTRACT-HUNTBOX-RECON: FP Hunt Box dice
 def _emit_combat_family(batch, stats):
+    """C3-01 wrapper: scope the batch's post-launch dice context to this
+    batch's combat-family rows (drive and gesture recovery alike)."""
+    global _RX_COMBAT_POOLS
+    if batch['kind'] not in ('combat', 'combat?'):
+        if not _zero_kill_corsairs_battle(batch):
+            return []
+        # R4-EXTRACT-COVERAGE-DROPS: the zero-kill Corsairs battle runs the
+        # same engine-opened drive (_open_event_battle via the family's
+        # Corsairs branch) on a copy that is a battle batch; the play row
+        # stays with the card / bookkeeping lane (_emit_chat_battle)
+        stats['detected']['cf_zero_kill_corsairs_battle'] += 1
+        batch = dict(batch, kind='combat')
+    previous = _RX_COMBAT_POOLS
+    _RX_COMBAT_POOLS = _combat_encoding_pools(batch, stats)
+    try:
+        return _emit_combat_family_rows(batch, stats)
+    finally:
+        _RX_COMBAT_POOLS = previous
+
+
+def _emit_combat_family_rows(batch, stats):
     global _RX_ALT_HIDX
     import ai
     import random
@@ -13131,6 +16809,19 @@ def _emit_combat_family(batch, stats):
         return []
     chunks = [r for r in batch['rng'] if r['kind'] == 'roll_num']
     _strike9f = _card_strike(batch)   # W1-001: shared strike predicate
+    if _strike9f:
+        # C3-03 (fix wave 2026-10-21): a CARD STRIKE (Dreadful Spells
+        # class) fights no battle, so it owns NO combat-family decision.
+        # The engine routes the victim's hits through the card_casualty
+        # pending_card_option (event_effects._route_card_casualties);
+        # _emit_card_interiors drives exactly that pending and emits its
+        # 'card_option' rows.  No pending_combat ever exists for it in
+        # self-play: the former gesture path here (_gd_rounds(0) on a
+        # _recovery_context 'casualty_allocation') re-emitted the same
+        # losses as fabricated 'casualty_alloc' rows (GAME19 T4 L306 The
+        # Spirit of Mordor: 3 card_option + 3 casualty_alloc kept).
+        stats['detected']['cf_card_strike'] += 1
+        return []
     wins = _combat_round_windows(batch)
     nrounds = len(wins)
     no_dice = not chunks
@@ -13157,10 +16848,101 @@ def _emit_combat_family(batch, stats):
     except Exception:
         stats['drop_reasons']['cf_recon'] += 1
         return []
-    if not plan:
-        stats['drop_reasons']['cc_no_plan'] += 1
-        return []
-    atk, dfn, _sieg = plan
+    _cors9 = _corsairs_landing(batch)
+    if not plan and _cors9 is None:
+        # R4-EXTRACT-COVERAGE-DROPS (R3-EXTRACT-CORSAIRS-REBUILD FU4): a
+        # literal Help Unlooked For event still opens through the event when
+        # the card lane's matcher proves the engine option (below); every
+        # other planless batch drops as before
+        from rendered_event_battle import funded_event_line as _huf_line0
+        if _huf_line0(batch) is None:
+            stats['drop_reasons']['cc_no_plan'] += 1
+            return []
+    # R3-EXTRACT-CORSAIRS-REBUILD (fix round 3): an EVENT-opened battle is
+    # opened through its engine effect, not an army_attack:
+    # (card id, effect choices), else None.  _lead_st9 = the board the
+    # re-roll Leadership bound is read on.
+    _event_open9 = None
+    _event_pc9 = {}          # the opened event pending's own keys
+    _cors_landed9 = True     # gd recovery boards reproduce the landing
+    _lead_st9 = st
+    _trim9 = None            # R4-EXTRACT-COVERAGE-DROPS: logged Corsairs trim
+    if _cors9 is not None:
+        # R2-RS-v029-C3-04 found the planner names an UNRELATED adjacent
+        # army (Umbar adjoins no landing region) and dropped the battle.
+        # The battle is the landing's CO-LOCATED battle: the engine lands
+        # the cargo and opens it (field 1.210(b), relief A10(ii) = USER D9,
+        # joining besiegers A10(iii)) with its own attacker_no_retreat.
+        _land9, _cargo9, _why9 = _corsairs_rebuild(batch, st, _cors9[0])
+        if _why9:
+            stats['drop_reasons'][_why9] += 1
+            return []
+        atk = dfn = _land9
+        _sieg = None             # the engine pending's is_siege (below)
+        _event_open9 = ('SHADOW_Strategy_Corsairs_of_Umbar',
+                        {'target_region': _land9, 'cargo': _cargo9})
+        _cors_landed9 = _corsairs_landing_logged(batch, _land9, _cargo9)
+        # R4-EXTRACT-COVERAGE-DROPS (R3-EXTRACT-CORSAIRS-REBUILD FU2): the
+        # Shadow's logged pre-battle trim (an overstacked landing), read in
+        # the card lane's own trim window; None = unproven (the open then
+        # drops at the trim pending as before)
+        _trim9 = None
+        from rendered_staged_movement import (corsairs_trim_window as _ctw9,
+                                              Unproven as _ctw_unproven9)
+        try:
+            _trim9 = _overstack_returns(_ctw9(batch, _land9),
+                                        shadow_kills=True)
+        except _ctw_unproven9:
+            _trim9 = None
+        try:
+            import event_effects as _ee9
+            _lead_st9 = ai.clone_state(st)
+            _ee9._direct_army_move(_lead_st9, 'umbar', _land9, Side.SHADOW,
+                                   cargo=_cargo9, allow_overstack=True,
+                                   defer_overstack=True)
+        except Exception:
+            # the effect's own move is refused the same way at the open
+            # below (a counted cf_event_open_*_refused drop); metered here
+            stats['detected']['cf_corsairs_lead_board_unlanded'] += 1
+            _lead_st9 = st
+    else:
+        # R4-EXTRACT-COVERAGE-DROPS: no plan only for a Help Unlooked For
+        # event batch (the guard above), whose pair the matcher must prove
+        atk, dfn, _sieg = plan if plan else (None, None, None)
+        from rendered_event_battle import funded_event_line as _huf_line9
+        if _huf_line9(batch) is not None:
+            # the literal Help Unlooked For event (Event die, or a Will die
+            # with its Board seat): the engine's field battle against the
+            # besiegers carries def_dice_reduction.  Its (stronghold,
+            # attack_from) is the engine option the card lane's own matcher
+            # proves from the log (rendered_event_battle.match); the plan's
+            # pair stands only when none is proven (_open_event_battle
+            # then still requires the engine to offer it)
+            import types as _types9
+            import card_options as _co9
+            from rendered_event_battle import match as _huf_match9
+            try:
+                _hopts9 = _co9.get_card_options(st, Side.FREE_PEOPLES,
+                                                'Help Unlooked For')
+                _hi9, _ = _huf_match9(
+                    [(i, _types9.SimpleNamespace(params={'choices': o}))
+                     for i, o in enumerate(_hopts9)], batch)
+            except Exception as _e9:
+                stats['drop_reasons']['cf_event_open_huf_options_exc:%s'
+                                      % type(_e9).__name__] += 1
+                return []
+            if _hi9 is not None:
+                atk = rr.sanitize(str(_hopts9[_hi9]['attack_from']))
+                dfn = rr.sanitize(str(_hopts9[_hi9]['stronghold']))
+            elif not plan:
+                # R4-EXTRACT-COVERAGE-DROPS: neither the planner nor the
+                # card lane's matcher names the battle
+                stats['drop_reasons']['cc_no_plan'] += 1
+                return []
+            if not plan:
+                stats['detected']['cf_event_open_huf_matched_no_plan'] += 1
+            _event_open9 = ('FREE_PEOPLES_Strategy_Help_Unlooked_For',
+                            {'stronghold': dfn, 'attack_from': atk})
     regs = set(rr._battle_regions(batch)) | {atk, dfn}
     side = Side.SHADOW if batch['die_side'] == 'SHADOW' else Side.FREE_PEOPLES
     atk_str = batch['die_side']
@@ -13173,44 +16955,52 @@ def _emit_combat_family(batch, stats):
         # leadership bound (a chunk longer than a side's Leadership
         # can never be its re-roll)
         try:
-            _lead = _battle_leadership(st, atk, dfn, atk_str)
+            _lead = _battle_leadership(_lead_st9, atk, dfn, atk_str)
             wins = _combat_round_windows(batch, _lead)
             nrounds = len(wins)
         except Exception:
             pass
     cards, _card_anom, _anom_slots = _round_cards(batch, wins)
     # 1.267: Grond / The Fighting Uruk-hai EVENT -> 3 mandatory rounds
-    _mand9 = _mandatory_siege_rounds(batch, cards) if not _strike9f else 0
+    _mand9 = _mandatory_siege_rounds(batch, cards)
     if _mand9:
         stats['detected']['mandatory_siege_rounds'] += 1
+    # C3-04: the event card played to open the siege (None otherwise);
+    # set below when the log's round-1 card reading contradicts the event
+    _mand_cid9 = _mandatory_siege_event(batch, cards) if _mand9 else None
+    _mand_r1_conflict9 = False
     st.dice = {Side.FREE_PEOPLES: [], Side.SHADOW: []}
     d = gs.ActionDie(gs.SH_FACES if side == Side.SHADOW else gs.FP_FACES, side)
     d.current = gs.ActionDieFace.ARMY
     d.used = False
     st.dice[side] = [d]
     _install_ledger_hands(st, batch)
+    if _mand9 and not _apply_mandatory_event_play(st, _mand_cid9):
+        # C3-04: the batch-start hand did not hold the played event card
+        # (ledger gap / placeholder): nothing to remove, metered
+        stats['detected']['cf_mand_event_not_in_hand'] += 1
+    if _event_open9 is not None and not _event_card_out_of_hand(
+            st, side, _event_open9[0]):
+        # R3-EXTRACT-CORSAIRS-REBUILD: the played event card leaves the
+        # hand (it is no combat-card option); a ledger gap is metered
+        stats['detected']['cf_event_card_not_in_hand'] += 1
+    # R4-EXTRACT-EVENT-BATTLE-CLAIMS (a): so does the Event-die battle-opening
+    # play that _round_cards no longer reads as a commit (the round-1 drive
+    # menu still offered it: 2023-03-13 Komap4uk v Bebeeru L931-932)
+    _evd_cid9 = _event_die_battle_exit(batch)
+    _evd_cid9 = str(_title_to_cid(_evd_cid9[1]) or '') if _evd_cid9 else ''
+    if (_evd_cid9 and _evd_cid9 != str(_mand_cid9 or '')
+            and (_event_open9 is None or _evd_cid9 != str(_event_open9[0]))
+            and not _event_card_out_of_hand(st, side, _evd_cid9)):
+        stats['detected']['cf_event_die_card_not_in_hand'] += 1
     try:
         legal = ai.get_legal_actions(st, side)
     except Exception:
         stats['drop_reasons']['cc_legal_exc'] += 1
         return []
-    if _strike9f:
-        # CARD STRIKE (Dreadful Spells class): no battle happened - no
-        # drive, no attack, no cc rounds; the victim ALLOCATION is the
-        # only combat-family decision, via the gesture path
-        emitted = []
-        broke = None
-        retreat_dests = set()
-        _drive_fx9 = set()
-        round_roll_hits = {}
-        s2 = st
-        keep = emitted   # ALIAS: gesture-path keep.append lands in emitted
-        # (telemetry: count real card strikes only â€” the bytecode
-        #  reconstruction had mis-hoisted this outside the if)
-        stats['detected']['cf_card_strike'] += 1
 
     atk_act = None
-    if not _strike9f:
+    if _event_open9 is None:
         atk_act = next(
             (a for a in legal
              if a.action_type == 'army_attack'
@@ -13218,18 +17008,25 @@ def _emit_combat_family(batch, stats):
              and rr.sanitize(str(a.params.get(
                  'to', a.params.get('to_region', '')))) == dfn),
             None)
-    if atk_act is None and not _strike9f:
-        atk_act = next(
-            (a for a in legal
-             if a.action_type == 'army_attack'
-             and rr.sanitize(str(a.params.get(
-                 'to', a.params.get('to_region', '')))) == dfn),
-            None)
-    if atk_act is None and not _strike9f:
-        stats['drop_reasons']['cc_no_attack'] += 1
+    if atk_act is None and _event_open9 is None:
+        # C3-09 (fix wave 2026-10-21): the engine does not offer the
+        # PLANNED attack.  Never substitute another army_attack into dfn
+        # from a different source region: that is a guessed attacker (on
+        # a co-located siege it is not even the same battle - the first
+        # attack into the stronghold region is an adjacent relief attack,
+        # GAME21 T9 L646 lossarnach -> minas tirith for the MT sortie),
+        # the recorded dice accept it whenever its strength fits, and the
+        # rows emitted before any later break were kept.  Drop the family.
+        _into9 = any(
+            a.action_type == 'army_attack'
+            and rr.sanitize(str(a.params.get(
+                'to', a.params.get('to_region', '')))) == dfn
+            for a in legal)
+        stats['drop_reasons'][('cc_plan_attack_not_offered' if _into9
+                               else 'cc_no_attack')] += 1
         return []
     emitted = []
-    broke = 'cf_card_strike' if _strike9f else None
+    broke = None
     retreat_dests = set()
     _drive_fx9 = set()
     round_roll_hits = {}
@@ -13277,16 +17074,60 @@ def _emit_combat_family(batch, stats):
         _combat_rng.FINAL_HITS_HOOK = None
     random.choice = lambda s2: s2[-1]
     _declared_rear = None
+    _drive_trim9 = {}           # R17-CORPUS-EXTRACT row 12: window -> trim size
+    _cas_break_round9 = None    # R4-EXTRACT-COVERAGE-DROPS: 1-based round of a
+    #                             casualty-reading break (ordinary allocation)
     try:
-        s2 = st if _strike9f else ai.apply_action(st, atk_act)
-        if not _strike9f:
-            # The executor captures this BEFORE attack-induced politics.
-            # Keep that immutable declaration through every recovery round;
-            # never select a new guard from the post-casualty Army.
-            _declared_rear = (getattr(s2, 'pending_combat', None) or {}).get(
-                'attacker_rearguard')
+        if _event_open9 is not None:
+            # R3-EXTRACT-CORSAIRS-REBUILD: the event opens its own battle
+            # (inside the recorded-dice scope: an opening with no card
+            # phase rolls at once).  A failed open is its own drop reason.
+            s2 = st
+            broke = _open_event_battle(s2, _event_open9[0], _event_open9[1],
+                                       atk, dfn, trim=_trim9)
+            if not broke:
+                _pc_e9 = s2.pending_combat
+                _event_pc9.update({k: _pc_e9[k] for k in _EVENT_BATTLE_PC_KEYS
+                                   if k in _pc_e9})
+                _sieg = bool(_pc_e9.get('is_siege'))
+                if _event_pc9.get('corsairs_relief_garrison'):
+                    # A10(ii): the recovery's partition has no relief
+                    # context - its garrison would read as fighters
+                    _cors_landed9 = False
+        else:
+            s2 = ai.apply_action(st, atk_act)
+        # The executor captures this BEFORE attack-induced politics.
+        # Keep that immutable declaration through every recovery round;
+        # never select a new guard from the post-casualty Army.
+        _declared_rear = (getattr(s2, 'pending_combat', None) or {}).get(
+            'attacker_rearguard')
+        if _mand9:
+            # C3-04: carry the EVENT pending's keys (3 mandatory rounds,
+            # round-1 FP combat-card block unless a Companion is in the
+            # battle) on the army_attack pending before any round: the
+            # engine then skips the forced round-1 FP decline, withholds
+            # combat_round_result until round 3 (no_reduce continuation)
+            # and every row encodes the event context.
+            _pc_m9 = getattr(s2, 'pending_combat', None)
+            if _pc_m9 is None or _pc_m9.get('rounds_fought', 0):
+                broke = 'cf_mand_no_open_pending'
+            else:
+                _pc_m9.update(_mandatory_event_pending_keys(_mand9))
+                if ((cards[0].get(dfn_tag) if cards else None) is not None
+                        and _mandatory_r1_def_card_blocked(s2, _pc_m9)):
+                    # the log commits a round-1 defender card the event
+                    # forbids: the event reading and the log's round-1
+                    # card reading disagree - neither side's round-1
+                    # card row is trusted (the gesture recovery skips
+                    # them too)
+                    broke = 'cf_mand_r1_def_card_conflict'
+                    _mand_r1_conflict9 = True
+                    # (R2-S4-EXTRACT's 'cf_round1_card_slot_side_mismatch':
+                    # an attacker card dropped into the defender's slot no
+                    # longer reads as a defender commit - _round_cards keys
+                    # commits by owner, R17-CORPUS-EXTRACT row 2)
         for _ in range(80):
-            if _strike9f:
+            if broke:
                 break
             pc = getattr(s2, 'pending_combat', None)
             if pc is None:
@@ -13328,7 +17169,11 @@ def _emit_combat_family(batch, stats):
                 slot = atk_tag if ph == 'attacker_combat_card' else dfn_tag
                 human = cards[r_i][slot]
                 if cards[r_i].get(slot + '_ambiguous'):
-                    broke = 'cc_commit_ambiguous'
+                    # R2-TR-test-audit0829-DFX: a retracted commit with no
+                    # unique replacement is its own loud reason
+                    broke = ('cc_commit_retracted'
+                             if cards[r_i].get(slot + '_retracted')
+                             else 'cc_commit_ambiguous')
                     break
                 if human is not None and not _combat_commit_board_matches(
                         s2, batch, cards[r_i].get(slot + '_ln')):
@@ -13347,6 +17192,11 @@ def _emit_combat_family(batch, stats):
                         # gap must not drop the decision.  Inject the
                         # named card, re-enumerate; still no offer ->
                         # drop as before.
+                        # R3-TOOLS-MISC (R2-TR-test-audit0829-DFX FU2): a
+                        # named card ALREADY in the deciding hand that is
+                        # not offered is illegal there, not a ledger gap.
+                        cc_in_hand = str(human) in [
+                            str(c) for c in s2.hands[dside].hand]
                         la = _inject_named_cc(s2, dside, human, la,
                                               stats)
                         cc = [a for a in la if a.action_type in
@@ -13355,6 +17205,9 @@ def _emit_combat_family(batch, stats):
                             la, lambda a: a.action_type ==
                             'combat_card_play' and
                             str(a.params.get('card_id')) == str(human))
+                        if hidx is None and cc_in_hand:
+                            broke = 'cc_card_illegal'
+                            break
                     if hidx is None:        # not offerable even injected
                         broke = 'cc_card_absent'
                         break
@@ -13456,6 +17309,15 @@ def _emit_combat_family(batch, stats):
                                 stats['detected']['cf_commuting_ordinary_cleanup'] += 1
                                 stats['detected']['cf_suppressed_reordered_ordinary_rows'] += \
                                     cleanup_proof['suppressed_ordinary_rows']
+                                # R2-RS-C3-05: the cleanup just proved each side
+                                # paid exactly these roll hits by direct removals
+                                # (it refuses unless both are > 0; it worked on a
+                                # clone, so pc is the untouched pre-cleanup
+                                # pending).  Record them like the ordinary path
+                                # below, or the final-mismatch verifier reads
+                                # eh=None for this round and drops its rows.
+                                round_roll_hits[(r_i, 'atk')] = int(pc.get('atk_hits', 0) or 0)
+                                round_roll_hits[(r_i, 'def')] = int(pc.get('def_hits', 0) or 0)
                                 s2 = recovered
                                 continue
                     # A defender may physically clean up its forced losses
@@ -13473,7 +17335,10 @@ def _emit_combat_family(batch, stats):
                             defender_events = _casualty_gesture_operations(
                                 batch, dfn_str, regs, w['first'], w['next_first'])
                             _, proof_rows = _drive_casualty_gestures(
-                                proof, pc['defender_side'], defender_events)
+                                proof, pc['defender_side'], defender_events,
+                                trim_tail=_RetreatTrimTail.of_window(
+                                    batch, dfn, dfn_str, w['first'],
+                                    w['next_first']))   # R17 row 12
                             forced_cleanup = not proof_rows
                         except (ValueError, RuntimeError):
                             pass
@@ -13493,10 +17358,20 @@ def _emit_combat_family(batch, stats):
                 try:
                     events = _casualty_gesture_operations(
                         batch, loser, regs, w['first'], w['next_first'])
-                    s2_next, allocations = _drive_casualty_gestures(s2, dside, events)
+                    # R17-CORPUS-EXTRACT row 12: a defender retreating into
+                    # its Stronghold trims in this same window
+                    _tail9 = (_RetreatTrimTail.of_window(
+                        batch, dfn, dfn_str, w['first'], w['next_first'])
+                        if loser == dfn_str else None)
+                    s2_next, allocations = _drive_casualty_gestures(
+                        s2, dside, events, trim_tail=_tail9)
                 except _CasualtyGestureError as error:
                     broke = 'cas_operation:' + str(error)
+                    _cas_break_round9 = r_i     # R4-EXTRACT-COVERAGE-DROPS
                     break
+                if _tail9 is not None:
+                    _drive_trim9[(r_i - 1) if 0 < r_i <= len(wins)
+                                 else len(wins) - 1] = _tail9.excess or 0
                 for before, menu, chosen in allocations:
                     stats['detected']['casualty_alloc'] += 1
                     emitted.append(('casualty_alloc', r_i, _emit_sample(
@@ -13575,25 +17450,15 @@ def _emit_combat_family(batch, stats):
                 if _mand9 and r_i < _mand9:
                     # 1.267: siege round 1..2 under Grond / The Fighting
                     # Uruk-hai is MANDATORY - no press decision, no Elite
-                    # cost.  The drive opened the battle by army_attack
-                    # (the engine pending carries no mandatory_rounds),
-                    # so continue it with the executor's own no-cost
-                    # press (no_reduce) when the log shows a further
-                    # round, else end it (only an elimination stops a
-                    # mandatory round early).  No row either way.
-                    stats['detected']['cf_press_mandatory'] += 1
-                    if more:
-                        _act9 = ai.Action(die_idx=-1, action_type='siege_press',
-                                          params={'no_reduce': True})
-                    else:
-                        _act9 = next((a for a in la
-                                      if a.action_type == 'siege_no_press'),
-                                     None)
-                        if _act9 is None:
-                            broke = 'cf_press_unmatched'
-                            break
-                    s2 = ai.apply_action(s2, _act9)
-                    continue
+                    # cost.  C3-04: the drive pending now carries the
+                    # event's mandatory_rounds, so the engine continues
+                    # rounds 1..2 itself (ai._set_post_round_phase) and
+                    # never opens this phase before round 3; reaching it
+                    # is an engine/extractor disagreement - loud drop,
+                    # no row.  (A log that stops before round 3 with no
+                    # elimination overruns its windows: cf_round_overrun.)
+                    broke = 'cf_press_mandatory_opened'
+                    break
                 hidx = _match_index(la, lambda a: a.action_type == want)
                 if hidx is None:
                     broke = 'cf_press_unmatched'
@@ -13606,20 +17471,40 @@ def _emit_combat_family(batch, stats):
 
             if ph == 'siege_trim':
                 tr = rr.sanitize(str(pc.get('trim_region') or dfn))
-                eb, _rb, to_cas = _window_trim(batch, tr, dfn_str)
+                # C3-07 (fix wave 2026-10-21): the whole-batch counter
+                # (_window_trim, lo=0) also read the battle's casualty
+                # drags (region -> casualties / reinforcements) as trimmed
+                # units - an Elite lost to hits labelled elites_back=1.
+                # The trim is the LAST `excess` defender removals inside
+                # the retreat's round window (the victor_advance lo above).
+                _exc7 = next((int(a.params.get('excess', 0) or 0)
+                              for a in la if a.action_type == 'siege_trim'), 0)
+                _lo7 = (0 if r_i <= 0
+                        else wins[min(r_i, len(wins)) - 1]['first'])
+                _tail7 = _fought_trim_tail(batch, tr, dfn_str, _exc7, lo=_lo7,
+                                           with_units=True)
+                if _tail7 is None:
+                    broke = 'cf_trim_tail_unproven'
+                    break
+                eb, _rb, to_cas, _tu7 = _tail7
                 if to_cas:
                     stats['detected']['siege_trim_to_casualties'] += 1
-                hidx = _match_index(la, lambda a: a.action_type ==
-                                    'siege_trim' and
-                                    int(a.params.get('elites_back', -1))
-                                    == eb)
+                hidx = _match_index(la, lambda a: _trim_row_matches(a, eb, _tu7))
                 if hidx is None:
                     broke = 'cf_trim_unmatched'
                     break
+                _row7 = (_emit_sample(s2, dside, la, hidx, 'siege_trim',
+                                      batch['turn']) if len(la) >= 2 else None)
+                s_next7 = ai.apply_action(s2, la[hidx])
+                # the totals gate cannot see a wrong k: a labelled trim
+                # must leave the client's settled Elite count
+                if len(la) >= 2 and not _trim_elites_settled(
+                        s_next7, batch['truth'], tr, dfn_str):
+                    broke = 'cf_trim_composition_mismatch'
+                    break
                 if len(la) >= 2:
-                    emitted.append(('siege_trim', r_i, _emit_sample(
-                        s2, dside, la, hidx, 'siege_trim', batch['turn'])))
-                s2 = ai.apply_action(s2, la[hidx])
+                    emitted.append(('siege_trim', r_i, _row7))
+                s2 = s_next7
                 continue
 
             if ph == 'victor_advance':
@@ -13821,10 +17706,9 @@ def _emit_combat_family(batch, stats):
                 owner_str = atk_str if owner == 'atk' else dfn_str
                 w = wins[min(max(r_i, 0), len(wins) - 1)]
                 lo = (wins[r_i - 1]['last'] if 0 < r_i < len(wins) else 0)
-                if ec.get('targets') or ec.get('pairs'):
+                if ec.get('targets'):
                     # 1.254 TARGET-BEARING menus (DET census P1-a):
-                    # WoP/BB/BoW carry ec['targets'] (which figure),
-                    # Heroic Death ec['pairs'] ((count, figure)).  The
+                    # WoP/BB/BoW carry ec['targets'] (which figure).  The
                     # victim is NAMED in the window's kill lines - match
                     # on it; count-only multi-matched and dropped.
                     hidx = _effect_target_pick(batch, ec, la, owner_str,
@@ -13871,28 +17755,19 @@ def _emit_combat_family(batch, stats):
                                               % _kp_why] += 1
                         _ons_done = True
                 if _CLOSURE and _ekind == 'onslaught' and not _ons_done:
-                    # rounds_fought is incremented before the onslaught choice,
-                    # so the owner's roll-hits may be keyed at r_i, r_i-1, or the
-                    # latest captured this combat (onslaught resolves in the
-                    # round just fought).
-                    _rh = round_roll_hits.get((r_i, owner))
-                    if _rh is None:
-                        _rh = round_roll_hits.get((r_i - 1, owner))
-                    if _rh is None:
-                        _cand = [v for (ri2, ow2), v in round_roll_hits.items()
-                                 if ow2 == owner]
-                        _rh = _cand[-1] if _cand else None
-                    if _rh is not None:
-                        _tot = _window_owner_hits(batch, owner_str, regs,
-                                                  w['first'], w['next_first'])
-                        _kk = _tot - _rh
-                        if _kk in _counts_legal:
-                            stats['detected']['cc_onslaught_backcalc'] += 1
-                            k = _kk
-                        else:
-                            stats['drop_reasons']['cf_onslaught_unclean'] += 1
+                    # R2-RS-C3-05: rounds_fought is incremented before the
+                    # post-stage Onslaught choice, so the round just fought is
+                    # 1-based r_i: window wins[r_i - 1] and key (r_i, owner)
+                    # ONLY (never the next window, never another round's or
+                    # the latest captured hits - drop beats wrong).
+                    _kk, _kk_why = _onslaught_roll_backcalc(
+                        batch, wins, r_i, owner, owner_str, regs,
+                        round_roll_hits, _counts_legal)
+                    if _kk is not None:
+                        stats['detected']['cc_onslaught_backcalc'] += 1
+                        k = _kk
                     else:
-                        stats['drop_reasons']['cf_onslaught_no_hits'] += 1
+                        stats['drop_reasons']['cf_onslaught_' + _kk_why] += 1
                 if _ekind == 'onslaught' and k is not None:
                     # W2-008: the resolver stash (_onslaught_decision) may
                     # already have emitted this batch's magnitude - never
@@ -13939,7 +17814,7 @@ def _emit_combat_family(batch, stats):
 
             broke = 'cf_phase_%s' % str(ph)[:18]
             break
-        if not broke and not _strike9f:
+        if not broke:
             _recorded_rng.finish()
     except _RecordedCombatDiceError as e:
         stats['drop_reasons']['cf_rng_mismatch:' + e.reason] += 1
@@ -13955,21 +17830,30 @@ def _emit_combat_family(batch, stats):
         _combat_rng.FINAL_HITS_HOOK = _original_final_hits_hook
 
     if broke and (broke.startswith('cf_shine_choice_unproven:')
-                  or broke.startswith('cf_words_of_power_target_unproven')):
+                  or broke.startswith('cf_words_of_power_target_unproven')
+                  or broke.startswith('cf_event_open_')):
         # No later phase has an authenticated state after this unresolved
         # choice. Do not feed the gesture-recovery paths a guessed effect.
+        # (R3-EXTRACT-CORSAIRS-REBUILD: nor a battle its event never opened.)
         stats['drop_reasons'][broke] += 1
         return [sample for _, _, sample in emitted]
 
     def _recovery_context(state9, **fields):
         """Install a reconstructed phase with the original battle formation."""
-        if not _strike9f and _declared_rear is None:
+        if _declared_rear is None:
             raise ValueError('missing declared battle formation')
+        # R3-EXTRACT-CORSAIRS-REBUILD: an event-opened battle's own pending
+        # keys (attacker_no_retreat, def_dice_reduction, ...) ride on every
+        # reconstructed in-battle phase, as on the engine's pending; the
+        # engine's victor_advance pending is a fresh dict without them
+        # (ai._finish_battle and both post-retreat advances)
+        _carry9 = ({} if fields.get('phase') == 'victor_advance'
+                   else _event_pc9)
         state9.pending_combat = {
             'attacker_region': atk, 'defender_region': dfn,
             'attacker_side': side,
             'defender_side': Side.FREE_PEOPLES if side == Side.SHADOW else Side.SHADOW,
-            'is_siege': _sieg, **fields}
+            'is_siege': _sieg, **_carry9, **fields}
         if _declared_rear is not None:
             state9.pending_combat['attacker_rearguard'] = _declared_rear
             if _declared_rear[2][1] or _declared_rear[2][2]:
@@ -13994,7 +17878,15 @@ def _emit_combat_family(batch, stats):
         key9, army9 = combat9._army_entry(state9, region9)
         return partition_battle_army(state9, army9, key9 or region9, owner9)[0]
 
-    def _gd_rounds(_start):
+    def _gd_rounds(_start, advance_after_verified=False, skip_alloc_round=None):
+        # R4-EXTRACT-COVERAGE-DROPS: skip_alloc_round (0-based) = the round
+        # whose casualty allocations the drive already settled (it emitted
+        # one side's and broke on the other's literal reading) - only that
+        # round's later phases (press, continue / retreat, advance) recover.
+        # R2-RS-C3-05: advance_after_verified (final-mismatch path only)
+        # lets the victor advance below run even when every round
+        # verified (_start == len(wins)); the drive's own advance row is
+        # dropped there, so without it the decision was lost.
         # USER truth-table fix #9 FINAL (game01_verification.md): the
         # unverified rounds' sub-decisions are still GESTURES - emit
         # them independently of the drive: per round window, each
@@ -14004,8 +17896,15 @@ def _emit_combat_family(batch, stats):
         # on a mirror-derived mid-battle state (recon + casualties
         # applied up to the round's first roll line).
         try:
-            if not _strike9f and _declared_rear is None:
+            if _declared_rear is None:
                 stats['drop_reasons']['gd_missing_formation'] += 1
+                return
+            if not _cors_landed9:
+                # R3-EXTRACT-CORSAIRS-REBUILD: these batch-start boards
+                # cannot land this Corsairs force (logged after the roll,
+                # dragged via a Board / card slot, or an A10(ii) relief) -
+                # rows on them would show the wrong battle
+                stats['drop_reasons']['gd_corsairs_landing_unreproduced'] += 1
                 return
             import game_state as gs9
             from collections import Counter as _Ctr9
@@ -14023,6 +17922,10 @@ def _emit_combat_family(batch, stats):
             except Exception:
                 rc9d0 = None
             _atk_slot = 'sh' if batch['die_side'] == 'SHADOW' else 'fp'
+            # R17-CORPUS-EXTRACT row 12: round window -> the defender's
+            # siege-trim size proved by its allocation (the drive's, or the
+            # recovery's below)
+            _trim_excess9 = dict(_drive_trim9)
             _dfn_slot = 'fp' if _atk_slot == 'sh' else 'sh'
             # the loop runs over ALL windows: the CC block self-guards
             # via _have (the drive's 1-based alloc indices made _start
@@ -14061,8 +17964,8 @@ def _emit_combat_family(batch, stats):
                     defender_region=_side_key(dfn, _dfn_e))
                 # No later round exists after either participating Army
                 # has been eliminated. A surviving rear is not a fighter.
-                if not _strike9f and (not _recovery_units(st_r, _atk_e)
-                                      or not _recovery_units(st_r, _dfn_e)):
+                if (not _recovery_units(st_r, _atk_e)
+                        or not _recovery_units(st_r, _dfn_e)):
                     stats['detected']['gd_round_after_battle_end'] += 1
                     break
                 # per-round COMBAT-CARD commit/decline (truth rows
@@ -14087,6 +17990,20 @@ def _emit_combat_family(batch, stats):
                     pass
                 if _real_rd and _have[('combat_card', r)] == 0 \
                         and r < len(cards):
+                    # R2-RS-C3-02: the card choices precede their own
+                    # pre-roll effects - a Relentless Assault-family cost
+                    # parked between the commit and the first roll is not
+                    # yet paid on either side's card row
+                    _st_round9 = st_r
+                    _cc_cut9 = _first_commit_line(
+                        cards, r, wins[r - 1]['last'] if r else -1,
+                        w['first'])
+                    if _cc_cut9 < w['first']:
+                        st_r = _recon_state(batch['truth_before'],
+                                            batch.get('turn'))
+                        _install_ledger_hands(st_r, batch)
+                        _apply_window_casualties(st_r, batch, regs,
+                                                 _cc_cut9)
                     for ph_nm, s_en9, slot9 in (
                             ('attacker_combat_card', _atk_e, _atk_slot),
                             ('defender_combat_card', _dfn_e, _dfn_slot)):
@@ -14097,6 +18014,12 @@ def _emit_combat_family(batch, stats):
                             # label (the play may belong to this round)
                             stats['drop_reasons']['gd_cc_anom'] += 1
                             continue
+                        if r == 0 and _mand_r1_conflict9:
+                            # C3-04: the drive proved the round-1 card
+                            # reading contradicts the event (a defender
+                            # commit the event forbids) - drop beats wrong
+                            stats['drop_reasons']['gd_cc_mand_r1_conflict'] += 1
+                            continue
                         # hand AS OF the commit itself: mid-battle
                         # draws (WK ability) put the played card in
                         # hand only moments before its exit (T9 Grond)
@@ -14104,13 +18027,37 @@ def _emit_combat_family(batch, stats):
                             st_r, batch,
                             at_line=cards[r].get(slot9 + '_ln')
                             or w['first'])
+                        if _mand9:
+                            # C3-04: the played event card is out of hand
+                            # (idempotent once the ledger line is past it)
+                            _apply_mandatory_event_play(st_r, _mand_cid9)
+                        # C3-06: the engine's card phases of 0-based round
+                        # r hold rounds_fought == r (encode_state reads it;
+                        # the former 'round' key was read by nothing)
                         _recovery_context(st_r, **{
-                            'phase': ph_nm, 'round': r + 1,
+                            'phase': ph_nm, 'rounds_fought': r,
                             'attacker_region': _side_key(atk, _atk_e),
                             'defender_region': _side_key(dfn, _dfn_e),
                             'attacker_side': _atk_e,
                             'defender_side': _dfn_e,
                             'deciding_side': s_en9, 'is_siege': _sieg})
+                        if _mand9:
+                            # C3-04: the event pending at round r+1's
+                            # card phases, as the engine holds it
+                            st_r.pending_combat.update(
+                                _mandatory_event_pending_keys(_mand9),
+                                rounds_fought=r)
+                            if (ph_nm == 'defender_combat_card'
+                                    and _mandatory_r1_def_card_blocked(
+                                        st_r, st_r.pending_combat)):
+                                # round-1 FP card blocked (no Companion):
+                                # a forced decline, never a row; a logged
+                                # commit contradicts the event reading
+                                if cid9 is None:
+                                    stats['detected']['gd_cc_mand_r1_forced'] += 1
+                                else:
+                                    stats['drop_reasons']['gd_cc_mand_r1_conflict'] += 1
+                                continue
                         if cid9 is not None and not _combat_commit_board_matches(
                                 st_r, batch, cards[r].get(slot9 + '_ln')):
                             stats['drop_reasons']['gd_cc_commit_board_mismatch'] += 1
@@ -14153,11 +18100,16 @@ def _emit_combat_family(batch, stats):
                             stats['drop_reasons']['gd_cc_unmatch'] += 1
                     st_r.pending_combat = None
                     _install_ledger_hands(st_r, batch)   # restore
+                    st_r = _st_round9   # R2-RS-C3-02: the round's own state
                 if r < _start:
                     continue
                 round_start_state = st_r
                 allocation_lines = _recovery_allocation_lines(
                     batch, regs, w['first'], w['next_first'], atk_str)
+                if r == skip_alloc_round:
+                    # R4-EXTRACT-COVERAGE-DROPS: settled by the drive
+                    allocation_lines = {}
+                    stats['detected']['gd_resume_after_cas_break'] += 1
                 if allocation_lines is None:
                     stats['drop_reasons']['gd_alloc_order_ambiguous'] += 1
                 for stage, s_str, s_enum in (
@@ -14186,6 +18138,9 @@ def _emit_combat_family(batch, stats):
                                 and not (_mand9 and r + 1 < _mand9))):
                         stats['drop_reasons']['gd_alloc_separate_loss_window'] += 1
                         continue
+                    _tail9 = (_RetreatTrimTail.of_window(
+                        batch, dfn, dfn_str, w['first'], w['next_first'])
+                        if stage == 'defender' else None)
                     try:
                         events = _casualty_gesture_operations(
                             batch, s_str, regs, w['first'], w['next_first'])
@@ -14193,10 +18148,21 @@ def _emit_combat_family(batch, stats):
                             continue
                         role = 'atk' if stage == 'attacker' else 'def'
                         recorded_hits = round_roll_hits.get((r + 1, role))
+                        if (_tail9 is not None and recorded_hits is None
+                                and any(e[0] in _tail9.lines for e in events)):
+                            # R17-CORPUS-EXTRACT row 12: with no recorded
+                            # hits the gesture count would book the trim
+                            # drags as hits; which drags were the trim is
+                            # then unproven
+                            stats['drop_reasons']['gd_alloc_siege_trim_hits_unknown'] += 1
+                            continue
                         gw = (int(recorded_hits) if recorded_hits is not None else
                               sum(2 if event[2] == 'loss_elite' else 1 for event in events))
+                        # C3-06: allocation follows round r's roll - the
+                        # engine already holds rounds_fought == r + 1
                         _recovery_context(st_r, **{
                             'phase': 'casualty_allocation', 'alloc_stage': stage,
+                            'rounds_fought': r + 1,
                             'attacker_region': _side_key(atk, _atk_e),
                             'defender_region': _side_key(dfn, _dfn_e),
                             'attacker_side': _atk_e, 'defender_side': _dfn_e,
@@ -14204,14 +18170,25 @@ def _emit_combat_family(batch, stats):
                             'def_hits': gw if stage == 'defender' else 0,
                             'deciding_side': s_enum, 'is_siege': _sieg})
                         _, allocations = _drive_casualty_gestures(
-                            st_r, s_enum, events, known_hits=recorded_hits is not None)
+                            st_r, s_enum, events, known_hits=recorded_hits is not None,
+                            trim_tail=_tail9)
                     except _CasualtyGestureError as error:
                         reason = ('gd_alloc_unmatch' if str(error) == 'operation_unmatched'
                                   else 'gd_alloc_operation:' + str(error))
                         stats['drop_reasons'][reason] += 1
                         continue
+                    if _tail9 is not None:
+                        _trim_excess9[r] = _tail9.excess or 0
                     for before, menu, chosen in allocations:
                         _pend_note(stats, 'casualty_alloc', 'open')
+                        if _mand9 and before.pending_combat is not None:
+                            # C3-04: the event pending of round r+1's
+                            # allocation, on the row's own clone AFTER the
+                            # drive (encoding only - the gesture drive ran
+                            # without it, so no engine transition changed)
+                            before.pending_combat.update(
+                                _mandatory_event_pending_keys(_mand9),
+                                rounds_fought=r + 1)
                         sample = _emit_sample(before, s_enum, menu, chosen,
                                               'casualty_alloc', batch['turn'])
                         if sample is not None:
@@ -14225,6 +18202,12 @@ def _emit_combat_family(batch, stats):
                 nlo = w['last']
                 nhi = wins[r + 1]['first'] if r + 1 < len(wins) \
                     else batch['end_line'] + 1
+                # R2-RS-C3-02: the press decision precedes round r+1's card
+                # commit - its state is cut there, so a Relentless Assault-
+                # family cost parked before the first roll is never shown
+                # as a loss of round r (GAME12 T10 L1108: The King is
+                # Revealed 1134, [2]S&E Regular -> Current SA Card 1137)
+                _press_cut9 = _first_commit_line(cards, r + 1, nlo, nhi)
                 # W2-008 (slice of W2-015): an Elite swap after the LAST
                 # window is that round's casualty allocation (elite
                 # downgrade), never a press payment - a paid press is
@@ -14243,14 +18226,16 @@ def _emit_combat_family(batch, stats):
                     # chunk widening a window (T9 WCtK: press #3)
                     _nhi2 = (wins[r + 1]['last'] if r + 1 < len(wins)
                              else batch['end_line'] + 1)
-                    paid = any(
-                        w['last'] < ln <= _nhi2
-                        and re.match(r'^\s*press\b', t)
-                        for (ln, t) in _CHAT_INDEX)
+                    # R2-RS-C3-02: only the attacker's own declaration -
+                    # the defender's 'press or stop?' is a question, not
+                    # the press (GAME12 T4 L289: attacker 'ok then no')
+                    paid = _attacker_press_declared(
+                        batch, w['last'], _nhi2, _COMBAT_CHAT_INDEX)
                 is_last = (r + 1 >= len(wins))
                 # W2-037: a card strike (Dreadful Spells class) fights no
-                # round, so there is no siege press/no-press decision
-                _press_do = (paid or is_last) and _sieg and not _strike9f
+                # round, so there is no siege press/no-press decision (such
+                # a batch returns at the C3-03 guard and never gets here)
+                _press_do = (paid or is_last) and _sieg
                 if _press_do and _mand9 and (r + 1) < _mand9:
                     # 1.267: rounds 1..2 of a Grond / Fighting Uruk-hai
                     # siege are mandatory - no press decision, no Elite
@@ -14292,7 +18277,8 @@ def _emit_combat_family(batch, stats):
                     # remaining physical rear must not create a press
                     # choice after all participating attackers were lost.
                     st_alive = _recon_state(batch['truth_before'], batch.get('turn'))
-                    _apply_window_casualties(st_alive, batch, regs, nhi)
+                    _apply_window_casualties(st_alive, batch, regs,
+                                             _press_cut9)   # R2-RS-C3-02
                     _recovery_context(st_alive,
                         attacker_region=_side_key(atk, _atk_e),
                         defender_region=_side_key(dfn, _dfn_e))
@@ -14300,17 +18286,48 @@ def _emit_combat_family(batch, stats):
                             not _recovery_units(st_alive, _dfn_e):
                         stats['detected']['gd_press_battle_ended'] += 1
                         _press_do = False
+                _pay_skip = ()
+                if _press_do and paid:
+                    # C3-02: the press precedes its own Elite downgrade -
+                    # leave exactly that payment pair unapplied below
+                    # (R2-RS-C3-02: searched before round r+1's commit)
+                    _pay_skip = _press_payment_skip(
+                        batch, atk_str, regs, nlo, _press_cut9, nhi)
+                    if _pay_skip is None:
+                        stats['drop_reasons']['gd_press_payment_ambiguous'] += 1
+                        _press_do = False
                 if _press_do:
-                    _recovery_context(st_r, **{
+                    # C3-02: the engine opens combat_round_result AFTER both
+                    # casualty allocations and offers siege_press only while
+                    # the attacker still holds an Elite - the row shows the
+                    # COMPLETED round (every casualty gesture before the next
+                    # window, as the alive check above), never
+                    # round_start_state (figures that already died; a forced
+                    # no-press emitted as a two-option choice).
+                    st_p = _recon_state(batch['truth_before'], batch.get('turn'))
+                    _install_ledger_hands(st_p, batch)
+                    if _mand9:
+                        # C3-04: the played event card is out of hand
+                        _apply_mandatory_event_play(st_p, _mand_cid9)
+                    _apply_window_casualties(st_p, batch, regs, _press_cut9,
+                                             skip=_pay_skip)
+                    _recovery_context(st_p, **{
                         'phase': 'combat_round_result',
+                        'rounds_fought': r + 1,      # C3-06: after round r
                         'attacker_region': atk,
                         'defender_region': dfn,
                         'attacker_side': _atk_e,
                         'defender_side': _dfn_e,
                         'deciding_side': _atk_e, 'is_siege': True})
+                    if _mand9:
+                        # C3-04: the event pending after round r+1 (the
+                        # menu reads neither key; the encoding does)
+                        st_p.pending_combat.update(
+                            _mandatory_event_pending_keys(_mand9),
+                            rounds_fought=r + 1)
                     try:
                         lp = [a for a in ai.get_legal_actions(
-                            st_r, _atk_e) if a.action_type in
+                            st_p, _atk_e) if a.action_type in
                             ('siege_press', 'siege_no_press')]
                     except Exception:
                         lp = []
@@ -14320,7 +18337,7 @@ def _emit_combat_family(batch, stats):
                     hp = _match_index(lp, lambda a: a.action_type
                                       == wantp)
                     if hp is not None and len(lp) >= 2:
-                        sp = _emit_sample(st_r, _atk_e, lp, hp,
+                        sp = _emit_sample(st_p, _atk_e, lp, hp,
                                           'siege_press', batch['turn'])
                         if sp is not None:
                             keep.append(('siege_press', r, sp))
@@ -14361,12 +18378,29 @@ def _emit_combat_family(batch, stats):
                     except Exception:
                         pass
                     st_c = None
+                    # R17-CORPUS-EXTRACT row 12: continue / retreat precede
+                    # the retreat's siege trim (it opens after the retreat):
+                    # its drags stay unapplied, never read as casualties
+                    _trim_skip9 = ()
+                    if (_fld_ok and rk9 == 'siege'
+                            and (_have[('attacker_continue', r + 1)] == 0
+                                 or _have[('defender_retreat', r + 1)] == 0)):
+                        _trim_skip9 = _window_trim_skip(
+                            batch, dfn, dfn_str, w['first'], w['next_first'],
+                            _trim_excess9.get(r))
+                        if _trim_skip9 is None:
+                            stats['drop_reasons']['gd_field_siege_trim_unproven'] += 1
+                            _fld_ok = False
                     if _fld_ok:
                         try:
                             st_c = _recon_state(batch['truth_before'], batch.get('turn'))
                             _install_ledger_hands(st_c, batch)
+                            # R2-RS-C3-02: continue / retreat precede round
+                            # r+1's card commit and its pre-roll costs
                             _apply_window_casualties(
-                                st_c, batch, regs, w['next_first'])
+                                st_c, batch, regs, _first_commit_line(
+                                    cards, r + 1, w['last'],
+                                    w['next_first']), skip=_trim_skip9)
                             _recovery_context(st_c,
                                 attacker_region=_side_key(atk, _atk_e),
                                 defender_region=_side_key(dfn, _dfn_e))
@@ -14378,9 +18412,16 @@ def _emit_combat_family(batch, stats):
                                 st_c = None
                         except Exception:
                             st_c = None
+                    # R4-EXTRACT-COMBAT-ROUND-KEYS (a): the drive keys
+                    # attacker_continue / defender_retreat with the 1-based
+                    # rounds_fought (its key r_i reads window wins[r_i - 1])
+                    # and this block keys window r with r + 1, so
+                    # (kind, r + 1) IS the same-round duplicate.  The former
+                    # extra `_have[(kind, r)] == 0` clause matched the
+                    # PREVIOUS round's legitimate drive row and dropped
+                    # round 2+ (GAME21 L1660, GAME06 L1793, GAME20 L937).
                     if st_c is not None and \
-                            _have[('attacker_continue', r + 1)] == 0 \
-                            and _have[('attacker_continue', r)] == 0:
+                            _have[('attacker_continue', r + 1)] == 0:
                         _wantc = None
                         if _more9 or rk9:
                             _wantc = 'combat_continue'
@@ -14401,6 +18442,7 @@ def _emit_combat_family(batch, stats):
                         if _wantc is not None:
                             _recovery_context(st_c, **{
                                 'phase': 'attacker_continue',
+                                'rounds_fought': r + 1,   # C3-06
                                 'attacker_region': atk,
                                 'defender_region': dfn,
                                 'attacker_side': _atk_e,
@@ -14428,14 +18470,16 @@ def _emit_combat_family(batch, stats):
                                 stats['drop_reasons'][
                                     'gd_continue_unmatch'] += 1
                     if st_c is not None and not rk9 and _more9 and \
-                            _have[('defender_retreat', r + 1)] == 0 \
-                            and _have[('defender_retreat', r)] == 0:
+                            _have[('defender_retreat', r + 1)] == 0:
+                        # (R4-EXTRACT-COMBAT-ROUND-KEYS (a): same-round
+                        # guard only - see attacker_continue above)
                         # the battle CONTINUED with no retreat = the
                         # defender STOOD - a decline-class decision
                         # (menu: retreat dests + no_retreat; GAME19 T8
                         # 'stay'; GAME01 T5 FoI T5-29b amended to match)
                         _recovery_context(st_c, **{
                             'phase': 'defender_retreat',
+                            'rounds_fought': r + 1,       # C3-06
                             'attacker_region': atk,
                             'defender_region': _side_key(dfn, _dfn_e),
                             'attacker_side': _atk_e,
@@ -14459,10 +18503,12 @@ def _emit_combat_family(batch, stats):
                                 keep.append(
                                     ('defender_retreat', r + 1, ss9))
                     if st_c is not None and rk9 and \
-                            _have[('defender_retreat', r + 1)] == 0 \
-                            and _have[('defender_retreat', r)] == 0:
+                            _have[('defender_retreat', r + 1)] == 0:
+                        # (R4-EXTRACT-COMBAT-ROUND-KEYS (a): same-round
+                        # guard only - see attacker_continue above)
                         _recovery_context(st_c, **{
                             'phase': 'defender_retreat',
+                            'rounds_fought': r + 1,       # C3-06
                             'attacker_region': atk,
                             'defender_region': _side_key(dfn, _dfn_e),
                             'attacker_side': _atk_e,
@@ -14499,21 +18545,43 @@ def _emit_combat_family(batch, stats):
                             stats['drop_reasons'][
                                 'gd_retreat_unmatch'] += 1
             # victor advance ONCE after the last window (field only,
-            # positive advance gesture; sieges capture/auto-advance)
+            # positive advance gesture; sieges capture/auto-advance).
+            # R3-SORTIE-SIEGE-PRESS: never for a CO-LOCATED battle - the
+            # engine opens no victor_advance when the attacker already
+            # stands in the defender's region (ai._finish_battle: atk !=
+            # def; the post-retreat branch: 'no move to decide'), and a
+            # sortie's winner "cannot advance outside of the region"
+            # (rulebook p.32).  GAME21 T20 L1660: the FP garrison's step
+            # from the Minas Tirith Stronghold box into the region after
+            # the besiegers retreated is no advance decision.
             if not _sieg and _have_k['victor_advance'] == 0 \
-                    and _start < len(wins):
+                    and rr.sanitize(str(atk)) != rr.sanitize(str(dfn)) \
+                    and (_start < len(wins) or advance_after_verified):
                 comp9v = _moved_group_composition(
                     batch, atk, dfn, lo=wins[-1]['first'])
                 mv9v = comp9v['reg'] + comp9v['elite'] + \
                     comp9v['leaders'] + comp9v['nazgul']
-                if mv9v > 0:
+                # R17-CORPUS-EXTRACT row 12: after a retreat INTO the
+                # Stronghold the garrison stays in the region (the engine's
+                # victor_advance precedes the siege and its trim): neither
+                # the trim nor a defender departure is applied
+                _wl9 = wins[-1]
+                _siege9 = _window_retreat(batch, dfn, dfn_str, _wl9['first'],
+                                          _wl9['next_first'])[0] == 'siege'
+                _skip_v9 = (_window_trim_skip(
+                    batch, dfn, dfn_str, _wl9['first'], _wl9['next_first'],
+                    _trim_excess9.get(len(wins) - 1)) if _siege9 else ())
+                if mv9v > 0 and _skip_v9 is None:
+                    stats['drop_reasons']['gd_advance_siege_trim_unproven'] += 1
+                elif mv9v > 0:
                     st_v = _recon_state(batch['truth_before'], batch.get('turn'))
                     _install_ledger_hands(st_v, batch)
-                    _apply_window_casualties(st_v, batch, regs, 10 ** 9)
+                    _apply_window_casualties(st_v, batch, regs, 10 ** 9,
+                                             skip=_skip_v9)
                     try:
                         import combat as _cmbv
                         _kv, _av = _cmbv._army_entry(st_v, dfn)
-                        if _av is not None:
+                        if _av is not None and not _siege9:
                             import ai as aiv
                             _av.units = [
                                 u for u in _av.units
@@ -14521,8 +18589,12 @@ def _emit_combat_family(batch, stats):
                                 != _dfn_e]
                     except Exception:
                         pass
+                    # C3-06: the engine's victor_advance pending keeps the
+                    # battle's rounds_fought (_finish_battle) - every round
+                    # window was fought
                     _recovery_context(st_v, **{
                         'phase': 'victor_advance',
+                        'rounds_fought': len(wins),
                         'attacker_region': atk, 'defender_region': dfn,
                         'attacker_side': _atk_e,
                         'defender_side': _dfn_e,
@@ -14576,7 +18648,19 @@ def _emit_combat_family(batch, stats):
             _sgd = max([e[1] for e in emitted
                         if e[0] in ('casualty_alloc',
                                     'siege_press')] or [0])
-            _gd_rounds(_sgd)
+            _skip_alloc9 = None
+            if (broke == 'cas_operation:replacement_unpaired'
+                    and _cas_break_round9 is not None
+                    and _sgd == _cas_break_round9 >= 1):
+                # R4-EXTRACT-COVERAGE-DROPS (R3-EXTRACT-CORSAIRS-REBUILD
+                # FU5): the drive emitted this round's first allocation and
+                # broke reading the second (an unpaired replacement gesture),
+                # so _sgd skipped the round's press / continue / retreat /
+                # advance.  Resume IN that round past its allocations (the
+                # second one stays unproven: the same reading fails there).
+                _sgd = _cas_break_round9 - 1
+                _skip_alloc9 = _sgd
+            _gd_rounds(_sgd, skip_alloc_round=_skip_alloc9)
     elif not no_dice and not _combat_final_ok(s2, batch['truth'],
                                               regs | retreat_dests):
         # USER truth-table fix #9 (game01_verification.md): the settled
@@ -14598,9 +18682,12 @@ def _emit_combat_family(batch, stats):
                 for own, own_str in (('atk', atk_str), ('def', dfn_str)):
                     gw = _window_owner_hits(batch, own_str, regs,
                                             w['first'], w['next_first'])
-                    eh = round_roll_hits.get((r, own))
-                    if eh is None:
-                        eh = round_roll_hits.get((r + 1, own))
+                    # C3-05: round_roll_hits keys are 1-BASED
+                    # rounds_fought (incremented before the allocation
+                    # pending; the drive pairs key r_i with wins[r_i-1]),
+                    # so 0-based window r is engine round r + 1 ONLY - the
+                    # old (r, own)-first lookup read round r-1's hits
+                    eh = round_roll_hits.get((r + 1, own))
                     if eh is None:
                         if gw > 0:
                             ok = False
@@ -14618,7 +18705,15 @@ def _emit_combat_family(batch, stats):
         # verified counts 0-based rounds: keep <= verified for the
         # 1-based kinds so the LAST verified round's drive samples
         # survive (gd resumes at 0-based verified = 1-based verified+1,
-        # so no double emission)
+        # so no double emission).  R2-RS-C3-05: the drive's END rows
+        # (victor_advance / siege_trim, appended with the 1-based
+        # rounds_fought of the last round) deliberately stay under the
+        # strict rule, i.e. they drop after a final mismatch: with every
+        # round verified the mismatch is a loss the per-round count cannot
+        # see (corpus 2024-06-24 Jaymanen v Adobim T2 L148: 3 Sauron
+        # Regulars parked on the SA card, drive 8 Shadow units vs 5), so
+        # the drive's end state is unproven.  _gd_rounds re-emits the
+        # advance from the gesture state (advance_after_verified below).
         _one_based9 = ('casualty_alloc', 'siege_press',
                        'attacker_continue', 'defender_retreat')
         keep = [e for e in emitted
@@ -14631,7 +18726,7 @@ def _emit_combat_family(batch, stats):
         if os.environ.get('RX_CF_DEBUG'):
             print('[CF]   final-mismatch verified=%d kept=%s'
                   % (verified, [(e[0], e[1]) for e in keep]))
-        _gd_rounds(verified)
+        _gd_rounds(verified, advance_after_verified=True)
         if os.environ.get('RX_CF_DEBUG'):
             print('[CF]   post-gd keep=%s'
                   % [(e[0], e[1]) for e in keep])
@@ -14650,66 +18745,103 @@ def _emit_combat_family(batch, stats):
             print('[ONS] enter line=%s fx=%s' % (batch.get('start_line'),
                                                  sorted(_drive_fx9)))
         try:
-            _ons_cid9 = next(
-                (c[sl] for c in cards for sl in ('fp', 'sh')
-                 if c.get(sl) and ('Fighting_Uruk' in str(c[sl])
-                                   or 'Orcs_Multiplying' in str(c[sl]))),
-                None)
-            if _ons_cid9 is not None:
-                _kpark9 = 0
+            # C3-10 (fix wave 2026-10-21): the ENGINE opens this pending
+            # (ai._open_deferred_onslaught), never a hand-built menu.  The
+            # former block summed every unit of EITHER side parked on
+            # either Current card over ALL rounds, offered counts
+            # 0..parked+2 (past the card's "up to four additional hits"),
+            # let the DIE side decide (a Shadow DEFENDER commits Onslaught
+            # too: corpus 2023-02-14 Yurdin v Hakuna T8 L820 was labelled
+            # K=12 for the Free Peoples) and showed the battle-start state.
+            from cards import get_card as _ons_card9
+            _ons9 = [(r9, c9[sl9]) for r9, c9 in enumerate(cards)
+                     for sl9 in ('fp', 'sh')
+                     if c9.get(sl9) and str(getattr(
+                         _ons_card9(c9[sl9]), 'combat_name', '')
+                         or '').lower() == 'onslaught']
+            if len(_ons9) > 1:
+                # one row per decision; which commit a park belongs to is
+                # not separable here - drop beats wrong
+                stats['drop_reasons']['ons_gesture_multi_commit'] += 1
+            elif _ons9:
+                _rc9, _ons_cid9 = _ons9[0]
+                _own9 = _ons_card9(_ons_cid9).side    # the card's OWNER
+                _own_str9 = _own9.name
+                _role9 = 'attacker' if _own_str9 == atk_str else 'defender'
+                _wc9 = wins[_rc9]
+                # K = the owner's Onslaught dice, cross-checked against
+                # the owner's park in the commit round (W2-008 doctrine)
+                _kpark9, _kwhy9 = _onslaught_park_k(
+                    batch, _own_str9, regs, _wc9['first'],
+                    _wc9['next_first'])
+                _pline9 = None
                 for r9 in batch['records']:
-                    if r9.get('op') != 'move':
+                    ln9 = int(r9.get('line', 0) or 0)
+                    if r9.get('op') != 'move' or not (
+                            _wc9['first'] <= ln9 < _wc9['next_first']):
                         continue
                     fk9 = rr.zone_kind(r9.get('from', ''))
+                    to9 = str(r9.get('to', '')).lower()
                     if fk9[0] not in ('region', 'stronghold') \
-                            or fk9[1] not in regs:
+                            or fk9[1] not in regs \
+                            or ('current sa card' not in to9
+                                and 'current fp card' not in to9):
                         continue
-                    if 'current sa card' not in \
-                            str(r9.get('to', '')).lower() and \
-                            'current fp card' not in \
-                            str(r9.get('to', '')).lower():
-                        continue
-                    for t9 in _group_tokens(r9.get('obj', '')):
-                        p9 = rr.parse_piece(t9)
-                        if p9 and p9[0] == 'unit':
-                            _kpark9 += p9[3]
-                if _kpark9 > 0:
-                    import game_state as gs9o
-                    _own9 = (gs9o.Side.SHADOW
-                             if batch['die_side'] == 'SHADOW'
-                             else gs9o.Side.FREE_PEOPLES)
+                    if any(p9 and p9[0] == 'unit'
+                           and _unit_side_str(p9[1]) == _own_str9
+                           for p9 in map(rr.parse_piece,
+                                         _group_tokens(r9.get('obj', '')))):
+                        _pline9 = ln9
+                        break
+                if _kwhy9 == 'no_park':
+                    # no owner park and no Onslaught roll: nothing to read
+                    stats['detected']['ons_gesture_no_park'] += 1
+                elif _kwhy9 != 'park' or _pline9 is None:
+                    # 'dice' = the sacrifice rendered as kills (its prefix
+                    # is inseparable from the round's casualties);
+                    # 'no_roll' / 'dice_mismatch' = K unproven
+                    stats['drop_reasons']['ons_gesture_%s'
+                                          % ('unparked' if _kwhy9 == 'dice'
+                                             else _kwhy9)] += 1
+                elif not _cors_landed9:
+                    # R3-EXTRACT-CORSAIRS-REBUILD: the batch-start board
+                    # below cannot land this Corsairs force (as _gd_rounds)
+                    stats['drop_reasons'][
+                        'ons_gesture_corsairs_landing_unreproduced'] += 1
+                else:
+                    # the decision state: the round's ordinary casualties
+                    # (every gesture before the park) applied, hands as of
+                    # the park; the engine has already advanced rounds_fought
                     st_o = _recon_state(batch['truth_before'], batch.get('turn'))
-                    _install_ledger_hands(st_o, batch)
+                    _apply_window_casualties(st_o, batch, regs, _pline9)
+                    _install_ledger_hands(st_o, batch, at_line=_pline9)
                     _recovery_context(st_o, **{
                         'phase': 'combat_effect_choice',
-                        'attacker_region': atk, 'defender_region': dfn,
-                        'attacker_side': _own9,
-                        'defender_side': (
-                            gs9o.Side.FREE_PEOPLES
-                            if _own9 == gs9o.Side.SHADOW
-                            else gs9o.Side.SHADOW),
-                        'deciding_side': _own9, 'is_siege': _sieg,
-                        'effect_choice': {
-                            'stage': 'post', 'owner': 'atk',
-                            'effect': 'onslaught',
-                            'card_id': _ons_cid9,
-                            'max_count': _kpark9 + 2}})
-                    la_o = [a for a in ai.get_legal_actions(st_o, _own9)
-                            if a.action_type == 'combat_effect_choice']
-                    if len(la_o) >= 2:
-                        _pend_note(stats, 'combat_effect', 'open')
-                    h_o = _match_index(
-                        la_o, lambda a: int(a.params.get('count', -2))
-                        == _kpark9)
-                    if h_o is not None and len(la_o) >= 2:
-                        stats['detected']['cc_onslaught_gesture'] += 1
-                        s_o = _emit_sample(st_o, _own9, la_o, h_o,
-                                           'combat_effect_choice',
-                                           batch['turn'])
-                        if s_o is not None:
-                            keep.append(('combat_effect', 0, s_o))
+                        'rounds_fought': _rc9 + 1,
+                        'attacker_region': atk, 'defender_region': dfn})
+                    if not ai._open_deferred_onslaught(
+                            st_o, st_o.pending_combat, _role9, _ons_cid9,
+                            False, False):
+                        # owner army gone / no hit capacity: the engine
+                        # opens no Onslaught decision
+                        stats['drop_reasons']['ons_gesture_no_pending'] += 1
                     else:
-                        stats['drop_reasons']['ons_gesture_unmatch'] += 1
+                        la_o = [a for a in ai.get_legal_actions(st_o, _own9)
+                                if a.action_type == 'combat_effect_choice']
+                        if len(la_o) >= 2:
+                            _pend_note(stats, 'combat_effect', 'open')
+                        h_o = _match_index(
+                            la_o, lambda a: int(a.params.get('count', -2))
+                            == _kpark9)
+                        if h_o is not None and len(la_o) >= 2:
+                            stats['detected']['cc_onslaught_gesture'] += 1
+                            s_o = _emit_sample(st_o, _own9, la_o, h_o,
+                                               'combat_effect_choice',
+                                               batch['turn'])
+                            if s_o is not None:
+                                keep.append(('combat_effect', 0, s_o))
+                        else:
+                            stats['drop_reasons']['ons_gesture_unmatch'] += 1
         except Exception as _eo9:
             stats['drop_reasons']['ons_gesture_exc:%s'
                                   % str(_eo9)[:12]] += 1
@@ -14729,6 +18861,7 @@ def _emit_combat_family(batch, stats):
 # besieged) evidences BOTH decisions: the attacker's army_attack TARGET and
 # the defender's retreat_into_siege (plus a possible siege_trim).
 # ==========================================================================
+@_fp_huntbox_batch_scope    # R3-EXTRACT-HUNTBOX-RECON: apply_action clones
 def _emit_siege_withdrawal(batch, stats):
     import ai
     import rendered_replay as rr
@@ -14877,12 +19010,11 @@ def _emit_siege_withdrawal(batch, stats):
                 s2 = ai.apply_action(s2, la[h2])
                 continue
             if ph == 'siege_trim':
-                eb, _rb, to_cas = _window_trim(batch, target, dfn_str)
+                eb, _rb, to_cas, _tu2 = _window_trim(batch, target, dfn_str,
+                                                     with_units=True)
                 if to_cas:
                     stats['detected']['siege_trim_to_casualties'] += 1
-                h2 = _match_index(la, lambda a: a.action_type ==
-                                  'siege_trim' and
-                                  int(a.params.get('elites_back', -1)) == eb)
+                h2 = _match_index(la, lambda a: _trim_row_matches(a, eb, _tu2))
                 if h2 is None:
                     stats['drop_reasons']['cf_trim_unmatched'] += 1
                     break
@@ -14970,15 +19102,30 @@ def _emit_discards(batches, stats):
         if snapshot is None and host.get('record_truth_version'):
             stats['drop_reasons']['discard_no_record_snapshot'] += 1
             continue
+        # R4B-EOT-DISCARD-SHADOW-BOX: a discard after the next turn's Phase 1
+        # dice recovery, logged before the turn marker, belongs to that turn
+        # (_annotate_remaining_pools: _rx_turn, pre-Hunt pools), so it is
+        # encoded under its number and _emit_sample stamps no stale Eyes.
+        d_turn = host.get('turn')
+        if record is not None and record.get('_rx_turn') is not None:
+            d_turn = record['_rx_turn']
         try:
             st = _recon_state(snapshot if snapshot is not None else host['truth_before'],
-                              host.get('turn'))
+                              d_turn)
         except Exception:
             stats['drop_reasons']['discard_recon'] += 1
             continue
         d_side = Side.FREE_PEOPLES if side_tag == 'fp' else Side.SHADOW
-        _install_ledger_hands(st, host, at_line=line)
+        if not _install_row_hands(st, host, stats, at_line=line):
+            continue                 # R17-CORPUS-EXTRACT row 10: this row only
         _install_persistent_cards(st, line, killable=True)
+        if d_turn != host.get('turn'):
+            # R4B: the turn change cleared the once-per-turn latches the
+            # ring / token ledgers still hold for the hosting turn (the same
+            # fields game_logic's per-turn reset clears)
+            st.fp_ring_used_this_turn = st.sh_ring_used_this_turn = False
+            st.fp_token_used_this_turn = st.sh_token_used_this_turn = False
+            st.sh_mouth_muster_used_this_turn = False
         if record is not None and '_rx_pools' in record:
             st._rx_full_pools = record['_rx_pools']
             st.dice = _install_full_pools(st._rx_full_pools)
@@ -15002,8 +19149,13 @@ def _emit_discards(batches, stats):
             stats['drop_reasons']['discard_unmatched'] += 1
             continue
         stats['kinds_emit']['discard_card'] += 1
-        out.append(_emit_sample(st, d_side, legal, hidx, 'discard_card',
-                                host['turn']))
+        # R4-EXTRACT-HUNTBOX-REMAINING: the fresh _recon_state holds no Hunt
+        # Box; a discard inside the action phase reads the FP dice settled
+        # before its own line, an end-of-turn / Phase 1 discard none.
+        with _fp_huntbox_cut(*_discard_fp_box_cut(batches, host, record,
+                                                  line)):
+            out.append(_emit_sample(st, d_side, legal, hidx, 'discard_card',
+                                    d_turn))
     return out
 
 
@@ -15057,7 +19209,8 @@ def _emit_guides(batches, stats):
         state._fellowship_tail_phase = False
         state._rx_before_hunt_allocation = optional
         line = record.get('line', 0)
-        _install_ledger_hands(state, batch, at_line=line)
+        if not _install_row_hands(state, batch, stats, at_line=line):
+            return                   # R17-CORPUS-EXTRACT row 10: this row only
         _install_persistent_cards(state, line, killable=True)
         if optional:
             # The future roll/Hunt allocation is not yet observed.
@@ -15065,9 +19218,24 @@ def _emit_guides(batches, stats):
             state.hunt_box = []
             state.eyes_allocated = 0
             state._rx_eyes_stamped = True
-        elif '_rx_pools' in record:
+        elif ('_rx_pools' in record
+              and getattr(state, '_fellowship_move_die_pending', None) is None):
+            # R2-RS-C9-02: a driven Hunt state that still owes its Fellowship
+            # movement die already holds the full physical pools
+            # (_prepare_fellowship_dice). Re-installing the record pools
+            # re-indexes that die, so the v47+ observation tail raises and
+            # aborts every later Guide row of the game. Same rule as
+            # _emit_sample and the reveal-placement prefix.
             state._rx_full_pools = record['_rx_pools']
             state.dice = _install_full_pools(state._rx_full_pools)
+        if not optional and driven is None:
+            # R3-EXTRACT-HUNTBOX-RECON: an inside-action replacement rebuilt
+            # by _recon_state (never fills hunt_box) carries the FP Hunt Box
+            # dice of the turn's moves settled before this action's die
+            # stage.  A driven Hunt state already holds them physically and
+            # still owes the current move's die (ruling 1.244: it enters the
+            # box only after that Hunt, and pending_guide_change holds it).
+            _topup_fp_huntbox(state, batch['turn'], batch.get('start_line'))
         try:
             legal = ai.get_legal_actions(state, Side.FREE_PEOPLES)
         except Exception:
@@ -15470,9 +19638,10 @@ def _fel_place_dest(batch, after_line):
             continue
         if 'Mordor' in str(r.get('to', '')):
             continue
-        if rr.zone_kind(str(r.get('to', '')))[0] != 'region':
+        # R4B-FELLOWSHIP-STRONGHOLD-BOX-MOVES: a Stronghold box is its region
+        if rr.zone_kind(str(r.get('to', '')))[0] not in ('region', 'stronghold'):
             continue
-        dest = rr.sanitize(str(r.get('to', '')))
+        dest = rr.pawn_zone_key(r.get('to', ''))
     return dest
 
 
@@ -15800,8 +19969,11 @@ def _emit_hunt_resolution(batch, stats):
         if worn_window is not None:
             from rendered_reactive_cards import drain_worn, Unproven
             try:
+                # R2-RS-C9-02: a tied Guide applied inside drain_worn skips
+                # the Guide branch below; keep its driven snapshot + count.
                 st2, worn_samples = drain_worn(st2, batch, stats, *worn_window[:2],
-                                              complete_window=worn_window[2])
+                                              complete_window=worn_window[2],
+                                              record_hunt_guide=True)
             except Unproven as error:
                 stats['drop_reasons'][str(error)] += 1
                 raise
@@ -16144,6 +20316,7 @@ def _emit_axebow_horn(batch, stats, lo, hi):
     return emit_movement_hunt_reduction(batch, stats)
 
 
+@_fp_huntbox_batch_scope    # R4-EXTRACT-HUNTBOX-REMAINING: fresh _recon_state
 def _emit_wizardstaff(batch, stats, lo, hi, is_mordor, ws_killed, tile_drawn):
     """Wizard's Staff prevent (killed + no tile drawn) vs decline (tile drawn +
     staff stays).  A KILL that still drew a tile is contradictory -> drop."""
@@ -16211,11 +20384,27 @@ def _emit_mithril(batch, stats, lo, hi, is_mordor):
     if is_fp_challenge_draw(batch):
         stats['detected']['mithril_not_applicable_challenge'] += 1
         return None
-    tile_drawn = any(it.get('kind') == 'draw_tile' for it in batch['rng'])
-    used = _TABLE.killed_in('MITHRIL_COAT', lo, hi)
-    if not (tile_drawn or used):
+    # R18-CORPUS row 5: the interpose is the FIRST drawn tile's.  A kill of
+    # the card anywhere in the batch was read as its redraw: a Worn with
+    # Sorrow and Toil table discard after a kept tile (2023-01-07
+    # juakinaki/Spartako T8 L888 tile, L892 Spartako kills Mithril) or a
+    # use on a later tile labelled the first tile 'redraw'.  The shared
+    # rule (_mithril_redraw_choice, also the card-interior and Shadow-hunt
+    # readers') ties the discard to the first tile's window and its
+    # replacement draw.
+    tiles = _hunt_tile_items(batch)
+    if not tiles:
+        if _TABLE.killed_in('MITHRIL_COAT', lo, hi):
+            stats['detected']['huntcard_mithril'] += 1
+            stats['drop_reasons']['mithril_drawn_tile_unproven'] += 1
         return None
     stats['detected']['huntcard_mithril'] += 1
+    used = _mithril_redraw_choice(
+        batch['records'], [(int(t.get('line') or 0), t.get('value')) for t in tiles],
+        0, lo - 1, hi)
+    if isinstance(used, str):
+        stats['drop_reasons'][used] += 1
+        return None
     try:
         st = _recon_state(batch['truth_before'], batch.get('turn'))
     except Exception:
@@ -16225,8 +20414,8 @@ def _emit_mithril(batch, stats, lo, hi, is_mordor):
     _install_persistent_cards(st, lo)
     _install_ledger_hands(st, batch)
     st.pending_card_option = None
-    tile = next((r for r in batch['rng'] if r['kind'] == 'draw_tile'), None)
-    tname = str(tile['value']).strip().lower() if tile else None
+    tile = tiles[0]
+    tname = str(tile['value']).strip().lower()
     fo = rc._tile_obj(gs, tname) if tname else None
     if fo is None:
         # A discarded card is not evidence of the tile's damage/reveal
@@ -16265,14 +20454,20 @@ def _emit_mithril(batch, stats, lo, hi, is_mordor):
                         batch['turn'])
 
 
+# R4-EXTRACT-HUNTBOX-REMAINING: emit_shadow_hunt_reaction (rendered_reactive_
+# cards) and the Staff / Mithril / Axe and Bow rows read the FP dice of the
+# turn's moves settled before this batch's stage (1.244: never its own die).
+@_fp_huntbox_batch_scope
 def _emit_hunt_cards(batch, stats):
     """Dispatch the three hunt-interpose table-card decisions for an FP batch.
     Additive + independent (own reconstruction, drop on any failure).
 
-    RNG-NEUTRAL: _emit_axebow_horn re-drives the hunt (rendered_census.
-    _drive_hunt), which on a stream-exhaustion fallback advances the global
-    generator.  We snapshot/restore random state around the whole dispatch so
-    this emitter consumes zero net randomness â€” the downstream _emit_hunt_
+    RNG-NEUTRAL: the hunt drives are RNG-neutral themselves since C7-01
+    (rendered_census._drive_hunt saves/restores the generator and an
+    exhausted forced roll stream is a named skip, never a live draw), and
+    _emit_axebow_horn now only delegates to emit_movement_hunt_reduction.
+    The snapshot/restore of random state around the whole dispatch is kept
+    as a harmless guard, so this emitter consumes zero net randomness â€” the downstream _emit_hunt_
     resolution / _drive_* of LATER batches then see the exact baseline RNG
     state, keeping every prior emit-kind count byte-identical (strict A/B)."""
     import random
@@ -16347,7 +20542,8 @@ def _emit_one_declare(b, placement, kind, stats):
     st.fellowship.hidden = True            # declaration precondition
     st.fellowship.mordor_entered = False
     st._declare_phase = True
-    _install_ledger_hands(st, b)
+    if not _install_row_hands(st, b, stats):
+        return None                  # R17-CORPUS-EXTRACT row 10: this row only
     _ensure_decks(st)   # T3: live declare states carry populated decks;
     # empty-deck staging made X[3222-3225]==0 a corpus-only declare
     # marker the net keyed P(pass) on (absent live -> declare collapse)
@@ -16405,7 +20601,8 @@ def _emit_one_decline(b, stats):
     st.fellowship.hidden = True
     st.fellowship.mordor_entered = False
     st._declare_phase = True
-    _install_ledger_hands(st, b)
+    if not _install_row_hands(st, b, stats):
+        return None, 'deck_prefix'   # R17-CORPUS-EXTRACT row 10: this row only
     _ensure_decks(st)                      # T3 staging parity with live
     _install_persistent_cards(st, b.get('start_line') or 0)
     try:
@@ -16434,7 +20631,10 @@ def _emit_one_heal_declare(b, stats):
     heal (rulebook p.34; same dialect log_replay records as
     in_place_heal).  Counts as category DECLARED and emits the
     in-place fellowship_declare sample.  A heal gesture with
-    progress > 0 does NOT reach here (caller enforces)."""
+    progress > 0 does NOT reach here (caller enforces).  C4-03: the
+    caller hands a batch whose truth_before carries the PRE-heal
+    corruption (the walk's from-track), never the raw first-stage
+    snapshot, which already holds the heal's own consequence."""
     import ai
     import rendered_replay as rr
     from game_state import Side
@@ -16447,7 +20647,8 @@ def _emit_one_heal_declare(b, stats):
     st.fellowship.mordor_entered = False
     st.fellowship.progress = 0
     st._declare_phase = True
-    _install_ledger_hands(st, b)
+    if not _install_row_hands(st, b, stats):
+        return None                  # R17-CORPUS-EXTRACT row 10: this row only
     _ensure_decks(st)                      # T3 staging parity with live
     _install_persistent_cards(st, b.get('start_line') or 0)
     try:
@@ -16489,6 +20690,7 @@ def _emit_cardhunt_worn(state, batch, action, victim, exits, tiles, stats):
     import rendered_replay as rr
     from rendered_reactive_cards import (Unproven, prepare_worn_trigger,
         worn_casualty_window, drain_worn)
+    from rendered_history import HistoryUnproven
     from unittest.mock import patch
     if (_REACTIVE_TABLE is None or _LEDGER is None or not _LEDGER.enabled
             or victim not in exits
@@ -16532,6 +20734,37 @@ def _emit_cardhunt_worn(state, batch, action, victim, exits, tiles, stats):
     except Unproven as error:
         stats['drop_reasons'][str(error)] += 1
         return []
+    except HistoryUnproven as error:
+        # R17-CORPUS-EXTRACT row 10: prepare_worn_trigger's hand install
+        # refuses this row only (the CE-04 per-row contract)
+        stats['drop_reasons']['fixed_policy:' + str(error)] += 1
+        return []
+
+
+_HUNT_WALK_MARKS = ('_rx_huntres', '_rx_reveal_predecision',
+                    '_rx_hunt_guide_predecision', '_rx_hunt_reduction_owned')
+
+
+def _merge_projected_hunt_marks(source_batch, batch):
+    """After the per-batch emitters: carry the Hunt walk's ownership marks
+    from the batch they ran on back to the parsed source batch that the
+    game-level emitters (_emit_cardhunt_arms, _emit_reveal_placements,
+    _emit_guides) read.
+
+    An excluded Hunt drops every walk mark.  R18-CORPUS row 66: for a mixed
+    FP movement + combat batch the walk runs on project_hunt_prefix's
+    deepcopy, and only the guide predecisions came back: the source kept no
+    _rx_huntres, so _emit_cardhunt_arms rebuilt the walk's own Mordor
+    take-corruption row as a second sample for the same tile (W3-011: one
+    owner per drawn tile)."""
+    if batch.get('_rx_hunt_exclusion'):
+        source_batch['_rx_hunt_exclusion'] = dict(batch['_rx_hunt_exclusion'])
+        for key in _HUNT_WALK_MARKS:
+            source_batch.pop(key, None)
+    elif batch is not source_batch:
+        for key in _HUNT_WALK_MARKS:
+            if key in batch:
+                source_batch[key] = batch[key]
 
 
 def _emit_cardhunt_arms(batches, stats):
@@ -16558,12 +20791,22 @@ def _emit_cardhunt_arms(batches, stats):
     import rendered_census as rc
     import rendered_replay as rr
     from game_state import Side
+    from rendered_history import HistoryUnproven
     out = []
     for b in batches:
         if b.get('_rx_hunt_exclusion'):
             continue
         from rendered_reactive_cards import emit_foul_worn
-        out.extend(emit_foul_worn(b, stats, _REACTIVE_TABLE))
+        # R4-EXTRACT-HUNTBOX-REMAINING: every row of this batch (fresh
+        # _recon_state, or a clone) reads the FP Hunt Box dice of the turn's
+        # moves settled before its stage (1.244: never the batch's own die)
+        with _fp_huntbox_cut(b.get('turn'), b.get('start_line')):
+            try:
+                out.extend(emit_foul_worn(b, stats, _REACTIVE_TABLE))
+            except HistoryUnproven as error:
+                # R17-CORPUS-EXTRACT row 10: its batch-hand install refuses
+                # this row only, never the game's card-hunt arms
+                stats['drop_reasons']['fixed_policy:' + str(error)] += 1
         if b.get('_rx_nazgul_hunt_owned'):
             # The recorded Event driver owns these post-flight states and
             # Shadow funding. Do not also synthesize a pre-Event FP Hunt.
@@ -16574,7 +20817,9 @@ def _emit_cardhunt_arms(batches, stats):
         tiles = _hunt_live_tiles(b)
         if not tiles:
             continue
-        _is_fp9 = (b['kind'] == 'hunt'
+        # R18-CORPUS row 66: a mixed movement + combat batch whose Hunt
+        # prefix the walk took (project_hunt_prefix) is an FP-die Hunt too
+        _is_fp9 = ((b['kind'] == 'hunt' or b.get('_rx_mixed_hunt_projected'))
                    and b.get('die_side') == 'FREE_PEOPLES')
         _mordor9 = bool(b['truth_before']['fel'].get('mordor')
                         or b['truth']['fel'].get('mordor'))
@@ -16684,7 +20929,8 @@ def _emit_cardhunt_arms(batches, stats):
             stats['drop_reasons']['chunt_recon'] += 1
             continue
         _prepare_fellowship_dice(st, b, pending=True, advance=True)
-        _install_ledger_hands(st, b)
+        if not _install_row_hands(st, b, stats):
+            continue                 # R17-CORPUS-EXTRACT row 10: this batch only
 
         def _drop_comp9(nm):
             for c in list(st.fellowship.companions):
@@ -16757,9 +21003,33 @@ def _emit_cardhunt_arms(batches, stats):
             if k == 0 and _eyehits9 and \
                     'eye' in str(tiles[0].get('value', '')).lower():
                 dmg9 = _eyehits9
+            # R17-CORPUS-EXTRACT row 11: the links follow the engine's chain
+            # (game_logic.resolve_hunt_decision -> continue_hunt_chain), in
+            # the order the victims left: a later link opens on the
+            # REMAINING damage, with casualty_taken once a casualty was
+            # taken (the sacrifice arms are then gone), and a Hunt-placed
+            # Hobbit leaves the Fellowship with his own link.  His
+            # hobbit_place opens once the tile's chain has finished
+            # (pop_hobbit_place_queue), on that state.  Each link used to
+            # open a fresh full-damage pending and the placement row showed
+            # the Hobbit still in the Fellowship (GAME01 T7 Gimli+Pippin).
+            links.sort(key=lambda nm: exits.get(nm, 0))
+            remaining, taken, placed = dmg9, False, []
             for nm in links:
+                if remaining <= 0:
+                    # the chain already ended: no decision opens for a
+                    # further victim of this tile
+                    stats['drop_reasons']['chunt_chain_damage_spent'] += 1
+                    if nm != '__corr__':
+                        _drop_comp9(nm)
+                    continue
                 st.pending_hunt = {'phase': 'hunt_sacrifice',
-                                   'damage': dmg9}
+                                   'damage': remaining}
+                if nm != links[0]:              # a continue_hunt_chain link
+                    st.pending_hunt['casualty_taken'] = taken
+                victim = next((c for c in st.fellowship.companions
+                               if rr._named_eq(c.name, nm)), None)
+                level = int(getattr(victim, 'level', 1) or 1)
                 from rendered_hunt_observation import mark as mark_hunt_observation
                 mark_hunt_observation(st, int(tiles[k]['line']) + 1, 'after_draw')
                 try:
@@ -16795,54 +21065,81 @@ def _emit_cardhunt_arms(batches, stats):
                 else:
                     stats['detected']['cardhunt_arm'] += 1
                     stats['kinds_emit'][want] += 1
-                    s = _emit_sample(st, Side.FREE_PEOPLES, legal, hidx,
-                                     'hunt_sacrifice', b['turn'])
-                    if s is not None:
-                        out.append(s)
-                    if nm in guide_ev or nm in random_ev:
-                        out.extend(_emit_cardhunt_worn(st, b, legal[hidx], nm,
-                            {name: exits[name] for name in left_all if name in exits}, tiles, stats))
+                    # R4-EXTRACT-HUNTBOX-REMAINING: as emit_foul_worn above
+                    with _fp_huntbox_cut(b.get('turn'), b.get('start_line')):
+                        s = _emit_sample(st, Side.FREE_PEOPLES, legal, hidx,
+                                         'hunt_sacrifice', b['turn'])
+                        if s is not None:
+                            out.append(s)
+                        if nm in guide_ev or nm in random_ev:
+                            out.extend(_emit_cardhunt_worn(st, b, legal[hidx], nm,
+                                {name: exits[name] for name in left_all if name in exits}, tiles, stats))
                     # hobbit PLACED not eliminated (Take Them Alive): the
                     # placement region is its own decision (GAME01 T2:
-                    # Merry -> BREE)
+                    # Merry -> BREE), opened after the chain (below)
                     if nm in hobbit_place:
-                        lvl = {'Meriadoc': 1, 'Peregrin': 1}.get(nm, 1)
-                        st.pending_hunt = {'phase': 'hobbit_place',
-                                           'companion': nm, 'level': lvl}
-                        try:
-                            la2 = [a for a in ai.get_legal_actions(
-                                st, Side.FREE_PEOPLES)
-                                if a.action_type == 'companion_separate']
-                            h2 = _match_index(
-                                la2, lambda a: rr.sanitize(str(
-                                    a.params.get('region',
-                                                 a.params.get('to_region',
-                                                              '')))) ==
-                                hobbit_place[nm])
-                            if h2 is not None and len(la2) >= 2:
-                                stats['kinds_emit']['hobbit_place'] += 1
-                                s2 = _emit_sample(st, Side.FREE_PEOPLES,
-                                                  la2, h2, 'hobbit_place',
-                                                  b['turn'])
-                                if s2 is not None:
-                                    out.append(s2)
-                            else:
-                                stats['drop_reasons'][
-                                    'chunt_hobbitplace_unmatched'] += 1
-                        except Exception:
-                            stats['drop_reasons'][
-                                'chunt_hobbitplace_exc'] += 1
+                        placed.append((nm, level))
                 # apply the link to the working state so the next link's
-                # menu reflects it (chain semantics)
+                # menu reflects it (chain semantics): the victim absorbs up
+                # to his level and a casualty is taken; a Hobbit guide's
+                # separation reduces the damage by one (GL-5)
+                if nm == '__corr__':
+                    remaining = 0
+                elif want == 'hunt_guide_separate':
+                    remaining = max(0, remaining - 1)
+                else:
+                    remaining -= min(remaining, level)
+                    taken = True
                 if nm != '__corr__':
                     _drop_comp9(nm)
                 st.pending_hunt = None
-            # the tile's corruption and reveal carry into the next window
-            if not _whole9:
-                st.fellowship.corruption = min(
-                    12, st.fellowship.corruption + max(0, ev['corr']))
-                if ev['flips'] % 2 == 1:
-                    st.fellowship.hidden = False
+            # the tile's corruption and reveal carry into the placements and
+            # the next window (a single tile nobody drove has no next one)
+            st.fellowship.corruption = min(
+                12, st.fellowship.corruption + max(0, ev['corr']))
+            if ev['flips'] % 2 == 1:
+                st.fellowship.hidden = False
+            # Companions separating on one Hunt tile move together (Almanac
+            # pp6-7): the first placement binds the group destination, so a
+            # later Hobbit of this tile has the one bound candidate and no
+            # decision (ai._get_pending_hunt_actions, group_destination)
+            bound = None
+            for nm, level in placed:
+                if bound is not None:
+                    if hobbit_place[nm] == bound:
+                        stats['detected']['chunt_hobbitplace_group_bound'] += 1
+                    else:
+                        stats['drop_reasons']['chunt_hobbitplace_group_split'] += 1
+                    continue
+                bound = hobbit_place[nm]
+                st.pending_hunt = {'phase': 'hobbit_place', 'companion': nm,
+                                   'level': level, 'damage': 0}
+                try:
+                    la2 = [a for a in ai.get_legal_actions(
+                        st, Side.FREE_PEOPLES)
+                        if a.action_type == 'companion_separate']
+                    h2 = _match_index(
+                        la2, lambda a: rr.sanitize(str(
+                            a.params.get('region',
+                                         a.params.get('to_region',
+                                                      '')))) ==
+                        hobbit_place[nm])
+                    if h2 is not None and len(la2) >= 2:
+                        stats['kinds_emit']['hobbit_place'] += 1
+                        # R4-EXTRACT-HUNTBOX-REMAINING: as above
+                        with _fp_huntbox_cut(b.get('turn'),
+                                             b.get('start_line')):
+                            s2 = _emit_sample(st, Side.FREE_PEOPLES,
+                                              la2, h2, 'hobbit_place',
+                                              b['turn'])
+                        if s2 is not None:
+                            out.append(s2)
+                    else:
+                        stats['drop_reasons'][
+                            'chunt_hobbitplace_unmatched'] += 1
+                except Exception:
+                    stats['drop_reasons']['chunt_hobbitplace_exc'] += 1
+            st.pending_hunt = None
     return out
 
 
@@ -16941,7 +21238,8 @@ def _reveal_verified_state(batch, batches, progress, placement, stats):
     st.hunt_pool, st.hunt_discard = pool, discarded
     from rendered_hunt_observation import mark as mark_hunt_observation
     mark_hunt_observation(st, line, 'verified_reveal_prefix')
-    _install_ledger_hands(st, batch, at_line=line)
+    if not _install_row_hands(st, batch, stats, at_line=line):
+        return None, None, None      # R17-CORPUS-EXTRACT row 10: counted
     _install_persistent_cards(st, line, killable=True)
     # The logged card has already been spent even if the player clears its
     # Current-card piece only after moving the Fellowship pawn.
@@ -17052,7 +21350,9 @@ def _emit_reveal_placements(batches, stats):
                 or _reveal_card9):
             stats['drop_reasons']['revplace_unsourced'] += 1
             continue
-        placement = rr.sanitize(str(flips[0].get('region', '')))
+        # R4B-FELLOWSHIP-STRONGHOLD-BOX-MOVES: a pawn flipped or dragged in a
+        # Stronghold box stands in its region (rr.pawn_zone_key)
+        placement = rr.pawn_zone_key(str(flips[0].get('region', '')))
         if _fsp_flip9:
             # W3-001: the FSP flip line names the TRACK, not a region -
             # the pawn stays where it was unless a figure move follows
@@ -17065,15 +21365,16 @@ def _emit_reveal_placements(batches, stats):
         for r in post:
             if r.get('op') == 'move' \
                     and 'The Fellowship' in str(r.get('obj', '')) \
-                    and rr.zone_kind(str(r.get('to', '')))[0] == 'region' \
+                    and rr.zone_kind(str(r.get('to', '')))[0] in ('region', 'stronghold') \
                     and 'Mordor' not in str(r.get('to', '')):
-                _lastmv9 = rr.sanitize(str(r.get('to', '')))
+                _lastmv9 = rr.pawn_zone_key(r.get('to', ''))
         if _lastmv9:
             placement = _lastmv9
         stats['detected']['reveal_place'] += 1
         st, evidence, reason = _reveal_verified_state(b, batches, n, placement, stats)
         if st is None:
-            stats['drop_reasons']['revplace_' + reason] += 1
+            if reason is not None:   # None: a counted per-row refusal
+                stats['drop_reasons']['revplace_' + reason] += 1
             continue
         try:
             legal = ai.get_legal_actions(st, Side.FREE_PEOPLES)
@@ -17097,6 +21398,163 @@ def _emit_reveal_placements(batches, stats):
 
 _COV_CATS = {'declared': 1, 'declined': 2, 'revealed': 3,
              'declined_nowindow': 4, 'ambiguous': 5}
+
+
+def _pre_marker_declaration(batches, first, pre, post_moves=(), mordor=False):
+    """C4-04: a declaration whose pawn move was logged BEFORE its turn
+    marker.  Some clients log Phase 1 (dice recovery, card draws) and the
+    Phase-2 Fellowship pawn move before '<replay> Turn N' and reset the FSP
+    counter only after it (2023-01-12 FLOX2/Yurdin T3: L163 'moves The
+    Fellowship from Hollin to Dimrill Dale', L165 marker, L167 'moves FSP
+    from Fellowship Track 2 to Fellowship Track 0', chat 'FSP in DD').  The
+    pawn move then rides the PREVIOUS turn's last batch and the turn's own
+    pre-stage list shows only the reset; read alone, the turn looked like a
+    decline and was labelled 'pass'.
+
+    R2-RS-v033-C4-04: other clients log the WHOLE of Phase 2 before the
+    marker, so the FSP reset rides the previous batch's tail too (2023-01-31
+    Mol/Spartako T6: '<Mol> Declare', L476 pawn Rivendell->Lorien, L477
+    heal, L478 FSP 5->0, L481 marker; 118 'pass' rows corpus-wide).  The
+    tail reset may come BEFORE the pawn move (2026-01-12 Rexxarchik/
+    SlowCobra T6 L445/L446): decision_truth is stamped before its record is
+    applied, so the pawn move's own snapshot already reads progress 0 and
+    the anchor is then the reset record.  `post_moves` are the turn's own
+    pre-stage pawn moves continuing that drag after the marker (2025-06-12
+    Stella Rossa/Kaeldar T5: Dimrill Dale->Parth Celebrant, reset, marker,
+    ->Lorien); `mordor` accepts a path whose LAST move enters 'Mordor 0'
+    (and then requires it): a declaration at a gate followed by the turn-
+    start Mordor entry (2023-01-26 Spartako/Germanator T6).
+
+    Returns (pawn moves, N, previous-batch tail records from the anchor on,
+    anchor record) when the batches prove the declaration, else None:
+      * an FSP reset from Track N>=1 to Track 0 among the turn's pre-stage
+        records, else (R2-RS-v033-C4-04) in the previous batch's tail after
+        the cut below, at any position relative to the pawn moves;
+      * the previous batch's pawn moves come AFTER its last Current-zone
+        action record (that action and its cleanup are over; a pawn moved
+        by a card or a reveal inside an action never qualifies: 2023-01-27
+        GalahadB/Mol L388, before the L391 cleanup);
+      * they form one connected path from the anchor's own decision
+        snapshot (the first pawn move, or the tail reset when it is logged
+        first), which is hidden, off the Mordor track, at progress == N;
+      * nothing else touches the Fellowship (pawn, FSP, flips) between the
+        anchor and the reset; with a tail reset nothing else touches it
+        anywhere in the tail after the cut or in the turn's pre-stage
+        records, and no hunt roll or hunt-tile draw sits between the cut
+        and the end of the gesture (a hunt reveal also moves the pawn and
+        resets the counter)."""
+    k = next((i for i, bb in enumerate(batches) if bb is first), None)
+    if not k:
+        return None
+    prev = batches[k - 1]
+    if int(prev.get('turn') or 0) >= int(first.get('turn') or 0):
+        return None
+
+    def _reset_from(r):
+        if r.get('op') == 'move' and str(r.get('obj', '')).strip() == 'FSP' \
+                and 'Fellowship Track 0' in str(r.get('to', '')):
+            mm = re.search(r'Fellowship Track (\d+)', str(r.get('from', '')))
+            if mm and int(mm.group(1)) >= 1:
+                return int(mm.group(1))
+        return 0
+    reset, n = None, 0
+    for r in pre:
+        if _reset_from(r):
+            reset, n = r, _reset_from(r)
+            break
+    recs = list(prev.get('records') or ())
+    # A table card triggered from its Board slot into a Current zone (Worn
+    # with Sorrow and Toil answering the declaration: 2023-12-03
+    # Strider656/Ira L198-L199) and the empty 'kills nothing in Current
+    # Action' cleanup are not records of the previous action.
+    table = {str(r.get('obj', '')).strip().lower() for r in recs
+             if r.get('op') == 'move' and re.match(
+                 r'board\d*$', str(r.get('from', '')).strip().lower())}
+
+    def _action_rec(r):
+        if 'current ' not in ' '.join(
+                str(r.get(z, '')) for z in ('from', 'to', 'zone')).lower():
+            return False
+        objs = [str(p).strip().lower()
+                for p in (r.get('pieces') or [r.get('obj', '')])]
+        return not all(o in table or o == 'nothing' for o in objs)
+    cut = max((int(r['line']) for r in recs if _action_rec(r)), default=-1)
+    moves = [r for r in recs if int(r['line']) > cut and r.get('op') == 'move'
+             and str(r.get('obj', '')).strip().lower() == 'the fellowship']
+    if not moves:
+        return None
+    tail_reset = reset is None
+    if tail_reset:
+        # R2-RS-v033-C4-04: the whole Phase 2 rode the previous batch
+        reset = next((r for r in recs
+                      if int(r['line']) > cut and _reset_from(r)), None)
+        if reset is None:
+            return None
+        n = _reset_from(reset)
+        moves = moves + list(post_moves)
+    elif post_moves:
+        return None
+    anchor = moves[0]
+    if tail_reset and int(reset['line']) < int(anchor['line']):
+        anchor = reset        # reset logged first: the pawn snapshot reads 0
+    snap = anchor.get('decision_truth')
+    fel = snap.get('fel') if isinstance(snap, dict) else None
+    if not isinstance(fel, dict) or not fel.get('hidden') or fel.get('mordor'):
+        return None
+    try:
+        if int(fel.get('progress', -1)) != n:
+            return None
+    except (TypeError, ValueError):
+        return None
+    import rendered_replay as rr
+    # the entry must leave a gate the pawn was actually NOMINATED to: a
+    # single drag straight into 'Mordor 0' (2023-05-17 Magic Geek/RompSteel
+    # T5 'Dagorlad -> Mordor 0') never logs which gate was declared, the
+    # same rule as the post-marker entry ('declare_entry_without_nomination')
+    # R4B-FELLOWSHIP-STRONGHOLD-BOX-MOVES: rr.pawn_zone_key reads a
+    # Stronghold box as its region ('Morannon Stronghold' is the gate)
+    if mordor and ('Mordor 0' not in str(moves[-1].get('to', ''))
+                   or len(moves) < 2
+                   or rr.pawn_zone_key(str(moves[-1].get('from', ''))) not in {
+                       rr.sanitize('Morannon'), rr.sanitize('Minas Morgul')}):
+        return None
+    where = rr.sanitize(str(fel.get('region') or ''))
+    for i, m in enumerate(moves):
+        entry = mordor and i == len(moves) - 1   # the turn-start entry
+        if ('mordor' in str(m.get('to', '')).lower() and not entry) \
+                or rr.pawn_zone_key(str(m.get('from', ''))) != where:
+            return None
+        where = rr.pawn_zone_key(str(m.get('to', '')))
+    lo = int(anchor['line'])
+    if tail_reset:
+        import game_state as gs
+        import rendered_census as rc
+        in_tail = {id(r) for r in recs}
+        hi = max(int(reset['line']), max(int(m['line']) for m in moves
+                                         if id(m) in in_tail))
+        for r in recs + list(pre):
+            if (id(r) in in_tail and int(r['line']) <= cut) or r is reset \
+                    or any(r is m for m in moves):
+                continue
+            obj = str(r.get('obj', '')).strip().lower()
+            if 'fellowship' in obj or obj == 'fsp':
+                return None
+            if id(r) in in_tail and int(r['line']) < hi and (
+                    r.get('op') in ('roll_num', 'roll_dice')
+                    or (r.get('op') == 'draw' and rc._tile_obj(
+                        gs, str(r.get('what', '')).strip().lower().replace(
+                            'on, on they went', 'on on they went'))
+                        is not None)):
+                return None
+    else:
+        hi = int(reset['line'])
+        for r in recs + list(pre):
+            if not lo <= int(r['line']) < hi or any(r is m for m in moves):
+                continue
+            obj = str(r.get('obj', '')).strip().lower()
+            if 'fellowship' in obj or obj == 'fsp':
+                return None
+    return moves, n, [r for r in recs if int(r['line']) >= lo], anchor
 
 
 def _emit_declarations(batches, stats):
@@ -17200,7 +21658,9 @@ def _emit_declarations(batches, stats):
             if b2 is None:
                 _rec(turn, b, 'ambiguous')
                 continue
-            placement = rr.sanitize(str(nominations[-1].get('to', '')))
+            # R4B-FELLOWSHIP-STRONGHOLD-BOX-MOVES: 'Morannon Stronghold' is
+            # the Morannon gate (2023-07-27 TheFatHobbit L380)
+            placement = rr.pawn_zone_key(str(nominations[-1].get('to', '')))
             s = _emit_one_declare(b2, placement, 'mordor', stats)
             if s is not None:
                 out.append(s)
@@ -17211,6 +21671,29 @@ def _emit_declarations(batches, stats):
         # at the turn's declare point -> declarations do not exist;
         # the turn leaves the denominator (counted for the report).
         if fel_tb.get('mordor'):
+            # R2-RS-v033-C4-04: a gate declaration and the turn-start Mordor
+            # entry logged wholly before the turn marker (2023-01-26
+            # Spartako/Germanator T6: L627 FSP 1->0, L628 North Ithilien->
+            # Minas Morgul, L629 ->Mordor 0) are THIS turn's declaration,
+            # not a Fellowship already on the Mordor track.
+            pm_mordor = (None if (fel_moves or flips or tile_pre) else
+                         _pre_marker_declaration(batches, b, pre, mordor=True))
+            if pm_mordor is not None:
+                stats['detected']['declare_mordor_entry'] += 1
+                stats['detected']['declare_pre_marker'] += 1
+                b2 = actual_prefix(pm_mordor[3])
+                if b2 is None:
+                    _rec(turn, b, 'ambiguous')
+                    continue
+                b2['records'] = pm_mordor[2] + list(b['records'])
+                # the gate the entry leaves = the last nominated region
+                # (R4B-FELLOWSHIP-STRONGHOLD-BOX-MOVES: a box is its region)
+                placement = rr.pawn_zone_key(str(pm_mordor[0][-1].get('from', '')))
+                s = _emit_one_declare(b2, placement, 'mordor', stats)
+                if s is not None:
+                    out.append(s)
+                _rec(turn, b2, 'declared', x=None if s is None else s['x'])
+                continue
             stats['detected']['declare_cov_inmordor'] += 1
             continue
         if tile_pre and not fel_moves and not flips:
@@ -17218,6 +21701,7 @@ def _emit_declarations(batches, stats):
             _rec(turn, b, 'ambiguous')
             continue
         n = 0
+        pre_marker = None
         if flips:
             n = int(flips[0].get('prev_track', 0) or 0)
         if n < 1:
@@ -17234,6 +21718,21 @@ def _emit_declarations(batches, stats):
                                          str(r.get('from', '')))
                         if _mm9:
                             n = max(n, int(_mm9.group(1)))
+                if n < 1 and not flips and fel_tb.get('hidden', True):
+                    # R2-RS-v033-C4-04: pawn move + reset rode the previous
+                    # batch's tail and the drag continues after the marker
+                    # (2025-06-12 Stella Rossa/Kaeldar T5)
+                    pre_marker = _pre_marker_declaration(
+                        batches, b, pre, post_moves=fel_moves)
+                    if pre_marker is not None:
+                        n = pre_marker[1]
+            elif not flips and fel_tb.get('hidden', True):
+                # C4-04: the pawn move was logged before the turn marker
+                # (previous batch's tail); the reset is here, or with it
+                # in that tail (R2-RS-v033-C4-04)
+                pre_marker = _pre_marker_declaration(batches, b, pre)
+                if pre_marker is not None:
+                    n = pre_marker[1]
         if n < 1:
             # no PLACEMENT declaration gesture this turn start
             if not fel_tb.get('hidden', True):
@@ -17249,6 +21748,7 @@ def _emit_declarations(batches, stats):
             # progress > 0 a heal walk does NOT count as declared
             # (falls through to the decline path).
             _heal9 = False
+            _heal_from9 = None
             for r in pre:
                 if r.get('op') == 'move' and \
                         str(r.get('obj', '')).strip().lower() \
@@ -17260,6 +21760,7 @@ def _emit_declarations(batches, stats):
                     if _hf9 and _ht9 and int(_ht9.group(1)) \
                             == int(_hf9.group(1)) - 1:
                         _heal9 = True
+                        _heal_from9 = int(_hf9.group(1))
                         break
             try:
                 _prog9 = int(fel_tb.get('progress', 0) or 0)
@@ -17267,10 +21768,20 @@ def _emit_declarations(batches, stats):
                 _prog9 = 0
             if _heal9 and _prog9 == 0:
                 stats['detected']['declare_heal0'] += 1
-                s = _emit_one_heal_declare(b, stats)
+                # C4-03: truth_before is the mirror at the first die stage,
+                # AFTER this heal's own 'Corruption from Fellowship Track N
+                # to N-1' walk, so the row encoded the label's consequence
+                # (corruption one low).  The decision state carries the
+                # walk's from-track N, the corruption the player saw when
+                # choosing to declare in place.  Fresh dicts: the batch
+                # snapshot other emitters read stays the post-heal truth.
+                b_heal = dict(b, truth_before=dict(
+                    b['truth_before'],
+                    fel=dict(fel_tb, corruption=_heal_from9)))
+                s = _emit_one_heal_declare(b_heal, stats)
                 if s is not None:
                     out.append(s)
-                _rec(turn, b, 'declared',
+                _rec(turn, b_heal, 'declared',
                      x=None if s is None else s['x'])
                 continue
             # v29/v32: the human DECLINED the declare window; emit the
@@ -17285,13 +21796,27 @@ def _emit_declarations(batches, stats):
                 _rec(turn, b, 'declined')
             continue
         stats['detected']['declare_progress_reset'] += 1
-        placement = (rr.sanitize(str(fel_moves[-1].get('to')))
+        if pre_marker is not None:
+            # C4-04: anchor on the pre-marker pawn moves themselves
+            stats['detected']['declare_pre_marker'] += 1
+            fel_moves = pre_marker[0]
+        # R4B-FELLOWSHIP-STRONGHOLD-BOX-MOVES: a declaration dragged into a
+        # Stronghold box names its region ('Dimrill Dale to Lorien
+        # Stronghold', 2023-02-17 Messor L333)
+        placement = (rr.pawn_zone_key(str(fel_moves[-1].get('to')))
                      if fel_moves else
-                     rr.sanitize(str(flips[0].get('region', ''))))
-        b2 = actual_prefix(fel_moves[0] if fel_moves else flips[0])
+                     rr.pawn_zone_key(str(flips[0].get('region', ''))))
+        # R2-RS-v033-C4-04: a pre-marker declaration anchors on the helper's
+        # anchor (the tail reset when it was logged before the pawn move)
+        b2 = actual_prefix(pre_marker[3] if pre_marker is not None else
+                           fel_moves[0] if fel_moves else flips[0])
         if b2 is None:
             _rec(turn, b, 'ambiguous')
             continue
+        if pre_marker is not None:
+            # the Balrog route proof (emit_declaration) reads the pawn path
+            # from the batch records: carry the pre-marker tail along
+            b2['records'] = pre_marker[2] + list(b['records'])
         s = _emit_one_declare(b2, placement, 'placement', stats)
         if s is not None:
             out.append(s)
@@ -17317,17 +21842,69 @@ def _emit_declarations(batches, stats):
 # NEVER SKIP DICE â€” a pass is a turn-ORDER pass, not a discarded die.
 # ==========================================================================
 _DIE_FACES_ACT = ('A', 'C', 'M', 'P', 'H', 'W')
-# FP action-token USE in the rendered stream ('Hunt for the ring
-# (Political)'/'(Card Draw)' leaving FP Dice for Current Action)
-_TOKEN_USE_RE = re.compile(
-    r'moves Hunt for the ring \((Political|Card|Card Draw)\) '
-    r'from FP Dice to Current (Action|FP Card)', re.I)
+# FP action-token USE = a net record accepted by _is_token_stage (token
+# piece from FP Dice into ANY Current slot), the predicate the token
+# ledger and the token-use emitter share.  R2-RS-v032-C4-01: the walk's
+# own regex (_TOKEN_USE_RE, now removed) accepted only 'Current
+# (Action|FP Card)', so a token staged into 'Current SA Card' (30 stages
+# in 23 games; 2025-04-14 Cheekz T2 L108, 2023-06-15 TheLegoQuill T7
+# L567) counted in the ledger but took no FP slot, and the next Shadow
+# die minted a phantom FP pass (Cheekz L112, TheLegoQuill L570 rows).
 # W1-011: the module renders the draw token as '(Card)' (never '(Card
 # Draw)') and some clients stage either token into 'Current FP Card'
 # (2024-08-11 L45/L98); a token use the walk cannot see became a
 # phantom FP pass event at the next Shadow die (9 events in 8 games, 2
 # of them emitted as rows: 2023-12-25 L34, 2024-08-11 L101; the other
 # 7 were pass-illegal under 1.223 and never reached the ledger).
+
+
+def _pass_token_slots(batches):
+    """C4-01: {turn: [stage_line, ...]} of the FP action-token uses that
+    take a turn-order slot in the 1.223 walk.
+
+    Read from the NET batch records (rendered_replay.resolve_undo_redo
+    already removed undone/redone snapshots and their echo lines), never
+    from the raw file: the raw scan matched the undo echo 'X undoes last
+    action : %X moves Hunt for the ring (...) from FP Dice to Current
+    Action.' as a second use, so one undone token became TWO FP slots
+    (2023-10-11 jakemcrae T2 L91/L92, L110/L112 -> 4 phantom Shadow pass
+    rows) and filled FP's turn over a real FP pass (2023-03-14 Waldo T5
+    L404-L407).  A stage whose piece next moves back into FP Dice (before
+    any kill in a Current slot) is a RETRACTION, not a use - the W1-011
+    rule of _annotate_token_ledger and _emit_token_uses (2023-01-15
+    Wirbelwind T2 L81-L85, 2024-08-02 Jaymanen T1 L92-L93)."""
+    recs = []
+    for b in batches:
+        for r in b.get('records') or ():
+            try:
+                ln = int(r.get('line') or 0)
+            except (TypeError, ValueError):
+                continue
+            if ln > 0:
+                recs.append((ln, b.get('turn') or 1, r))
+    recs.sort(key=lambda x: x[0])
+    slots = {}
+    seen = set()
+    for k, (ln, turn, r) in enumerate(recs):
+        if ln in seen or not _is_token_stage(r):
+            continue                    # R2-RS-v032-C4-01: ledger predicate
+        seen.add(ln)
+        kind = _token_kinds(r.get('obj'))[0]
+        retracted = False
+        for _ln2, _t2, r2 in recs[k + 1:]:
+            op2 = r2.get('op')
+            if op2 == 'move' and kind in _token_kinds(r2.get('obj')) \
+                    and 'current' in str(r2.get('from', '')).lower():
+                # the staged piece moves on: back into FP Dice = retracted
+                retracted = 'fp dice' in str(r2.get('to', '')).lower()
+                break
+            if op2 == 'kill' and kind in _token_kinds(
+                    r2.get('pieces') or r2.get('body')) \
+                    and 'current' in str(r2.get('zone', '')).lower():
+                break
+        if not retracted:
+            slots.setdefault(turn, []).append(ln)
+    return slots
 
 
 def _emit_one_pass(snap, passer, actor, init, spent, turn, hand_line, stats):
@@ -17367,7 +21944,14 @@ def _emit_one_pass(snap, passer, actor, init, spent, turn, hand_line, stats):
                 d.current = f
                 d.used = False
                 st.dice[sd].append(d)
-    _install_ledger_hands(st, {'start_line': hand_line}, at_line=hand_line)
+    # INV-PASS-3 (fix wave 2026-10-21): the FP dice already in the Hunt
+    # Box at the pass slot (the turn's Fellowship moves before hand_line),
+    # exactly as the hunt modifier and the ordinary rows read them.  The
+    # pass rows encoded n_fp_in_box = 0 on 100% of rows before this.
+    _seed_fp_huntbox(st, {'turn': turn, 'start_line': hand_line})
+    if not _install_row_hands(st, {'start_line': hand_line}, stats,
+                              at_line=hand_line):
+        return None                  # R17-CORPUS-EXTRACT row 10: this row only
     try:
         legal = ai.get_legal_actions(st, pside)
     except Exception:
@@ -17393,11 +21977,22 @@ def _emit_passes(batches, pools, stats, rendered_path):
     opening pass)."""
     import rendered_replay as rr
     out = []
-    u2side = {}
+    # R2-RS-C1-PASSES (round 2, 2026-10-22): a letter-roll line's side is
+    # the PHYSICAL side of its net (undo-resolved) roll_dice record
+    # (C1-03 _rx_roll_side via _roll_side_resolver), keyed by rendered
+    # line - never the rolling user's last staged die ($nick, I3).  The
+    # u2side lookup booked both sides' rolls to one side whenever one user
+    # staged a die of the other side (2023-02-02 SolidSnake L840): the FP
+    # pool stayed empty or held Shadow faces and every pass row was lost.
+    # Only op 'roll_dice' is an action pool ('allocated_eye_display' is an
+    # Eye-only display of an allocated die).  A letter-roll line with no
+    # net record is a retracted roll: skipped, like any non-record line.
+    roll_side = _roll_side_resolver(batches)
+    side_by_line = {}
     for b in batches:
         for r in b['records']:
-            if r.get('op') == 'move' and r.get('die_stage'):
-                u2side[r.get('player')] = r['die_stage'][0]
+            if r.get('op') == 'roll_dice':
+                side_by_line[int(r.get('line') or 0)] = roll_side(r)
     turn_batches = {}
     for b in batches:
         turn_batches.setdefault(b['turn'], []).append(b)
@@ -17409,7 +22004,11 @@ def _emit_passes(batches, pools, stats, rendered_path):
     # go to the hunt box, not the action pool).
     turn_init = {}
     turn_roll_line = {}
-    token_slots = {}
+    turn_reroll_line = {}       # C4-02: a side's SECOND letter roll line
+    # C4-01: FP action-token use = an FP turn-order SLOT (no die), from the
+    # net (undo-resolved) records with retractions removed - never the raw
+    # file, whose undo/redo echo lines re-match the use
+    token_slots = _pass_token_slots(batches)
     with open(rendered_path, encoding='utf-8', errors='ignore') as f:
         for i, raw in enumerate(f, 1):
             s = raw.strip()
@@ -17422,17 +22021,17 @@ def _emit_passes(batches, pools, stats, rendered_path):
                 continue
             ml = rr._ROLL_LET_RE.match(body)
             if ml:
-                rside = u2side.get(ml.group(1).strip())
+                rside = side_by_line.get(i)
                 if rside is not None:
                     d = turn_init.setdefault(turn, {})
                     if rside not in d:          # first roll per side/turn
                         d[rside] = Counter(f for f in ml.group(2).split()
                                            if f in _DIE_FACES_ACT)
                         turn_roll_line.setdefault(turn, {})[rside] = i
+                    else:
+                        turn_reroll_line.setdefault(turn, {}).setdefault(
+                            rside, i)
                 continue
-            if _TOKEN_USE_RE.search(body):
-                # FP action-token use = an FP turn-order SLOT (no die)
-                token_slots.setdefault(turn, []).append(i)
 
     # W2-038: dice that LEAVE the pool without a die-stage are not
     # available for the rest of the turn - The Day Without Dawn's
@@ -17449,6 +22048,16 @@ def _emit_passes(batches, pools, stats, rendered_path):
     # a die coming back to its pool from an off-pool zone, or staged
     # from a card slot (W4-018 via-card dialect), re-credits one.
     removal_ev = _pass_pool_removals(batches, turn_roll_line)
+    # C4-02: a POOL die re-faced outside a stage (Elven Ring / Will of the
+    # West / Mirror on an unused die: 'changes Free Action Die (W) to C',
+    # the client then staging 'Free Action Die (C)') moves one die between
+    # faces.  Unapplied, the staged C was not in the roll, the Counter
+    # subtraction dropped it and the W stayed in the remainder for the
+    # rest of the turn: phantom passes for a side with no dice left
+    # (2023-04-27 savedbyhim T7 L715/L719/L729) and lost fewer-dice passes
+    # read as equal dice (2023-02-17 Pinkerton T6 L432).
+    reface_ev = _pass_pool_refaces(batches, turn_roll_line,
+                                   turn_reroll_line, stats)
 
     # ---- structural alternation walk (1.223) --------------------------
     def _other(sd):
@@ -17465,18 +22074,26 @@ def _emit_passes(batches, pools, stats, rendered_path):
         if not any(e[0] == 'die' for e in seq):
             continue
         init = turn_init.get(t, {})
-        init = {'FREE_PEOPLES': init.get('FREE_PEOPLES', Counter()),
-                'SHADOW': init.get('SHADOW', Counter())}
+        # copies: C4-02 re-faces edit the turn pools in place
+        init = {'FREE_PEOPLES': Counter(init.get('FREE_PEOPLES', ())),
+                'SHADOW': Counter(init.get('SHADOW', ()))}
         spent = {'FREE_PEOPLES': Counter(), 'SHADOW': Counter()}
         removed = {'FREE_PEOPLES': Counter(), 'SHADOW': Counter()}
         rm_ev = removal_ev.get(t, [])
         rm_i = 0
+        rf_ev = reface_ev.get(t, [])
+        rf_i = 0
+        rf_applied = []
         first_b = next(e[3] for e in seq if e[0] == 'die')
         expected = 'FREE_PEOPLES'       # FP holds the turn's first slot
         prev_b = None
         for kind, ln, actor, b in seq:
             # W2-038: pool exits / kills / re-credits before this slot
             while rm_i < len(rm_ev) and rm_ev[rm_i][0] < ln:
+                # C4-02: pool re-faces on earlier lines apply first
+                rf_i = _apply_pool_refaces(rf_ev, rf_i, rm_ev[rm_i][0],
+                                           init, spent, removed, stats,
+                                           rf_applied)
                 _, rside, rface, rn = rm_ev[rm_i]
                 rm_i += 1
                 if rn < 0:
@@ -17484,6 +22101,8 @@ def _emit_passes(batches, pools, stats, rendered_path):
                 if rn:
                     removed[rside][rface] += rn
                     stats['detected']['pass_pool_removal'] += 1
+            rf_i = _apply_pool_refaces(rf_ev, rf_i, ln, init, spent,
+                                       removed, stats, rf_applied)
             gone = {sd: spent[sd] + removed[sd] for sd in spent}
             if actor != expected:
                 # the expected side was skipped: a PASS if it still
@@ -17493,6 +22112,16 @@ def _emit_passes(batches, pools, stats, rendered_path):
                     stats['detected']['pass'] += 1
                     snap = (prev_b['truth'] if prev_b is not None
                             else first_b.get('truth_before'))
+                    # R2-RS-C1-PASSES: prev_b's 'truth' holds the END-of-
+                    # batch rings ('post'), which include the next actor's
+                    # pre-staging ring use in prev_b's tail; the passer
+                    # decides at the slot, before it.  The ledger's 'slot'
+                    # view goes on a COPY (other consumers read 'truth').
+                    slot9 = ((prev_b.get('_rx_rings') or {}).get('slot')
+                             if prev_b is not None else None)
+                    if isinstance(snap, dict) and slot9 is not None:
+                        snap = dict(snap)
+                        snap['_rx_rings'] = dict(slot9)
                     if snap is None:
                         stats['drop_reasons']['pass_no_context'] += 1
                     else:
@@ -17501,12 +22130,160 @@ def _emit_passes(batches, pools, stats, rendered_path):
                         if s9 is not None:
                             out.append(s9)
             if kind == 'die':
+                # C4-02: a spend the applied re-faces cannot fund reverts
+                # the contradicted swap rather than being dropped
+                _reface_reconcile(rf_applied, actor, b['die_face'], init,
+                                  spent, removed, stats)
                 spent[actor][b['die_face']] += 1
                 prev_b = b
             else:
                 stats['detected']['token_slot'] += 1
             expected = _other(actor)
     return out
+
+
+def _pass_pool_refaces(batches, turn_roll_line, turn_reroll_line=None,
+                       stats=None):
+    """C4-02: {turn: [(line, side, from_face, to_face), ...]} of action-die
+    re-faces ('<p> changes Free Action Die (W) to C') that may hit a die
+    still in its pool, in line order, from the NET (undo-resolved) batch
+    records.  Excluded: re-faces at or before that side's turn roll (the
+    roll line already shows the pool) and the batch's own STAGED die's
+    re-face - a line after its stage that _lead_change_lines applies to
+    the lead (Elven Ring / Will of the West on the die in Current Action),
+    whose spend the walk already books under the staged face.  A die is
+    never re-faced as the lead before it is staged, so pre-stage change
+    lines are kept out of that disambiguation.  Also excluded (counted):
+    re-faces after a SECOND letter roll of that side in the turn - they
+    act on that re-roll's pool, not on the first-roll pool the walk
+    starts from (2023-04-07 Emperor_Meow T5 L539-545 hand-restore the
+    mis-rolled L531 pool back to the L518 roll the walk already holds).
+
+    Eye faces are never in the action pool.  An X -> E re-face takes a
+    POOL die out only when that Eye then leaves the pool (a 'Shadow Action
+    Die (E)' move from SA Dice before the next stage: The Lidless Eye /
+    a manual Hunt allocation, 2023-04-07 Emperor_Meow T9 L1231-1236);
+    unpaired, it re-faced a die already outside the pool (moved to the
+    Hunt box first, 2023-01-06 Spartako T5 L471/L476; the staged die) or
+    was reverted, and an E -> Y re-face never adds an action die."""
+    turn_reroll_line = turn_reroll_line or {}
+    det = stats['detected'] if stats is not None else Counter()
+    ev = {}
+    eye_wait = {}       # side -> [(turn, event)] X->E awaiting the E's exit
+    cur_t = None
+
+    def _drop_eye_wait():
+        det['pass_pool_reface_eye_unpaired'] += sum(
+            len(v) for v in eye_wait.values())
+        eye_wait.clear()
+
+    for b in batches:
+        t = b.get('turn')
+        if t != cur_t:
+            _drop_eye_wait()
+            cur_t = t
+        side_b = b.get('die_side')
+        start = b.get('start_line')
+        recs = b.get('records', ()) or ()
+        lead = None
+        for r in recs:
+            if r.get('op') == 'move':
+                frm = (r.get('from') or '').strip()
+                to = (r.get('to') or '').strip()
+                if r.get('die_stage'):
+                    _drop_eye_wait()
+                elif frm in _POOL_ZONES and to not in _POOL_ZONES:
+                    for sd_m, f_m in _die_tokens(r.get('obj', '')):
+                        if (f_m == 'E' and sd_m == _POOL_ZONES[frm]
+                                and eye_wait.get(sd_m)):
+                            t_e, e = eye_wait[sd_m].pop(0)
+                            ev.setdefault(t_e, []).append(e)
+                            det['pass_pool_reface_eye_exit'] += 1
+                continue
+            if r.get('op') != 'other':
+                continue
+            m = _DIE_CHANGE_RE.match(str(r.get('raw', '')))
+            ln = r.get('line')
+            if not m or not isinstance(ln, int):
+                continue
+            sd = 'FREE_PEOPLES' if m.group(1).lower() == 'free' else 'SHADOW'
+            x, y = m.group(2).upper(), m.group(3).upper()
+            if x == y:
+                continue
+            if ln <= turn_roll_line.get(t, {}).get(sd, 10 ** 9):
+                continue
+            if ln > turn_reroll_line.get(t, {}).get(sd, 10 ** 9):
+                det['pass_pool_reface_after_reroll'] += 1
+                continue
+            if sd == side_b and isinstance(start, int) and ln > start:
+                if lead is None:
+                    lead = _lead_change_lines({
+                        'die_side': side_b,
+                        'die_face': b.get('die_face'),
+                        'records': [q for q in recs
+                                    if not (q.get('op') == 'other'
+                                            and isinstance(q.get('line'), int)
+                                            and q['line'] < start)]})[1]
+                if ln in lead:
+                    continue
+            if x == 'E':
+                det['pass_pool_reface_from_eye'] += 1
+                continue
+            if y == 'E':
+                eye_wait.setdefault(sd, []).append((t, (ln, sd, x, y)))
+                continue
+            ev.setdefault(t, []).append((ln, sd, x, y))
+    _drop_eye_wait()
+    return {t: sorted(v) for t, v in ev.items()}
+
+
+def _apply_pool_refaces(ev, i, upto, init, spent, removed, stats,
+                        applied=None):
+    """C4-02: apply the re-faces ev[i:] on lines before `upto` to the turn
+    pools `init` (mutated in place); returns the next index.  X -> Y moves
+    one UNUSED X die (init - spent - removed) to face Y; an Eye target
+    leaves the action pool (Eye faces are never in it).  With no unused X
+    the re-faced die was not in the pool (already spent, parked, an Eye)
+    and the remaining-dice count is left alone - counted, never guessed.
+    Applied action-face swaps are logged in `applied` for
+    _reface_reconcile."""
+    while i < len(ev) and ev[i][0] < upto:
+        _, sd, x, y = ev[i]
+        i += 1
+        if (init[sd] - (spent[sd] + removed[sd]))[x] <= 0:
+            stats['detected']['pass_pool_reface_offpool'] += 1
+            continue
+        init[sd][x] -= 1
+        if y in _DIE_FACES_ACT:
+            init[sd][y] += 1
+            if applied is not None:
+                applied.append((sd, x, y))
+        stats['detected']['pass_pool_reface'] += 1
+    return i
+
+
+def _reface_reconcile(applied, sd, face, init, spent, removed, stats):
+    """C4-02: a `face` die of side `sd` is about to be spent with none
+    unused.  When an applied re-face `face` -> Y of that side left a Y
+    still unused, the later spend proves that re-face did not hit this
+    pool die (a log whose later gestures contradict the change line):
+    revert the latest such swap instead of letting the Counter subtraction
+    drop the spend and inflate the remainder (2023-06-02 Thistlefoot T3:
+    'A to C' at L175, then an A staged at L181).  R2-RS-C1-PASSES: that
+    example was a $nick artifact (L157 is the FP user re-rolling the
+    SHADOW dice; on its physical side L173-175 are after-reroll re-faces
+    and nothing contradicts); the revert stays as a guard."""
+    avail = init[sd] - (spent[sd] + removed[sd])
+    if avail[face] > 0:
+        return
+    for k in range(len(applied) - 1, -1, -1):
+        s, x, y = applied[k]
+        if s == sd and x == face and avail[y] > 0:
+            init[sd][y] -= 1
+            init[sd][x] += 1
+            del applied[k]
+            stats['detected']['pass_pool_reface_reverted'] += 1
+            return
 
 
 _POOL_ZONES = {'FP Dice': 'FREE_PEOPLES', 'SA Dice': 'SHADOW'}
@@ -17738,13 +22515,26 @@ def process_batch(batch, stats):
             # a play, never a commit (W1-001: shared predicate - the
             # actor rolled alone with a strike-effect title; a battle
             # where only the defender rolled is a COMMIT).
+            # R3-EXTRACT-CORSAIRS-REBUILD: and the card lies on its Board
+            # slot at the first roll - a combat card misdropped on a Board
+            # slot and moved on to the Current SA Card slot before the roll
+            # is a commit (2023-03-31 SolidSnake T11 L1222-1224, Deadly
+            # Strife; _table_play_on_board keeps the evidenced exceptions)
             _strike9 = _card_strike(batch)
-            if not _strike9 and not any(
-                    r.get('op') == 'move'
-                    and _pt9 in str(r.get('obj', ''))
-                    and str(r.get('to', '')).startswith('Board')
-                    for r in batch['records']):
+            if not _strike9 and not _table_play_on_board(batch, _pt9):
                 _pt9 = None
+        if _pt9 is None and kind != 'hunt':
+            # R3-EXTRACT-BATTLE-OPEN-BOUGHT: a BATTLE-OPENING event played
+            # on a staged EVENT die and left in the Current FP/SA Card slot
+            # (2024-03-23 HeresJim L892-893 Help Unlooked For) is a play too
+            # - an Event die cannot fund an attack.  The proof and its
+            # guards (no ring / 'changes' re-face, own non-'(chosen)' drag
+            # before the first roll, no earlier opponent commit, no
+            # retraction, no card already in play) live in the predicate.
+            _evt9 = _card_play_title(batch)
+            if _event_die_battle_play(batch, _evt9):
+                _pt9 = _evt9
+                stats['detected']['play_event_die_battle'] += 1
         _play_extra = None
         if _pt9 is not None:
             # This literal event classification remains relevant even when
@@ -17777,6 +22567,10 @@ def process_batch(batch, stats):
         except Exception as e:
             stats['drop_reasons']['drive_exc:%s' % str(e)[:20]] += 1
             return None
+        # R3-MOUTH-EXECUTOR: count what the census driver detected in the log
+        # (e.g. an illegal Mouth drag on a card Nazgul flight), whatever the
+        # drive status; those tagged diffs are never divergences.
+        diffs = rc._count_detected(diffs, stats['detected'])
         if status != 'drove':
             stats['drop_reasons']['resolver_skip:%s' % (reason or status)] += 1
             # An un-drivable hunt (Shadow tile-card / special / Mordor) still
@@ -18003,6 +22797,21 @@ def _rebucket_mcu(stats, new_samples, mcu0, afd0):
 _DIE_POOL_ZONES = frozenset({'sa dice', 'fp dice'})
 
 
+def _inert_chat(record):
+    """R17-CORPUS-EXTRACT row 13: True for a chat record, which changes
+    nothing on the board.  rendered_replay.parse_line turns a chat that is
+    one region name into op='route_hint' (inert evidence a later Hunt /
+    reveal matcher may consult); every other chat line yields no record.
+    The provers below were written when chat produced no record (two of
+    them allowed an op 'chat' parse_line never emits), so a route hint
+    inside a stage-and-return hesitation read as the owner's gesture and
+    the W2-031 fold was refused: _emit_passes then booked the hesitation as
+    a turn-order slot and a spent die and minted a 'pass' row for the other
+    side (2023-01-15 GenericPie/Mistakentuna L187 stage A, L188
+    '<Mistakentuna> lorien', L190 return A, L191 stage P)."""
+    return record.get('op') == 'route_hint'
+
+
 def _hunt_box_stage_return_hesitation(b, si):
     """Prove a first-action die staging undone before any game effect.
 
@@ -18036,7 +22845,8 @@ def _hunt_box_stage_return_hesitation(b, si):
     # No die changes, removals, or earlier actions may invalidate uniqueness.
     roll_line = min(int(own[0]['line']), int(other[0]['line']))
     prefix = [r for r in records[:si] if int(r.get('line') or 0) > roll_line]
-    if any(r.get('op') not in ('roll_dice', 'add_eye', 'chat') for r in prefix):
+    if any(r.get('op') not in ('roll_dice', 'add_eye') and not _inert_chat(r)
+           for r in prefix):
         return None
     shadow = other[0].get('player')
     allocations = [r for r in records[:si] if r.get('op') == 'alloc_eye'
@@ -18044,7 +22854,8 @@ def _hunt_box_stage_return_hesitation(b, si):
     eyes = len(allocations) + sum(f == 'E' for f in other[0].get('faces', []))
     if not allocations:
         return None
-    tail = records[si + 1:]
+    # R17-CORPUS-EXTRACT row 13: chat records are no gesture
+    tail = [r for r in records[si + 1:] if not _inert_chat(r)]
     if not tail:
         return None
     returned = tail[-1]
@@ -18078,7 +22889,8 @@ def _hunt_box_stage_return_hesitation(b, si):
     b['_rx_hunt_box_hesitation'] = {
         'stage_line': stage['line'], 'return_line': returned['line'],
         'roundtrips': pairs, 'unique_fp_face': face, 'shadow_eyes': eyes}
-    return si, len(records) - 1, []
+    return si, next(k for k in range(len(records) - 1, si, -1)
+                    if records[k] is returned), []
 
 
 def _stage_return_hesitation(b):
@@ -18111,9 +22923,11 @@ def _stage_return_hesitation(b):
                 return None         # the OPPONENT returned it (a real action)
             ri = k
             break
-    if ri is None or ri != len(recs) - 1:
+    if ri is None or not all(_inert_chat(r) for r in recs[ri + 1:]):
         return None                 # no return, or gestures after it
-    between = recs[si + 1:ri]
+    # R17-CORPUS-EXTRACT row 13: a chat record is no gesture (the fold
+    # keeps it, _fold_die_restage_hesitations)
+    between = [r for r in recs[si + 1:ri] if not _inert_chat(r)]
     for r in between:
         if r.get('op') != 'move' or r.get('player') == S.get('player'):
             return None             # the owner did something with the die
@@ -18132,9 +22946,13 @@ def _pre_roll_return_hesitation(g, b, rendered_path=None, raw_path=None, allocat
     records = b.get('records') or []
     si = next((i for i, r in enumerate(records)
                if r.get('die_stage') and r.get('line') == b.get('start_line')), None)
-    if si is None or si + 1 >= len(records):
+    # R17-CORPUS-EXTRACT row 13: the return is the next non-chat record
+    ri = None if si is None else next(
+        (i for i in range(si + 1, len(records)) if not _inert_chat(records[i])),
+        None)
+    if ri is None:
         return None
-    stage, returned = records[si:si + 2]
+    stage, returned = records[si], records[ri]
     side = stage['die_stage'][0]
     if allocation and (side != 'SHADOW' or _die_tokens(stage.get('obj')) != [('SHADOW', 'E')]):
         return None
@@ -18154,7 +22972,7 @@ def _pre_roll_return_hesitation(g, b, rendered_path=None, raw_path=None, allocat
     if any(r.get('op') == 'roll_dice' and int(r.get('line') or 0) <= int(returned['line'])
            for x in turn_batches for r in x.get('records', [])):
         return None
-    tail = list(records[si + 2:])
+    tail = list(records[ri + 1:])
     following = next((x for x in turn_batches if int(x.get('start_line') or 0) > int(b.get('start_line') or 0)), None)
     if following is not None:
         tail.extend(r for r in following.get('records', []) if int(r.get('line') or 0) < int(following['start_line']))
@@ -18167,7 +22985,8 @@ def _pre_roll_return_hesitation(g, b, rendered_path=None, raw_path=None, allocat
     # Drawn hands and rolled pools are reconstructed at their own prefixes.
     for record in tail:
         op = record.get('op')
-        safe = op in ('draw', 'roll_dice', 'alloc_eye', 'add_eye', 'view_hand')
+        safe = (op in ('draw', 'roll_dice', 'alloc_eye', 'add_eye', 'view_hand')
+                or _inert_chat(record))
         if op == 'other':
             safe = bool(re.fullmatch(r'\S+ views the (?:Free Peoples|Shadow) event hand\.',
                                      str(record.get('raw', ''))))
@@ -18351,7 +23170,7 @@ def _pre_roll_return_hesitation(g, b, rendered_path=None, raw_path=None, allocat
         b['_rx_pre_roll_allocation'] = {'stage_line': stage['line'], 'box_line': returned['line'], 'pid': ids[0]}
     else:
         b['_rx_pre_roll_return'] = {'stage_line': stage['line'], 'return_line': returned['line'], 'pid': ids[0]}
-    return si, si + 1, []
+    return si, ri, []
 
 
 def _fold_staged_eye_allocations(g, rendered_path=None, raw_path=None):
@@ -18450,7 +23269,11 @@ def _fold_die_restage_hesitations(g, rendered_path=None, raw_path=None):
             merged['_rx_pre_roll_returns'] = (list(h.get('_rx_pre_roll_returns') or [])
                 + ([h['_rx_pre_roll_return']] if h.get('_rx_pre_roll_return') else [])
                 + list(n.get('_rx_pre_roll_returns') or []))
-        merged['records'] = (list(h['records'][:si]) + list(h['records'][ri + 1:])
+        # R17-CORPUS-EXTRACT row 13: the hesitation's chat records stay
+        merged['records'] = (list(h['records'][:si])
+                             + [r for r in h['records'][si + 1:ri]
+                                if _inert_chat(r)]
+                             + list(h['records'][ri + 1:])
                              + [x for k, x in enumerate(n_recs)
                                 if k not in drop_n])
         merged['rng'] = list(h.get('rng') or []) + list(n.get('rng') or [])
@@ -18474,6 +23297,14 @@ def _validate_unpaid_phase_tails(batches):
     for batch in batches:
         if not batch.get('_phase_only'):
             continue
+        if batch.get('_rx_turn_orphans'):
+            # C6-03: records between two turn markers with no die stage (a
+            # stale marker left by an undo across the turn boundary, a turn
+            # counter advanced mid-setup). That turn closed without a paid
+            # action, so it is not a provable turn setup; the per-turn
+            # emitters would mint samples for a phantom turn.
+            raise _Quarantine('coverage_unpaid_phase_tail_unproven',
+                              {'detail': 'turn_closed_without_paid_stage', 'line': batch['start_line']})
         if not any(r.get('op') == 'roll_dice' for r in batch['records']):
             # A draw-only unfinished setup cannot prove a silent allocation
             # or declaration decline in the generic per-turn emitters.
@@ -18481,8 +23312,11 @@ def _validate_unpaid_phase_tails(batches):
                               {'detail': 'phase_closure_missing', 'line': batch['start_line']})
         for record in batch['records']:
             op = record.get('op')
-            allowed = op in ('roll_dice', 'draw', 'alloc_eye', 'add_eye',
-                             'pass', 'view_hand')
+            # R18-CORPUS row 65: a region-name chat (route_hint) changes
+            # nothing on the board (R17-CORPUS-EXTRACT row 13, _inert_chat)
+            allowed = (op in ('roll_dice', 'draw', 'alloc_eye', 'add_eye',
+                              'pass', 'view_hand')
+                       or _inert_chat(record))
             if op == 'draw':
                 allowed = rr._draw_kind(str(record.get('what', '')))[0] == 'deck'
             if op == 'other':
@@ -18697,6 +23531,11 @@ def extract_one(rendered_path, stem, meta):
                                   {'batch': b['idx'], 'detail': detail})
 
     # ---- Gates 4/5/8: drive + legality-matched sample emission -------
+    # R3-TOOLS-MISC (C3-10): 'kinds_emit' (manifest 'emit_by_kind') counts rows
+    # at their emit sites, BEFORE admission (the hunt-pool provenance check,
+    # _filter_ai_policy_samples, _ring_truth_guard); the after-admission
+    # count is 'stored_phases' (manifest
+    # 'stored_by_phase').  The two differ by design.
     stats = {'kinds_emit': Counter(), 'drop_reasons': Counter(), 'drove': 0,
              'diverged': 0, 'nomatch': 0, 'ambiguous': 0,
              'played_cids': set(), 'detected': Counter(),
@@ -18713,12 +23552,18 @@ def extract_one(rendered_path, stem, meta):
     declare_cov = []      # v32 gate-(e) per-turn coverage records
     # v27 List-2 pre-computation (game-level): per-turn Shadow eye allocation
     # + per-(turn,side) rolled dice pool for elven-ring menu reconstruction.
-    try:
-        eye_counts = _turn_eye_counts(rendered_path, batches)
-    except Exception:
-        eye_counts = {}
+    # C2-01: no fallback - an empty dict would ship every eye_allocate label
+    # of the game as 0 and put no allocated Eyes in any rebuilt Hunt Box.
+    eye_counts = _turn_eye_counts(rendered_path, batches)
+    # C1-03: every roll's side from its raw die pieces (gate 3 proved the
+    # raw log exists); the dice passes below never infer it from the user.
+    _annotate_physical_roll_sides(batches, rendered_path, _raw_log_path(stem))
+    # R18-CORPUS row 4: a die rolled on its own changes that die only
+    _annotate_partial_rolls(batches, rendered_path, _raw_log_path(stem))
     try:
         pools = _roll_pools(batches)
+    except _Quarantine:
+        raise
     except Exception:
         pools = {}
     # X-audit B1 (2026-08-31): eyes_allocated was NEVER reconstructed -
@@ -18781,8 +23626,11 @@ def extract_one(rendered_path, stem, meta):
                 continue
             b = mixed_hunt['batch']
             stats['detected']['mixed_hunt_completed_prefix'] += 1
+            # R18-CORPUS row 66: the source batch keeps kind 'combat', but
+            # its Hunt is this FP movement prefix's (_emit_cardhunt_arms)
+            source_batch['_rx_mixed_hunt_projected'] = True
         global _RX_RINGS_CUR, _RX_LINE_CUR
-        _RX_RINGS_CUR = (b.get('_rx_rings') or {}).get('post')
+        _RX_RINGS_CUR = (b.get('_rx_rings') or {}).get('decision')  # C1-04
         _RX_LINE_CUR = b.get('start_line') or 0
         _RX_HUNT_HISTORY.current_batch = b
         # W4-033: per-batch baselines for the move_comp_unmatched re-bucket
@@ -18829,12 +23677,7 @@ def extract_one(rendered_path, stem, meta):
                 raise
             except Exception as e:
                 stats['drop_reasons']['extra_exc:%s' % str(e)[:16]] += 1
-        if b.get('_rx_hunt_exclusion'):
-            source_batch['_rx_hunt_exclusion'] = dict(b['_rx_hunt_exclusion'])
-            for key in ('_rx_huntres', '_rx_reveal_predecision', '_rx_hunt_guide_predecision', '_rx_hunt_reduction_owned'):
-                source_batch.pop(key, None)
-        elif b is not source_batch and b.get('_rx_hunt_guide_predecision'):
-            source_batch['_rx_hunt_guide_predecision'] = b['_rx_hunt_guide_predecision']
+        _merge_projected_hunt_marks(source_batch, b)
         # W4-033 (P meter): `move_comp_unmatched` ticks in _emit_bookkeeping
         # BEFORE the List-2 extras see the batch; when they emit the
         # batch's army_attack row (or count their own attack-family drop)
@@ -18950,6 +23793,10 @@ def extract_one(rendered_path, stem, meta):
         'ring_ledger': ring_audit,
         'token_ledger': token_audit,
         'hunt_pool_refusals': pool_refusals,
+        # R2-S4-EXTRACT (r027): the Mirror's quiet repairs this game (C6-01
+        # casualty-ledger no-ops, C6-02 stale-origin board copies removed)
+        # - mirror drift is visible per game at re-extraction
+        'mirror_diagnostics': g.get('mirror_diagnostics', {}),
         'secs': round(time.time() - t0, 1), 'error': None,
     }
     led = _LEDGER
@@ -18965,6 +23812,10 @@ def extract_one(rendered_path, stem, meta):
             'disposal_kills': led.n_disposal,       # W1-002
             'undone_kills': led.n_undone_kills,     # W1-002
             'undone_draws': led.n_undone_draws,     # W1-024
+            'undone_rand': led.n_undone_rand,       # C1-02
+            'redone': led.n_redone,                 # C1-02
+            'deck_ret': led.n_deck_ret,             # C1-02
+            'deck_in': led.n_deck_in,               # C1-02
             'views': led.n_views, 'amb_decks': amb_decks,
             # W1-002: every ambiguity window ever opened, [open, close]
             # (close None = still open at game end)

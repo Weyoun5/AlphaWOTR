@@ -19,7 +19,9 @@ import numpy as np
 
 SRC = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(SRC)
-sys.path.insert(0, SRC)
+# insert only when absent (one copy per process; src/ module names are unique on sys.path)
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
 os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 
 DATA = os.path.join(ROOT, 'data')
@@ -98,6 +100,59 @@ def saruman_encoding_distinct():
     return bool(getattr(ai, 'ACT_ENC_SARUMAN_DISTINCT', False))
 
 
+class AliasedActionUnderV53Error(RuntimeError):
+    """R3-V53-FOLLOWONS packing guard (USER D5 2026-10-22, encoding
+    generation v53).  A sample stamped alias_v53 trains a row whose menu
+    holds a byte-identical encoding twin (same row, same region) that the
+    v53 action tail tells apart: other figures moved (E5-01), another
+    companion ability (A1-01) or another Through a Day and a Night route
+    (E3-02).  Under an encoder WITHOUT the matching ai.ACT_ENC_* capability
+    that merge is the known pre-v53 behaviour (the trainer's multi-positive
+    CE treats the twins as one target; pack_npz announces and records it).
+    Under an encoder that CLAIMS the capability it is an encoder regression
+    and the pack is refused - never a silent skip, never a menu filter."""
+
+
+# alias class -> the ai capability flag that makes those rows encode distinctly
+V53_ALIAS_CLASSES = (('A1-01', 'ACT_ENC_COMPANION_ADVANCE_DISTINCT'),
+                     ('E5-01', 'ACT_ENC_ARMY_FIGURES_DISTINCT'),
+                     ('E3-02', 'ACT_ENC_TDAAN_ROUTE_DISTINCT'))
+CAPABILITY_FLAGS = ('OBS_HAND_FULLY_VISIBLE', 'OBS_THREAT_COUNTS_EXACT',
+                    'ACT_ENC_COMPANION_ADVANCE_DISTINCT',
+                    'ACT_ENC_ARMY_FIGURES_DISTINCT',
+                    'ACT_ENC_TDAAN_ROUTE_DISTINCT', 'ACT_ENC_SARUMAN_DISTINCT')
+
+
+def encoding_capabilities():
+    """The loaded engine's encoder capability flags (recorded in every
+    packed npz; read by the alias guards)."""
+    import ai
+    return {name: bool(getattr(ai, name, False)) for name in CAPABILITY_FLAGS}
+
+
+def v53_alias_classes(ai, state, side, legal, hidx, encs, regs):
+    """Sorted alias classes ('A1-01' / 'E5-01' / 'E3-02') in which the
+    chosen row legal[hidx] has a byte-identical encoding twin (same encs
+    row, same region index) whose encoding_v53 action tail differs - the
+    rows the loaded encoder merges.  Always [] under v53: the tail is part
+    of the encoding there, so twins share it."""
+    from encoding_v53 import TAIL_ACTION_TYPES, action_tail
+    chosen = legal[hidx]
+    if chosen.action_type not in TAIL_ACTION_TYPES:
+        return []
+    E = np.asarray(encs)
+    R = np.asarray(regs)
+    twins = [int(j) for j in np.flatnonzero((E == E[hidx]).all(axis=1) & (R == R[hidx]))
+             if int(j) != int(hidx) and legal[int(j)].action_type == chosen.action_type]
+    if not twins:
+        return []
+    mine = action_tail(ai, chosen, state, side)
+    if any(not np.array_equal(mine, action_tail(ai, legal[j], state, side)) for j in twins):
+        return [{'advance_political': 'A1-01', 'army_move': 'E5-01',
+                 'victor_advance': 'E5-01', 'card_option': 'E3-02'}[chosen.action_type]]
+    return []
+
+
 def pack_npz(samples, path, extras=None, allow_v41_alias=False):
     excluded = [i for i, s in enumerate(samples) if s.get('ai_policy_exclusion')]
     if excluded:
@@ -118,6 +173,27 @@ def pack_npz(samples, path, extras=None, allow_v41_alias=False):
                os.environ.get('WOTR_ACT_GEN', '').strip() or 'un-pinned',
                _alias_idx[:8], '...' if len(_alias_idx) > 8 else '',
                sorted(set(str(samples[i].get('phase')) for i in _alias_idx))))
+    # R3-V53-FOLLOWONS: the v53 alias guard reads the capability flags -
+    # a stamped class the loaded encoder claims to distinguish is an encoder
+    # regression (refused); without the capability the merge is the known
+    # pre-v53 behaviour: announced here, recorded per sample in the npz
+    _caps9 = encoding_capabilities()
+    _flag9 = dict(V53_ALIAS_CLASSES)
+    _v53_alias = [(i, tuple(s.get('alias_v53') or ())) for i, s in enumerate(samples)
+                  if s.get('alias_v53')]
+    _lying9 = [(i, c) for i, classes in _v53_alias for c in classes if _caps9[_flag9[c]]]
+    if _lying9:
+        raise AliasedActionUnderV53Error(
+            'ALIAS_V53: %d sample(s) carry a byte-identical encoding twin in a '
+            'class the loaded encoder claims to encode distinctly (%s) - '
+            'refusing to pack: the action encoder regressed'
+            % (len(_lying9), _lying9[:8]))
+    if _v53_alias:
+        print('[ALIAS_V53] %d sample(s) merged with encoding twins by the %s '
+              'encoder (classes %s; no v53 capability) - recorded in the npz '
+              "'alias_v53' array; the D6 corpus is extracted under WOTR_ACT_GEN=v53"
+              % (len(_v53_alias), os.environ.get('WOTR_ACT_GEN', '').strip() or 'un-pinned',
+                 sorted(set(c for _, classes in _v53_alias for c in classes))), flush=True)
     N = len(samples)
     D = samples[0]['x'].shape[0]
     A = samples[0]['encs'].shape[1]
@@ -182,6 +258,8 @@ def pack_npz(samples, path, extras=None, allow_v41_alias=False):
                             for s in samples]),
                         observation_contract=np.asarray([str(s.get('observation_contract', 'legacy'))
                                                          for s in samples]),
+                        encoding_capabilities=np.asarray(json.dumps(_caps9, sort_keys=True)),
+                        alias_v53=np.asarray([','.join(s.get('alias_v53') or ()) for s in samples]),
                         **(extras or {}))
     os.replace(tmp, path)
     return len(_alias_idx)

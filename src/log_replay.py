@@ -12,10 +12,14 @@ dumps.  The ONLY sanctioned production import from this module was the
 CardDecoder family (card-identity decoding from draw events — hidden
 information the rendered board text cannot carry; NOT piece-move
 parsing); it now lives in card_decoder.py and is RE-EXPORTED here for
-legacy importers.  Known raw-replay defects P1-P8 (see
-data/log_census_report.json parser_defects) are documented, NOT fixed
-— the machinery is retired from live paths.  Remaining consumers:
-diagnostics (log_census.py) and legacy test coverage.
+legacy importers.  Known open raw-replay defects are documented in
+log_census.PARSER_DEFECTS (the report's parser_defects), NOT fixed
+— the machinery is retired from live paths.  P4 (a separation to Dead
+Marshes booked as a death) and P3-R1 (an active->active ring re-seat
+booked as an FP use) have since been fixed; they are listed in
+log_census.PARSER_DEFECTS_FIXED (the report's parser_defects_fixed)
+with the code that fixed them.  Remaining consumers: diagnostics
+(log_census.py) and legacy test coverage.
 =====================================================================
 
 This script reads log files from the WOTR-Gandalf board game client and translates
@@ -243,35 +247,73 @@ RING_ACTIVE_LOCS = {'Game.2008', 'Game.2009', 'Game.2010'}
 RING_USED_LOCS = {'Game.2011', 'Game.2012', 'Game.2013'}
 
 # --- Table-card KILL detection (USER 2026-07-19, ruling 1.149) ----------
-# The three deliberately-killable play-on-table cards, keyed by piece id.
-# 106/145 are FP Strategy cards (killed by SHADOW: any die + one ARMY-type
-# card + one Character card from hand); 202 is the SA Palantir (killed by
-# FP: a Will of the West die alone, or any die + one Elven Ring).
-_TABLE_KILL_PIDS = {'106', '145', '202'}
+# The three deliberately-killable play-on-table cards, keyed by DECODED
+# IDENTITY (deck type, card number), never by piece id (C5-01): in human
+# VASSAL logs a card pid fixes only its DECK (_FP_PID_TYPES/_SA_PID_TYPES);
+# the card it holds is per game (the shuffled commitment and the
+# 'reveal <pid> <hash> <number>' lines -- pid 106 reveals every FP Strategy
+# number across the corpus).  'A Power too Great' / 'The Power of Tom
+# Bombadil' are FP Strategy cards (killed by SHADOW: any die + one
+# ARMY-type card + one Character card from hand); 'The Palantir of
+# Orthanc' is an SA Character card (killed by FP: a Will of the West die
+# alone, or any die + one Elven Ring).
 # Board (table) slots a played persistent card sits in.
 _TABLE_SLOT_ZONES = {'Game.2029', 'Game.2030', 'Game.2031', 'Game.2032',
                      'Game.2033', 'Game.2034'}
-# SA Strategy cards of card_type 'Army'.  Only an ARMY-type Strategy card
-# (NOT a Muster-type one) plus a Character-deck card pays for the Shadow
-# kill of 'A Power too Great' / 'The Power of Tom Bombadil'.  Pids verified
-# against cards.get_card(cid).card_type (messages.properties alpha order):
-#  164 Denethor's Folly       170 Half-Orcs and Goblin-Men  171 Hill-Trolls
-#  180 Olog-Hai               187 Return to Valinor         189 Shadows Gather
-#  195 Corsairs of Umbar      196 The Day Without Dawn       197 The Fighting Uruk-Hai
-#  205 The Shadow is Moving   206 The Shadow Lengthens
-_SA_ARMY_CARD_PIDS = frozenset(
-    {164, 170, 171, 180, 187, 189, 195, 196, 197, 205, 206})
 # FP / SH action-die piece ids (base + bonus) — for the kill payment scan.
 _FP_DIE_PIDS = frozenset({'210', '211', '212', '213', '358', '359'})
 
 _TABLE_KILL_INFO_CACHE = None
+_SA_ARMY_NUMS_CACHE = None
+
+# card_decoder deck tables (card number -> title) by deck type
+_DECK_TABLES = {'FP Character': FP_CHARACTER_CARDS,
+                'FP Strategy': FP_STRATEGY_CARDS,
+                'SA Character': SA_CHARACTER_CARDS,
+                'SA Strategy': SA_STRATEGY_CARDS}
+# deck-table title -> registry title where they differ beyond case/
+# accents/punctuation (the same variant row as ai._lookup_card_id)
+_DECK_TITLE_ALIASES = {
+    'musteringofalongplannedwar': 'musteringsoflongplannedwar'}
 
 
-def _table_kill_card_info(pid: str):
-    """piece id -> (card_id, card_name, killer_side) for the three
-    play-on-table killable cards, or None.  card_id/name come from the
-    cards registry so the id matches persistent_cards.remove_card()
-    exactly (the Palantír's accented name included)."""
+def _card_pid_deck_type(pid) -> Optional[str]:
+    """card piece id -> its deck ('FP Character' / 'FP Strategy' /
+    'SA Character' / 'SA Strategy') -- the only thing a pid fixes in a
+    human log; None for an expansion ('X') or non-card pid."""
+    try:
+        p = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if 106 <= p <= 157:
+        t, base = _FP_PID_TYPES[p - 106], 'FP'
+    elif 158 <= p <= 209:
+        t, base = _SA_PID_TYPES[p - 158], 'SA'
+    else:
+        return None
+    if t == 'X':
+        return None
+    return base + (' Character' if t == 'C' else ' Strategy')
+
+
+def _deck_number_of(deck_type: str, registry_name: str) -> Optional[int]:
+    """registry card title -> its card number in the card_decoder deck
+    table of `deck_type` (accent/case/punctuation tolerant), or None."""
+    hits = []
+    for num, title in _DECK_TABLES[deck_type].items():
+        key = _normalize_name(title)
+        if _DECK_TITLE_ALIASES.get(key, key) == _normalize_name(
+                registry_name):
+            hits.append(num)
+    return hits[0] if len(hits) == 1 else None
+
+
+def _table_kill_card_info(deck_type: str, card_num):
+    """decoded identity (deck type, card number) -> (card_id, card_name,
+    killer_side) for the three play-on-table killable cards, or None.
+    card_id/name come from the cards registry so the id matches
+    persistent_cards.remove_card() exactly (the Palantír's accented name
+    included)."""
     global _TABLE_KILL_INFO_CACHE
     if _TABLE_KILL_INFO_CACHE is None:
         # A failed registry scan must be LOUD and must not cache the
@@ -281,17 +323,48 @@ def _table_kill_card_info(pid: str):
         info = {}
         for cid, c in get_cards().items():
             n = c.card_name
-            if n == 'A Power too Great':
-                info['106'] = (cid, n, Side.SHADOW)
-            elif n == 'The Power of Tom Bombadil':
-                info['145'] = (cid, n, Side.SHADOW)
+            if n in ('A Power too Great', 'The Power of Tom Bombadil'):
+                dt, killer = 'FP Strategy', Side.SHADOW
             elif 'Palant' in n and 'Orthanc' in n:
-                info['202'] = (cid, n, Side.FREE_PEOPLES)
+                dt, killer = 'SA Character', Side.FREE_PEOPLES
+            else:
+                continue
+            num = _deck_number_of(dt, n)
+            if num is not None:
+                info[(dt, num)] = (cid, n, killer)
         if len(info) != 3:
             raise RuntimeError(
                 'table-kill card scan incomplete: %r' % (info,))
         _TABLE_KILL_INFO_CACHE = info
-    return _TABLE_KILL_INFO_CACHE.get(pid)
+    return _TABLE_KILL_INFO_CACHE.get((deck_type, card_num))
+
+
+def _sa_army_strategy_numbers() -> frozenset:
+    """SA Strategy card NUMBERS (card_decoder numbering) whose registry
+    card_type is 'Army'.  Only an ARMY-type Strategy card (NOT a
+    Muster-type one) plus a Character-deck card pays for the Shadow kill
+    of 'A Power too Great' / 'The Power of Tom Bombadil'.  Every deck
+    title must resolve in the registry (loud otherwise)."""
+    global _SA_ARMY_NUMS_CACHE
+    if _SA_ARMY_NUMS_CACHE is None:
+        from cards import get_cards
+        types = {_normalize_name(c.card_name): c.card_type
+                 for c in get_cards().values()
+                 if c.side == Side.SHADOW and c.deck == 'Strategy'}
+        army, missing = set(), []
+        for num, title in SA_STRATEGY_CARDS.items():
+            key = _normalize_name(title)
+            t = types.get(_DECK_TITLE_ALIASES.get(key, key))
+            if t is None:
+                missing.append(title)
+            elif t == 'Army':
+                army.add(num)
+        if missing or not army:
+            raise RuntimeError(
+                'SA Strategy deck titles missing from the card registry: '
+                '%r' % (missing,))
+        _SA_ARMY_NUMS_CACHE = frozenset(army)
+    return _SA_ARMY_NUMS_CACHE
 
 # Shadow minion piece IDs (identified from log behavior)
 MINION_PIECES = {
@@ -559,6 +632,17 @@ _REVEALING_EVENT_CARDS = {
     'nazgulsearch', 'thenazgulstrike', 'nazgulstrike',
 }
 
+# R2-S4-EXTRACT (C5-03 rescan r024): card-forced hunt-tile draws the ENGINE
+# resolves with NO FP hunt-damage choice (normalized names):
+# event_effects._effect_foul_thing (random casualty), _effect_isildurs_bane
+# (all damage as corruption), _effect_challenge_of_king (3 tiles, no
+# damage).  A tile drawn inside one of these open card windows opens no
+# hunt-damage ctx (The Breaking of the Fellowship has its own gate).
+_ENGINE_RESOLVED_DRAW_CARDS = {
+    'foulthingfromthedeep', 'isildursbane', 'challengeoftheking',
+    'thechallengeoftheking',
+}
+
 
 HUNT_TILE_PIECES = {
     '214': '0r', '215': '0r',
@@ -748,6 +832,10 @@ class LogReplayer:
         # elven_ring record is folded into the discard_table_card).
         self._table_card_kills: Dict[int, dict] = {}
         self._table_kill_ring_lines: set = set()
+        # C5-01: drag line_num -> reason, for drags that pass every kill
+        # test except a card IDENTITY the log does not decode (killed
+        # card, or the payment's Army/Muster type) -- NOT staged, logged.
+        self._table_kill_unresolved: Dict[int, str] = {}
 
         # Last human-readable (%) line for unit type / tile name parsing
         self._last_readable_line: Optional[str] = None
@@ -772,6 +860,21 @@ class LogReplayer:
         # region holds ONLY the garrison side (demanray T16 Erebor L1470).
         self._siege_garrison: Dict[str, Side] = {}
         self._siege_arrived: set = set()
+        # R2-RS-r024-NEW (fix round 2, 2026-10-22): a side of an ACTIVE
+        # siege reaching zero units is DEFERRED, not committed - a human's
+        # elite downgrade / re-shuffle is two log lines (elite out, then
+        # regular back) and the zero in between is mid-gesture.  san ->
+        # (line seq when it went to zero, side that emptied, region key).
+        # Committed by _settle_siege_over_pending once a later '$' action
+        # line did not touch the region (or at end of replay); dropped if
+        # the side's units come back first.  _line_seq counts
+        # _process_line calls (robust to callers that never advance
+        # line_num); _siege_touch_seq = last seq the region's control was
+        # re-evaluated; _siege_last_action_seq = seq of the last '$' line.
+        self._siege_over_pending: Dict[str, Tuple[int, str, str]] = {}
+        self._siege_touch_seq: Dict[str, int] = {}
+        self._siege_last_action_seq: int = 0
+        self._line_seq: int = 0
 
         # Pending combat card (from Controls.840 selection)
         self._pending_combat_card: Optional[Tuple[str, Side]] = None
@@ -784,6 +887,13 @@ class LogReplayer:
         # attaches the card to combat-effect-choice records (Onslaught
         # sacrifices, 'ffN' Dread-and-Despair forfeit chats)
         self._last_combat_card_name: dict = {}
+
+        # C5-02: piece id -> (card_name, side) of the play_event record
+        # each card reveal created (a combat reveal retags that record
+        # to combat_card with the same name and side).  A card piece
+        # taken back to a hand retracts ONLY its own record - never the
+        # most recent play of another card or the other side.
+        self._reveal_pid_record: Dict[str, Tuple[str, Side]] = {}
 
         # True per side from a combat-card reveal until the next dice
         # roll: Relentless-Assault self-hits are decided BEFORE the
@@ -805,6 +915,9 @@ class LogReplayer:
 
         # Hunt-damage decision synthesis (take corruption vs sacrifice)
         self._hunt_ctx: Optional[dict] = None
+        # tile pid whose draw opened _hunt_ctx (R2-S4-EXTRACT: a drag of
+        # that tile back to the Hunt Pool cancels its decision)
+        self._hunt_ctx_tile: Optional[str] = None
 
         # Fellowship hidden-marker sync: direct hidden assignments consume
         # the player's subsequent marker flip(s) (prevents toggle
@@ -1109,6 +1222,19 @@ class LogReplayer:
         'fellowship_reveal_place',
     })
 
+    @staticmethod
+    def _is_stop_tile_step_back(action_type: str, params) -> bool:
+        """C5-03: a BACKWARD Mordor-track drag is never an FP action -
+        it is a stop tile's cancelled step (Shelob's Lair, 'On, On They
+        Went', 'Give it to Uss!', 'The Ring is Mine!' drawn in Mordor),
+        so it must not close an open hunt-damage decision."""
+        if action_type != 'mordor_move' or not isinstance(params, dict):
+            return False
+        try:
+            return int(params.get('to_step')) < int(params.get('from_step'))
+        except (TypeError, ValueError):
+            return False
+
     def _record_action(self, action_type: str, params: dict, side: Side):
         """Record a player decision for AI training extraction."""
         # Unresolved hunt damage + a non-hunt action following it means
@@ -1131,7 +1257,9 @@ class LogReplayer:
             self.log("Hunt damage absorbed by separation sacrifice "
                      "(%s)" % (params or {}).get('companion'))
         elif (ctx is not None and not ctx.get('resolved')
-                and action_type not in self._HUNT_RESOLUTION_TYPES):
+                and action_type not in self._HUNT_RESOLUTION_TYPES
+                and not self._is_stop_tile_step_back(action_type,
+                                                     params)):
             ctx['resolved'] = True
             self.action_log.append((
                 'hunt_take_corruption',
@@ -1519,8 +1647,9 @@ class LogReplayer:
         self.log(f"Attack synthesized: {side.name} -> {region_loc or '?'} "
                  f"(from {from_loc})")
 
-    # region -> owning Nation (local copy of ai._region_nation — kept
-    # local so the parser never imports the torch-heavy ai module)
+    # region -> owning Nation (local copy of ai._FACTION_TO_NATION — kept
+    # local so the parser never imports the torch-heavy ai module; the
+    # same keys and values, test_round17_R17_LOGREPLAY_no_ai_import)
     _FACTION_TO_NATION = {
         'gondor': Nation.GONDOR, 'rohan': Nation.ROHAN,
         'elves': Nation.ELVES, 'dwarves': Nation.DWARVES,
@@ -1529,7 +1658,17 @@ class LogReplayer:
         'southrons': Nation.SOUTHRON_EASTERLINGS,
         'southron': Nation.SOUTHRON_EASTERLINGS,
         'southrons and easterlings': Nation.SOUTHRON_EASTERLINGS,
+        'easterlings': Nation.SOUTHRON_EASTERLINGS,
     }
+
+    @classmethod
+    def _region_nation(cls, region_san: str) -> Optional[Nation]:
+        """The Nation owning a sanitized map region, or None (the parser's
+        ai._region_nation; board.fid_to_name yields the canonical
+        lower-case faction names)."""
+        meta = board.regions.get(region_san, {})
+        fac = str(board.fid_to_name.get(meta.get('parent_id'), '')).lower()
+        return cls._FACTION_TO_NATION.get(fac)
 
     def _auto_tag_defender_political(self, region_san: str, attacker_side):
         """An attack on nation N's region makes N's political advance
@@ -1537,9 +1676,7 @@ class LogReplayer:
         attack callout in the log — retro-tag the nearest recent die-less
         political record of the defending nation as auto so it is not
         treated as a separate decision."""
-        meta = board.regions.get(region_san, {})
-        fac = str(board.fid_to_name.get(meta.get('parent_id'), '')).lower()
-        nat = self._FACTION_TO_NATION.get(fac)
+        nat = self._region_nation(region_san)
         if nat is None:
             return
         # RB-07: the engine advances each attacked nation ONCE per battle;
@@ -1658,13 +1795,25 @@ class LogReplayer:
 
     def _piece_side(self, pieces: List[str]) -> Side:
         """Side owning the given pieces (FP if any FP-nation piece)."""
+        saw_nazgul = False
         for p in pieces:
             if p in COMPANIONS:
                 return Side.FREE_PEOPLES
-            nation, _ = get_unit_type_from_piece_id(p, self.piece_types)
+            nation, kind = get_unit_type_from_piece_id(p, self.piece_types)
             if nation is not None:
                 return (Side.SHADOW if nation in SHADOW_NATIONS
                         else Side.FREE_PEOPLES)
+            if kind == 'NAZGUL' or p in MINION_PIECES:
+                saw_nazgul = True
+        # C5-04: the AUTHORITATIVE table types Nazgul pids (None,
+        # 'NAZGUL'); a Nazgul is ALWAYS Shadow, so a drag whose only
+        # side evidence is Nazgul pieces is Shadow (it fell through to
+        # the FP default; mixed drags keep the first-evidence rule).
+        # R2-S4-EXTRACT: the minions (253 Witch King, 254 Saruman, 255
+        # Mouth of Sauron) get (None, None) from the table and are
+        # ALWAYS Shadow too.
+        if saw_nazgul:
+            return Side.SHADOW
         return Side.FREE_PEOPLES
 
     def _find_attacker_from(self, region_san: str, side: Side) -> str:
@@ -1725,8 +1874,11 @@ class LogReplayer:
             self.state.armies[to_key] = gs.Army(region=to_region)
         return to_key, self.state.armies[to_key]
 
-    def _update_region_control(self, region_key: str):
-        """Update enemy_controlled for a specific region after army changes."""
+    def _update_region_control(self, region_key: str, _settle: bool = False):
+        """Update enemy_controlled for a specific region after army changes.
+
+        _settle=True (only from _settle_siege_over_pending): commit a
+        deferred siege-over now instead of deferring it again."""
         from game_logic import is_shadow_region, is_fp_region
 
         san = sanitize(region_key)
@@ -1751,21 +1903,18 @@ class LogReplayer:
                 army = a
                 break
 
-        # Known Shadow minion names (stored as Companion objects without proper nation)
-        shadow_minion_names = {'Witch King', 'Saruman', 'Mouth of Sauron'}
-
+        # C5-05 (fix wave 2026-10-21): the occupier is decided by army
+        # UNITS only, exactly like the engine authority
+        # game_logic.enforce_settlement_control (`if not a.units:
+        # continue`; sides from a.units) and cleanup_sieges.  Leaders,
+        # Nazgul, minions and companions never capture or reclaim a
+        # settlement (ruling 1.55(a): an ARMY captures) - a lone Nazgul
+        # flying into an empty FP town used to record a phantom capture.
         has_fp = False
         has_sh = False
         if army:
             for u in army.units:
                 if u.nation in SHADOW_NATIONS:
-                    has_sh = True
-                else:
-                    has_fp = True
-            for l in army.leaders:
-                name = getattr(l, 'name', '')
-                if isinstance(l, Nazgul) or name in shadow_minion_names or \
-                   (hasattr(l, 'nation') and l.nation in SHADOW_NATIONS):
                     has_sh = True
                 else:
                     has_fp = True
@@ -1782,27 +1931,48 @@ class LogReplayer:
             if gside is not None:
                 g_has = has_sh if gside == Side.SHADOW else has_fp
                 b_has = has_fp if gside == Side.SHADOW else has_sh
+                # R2-RS-r024-NEW: this line touched the region (the
+                # gesture-end test in _settle_siege_over_pending)
+                self._siege_touch_seq[san] = self._line_seq
                 if g_has:
                     if b_has:
+                        if self._siege_over_pending.pop(san, None) \
+                                is not None:
+                            self.log(f"Siege at {region_key} continues "
+                                     f"(zero-unit state was mid-gesture)")
                         self._siege_arrived.add(san)
                         return  # siege in progress: control frozen
                     if san not in self._siege_arrived:
-                        return  # setup window: besieger not advanced yet
+                        # setup window: besieger not advanced yet (a
+                        # garrison zero-unit transient here is over too)
+                        self._siege_over_pending.pop(san, None)
+                        return
                     # besiegers eliminated after arriving: siege over,
-                    # the garrison side holds — resolve control below
-                    besieged.discard(san)
-                    self._siege_garrison.pop(san, None)
-                    self._siege_arrived.discard(san)
-                    self.log(f"Siege at {region_key} over "
-                             f"(besiegers eliminated)")
+                    # the garrison side holds
+                    _which = 'besiegers'
                 else:
-                    # garrison eliminated: siege over, capture resolves
-                    # through the composition logic below
-                    besieged.discard(san)
-                    self._siege_garrison.pop(san, None)
-                    self._siege_arrived.discard(san)
-                    self.log(f"Siege at {region_key} over "
-                             f"(garrison eliminated)")
+                    # garrison eliminated: siege over, capture
+                    _which = 'garrison'
+                if not _settle:
+                    # R2-RS-r024-NEW: DEFER.  One side at zero units can
+                    # be the middle of a two-line gesture (elite out, then
+                    # its regular refunded / a Shadow re-shuffle); ending
+                    # the siege here lost the siege state for good and
+                    # turned the besieger's later reinforcing drag into an
+                    # army_attack.  Control stays frozen until
+                    # _settle_siege_over_pending sees the gesture end.
+                    if san not in self._siege_over_pending:
+                        self._siege_over_pending[san] = (
+                            self._line_seq, _which, region_key)
+                    return
+                # committed (gesture over): control resolves through the
+                # composition logic below
+                self._siege_over_pending.pop(san, None)
+                besieged.discard(san)
+                self._siege_garrison.pop(san, None)
+                self._siege_arrived.discard(san)
+                self.log(f"Siege at {region_key} over "
+                         f"({_which} eliminated)")
 
         # FP settlement: Shadow captures if only Shadow units present
         if region_is_fp:
@@ -1827,6 +1997,25 @@ class LogReplayer:
                 self.state.enemy_controlled[Side.FREE_PEOPLES].discard(san)
                 if besieged is not None and not has_fp:
                     besieged.discard(san)
+
+    def _settle_siege_over_pending(self, flush: bool = False):
+        """R2-RS-r024-NEW: commit deferred siege-over transitions whose
+        gesture has ended.  The gesture is over once a '$' action line
+        AFTER the zero-unit line was processed without touching the
+        region (chat, roll and '%' lines never end it); flush=True (end of
+        replay) commits every entry.  The commit re-evaluates the CURRENT
+        composition through _update_region_control(_settle=True): units
+        back -> the siege goes on; still zero -> 'Siege at X over' and the
+        capture/reclaim logic, exactly as before the deferral."""
+        for san, (seq0, _which, region_key) in list(
+                self._siege_over_pending.items()):
+            last_act = self._siege_last_action_seq
+            if not flush and not (
+                    last_act > seq0
+                    and self._siege_touch_seq.get(san, seq0) < last_act):
+                continue
+            self._siege_over_pending.pop(san, None)
+            self._update_region_control(region_key, _settle=True)
 
     def log(self, msg: str):
         """Log a message if verbose."""
@@ -1853,13 +2042,15 @@ class LogReplayer:
         r'<~Scribe\.141~>([\d\s]+?)<~Scribe\.142~><~([\w.]+)~>'
         r'<~Scribe\.143~><~([\w.]+)~><~Scribe\.144~>')
 
-    # Die-face change line ('$GJB changes 105  to A 85B43B').  The
-    # client interpreter does NOT snapshot these (ay_0.k() runs only
-    # before moves/kills/flips/allocates dispatches), so an undo after
-    # one restores the snapshot of the PRECEDING snapshotted command —
-    # reverting that command AND the face change.
-    _DIE_CHANGE_LINE_RE = re.compile(
-        r'^\$\w+\s+changes\s+\d+\s+to\s+[A-Z]\b')
+    # '$nick' prefix of an action line / '<nick>' of a chat line: any run
+    # without whitespace, '<', '>' or '~' (log_census.CHAT_RE; '~' keeps
+    # the encoded client keys such as <~Game.7~> out).  R2-S4-EXTRACT
+    # (C7-05): `\w+` missed $Alexey'a / $Noir-Pelerin / $Fabio.Borselli.
+    # R17-LOGREPLAY: ONE nick class for every nick grammar of the class
+    # (the table-card-kill pre-pass regexes below use it too).
+    _NICK_CLASS = r'[^<>\s~]+'
+    _NICK_PREFIX_RE = re.compile(r'^\$(%s)' % _NICK_CLASS)
+    _CHAT_LINE_RE = re.compile(r'^<(%s)>\s*(.*)' % _NICK_CLASS)
 
     @staticmethod
     def dedupe_adjacent_lines(log_lines: List[str]) -> List[int]:
@@ -1911,65 +2102,39 @@ class LogReplayer:
 
     @staticmethod
     def undo_prepass(log_lines: List[str]) -> List[str]:
-        """Apply VASSAL undo buttons (<~Controls.819~>) to the line list.
+        """Apply the client's undo (<~Controls.819~>) and redo
+        (<~Controls.16~>, 'redoes last action') buttons to the line list.
 
-        Each press cancels the nearest preceding player command
-        ($-prefixed line).  Undone lines and the undo lines themselves
-        are BLANKED (not deleted) so line numbers stay stable for
-        curation keys and diagnostics; _process_line('') is a no-op.
-        Without this, undone actions replay as real decisions AND their
-        redos replay again (2023-12-06 T6 lines 550-560: three undos,
-        chat "can I redo? the movement?", then different moves —
-        double-applied piece drags cascaded tracking drift for the rest
-        of the game).
+        Undone lines and the undo/redo lines themselves are BLANKED (not
+        deleted) so line numbers stay stable for curation keys and
+        diagnostics; _process_line('') is a no-op.  Without this, undone
+        actions replay as real decisions AND their redos replay again
+        (2023-12-06 T6 lines 550-560: three undos, chat "can I redo? the
+        movement?", then different moves - double-applied piece drags
+        cascaded tracking drift for the rest of the game; Mol/Columbo
+        2024-10-20 L267-276: Gandalf the White's arrival drag+flip undone
+        x3 then redone x3 - the client keeps GtW at Fangorn).
 
-        t125 fix 4: die-face change lines are never snapshotted by the
-        client, so an undo whose nearest preceding command is a
-        'changes X to Y' line actually restores the snapshot of the
-        command BEFORE it — reverting the die spend AND the face change
-        (Wirbelwind lines 125-129: spend, ring-collect, change, undo,
-        undo left the parser one die over-spent).  Blank the change
-        line(s) AND keep walking to the real snapshot target.
-
-        t138 wave-3 (triage N8 root): <~Controls.16~> is the client's
-        REDO button ('redoes last action', messages.properties 64).
-        Each press re-applies the most recently undone command — the
-        old pass left it unhandled, so an undo+redo pair NET-DELETED
-        the command (Mol/Columbo 2024-10-20 L267-276: Gandalf the
-        White's arrival drag+flip undone x3 then redone x3; the client
-        keeps GtW at Fangorn, the parser kept him dead for 19
-        checkpoints).  Redo restores the blanked line group LIFO; a new
-        $-command clears the redo stack (VASSAL semantics — chat and
-        <game>/<replay> lines do not).  1,568/17,180 corpus logs carry
-        at least one redo press.
+        R17-LOGREPLAY: the netting IS the native snapshot stack,
+        client_snapshot_net.net_raw - the one model the production corpus
+        chain (rendered_extract, rendered_replay, rendered_pool_transport
+        via log_census.undo_redo_net) and the log_census ground truth
+        use.  Only snapshot commands (client_snapshot_net.SNAPSHOT_KEYS:
+        the client's moves / kills / flips / allocates / draws, k() runs
+        before them) are pushed; an undo pops the newest and folds the
+        <auto> snapshot labels under it; a redo restores LIFO; only a
+        snapshot command clears the redo stack - rolls, die-face
+        changes, card choices and chat do not.  The parser's own model
+        (the target of an undo = the nearest '$' line that is not a
+        die-face change; ANY '$' line cleared redo) netted 24 of a
+        150-game stride sample differently: [move, roll, undo] kept the
+        move and dropped the roll, [move, undo, roll, redo] left the move
+        undone, and an undo left the <auto> label under it standing.
 
         Mutates *log_lines* IN PLACE (idempotent) and returns it, so the
         preprocess() call covers every replay path's own line list."""
-        redo_stack = []          # [[(idx, original), ...], ...]
-        for i, line in enumerate(log_lines):
-            if '<~Controls.819~>' in line:
-                group = []
-                for j in range(i - 1, -1, -1):
-                    lj = log_lines[j]
-                    if lj and lj.startswith('$') \
-                            and '<~Controls.819~>' not in lj \
-                            and '<~Controls.16~>' not in lj:
-                        group.append((j, lj))
-                        log_lines[j] = ''
-                        if LogReplayer._DIE_CHANGE_LINE_RE.match(lj):
-                            continue  # not snapshotted: keep walking
-                        break
-                log_lines[i] = ''
-                if group:
-                    redo_stack.append(group)
-            elif '<~Controls.16~>' in line and line.startswith('$'):
-                if redo_stack:
-                    for j, original in redo_stack.pop():
-                        log_lines[j] = original
-                log_lines[i] = ''
-            elif line and line.startswith('$') and redo_stack:
-                # a fresh command invalidates the redo stack
-                redo_stack = []
+        from client_snapshot_net import net_raw   # local: pure-re module
+        log_lines[:] = net_raw(log_lines)
         return log_lines
 
     # Piece-move line in ANY encoding — built from the authoritative
@@ -2262,30 +2427,40 @@ class LogReplayer:
                     self._skip_move_lines.add(ent[0])
                     self._move_from_rewrites[n] = ent[1]
 
-    # Table-card-kill pre-pass regexes (ruling 1.149)
+    # Table-card-kill pre-pass regexes (ruling 1.149).  R17-LOGREPLAY:
+    # the nick is _NICK_CLASS, as in _NICK_PREFIX_RE - `\w+` gave
+    # $Alexey'a no side (his rolls never matched) and read his drags as
+    # 'Alexey', so his table-card kills were never staged.
     _TCK_MOVE_RE = re.compile(
-        r'^\$(\w+).*?<~(?:Scribe\.141|Controls\.281)~>([\d\s]+?)'
+        r'^\$(%s).*?<~(?:Scribe\.141|Controls\.281)~>([\d\s]+?)'
         r'<~(?:Scribe\.142|Controls\.282)~><~([\w.]+)~>'
-        r'<~(?:Scribe\.143|Controls\.283)~><~([\w.]+)~>')
+        r'<~(?:Scribe\.143|Controls\.283)~><~([\w.]+)~>' % _NICK_CLASS)
     _TCK_644_RE = re.compile(
         r'<~Controls\.644~>([\d\s]+?)<~Controls\.645~><~([\w.]+)~>')
     _TCK_DISC_RE = re.compile(
         r'<~Controls\.281~>([\d\s]+?)<~Controls\.282~><~Controls\.(45|46)~>')
-    _TCK_ROLL_RE = re.compile(r'^\$(\w+)<~Controls\.345~>([\d ]+)')
+    _TCK_ROLL_RE = re.compile(
+        r'^\$(%s)<~Controls\.345~>([\d ]+)' % _NICK_CLASS)
+    # same 'reveal <pid> <hash> <number>' grammar _process_line decodes
+    _TCK_REVEAL_RE = re.compile(r'reveal (\d+) ([A-F0-9]+) (\d+)')
 
     def _preprocess_table_card_kills(self, log_lines: List[str]):
         """USER 2026-07-19 (ruling 1.149): stage deliberate OPPONENT
         table-card kills as single discard_table_card records.
 
-        A kill = a play-on-table card (106 A Power too Great / 145 The
-        Power of Tom Bombadil / 202 The Palantír of Orthanc) dragged off
-        its Board slot (2029-2034) to a non-slot zone BY THE OPPONENT of
-        its owner, with the rule's PAYMENT signature in a small +/- line
-        window:
-          * SHADOW kills 106/145: one ARMY-type + one Character card
+        A kill = a play-on-table card (A Power too Great / The Power of
+        Tom Bombadil / The Palantír of Orthanc) dragged off its Board
+        slot (2029-2034) to a non-slot zone BY THE OPPONENT of its owner,
+        with the rule's PAYMENT signature in a small +/- line window.
+        Card identities are the per-game DECODED ones (C5-01: a pid fixes
+        only the deck): the latest non-commitment reveal of the pid, else
+        the deck-commitment decode.  A drag that passes every test but
+        whose identity does not decode is not staged; it is reported in
+        self._table_kill_unresolved and logged at its line.
+          * SHADOW kills APTG/Bombadil: one ARMY-type + one Character card
             discarded from the Shadow hand (Controls.281 -> Controls.46).
             (A Muster-type strategy card does NOT pay — only Army-type.)
-          * FP kills 202: the card rides a Controls.644 kill to 'Used'
+          * FP kills the Palantir: the card rides a Controls.644 kill to 'Used'
             bundled with an FP action die (the payment die), so the removal
             is provably die-PAID; payment='ring' when an Elven Ring goes
             active->used in the tight window, else 'will' (Will of the West).
@@ -2315,6 +2490,37 @@ class LogReplayer:
                 if 210 <= v <= 213:
                     pside[m.group(1)] = Side.FREE_PEOPLES
                     break
+        # Per-game card identity (C5-01): pid -> [(line idx, number)] from
+        # every 'reveal <pid> <hash> <number>'.  Controls.861 combat
+        # commitments carry a hand SLOT in that field (see _process_line),
+        # so they are left to the commitment decode.
+        reveals: Dict[str, List[Tuple[int, int]]] = {}
+        for j, ln in enumerate(log_lines):
+            if 'reveal ' not in ln or 'Controls.861' in ln:
+                continue
+            for rm in self._TCK_REVEAL_RE.finditer(ln):
+                reveals.setdefault(rm.group(1), []).append(
+                    (j, int(rm.group(3))))
+
+        def _card_num(pid: str, deck_type: str, at: int) -> Optional[int]:
+            """The card number `pid` holds in THIS game at line index
+            `at`: its latest reveal at/before `at`, else the deck-
+            commitment decode; None when neither decodes it."""
+            num = None
+            for j, v in reveals.get(pid, ()):
+                if j > at:
+                    break
+                num = v
+            if num is None:
+                num = self.card_decoder.decode_piece(int(pid), deck_type)
+            # R2-S4-EXTRACT (C5-01 rescan): a number outside the base
+            # deck table (expansion numbering 24-27) names no card - it
+            # is UNDECODABLE (reported below), never 'decoded, and not a
+            # table-kill card' / 'not an Army card'.
+            if num is not None and num not in _DECK_TABLES[deck_type]:
+                return None
+            return num
+
         for idx in range(n):
             line = log_lines[idx]
             if 'Game.20' not in line:
@@ -2325,7 +2531,7 @@ class LogReplayer:
             if not m:
                 continue
             pids = m.group(2).split()
-            if len(pids) != 1 or pids[0] not in _TABLE_KILL_PIDS:
+            if len(pids) != 1:
                 continue
             frm, to = m.group(3), m.group(4)
             if frm not in _TABLE_SLOT_ZONES or to in _TABLE_SLOT_ZONES:
@@ -2333,30 +2539,57 @@ class LogReplayer:
             if to in ('Controls.45', 'Controls.46'):
                 continue  # returned to a hand = a play RETRACT, not a kill
             tgt = pids[0]
-            info = _table_kill_card_info(tgt)
-            if info is None or info[0] is None:
+            # The pid fixes only the DECK: an FP Strategy card may be
+            # APTG/Bombadil (killed by SHADOW), an SA Character card the
+            # Palantir (killed by FP); the decoded number says which.
+            tdt = _card_pid_deck_type(tgt)
+            if tdt == 'FP Strategy':
+                killer = Side.SHADOW
+            elif tdt == 'SA Character':
+                killer = Side.FREE_PEOPLES
+            else:
                 continue
-            card_id, card_name, killer = info
             if pside.get(m.group(1)) != killer:
                 continue  # only the OPPONENT of the owner can kill it
+            tnum = _card_num(tgt, tdt, idx)
+            info = None
+            if tnum is not None:
+                info = _table_kill_card_info(tdt, tnum)
+                if info is None:
+                    continue  # decoded, and not a table-kill card
+            unresolved = []
+            if info is None:
+                unresolved.append('table card pid %s (%s) identity '
+                                  'undecodable' % (tgt, tdt))
             lo, hi = max(0, idx - 10), min(n, idx + 11)
             if killer == Side.SHADOW:
                 has_army = has_char = False
-                for w in log_lines[lo:hi]:
-                    dm = self._TCK_DISC_RE.search(w)
+                army_unknown = []
+                for j in range(lo, hi):
+                    dm = self._TCK_DISC_RE.search(log_lines[j])
                     if not dm or dm.group(2) != '46':
                         continue
                     for p in dm.group(1).split():
-                        try:
-                            ip = int(p)
-                        except ValueError:
-                            continue
-                        if ip in _SA_ARMY_CARD_PIDS:
-                            has_army = True
-                        elif 158 <= ip <= 209 and _SA_PID_TYPES[ip - 158] == 'C':
+                        pdt = _card_pid_deck_type(p)
+                        if pdt == 'SA Character':
                             has_char = True
-                if not (has_army and has_char):
+                        elif pdt == 'SA Strategy':
+                            pnum = _card_num(p, pdt, j)
+                            if pnum is None:
+                                army_unknown.append(p)
+                            elif pnum in _sa_army_strategy_numbers():
+                                has_army = True
+                if not has_char or not (has_army or army_unknown):
                     continue
+                if not has_army:
+                    unresolved.append(
+                        'payment SA Strategy pid(s) %s Army/Muster type '
+                        'undecodable' % ' '.join(army_unknown))
+                if unresolved:
+                    self._table_kill_unresolved[idx + 1] = '; '.join(
+                        unresolved)
+                    continue
+                card_id, card_name, _k = info
                 params = {'card_id': card_id, 'card_name': card_name}
             else:  # FP kills the Palantir: a Will of the West die alone, or
                 # any die + one Elven Ring.  Require the die-PAID removal
@@ -2376,6 +2609,12 @@ class LogReplayer:
                         break
                 if not confirmed:
                     continue
+                if unresolved:
+                    # identity unknown: no kill, and no ring drag folded
+                    self._table_kill_unresolved[idx + 1] = '; '.join(
+                        unresolved)
+                    continue
+                card_id, card_name, _k = info
                 # payment: an Elven Ring active->used TIGHTLY around the
                 # drag is the ring cost; otherwise a Will of the West die.
                 rlo, rhi = max(0, idx - 4), min(n, idx + 5)
@@ -2512,6 +2751,10 @@ class LogReplayer:
         for line_num, line in enumerate(log_lines, 1):
             self.line_num = line_num
             self._process_line(line)
+        # R2-RS-r024-NEW: a siege-over deferred on the final lines has no
+        # later action line to end its gesture - commit it now.
+        if self._siege_over_pending:
+            self._settle_siege_over_pending(flush=True)
 
         if self.verbose:
             print(f"\n=== REPLAY COMPLETE ===")
@@ -2523,6 +2766,15 @@ class LogReplayer:
         # Strip checksum
         line = re.sub(r'\s+[A-F0-9]{6}$', '', line)
         line = re.sub(r'\s+null$', '', line)
+
+        # R2-RS-r024-NEW: settle deferred siege-over transitions whose
+        # gesture ended on an earlier line, BEFORE this line is handled;
+        # then note whether this line is an action ('$') line.
+        self._line_seq += 1
+        if self._siege_over_pending:
+            self._settle_siege_over_pending()
+        if line.startswith('$'):
+            self._siege_last_action_seq = self._line_seq
 
         # ---- end-of-game noise (USER RULING 1.157) ------------------
         # Lazy latch: an armed military-victory/concession signal only
@@ -2639,7 +2891,9 @@ class LogReplayer:
             return
 
         # Extract $PlayerName prefix for player->side mapping
-        player_prefix = re.match(r'^\$(\w+)', line)
+        # (R2-S4-EXTRACT C7-05: the full nick, so the chat lookup below
+        # finds $Alexey'a under the same key as <Alexey'a>)
+        player_prefix = self._NICK_PREFIX_RE.match(line)
         if player_prefix:
             self._current_line_player = player_prefix.group(1)
 
@@ -2652,7 +2906,7 @@ class LogReplayer:
             return
 
         # Chat message - check for "pass" before skipping
-        chat_match = re.match(r'^<(\w+)>\s*(.*)', line)
+        chat_match = self._CHAT_LINE_RE.match(line)
         if chat_match:
             player = chat_match.group(1)
             msg = chat_match.group(2).strip().lower()
@@ -2872,8 +3126,13 @@ class LogReplayer:
             # zone (Game.2036 vs 2037) is not evidence (2023-12-07_001647
             # put the '2r' reveal tile on 2037)
             low = str(tile_name).strip().lower()
+            # C5-03: the piece map spells specials differently from the
+            # engine keys ('On, On They Went' vs 'On On They Went',
+            # unaccented vs accented Smeagol) - match on the FOLDED
+            # name, the same key _tile_template uses
+            _fold82 = self._tile_fold_name(tile_name)
             sp = next((t for k, t in gs.SPECIAL_HUNT_TILES.items()
-                       if k.lower() == low), None)
+                       if self._tile_fold_name(k) == _fold82), None)
             if sp is not None:
                 is_reveal = bool(getattr(sp, 'reveal', False))
             elif re.fullmatch(r'-?\d+\s*r', low):
@@ -2926,10 +3185,28 @@ class LogReplayer:
             # Damage tiles open a hunt-damage decision for FP: take the
             # corruption, sacrifice the guide, or a random companion.
             # Resolution is synthesized from what happens next.
-            try:
-                dmg = int(str(tile_name).strip().rstrip('r!'))
-            except (ValueError, TypeError):
-                dmg = 0
+            if sp is not None:
+                # C5-03: a special tile's damage is the ENGINE tile's
+                # (its name never parses as a number); an Eye special
+                # ('The Ring is Mine!') or a die-roll special ("Shelob's
+                # Lair") has dynamic damage -> None, like the Eye tiles
+                if getattr(sp, 'is_eye', False) \
+                        or getattr(sp, 'is_dice_roll', False):
+                    dmg = None
+                else:
+                    dmg = int(getattr(sp, 'damage', 0) or 0)
+            else:
+                try:
+                    dmg = int(str(tile_name).strip().rstrip('r!'))
+                except (ValueError, TypeError):
+                    dmg = 0
+            # NOTE (R2-S4-EXTRACT): a second draw does NOT by itself drop
+            # an earlier unresolved ctx - a reveal walk through Shadow
+            # strongholds draws extra tiles whose damage ADDS to the
+            # first tile's (thedude/Elladan L259-270, DaniilVolk/yekdo
+            # L257).  A Mithril Coat and Sting replacement is recognised
+            # by the replaced tile going back to the Hunt Pool (see the
+            # hunt-tile drag branch of the move handler).
             # The Breaking of the Fellowship: the tile drawn inside the
             # card window counts SEPARATIONS, not hunt damage - no damage
             # ctx (GAME21 rendered L261-264: draw '2' -> Merry+Pippin
@@ -2944,15 +3221,32 @@ class LogReplayer:
                 self.log("BoF tile draw: separation count, "
                          "no hunt-damage ctx")
                 return
-            if dmg > 0:
+            # R2-S4-EXTRACT (C5-03 rescan r024): the other card-forced
+            # draws whose result the ENGINE resolves with no FP
+            # hunt-damage choice - Foul Thing from the Deep (a RANDOM
+            # casualty, _effect_foul_thing), Isildur's Bane (all damage
+            # as corruption) and The Challenge of the King (3 tiles, no
+            # damage).  Same open-window gate as BoF.  Orc Patrol keeps
+            # its ctx: it applies the hunt normally (FP decision).
+            if (getattr(self, '_card_window_side', None) is not None
+                    and _normalize_name(str(getattr(
+                        self, '_card_window_card', None) or ''))
+                    in _ENGINE_RESOLVED_DRAW_CARDS):
+                self.log("Card-forced tile draw (%s): engine-resolved, "
+                         "no hunt-damage ctx" % self._card_window_card)
+                return
+            if dmg is not None and dmg > 0:
                 self._hunt_ctx = {'damage': dmg, 'resolved': False}
-            elif low.startswith('eye') or 'ring is mine' in low:
+                self._hunt_ctx_tile = tile_id
+            elif dmg is None or low.startswith('eye') \
+                    or 'ring is mine' in low:
                 # Eye tiles: damage = hunt-roll successes (>= 1 whenever
                 # a tile is drawn) — the FP damage decision is real, with
                 # dynamic damage the engine recomputes (2023-03-15 T1
                 # line 74/77: Eye tile drawn, Gandalf guide-sacrificed;
                 # without a ctx the kill recorded no decision)
                 self._hunt_ctx = {'damage': None, 'resolved': False}
+                self._hunt_ctx_tile = tile_id
             return
 
         # Dice roll: <~Controls.345~>dice_ids <~Controls.346~>values
@@ -3003,6 +3297,12 @@ class LogReplayer:
                          f"{_tck['side'].name} "
                          f"(payment={_tck['params'].get('payment', 'discards')})")
                 return
+            _tku = self._table_kill_unresolved.get(self.line_num)
+            if _tku is not None:
+                # C5-01: kill-shaped drag whose card identity the log
+                # does not decode -- not staged, said out loud
+                self.log(f"Table-card drag NOT staged as a kill "
+                         f"(ruling 1.149): {_tku}")
             # Elven-ring pieces dragged between ring slots (Scribe-drag
             # clients, e.g. 2023-12-06 Rizino1): active slot -> used slot
             # = the FP player USES that ring (user ruling 2026-07-03 —
@@ -3911,14 +4211,44 @@ class LogReplayer:
             except ValueError:
                 _pid = -1
             if 106 <= _pid <= 209:
-                for k in range(len(self.action_log) - 1,
-                               max(-1, len(self.action_log) - 16), -1):
-                    at, ap, aside = self.action_log[k]
-                    if at == 'play_event':
-                        self.log(f"Play RETRACTED: "
-                                 f"{ap.get('card_name')}")
-                        self.action_log.pop(k)
-                        break
+                # C5-02: retract ONLY the record this piece's own reveal
+                # created (its play_event, or the combat_card retag of
+                # it): same side AND same card.  Popping the first
+                # play_event in the window deleted an unrelated real
+                # play (the opponent's event, or this side's earlier
+                # one) whenever a committed combat card was taken back
+                # (_handle_card_retraction specimen L212-216), and left
+                # the retracted card recorded as a combat card.  A
+                # piece with no recorded reveal (face-down commitment
+                # taken back unrevealed) has no record to remove.
+                _own = self._reveal_pid_record.get(str(_pid))
+                _hit = None
+                if _own is not None:
+                    _want_name, _want_side = _own
+                    for k in range(len(self.action_log) - 1,
+                                   max(-1, len(self.action_log) - 16), -1):
+                        at, ap, aside = self.action_log[k]
+                        if (at in ('play_event', 'combat_card')
+                                and aside == _want_side
+                                and (ap or {}).get('card_name')
+                                == _want_name):
+                            _hit = k
+                            break
+                if _hit is not None:
+                    at, ap, aside = self.action_log.pop(_hit)
+                    del self._reveal_pid_record[str(_pid)]
+                    if (at == 'combat_card'
+                            and self._last_combat_card_name.get(aside)
+                            == ap.get('card_name')):
+                        # no longer committed: never attach it to a
+                        # later combat-effect-choice record
+                        self._last_combat_card_name.pop(aside, None)
+                    self.log(f"Play RETRACTED: "
+                             f"{ap.get('card_name')} ({at})")
+                else:
+                    self.log(f"Card piece {_pid} back to {to_loc}: no "
+                             f"recorded play of its own in the last 15 "
+                             f"records - action_log untouched")
                 return
 
         # Hunt-tile drags: tiles shuttled between the tile
@@ -3936,6 +4266,20 @@ class LogReplayer:
         if _tile_ps:
             for p in _tile_ps:
                 self._tile_to_zone(p, to_loc)
+                # R2-S4-EXTRACT (C5-03 rescan r024): the tile whose draw
+                # opened the still-unresolved hunt decision went BACK to
+                # the Hunt Pool (Mithril Coat and Sting: SilmarillWill
+                # L1085, Paccia L673) - it was cancelled, so its decision
+                # is gone.  Corpus logs only, like the draw supersede.
+                if (to_loc == 'Hunt Pool'
+                        and not getattr(self, '_ai_bridge_log', False)
+                        and self._hunt_ctx is not None
+                        and not self._hunt_ctx.get('resolved')
+                        and self._hunt_ctx_tile == p):
+                    self._hunt_ctx = None
+                    self._hunt_ctx_tile = None
+                    self.log("Hunt tile %s back to the Hunt Pool: its "
+                             "unresolved hunt-damage ctx dropped" % p)
             pieces = [p for p in pieces if p not in _tile_ps]
             if not pieces:
                 return
@@ -3965,12 +4309,11 @@ class LogReplayer:
                 src = stronghold_base_region(from_loc) or from_loc
                 if is_map_region(dest):
                     dsan = sanitize(dest)
-                    try:
-                        nat = None
-                        import ai as _ai_mod  # circular-safe local
-                        nat = _ai_mod._region_nation(dsan)
-                    except Exception:
-                        nat = None
+                    # R17-LOGREPLAY: the parser's own table, never the
+                    # torch-heavy ai module (whose swallowed import
+                    # failure turned an FP capture of a Shadow
+                    # settlement into a 'Control restored')
+                    nat = self._region_nation(dsan)
                     native_shadow = nat is not None and nat.name in (
                         'SAURON', 'ISENGARD', 'SOUTHRON_EASTERLINGS')
                     if (side == Side.SHADOW) == native_shadow:
@@ -4509,6 +4852,8 @@ class LogReplayer:
             _san_g = sanitize(from_loc)
             self._siege_garrison[_san_g] = _g_side
             self._siege_arrived.discard(_san_g)
+            # a fresh siege supersedes any deferred siege-over here
+            self._siege_over_pending.pop(_san_g, None)
             # Piece-level tracking mirrors the client: the garrison now
             # physically sits in the stronghold SUB-BOX zone (army state
             # is untouched — the kill handler already maps a box-tracked
@@ -4586,6 +4931,9 @@ class LogReplayer:
                         set()).discard(sanitize(region))
                 self._siege_garrison.pop(sanitize(region), None)
                 self._siege_arrived.discard(sanitize(region))
+                # (a deferred siege-over here is left to
+                # _settle_siege_over_pending: with the siege gone it runs
+                # the plain capture/reclaim pass for the region)
                 # survivors leave the sub-box: track them back in the
                 # region zone (mirrors the client's drag)
                 for p in pieces:
@@ -4901,11 +5249,15 @@ class LogReplayer:
                 non_comp = self._redirect_tracked_musters(
                     non_comp, to_loc, to_key)
             if non_comp:
-                # Determine side from piece nation lookup
+                # Determine side from piece nation lookup.  C5-04: a
+                # Nazgul (typed (None, 'NAZGUL') by the AUTHORITATIVE
+                # table) is ALWAYS Shadow - a lone Nazgul returning from
+                # SA Casualties was an FP muster (2024-02-05
+                # Polijuna-TBIS L1654 pid 039 -> Barad-Dur).
                 is_shadow = any(
                     get_unit_type_from_piece_id(p, self.piece_types)[0] in SHADOW_NATIONS
+                    or get_unit_type_from_piece_id(p, self.piece_types)[1] == 'NAZGUL'
                     for p in non_comp
-                    if get_unit_type_from_piece_id(p, self.piece_types)[0] is not None
                 )
                 self._handle_muster(non_comp, to_loc, is_shadow)
             return
@@ -6589,6 +6941,11 @@ class LogReplayer:
         # also glued the Shadow die onto the next unrelated Shadow row.
         if minions_mustered:
             muster_side = Side.SHADOW
+        # C5-04: a Nazgul is ALWAYS Sauron's (nation forced above), so
+        # its muster record is Shadow too - else the record went to FP
+        # and stole the pending FP die.
+        if units_added['nazgul']:
+            muster_side = Side.SHADOW
         muster_params = {'region': to_loc, 'units': units_added}
         if getattr(self, '_muster_by_nation_tmp', None):
             # 119: the placed pieces name their nation — ground truth
@@ -7644,6 +8001,10 @@ class LogReplayer:
         side_name = "FP" if is_fp else "SA"
         self.log(f"{side_name} plays: {card_name}")
         self._record_action('play_event', {'card_name': card_name}, side)
+        # C5-02: remember which record this piece's reveal created, so
+        # a later retraction of the piece removes exactly that record
+        if piece_id:
+            self._reveal_pid_record[str(piece_id)] = (card_name, side)
         # Cards whose placements are FIXED by the card text — subsequent
         # musters/moves are effects, not decisions (flagged auto so
         # extraction excludes them from policy training)
@@ -8792,6 +9153,11 @@ def create_replay_gui(state: gs.GameState, board_obj, replayer: LogReplayer):
             gui._replayer.line_num = gui._log_index + 1
             gui._replayer._process_line(line)
             gui._log_index += 1
+            # R2-RS-r024-NEW: end of log - commit any deferred siege-over
+            # (parse_and_replay does the same after its loop)
+            if gui._log_index >= len(gui._log_lines) \
+                    and gui._replayer._siege_over_pending:
+                gui._replayer._settle_siege_over_pending(flush=True)
             progress_lbl.config(text=f"{gui._log_index}/{len(gui._log_lines)}")
             update_console_display()
             sync_hands_to_gui()
@@ -8809,6 +9175,10 @@ def create_replay_gui(state: gs.GameState, board_obj, replayer: LogReplayer):
             gui._replayer.line_num = gui._log_index + 1
             gui._replayer._process_line(line)
             gui._log_index += 1
+        # R2-RS-r024-NEW: end of log - commit any deferred siege-over
+        if gui._log_index >= len(gui._log_lines) \
+                and gui._replayer._siege_over_pending:
+            gui._replayer._settle_siege_over_pending(flush=True)
         progress_lbl.config(text=f"{gui._log_index}/{len(gui._log_lines)}")
         update_console_display()
         sync_hands_to_gui()

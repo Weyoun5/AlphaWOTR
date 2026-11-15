@@ -25,6 +25,16 @@ import numpy as np
 OBSERVATION_WIDTH = 4647   # wotr_snapshot_encode_state output width (frozen v52 observation)
 
 
+def observation_width(ai):
+    """R3-V53-FOLLOWONS: the controller's observation width for this engine's encoding generation -
+    4647 (v52 encode_state) or 4745 under v53 (encode_state_v53 = v52 ++ the encoding_v53 state tail).
+    Module constants only: ai.get_feature_dim() would consume the active search RNG."""
+    if getattr(ai, '_V53_CONTEXT_ON', False):
+        import encoding_v53
+        return OBSERVATION_WIDTH + encoding_v53.STATE_TAIL_DIM
+    return OBSERVATION_WIDTH
+
+
 class Operation(IntEnum):
     PV = 1
     PVM = 2
@@ -174,8 +184,9 @@ class NumericInferenceBridge:
         # Coordinator fix (2026-09-09): never call ai.get_feature_dim() inside a search.
         # The frozen helper builds an initial game state and shuffles the hunt pool,
         # consuming 18 words of the active (search) RNG stream; the source search never
-        # does that. The observation width is the controller's fixed 4647 (encode_state).
-        self.feature_dim = OBSERVATION_WIDTH
+        # does that. The observation width is the controller's encode_state width: 4647, or 4745 under
+        # encoding generation v53 (R3-V53-FOLLOWONS observation_width).
+        self.feature_dim = observation_width(ai)
         self.action_dim = ai.ACTION_ENCODING_DIM
         self.region_count = ai.NUM_REGIONS
         for index, net in enumerate(self.nets):
@@ -223,7 +234,8 @@ class NumericInferenceBridge:
         client = self._client(ai, net)
         if client is not None:
             priors, v = client.pv(net.remote_key, np.asarray(vec, dtype=np.float32), ae, ri)
-            v = ai._validate_search_value(v)
+            vm = getattr(net, 'value_model', None)   # VALUENET: not the served head
+            v = ai._validate_search_value(v if vm is None else vm.values([vec])[0])
             priors = ai._validate_search_priors(priors, rows)
             priors = priors / (priors.sum() + 1e-10)
             return priors, float(v)
@@ -232,7 +244,9 @@ class NumericInferenceBridge:
         with torch.no_grad():
             x = torch.from_numpy(np.array([vec])).to(ai.DEVICE)
             backbone_out, node_emb = net.forward_backbone(x)
-            v = ai._validate_search_value(net.value_head(backbone_out).squeeze(-1).item())
+            vm = getattr(net, 'value_model', None)   # VALUENET: priors below stay the net's
+            v = ai._validate_search_value(net.value_head(backbone_out).squeeze(-1).item() if vm is None
+                                          else vm.values([vec])[0])
             ae_t = torch.from_numpy(ae).to(ai.DEVICE)
             ri_t = torch.from_numpy(ri).to(ai.DEVICE)
             priors_t = net.score_actions_spatial(backbone_out, node_emb, ae_t, ri_t)

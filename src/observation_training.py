@@ -24,6 +24,8 @@ CONTRACT_DIMENSIONS = {
     'v51_breaking_hunt_context_v1': 4350,
     'v52_observed_combat_round_v2': 4481,
     'v52_observed_combat_round_v3': 4647,
+    # R2-D5-V53: v52 (4647) + encoding_v53.STATE_TAIL_DIM (98)
+    'v53_hand_threat_context_v1': 4745,
 }
 
 FULL_NETWORK_MODE = 'full_network_v1'

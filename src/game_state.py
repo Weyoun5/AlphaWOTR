@@ -676,12 +676,14 @@ class GameState:
     # Ring usage tracking (reset at start of each turn)
     fp_ring_used_this_turn: bool = False
     sh_ring_used_this_turn: bool = False
-    # A7 (USER 2026-08-19): an Elven Ring is a LEGALITY EXPANSION, not a face
-    # change - while up, ONE action of that side may be funded by any die the
-    # ring permits (FP: any non-Will die; Shadow: any) and the die KEEPS its
-    # rolled face.  Cleared by game_logic.ring_waiver_spend and at every turn
-    # boundary.  (The client's ring command renders no die face, so a face
-    # change is unreconstructible from any log.)
+    # Obsolete legacy flags of the retired A7 (USER 2026-08-19) waiver model
+    # (a ring as a side-wide legality expansion, the die keeping its face).
+    # SUPERSEDED 2026-09-04/05 (audit/2026-09-04/decision_pass/elven_rings/
+    # bridge_report.md; rulebook p.21, Almanac pp.31-32): an Elven Ring
+    # physically changes one unused die (game_logic.use_elven_ring sets
+    # die.current) and never sets these; game_logic.ring_waiver_active
+    # rejects a state that still carries one.  Still cleared at turn
+    # boundaries and by game_logic.ring_waiver_spend.
     fp_ring_waiver: bool = False
     sh_ring_waiver: bool = False
     # Mouth of Sauron ability (user ruling 2026-07-03): once per turn,

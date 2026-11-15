@@ -24,6 +24,10 @@ registered: this schema covers the GameState object graph, not search trees or
 process-global RNG state.
 See inventory/runtime_instance_inventory.json, inventory/snapshot_schema_provenance.json,
 and inventory/bridge_combat_metadata.json for optional live reporting attributes.
+Every attribute the engine or the live bridge stores on these objects must be
+registered here: an unregistered one makes encode_graph refuse the whole state,
+so every native search from that position fails (R3-LIVE-SEARCH-ROOT-CAUSE).
+src/test_round3_R3_LIVE_SEARCH_ROOT_CAUSE.py enforces this statically.
 """
 
 SCHEMA_VERSION = 'wotr_snapshot_graph_v2_external_die_faces'
@@ -313,6 +317,7 @@ CLASS_FIELDS = {'ai.Action': ('die_idx', 'action_type', 'params'),
                           '_fellowship_tail_phase',
                           '_fp_used_hunt_box_last_turn',
                           '_hobbit_place_queue',
+                          '_hobbit_place_tiles',
                           '_mithril_stash',
                           '_overstack_regions',
                           '_owed_draws',
@@ -345,7 +350,8 @@ CLASS_FIELDS = {'ai.Action': ('die_idx', 'action_type', 'params'),
                           '_search_roll_ms',
                           '_siege_movein',
                           '_siege_movein_failed',
-                          '_wwsat_forced'),
+                          '_wwsat_forced',
+                          '_commit_from_table'),
  'game_state.GandalfTheWhite': ('level',
                                 'leadership',
                                 'captain_of_the_west',

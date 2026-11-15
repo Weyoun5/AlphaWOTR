@@ -36,9 +36,11 @@ def observed_path(state, batch, after_line, before_line, *, declaration=False):
     import fellowship_reveal_route as route
     import game_logic as gl
     records = [r for r in batch['records'] if after_line <= int(r['line']) < before_line]
+    # R4B-FELLOWSHIP-STRONGHOLD-BOX-MOVES: a pawn dragged into or out of a
+    # Stronghold box is in its region (rr.pawn_zone_key)
     moves = [r for r in records if r.get('op') == 'move'
              and str(r.get('obj', '')).lower() == 'the fellowship'
-             and rr.zone_kind(r.get('to', ''))[0] == 'region']
+             and rr.zone_kind(r.get('to', ''))[0] in ('region', 'stronghold')]
     if not moves:
         raise Unproven('balrog_route_placement_missing')
     start = gl.fellowship_region(state)
@@ -46,9 +48,9 @@ def observed_path(state, batch, after_line, before_line, *, declaration=False):
     waypoints = []
     actor = moves[0].get('player')
     for move in moves:
-        if move.get('player') != actor or rr.sanitize(move['from']) != previous:
+        if move.get('player') != actor or rr.pawn_zone_key(move['from']) != previous:
             raise Unproven('balrog_route_gestures_disconnected')
-        previous = rr.sanitize(move['to'])
+        previous = rr.pawn_zone_key(move['to'])
         waypoints.append(previous)
     hints = [r for r in records if r.get('op') == 'route_hint']
     if any(r.get('player') != actor for r in hints):

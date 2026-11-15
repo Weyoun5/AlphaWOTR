@@ -88,11 +88,16 @@ def execute_staged(state,mvs,result):
             result["effects"].append(f"{to} not adjacent to {frm}")
             continue
         if not _dest_ok0[to]:
-            # ONE predicate with the spec / chain surface: a besieged
+            # ONE predicate with the spec / chain surface: never into a
+            # region a protection card covers (R17-ENG-EVENTS); a besieged
             # region is joinable only as the BESIEGER (the walled-in FP
             # garrison does not block the join - GAME19); a besieged SH
             # garrison is unjoinable; otherwise no enemy units
-            if to in getattr(state, 'besieged_strongholds', set()):
+            _blk9 = ee._shadow_move_blocker(state, to)
+            if _blk9:
+                result["effects"].append(
+                    f"{to} is protected by {_blk9} - move refused")
+            elif to in getattr(state, 'besieged_strongholds', set()):
                 result["effects"].append(f"{to} is besieged - move refused")
             else:
                 result["effects"].append(

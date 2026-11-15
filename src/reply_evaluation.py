@@ -38,13 +38,16 @@ def own_value_context(ai, root_side, own_net, *, profile):
     The handle must carry its loaded side; a remote key alone is not evidence
     of model identity. Existing reward-contract warm-start rules still apply.
     """
-    tag=root_tag(ai,root_side);previous=ai.PLAYER_PROFILES
+    tag=root_tag(ai,root_side);previous=ai.PLAYER_PROFILES;previous_off=ai.PLAYER_OFF_TARGET
     try:
         ai.PLAYER_PROFILES={**previous,tag:profile}
+        # SEARCHCOR: the searching net's own off-target win weight (its league
+        # reward table; None = the contract weights) travels with its profile
+        ai.PLAYER_OFF_TARGET={**previous_off,tag:getattr(own_net,'search_off_target',None)}
         validate_root_context(ai,root_side,own_net)
         yield
     finally:
-        ai.PLAYER_PROFILES=previous
+        ai.PLAYER_PROFILES=previous;ai.PLAYER_OFF_TARGET=previous_off
 
 
 def load_root_model(ai, path, root_side, *, profile):

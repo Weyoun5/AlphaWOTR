@@ -152,6 +152,19 @@ def modifier_refusal(batches, before_line, details=None):
                          ('mithril coat and sting', 'mithril coat and sting/blade of westernesse')
                          and origin in ('free peoples hand', *current)
                          and (target in current or re.fullmatch(r'board[0-9]+', target)))
+                if (not inert and record.get('op') == 'move'
+                        and str(record.get('obj', '')).strip().lower() in
+                        ('mithril coat and sting', 'mithril coat and sting/blade of westernesse')
+                        and re.fullmatch(r'board[0-9]+', origin)
+                        and re.fullmatch(r'board[0-9]+', target)):
+                    # C9-03: a Board->Board drag keeps the card on the table.
+                    # A use answers a drawn tile and precedes its replacement
+                    # draw, so only a drag strictly between two tile draws of
+                    # this batch (draws past the boundary included) can be
+                    # one. Any other drag is a table rearrangement.
+                    drawn = _batch_tile_draw_lines(batch)
+                    line = int(record.get('line') or 0)
+                    inert = not (any(d < line for d in drawn) and any(d > line for d in drawn))
                 if not inert:
                     mithril_use = True
         if mithril_use:
@@ -189,6 +202,28 @@ def modifier_refusal(batches, before_line, details=None):
         if returned != expected_returns or removed != expected_removed:
             return 'pool_modifier_history'
     return None
+
+
+def _batch_tile_draw_lines(batch):
+    """Lines of every Hunt tile drawn anywhere in *batch* (C9-03).
+
+    Uses the tile test of _mithril_redraw_proof plus the batch's draw_tile
+    RNG items, so a possible Mithril redraw window is never missed.
+    """
+    import rendered_replay as rr
+    from rendered_mordor_pool import tile
+    records = list(batch.get('records', ()))
+    lines = {int(item.get('line') or 0) for item in batch.get('rng', ())
+             if item.get('kind') == 'draw_tile'}
+    for record in records:
+        if record.get('op') != 'draw':
+            continue
+        line = int(record.get('line') or 0)
+        prefix = [r for r in records if int(r.get('line') or 0) < line]
+        if (tile(record.get('what', '')) is not None
+                and rr._draw_kind(record.get('what', ''), prefix)[0] == 'tile'):
+            lines.add(line)
+    return lines
 
 
 def _mithril_redraw_proof(records, *, allow_held=False):

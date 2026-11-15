@@ -9,6 +9,7 @@ controller exports fails loudly at `configure` with the missing symbol names.
 from dataclasses import dataclass
 from pathlib import Path
 import ctypes as C
+import math
 import threading
 import numpy as np
 
@@ -19,8 +20,9 @@ ABI_VERSION = 1          # SHARED_ABI section 9: stays 1 while only NEW exports 
 # Milestone-2 exports (SHARED_ABI 9.3-9.5, FINAL 2026-09-09) are optional symbol groups; a
 # capability is present only when its whole group exists.  Detected by symbol, never assumed.
 STATUS_REQUEST, STATUS_COMPLETE, STATUS_ROOT_PRIORS = 0, 1, 2
-FEATURES = 4647
-ACTION_WIDTH = 157
+STATUS_ROOT_PLAN = 3     # LIVE1104 S03: root plan pending (only after request_root_plan; capability 'root_plan')
+FEATURES = 4647          # v52 request widths: the default, and the only widths of a library without
+ACTION_WIDTH = 157       # wotr_search_controller_encoding_widths (built before R3-V53-FOLLOWONS)
 OP_PV, OP_PVM, OP_EVAL, OP_COMBAT_DIST = 1, 2, 3, 4
 OPERATION_NAMES = {OP_PV: 'PV', OP_PVM: 'PVM', OP_EVAL: 'EVAL', OP_COMBAT_DIST: 'COMBAT_DIST'}
 PURPOSE_NAMES = {1: 'root_expand', 2: 'leaf_expand', 3: 'opponent_policy', 4: 'flush_policy',
@@ -43,7 +45,24 @@ class WotrSearchConfig(C.Structure):
         ('opponent_policy_epsilon', C.c_double), ('conf_leaf', C.c_int32), ('conf_track', C.c_int32),
         ('conf_ref', C.c_int32), ('determinize', C.c_int32), ('add_noise', C.c_int32),
         ('overlay_assert', C.c_int32), ('reward_contract', C.c_int32), ('fp_profile', C.c_int32),
-        ('sh_profile', C.c_int32), ('phi_rings_rho', C.c_double), ('trace', C.c_int32)]
+        ('sh_profile', C.c_int32), ('phi_rings_rho', C.c_double), ('trace', C.c_int32),
+        # C02 (round 18): the root's turn owner (ai.search_turn_owner): 0 = not given, 1 = FP, 2 = SH.  It
+        # fills the trailing padding: sizeof stays 192, so a box built before the field still accepts the
+        # struct_size (and ignores the value); a zero-initialized config means "not given".
+        ('root_turn_owner', C.c_int32),
+        # SEARCHFIX FIX F (ai._FPU_PARENT): 1 = an unvisited child scores the deciding node's current Q.  Appended:
+        # sizeof 200; struct_size stays 192 while it is 0 (config_wire_size).
+        ('fpu_parent', C.c_int32)]
+
+
+CONFIG_SIZE_V1 = 192     # sizeof before fpu_parent (the size every box accepts)
+assert WotrSearchConfig.fpu_parent.offset == CONFIG_SIZE_V1 and C.sizeof(WotrSearchConfig) == 200
+
+
+def config_wire_size(config):
+    """struct_size to send: a box built before fpu_parent accepts only 192, so the field's size is sent only with the
+    switch on (an old box then refuses it loudly); this controller accepts both, 192 meaning fpu_parent 0."""
+    return C.sizeof(WotrSearchConfig) if config.fpu_parent else CONFIG_SIZE_V1
 
 
 class WotrSearchRequest(C.Structure):
@@ -119,6 +138,10 @@ OPTIONAL_SYMBOLS = {
     'observer_events': {
         'wotr_search_controller_observer_events': ([P], P),
     },
+    # R3-V53-FOLLOWONS: the controller's request widths (the encoding generation of its tables).
+    'encoding_widths': {
+        'wotr_search_controller_encoding_widths': ([P, C.POINTER(C.c_uint64), C.POINTER(C.c_uint64)], C.c_int),
+    },
     # 9.6: tree-reuse session (detached subtree) + create_reusing.
     'tree_reuse': {
         'wotr_search_session_detach': ([P, C.c_uint64], P),
@@ -127,6 +150,19 @@ OPTIONAL_SYMBOLS = {
         'wotr_search_session_state': ([P], P),
         'wotr_search_controller_create_reusing': ([P, P, P, P, P, P, C.POINTER(WotrSearchConfig), P, C.c_int32,
                                                    C.POINTER(C.c_int32)], P),
+    },
+    # LIVE1104 S03: the root plan of the WOTR_ROOT_BREADTH native port (wotr_bridge/live/l1104_root_breadth.py):
+    # request before the first advance, status 3 once after root expansion (view + menu of the K root children),
+    # set_root_plan(admitted child indices, floor, probe, drop), and the served/dropped record after completion.
+    'root_plan': {
+        'wotr_search_controller_request_root_plan': ([P], C.c_int),
+        'wotr_search_controller_root_plan_view': ([P, C.POINTER(C.c_uint64), C.POINTER(C.POINTER(C.c_double)),
+                                                   C.POINTER(C.POINTER(C.c_uint8))], C.c_int),
+        'wotr_search_controller_root_plan_menu': ([P], P),
+        'wotr_search_controller_set_root_plan': ([P, C.POINTER(C.c_uint64), C.c_uint64, C.c_uint64, C.c_uint64,
+                                                  C.c_double], C.c_int),
+        'wotr_search_controller_root_plan_result': ([P, C.POINTER(C.c_uint64), C.POINTER(C.c_uint64),
+                                                     C.POINTER(C.POINTER(C.c_uint64))], C.c_int),
     },
 }
 _CONFIGURED = set()
@@ -190,16 +226,77 @@ def has_capability(lib, name):
         return False
 
 
-def candidate_library(box=BOX):
+def encoding_widths(ai):
+    """(observation, action) request widths for this engine's encoding generation (R3-V53-FOLLOWONS,
+    USER D5 2026-10-22): v52 (4647, 157); v53 = v52 ++ the encoding_v53 tails (4745, 199).  Module
+    constants only - never ai.get_feature_dim(), which consumes the active search RNG."""
+    v53_obs = bool(getattr(ai, '_V53_CONTEXT_ON', False))
+    v53_act = bool(getattr(ai, '_ACT_V53_ON', False))
+    if v53_obs or v53_act:
+        import encoding_v53
+        widths = (FEATURES + encoding_v53.STATE_TAIL_DIM, ACTION_WIDTH + encoding_v53.ACTION_TAIL_DIM)
+        if not (v53_obs and v53_act and ai.ACT_GEN == 'v53' and ai._V53_ACTION_TAIL_START == ACTION_WIDTH
+                and ai.ACTION_ENCODING_DIM == widths[1]):
+            raise ControllerUnavailable('Inconsistent v53 engine for the native search controller (ACT_GEN=%r, '
+                                        'action width %r)' % (ai.ACT_GEN, ai.ACTION_ENCODING_DIM))
+        return widths
+    if ai.ACT_GEN != 'v52' or ai.ACTION_ENCODING_DIM != ACTION_WIDTH:
+        raise ControllerUnavailable('The native search controller encodes generation v52 or v53 only (ACT_GEN=%r, '
+                                    'action width %r)' % (ai.ACT_GEN, ai.ACTION_ENCODING_DIM))
+    return (FEATURES, ACTION_WIDTH)
+
+
+def negotiate_widths(reported, expected):
+    """The request widths both sides agree on, or a loud refusal.  `reported` is the library's
+    wotr_search_controller_encoding_widths for the created controller (None: the library predates the
+    export and encodes v52 only); `expected` is encoding_widths(ai) of the calling engine."""
+    expected = tuple(int(x) for x in expected)
+    if reported is None:
+        if expected != (FEATURES, ACTION_WIDTH):
+            raise ControllerUnavailable(
+                'The native controller library predates wotr_search_controller_encoding_widths and encodes v52 '
+                'only; this engine needs %r - rebuild the controller box (R3-V53-FOLLOWONS)' % (expected,))
+        return expected
+    reported = tuple(int(x) for x in reported)
+    if reported != expected:
+        raise RuntimeError('The native controller encodes requests at %r but this engine expects %r '
+                           '(observation/action tables of another encoding generation)' % (reported, expected))
+    return reported
+
+
+def controller_widths(lib, pointer, capabilities, expected=None):
+    """Negotiated widths of a created controller (`expected` None = the v52 default)."""
+    reported = None
+    if capabilities.get('encoding_widths'):
+        observation, action = C.c_uint64(0), C.c_uint64(0)
+        if lib.wotr_search_controller_encoding_widths(pointer, C.byref(observation), C.byref(action)):
+            raise _error(lib)
+        reported = (int(observation.value), int(action.value))
+    return negotiate_widths(reported, (FEATURES, ACTION_WIDTH) if expected is None else expected)
+
+
+def action_features(ai):
+    """The native action-feature tables / encoder of this engine's generation: v52 ActionFeatures (157
+    rows) or v53 ActionFeaturesV53 (199 rows; refuses a resident DLL without the v53 exports)."""
+    import native_action_features
+    if encoding_widths(ai)[1] == ACTION_WIDTH:
+        return native_action_features.ActionFeatures(ai)
+    return native_action_features.ActionFeaturesV53(ai)
+
+
+def candidate_library(box=None):
     """Load (or verify) the candidate DLL as THE resident native library.
 
     bridge.library() caches one library per process; the candidate must be the
     first native library loaded (the `bridge.HERE = BOX; bridge.library()`
     pattern of run_gate.py). Snapshot and random-stream signatures are attached
     so table handles, menus and RNG clones share the controller's library.
+    box defaults to the module global BOX read AT CALL TIME (R3-TOOLS-MISC,
+    R2-RS-BRIDGE-HERE FU3: a `box=BOX` default froze it at definition, so a
+    caller that rebinds controller_binding.BOX still got the old box).
     """
     import bridge, snapshot, random_stream
-    box = Path(box).resolve()
+    box = Path(BOX if box is None else box).resolve()
     if bridge._LIB is None:
         manifest = box / 'build/manifest.json'
         if not manifest.exists():
@@ -254,8 +351,8 @@ class RequestView:
     batch: int
     rows: int
     leaf_ids: np.ndarray       # uint64 [B]
-    observations: np.ndarray   # float32 [B, 4647]
-    actions: np.ndarray        # float32 [rows, 157]
+    observations: np.ndarray   # float32 [B, Controller.widths[0]] (4647 v52, 4745 v53)
+    actions: np.ndarray        # float32 [rows, Controller.widths[1]] (157 v52, 199 v53)
     regions: np.ndarray        # int64 [rows]
     offsets: np.ndarray        # uint64 [B+1]
     raw: dict
@@ -369,7 +466,9 @@ class Controller:
     """
 
     def __init__(self, lib, root_state, observation_tables, action_tables, menu_tables, hunt_tables, rng, config,
-                 session=None, adopt=False):
+                 session=None, adopt=False, widths=None):
+        # widths: encoding_widths(ai) of the engine whose tables these are (None = v52); the created
+        # controller's own widths must equal it (R3-V53-FOLLOWONS negotiate_widths), else it is refused
         import snapshot, random_stream
         configure(lib)
         if type(root_state) is not snapshot.NativeSnapshot or root_state._lib is not lib:
@@ -378,7 +477,7 @@ class Controller:
             raise ValueError('RNG must be a NativeRandom of the controller library')
         if not isinstance(config, WotrSearchConfig):
             raise ValueError('config must be a WotrSearchConfig')
-        config.struct_size = C.sizeof(WotrSearchConfig)
+        config.struct_size = config_wire_size(config)
         self._lib = lib
         self._config = config
         self.capabilities = capabilities(lib)
@@ -425,6 +524,11 @@ class Controller:
                     self.reused = bool(pointer) and reused.value == 1
         if not pointer:
             raise _error(lib)
+        try:
+            self.widths = controller_widths(lib, pointer, self.capabilities, widths)
+        except BaseException:
+            lib.wotr_search_controller_destroy(pointer)
+            raise
         self._pointer = pointer
 
     def detach_child(self, index):
@@ -456,6 +560,11 @@ class Controller:
                 raise RuntimeError('Controller reported status 2 (root priors pending) without the exchange exports')
             if not self._config.add_noise:
                 raise RuntimeError('Controller paused for root priors although add_noise is 0')
+            return status.value
+        if status.value == STATUS_ROOT_PLAN:   # LIVE1104 S03
+            if not getattr(self, '_root_plan_requested', False):
+                raise RuntimeError('Controller reported status 3 (root plan pending) although no plan was requested')
+            self._root_plan_pending = True
             return status.value
         if status.value not in (STATUS_REQUEST, STATUS_COMPLETE):
             raise RuntimeError('Controller advance returned unknown status %d' % status.value)
@@ -504,6 +613,86 @@ class Controller:
                     self._pointer, values.ctypes.data_as(C.POINTER(C.c_double)), C.c_uint64(values.shape[0])):
                 raise _error(self._lib)
             self._root_priors_pending = False
+
+    # -- LIVE1104 S03 root plan (capability 'root_plan') --
+    def _require_root_plan(self, name):
+        if not self.capabilities.get('root_plan'):
+            raise ControllerUnavailable('%s requires the LIVE1104 S03 root plan exports; this library lacks them' % name)
+
+    def request_root_plan(self):
+        """Before the first advance: the search will pause once (status 3) after root expansion for set_root_plan."""
+        self._require_root_plan('request_root_plan')
+        with self._lock:
+            self._require_open()
+            if self._lib.wotr_search_controller_request_root_plan(self._pointer):
+                raise _error(self._lib)
+            self._root_plan_requested = True
+            self._root_plan_pending = False
+
+    def root_plan_view(self):
+        """Status 3 only: owned copies of the K stored child priors (double) and is_free flags, in child order."""
+        self._require_root_plan('root_plan_view')
+        count = C.c_uint64(0)
+        priors_ptr = C.POINTER(C.c_double)()
+        free_ptr = C.POINTER(C.c_uint8)()
+        with self._lock:
+            self._require_open()
+            if not getattr(self, '_root_plan_pending', False):
+                raise RuntimeError('No root plan is pending')
+            if self._lib.wotr_search_controller_root_plan_view(self._pointer, C.byref(count), C.byref(priors_ptr),
+                                                               C.byref(free_ptr)):
+                raise _error(self._lib)
+            k = int(count.value)
+            if k < 1:
+                raise RuntimeError('Controller handed out an empty root plan view')
+            priors = _owned(_view(priors_ptr, C.c_double, k, np.float64), np.float64, (k,))
+            free = _owned(_view(free_ptr, C.c_uint8, k, np.uint8), np.uint8, (k,))
+        return RootPriorsView(children=k, priors=priors, is_free=free)
+
+    def root_plan_menu(self):
+        """Status 3 only: the root children's rows (the root_menu format) as an owned NativeSnapshot."""
+        import snapshot
+        self._require_root_plan('root_plan_menu')
+        with self._lock:
+            self._require_open()
+            if not getattr(self, '_root_plan_pending', False):
+                raise RuntimeError('No root plan is pending')
+            pointer = self._lib.wotr_search_controller_root_plan_menu(self._pointer)
+            if not pointer:
+                raise _error(self._lib)
+            return snapshot.NativeSnapshot(self._lib, pointer)
+
+    def set_root_plan(self, indices, floor, probe, drop):
+        """Status 3 only: admitted root child indices (in admission order), forced-visit floor per child, probe and
+        drop (l1104_root_breadth.RootBreadthConfig); the next advance runs the simulations."""
+        self._require_root_plan('set_root_plan')
+        values = np.ascontiguousarray([int(i) for i in indices], dtype=np.uint64)
+        floor, probe, drop = int(floor), int(probe), float(drop)
+        if floor < 0 or probe < 0 or not math.isfinite(drop):
+            raise ValueError('Root plan floor/probe must be >= 0 and drop finite')
+        with self._lock:
+            self._require_open()
+            if not getattr(self, '_root_plan_pending', False):
+                raise RuntimeError('No root plan is pending')
+            pointer = values.ctypes.data_as(C.POINTER(C.c_uint64)) if values.shape[0] else None
+            if self._lib.wotr_search_controller_set_root_plan(self._pointer, pointer, C.c_uint64(values.shape[0]),
+                                                              C.c_uint64(floor), C.c_uint64(probe), C.c_double(drop)):
+                raise _error(self._lib)
+            self._root_plan_pending = False
+
+    def root_plan_result(self):
+        """After completion: {'served': forced visits served, 'dropped': child indices in drop order}."""
+        self._require_root_plan('root_plan_result')
+        served, count = C.c_uint64(0), C.c_uint64(0)
+        dropped_ptr = C.POINTER(C.c_uint64)()
+        with self._lock:
+            self._require_open()
+            if self._lib.wotr_search_controller_root_plan_result(self._pointer, C.byref(served), C.byref(count),
+                                                                 C.byref(dropped_ptr)):
+                raise _error(self._lib)
+            k = int(count.value)
+            dropped = [int(x) for x in _view(dropped_ptr, C.c_uint64, k, np.uint64)] if k else []
+        return {'served': int(served.value), 'dropped': dropped}
 
     # -- 9.5 combat distribution request (op 4) --
     def request_payload(self, ai):
@@ -573,6 +762,7 @@ class Controller:
             if self._lib.wotr_search_controller_request(self._pointer, C.byref(out)):
                 raise _error(self._lib)
             batch, rows = int(out.batch), int(out.rows)
+            features, action_width = self.widths   # R3-V53-FOLLOWONS: the negotiated generation widths
             operation = int(out.operation)
             if operation not in OPERATION_NAMES:
                 raise RuntimeError('Controller issued unknown operation %d' % operation)
@@ -592,24 +782,24 @@ class Controller:
                 view = RequestView(
                     request_id=int(out.request_id), operation=operation, model_side=int(out.model_side),
                     purpose=int(out.purpose), batch=1, rows=0, leaf_ids=_owned(leaf, np.uint64, (1,)),
-                    observations=np.empty((0, FEATURES), dtype=np.float32),
-                    actions=np.empty((0, ACTION_WIDTH), dtype=np.float32), regions=np.empty(0, dtype=np.int64),
+                    observations=np.empty((0, features), dtype=np.float32),
+                    actions=np.empty((0, action_width), dtype=np.float32), regions=np.empty(0, dtype=np.int64),
                     offsets=np.zeros(2, dtype=np.uint64), raw=dict(leaf_ids=leaf))
                 self._pending = view
                 self.requests_issued += 1
                 return view
             raw = dict(
                 leaf_ids=_view(out.leaf_ids, C.c_uint64, batch, np.uint64),
-                observations=_view(out.observations, C.c_float, batch * FEATURES, np.float32),
-                actions=_view(out.actions, C.c_float, rows * ACTION_WIDTH, np.float32),
+                observations=_view(out.observations, C.c_float, batch * features, np.float32),
+                actions=_view(out.actions, C.c_float, rows * action_width, np.float32),
                 regions=_view(out.regions, C.c_int64, rows, np.int64),
                 offsets=_view(out.offsets, C.c_uint64, batch + 1, np.uint64))
             view = RequestView(
                 request_id=int(out.request_id), operation=operation, model_side=int(out.model_side),
                 purpose=int(out.purpose), batch=batch, rows=rows,
                 leaf_ids=_owned(raw['leaf_ids'], np.uint64, (batch,)),
-                observations=_owned(raw['observations'], np.float32, (batch, FEATURES)),
-                actions=_owned(raw['actions'], np.float32, (rows, ACTION_WIDTH)),
+                observations=_owned(raw['observations'], np.float32, (batch, features)),
+                actions=_owned(raw['actions'], np.float32, (rows, action_width)),
                 regions=_owned(raw['regions'], np.int64, (rows,)),
                 offsets=_owned(raw['offsets'], np.uint64, (batch + 1,)), raw=raw)
             if int(view.offsets[0]) != 0 or int(view.offsets[-1]) != rows:

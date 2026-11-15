@@ -216,6 +216,10 @@ class WotrGUI:
         self.root = tk.Tk()
         self.root.title("War of the Ring")
         self.root.configure(bg=COLORS["bg"])
+        # R3-LEGACY-GUI-TURN (R2-RS-P1-09 FU2): an exception escaping any
+        # Tk callback (button binding, after() timer, key binding) is
+        # named in the GUI log, not only printed to stderr
+        self.root.report_callback_exception = self._report_callback_exception
 
         # State tracking
         self.current_side = Side.FREE_PEOPLES
@@ -233,6 +237,9 @@ class WotrGUI:
         # Self-play (watch mode)
         self.selfplay_running = False
         self.selfplay_active_side = None  # Who acts next
+        # C02 (round 18): the side whose die action is being resolved
+        # (ai._turn_owner_after); None before the turn's first action
+        self.selfplay_turn_owner = None
         self.selfplay_turn = 0
         self.selfplay_speed = 800  # ms between actions
         self.selfplay_paused = False
@@ -241,6 +248,11 @@ class WotrGUI:
         self.replay_steps = None
         self.replay_meta = {}
         self.replay_idx = 0
+
+        # Read-only viewer label (P1-04): live_view's ENGINE MIRROR sets
+        # it; while set, manual state-editing controls are refused (see
+        # _manual_controls_refusal).
+        self.read_only_view: Optional[str] = None
 
         # Card decks live on self.state (fp_char_deck etc.); no GUI mirrors.
         self._init_card_decks()
@@ -580,6 +592,10 @@ class WotrGUI:
                          bg=COLORS["fp_secondary"], width=10).pack(side=tk.LEFT, padx=2)
         self._make_button(dice_btn_frame2, "Recover", self._on_recover_dice,
                          width=10).pack(side=tk.LEFT, padx=2)
+        # R4-GUI-SKIP-DIE-BUTTON (USER A2-06a/b, ruling 1.276): the
+        # engine's die-discard rows; End Turn's rule-1.67 refusal names it
+        self._make_button(dice_btn_frame2, "Skip Die", self._on_skip_die,
+                         width=10).pack(side=tk.LEFT, padx=2)
 
         # --- Action Buttons ---
         action_frame = tk.LabelFrame(self.side_panel, text="Actions", bg=COLORS["panel_bg"], fg=COLORS["text"])
@@ -687,23 +703,90 @@ class WotrGUI:
             cursor="hand2"
         )
 
-        # Bind click and hover events.  LIVE mode guard: manual
-        # state-editing controls are refused while an EngineSession is
-        # driving the game -- the engine is the only mutator; zoom
-        # controls stay usable (view-only).
+        # Bind click and hover events.  Read-only guard: manual
+        # state-editing controls are refused in LIVE mode, trace replay,
+        # the ENGINE MIRROR and watch mode (_manual_controls_refusal);
+        # zoom controls stay usable (view-only).
         def _dispatch(_e=None, _cmd=command, _txt=text):
-            if (getattr(self, 'live_session', None) is not None
-                    and _txt not in ('-', '+', 'Fit')):
-                self.log("REFUSED: manual controls are disabled in "
-                         "LIVE mode - use the decision panel "
-                         "(engine-legal actions only)")
-                return
+            if (_txt not in self._VIEW_ONLY_CONTROLS
+                    and not self._replay_view_control(_txt)
+                    and not self._watch_view_control(_txt)):
+                why = self._manual_controls_refusal()
+                if why is not None:
+                    self.log("REFUSED: " + why)
+                    return
             _cmd()
         btn.bind("<Button-1>", _dispatch)
         btn.bind("<Enter>", lambda e: btn.configure(bg=hover_color))
         btn.bind("<Leave>", lambda e: btn.configure(bg=bg_color))
 
         return btn
+
+    # Controls that only change the view; usable in every mode.
+    _VIEW_ONLY_CONTROLS = ('-', '+', 'Fit')
+
+    # R2-S4-ENGINE-AI-TOOLS (rescan r022, P1-04 regression): view controls
+    # usable in TRACE REPLAY only.  A recorded trace hides nothing and
+    # _replay_goto fills self.hands for both sides; 'Switch Side' only
+    # flips current_side (the Hand listbox's source) and mutates no
+    # snapshot.  Still refused in LIVE mode and the ENGINE MIRROR, where
+    # the other side's hand is hidden information (1.261).
+    _REPLAY_VIEW_CONTROLS = ('Switch Side',)
+
+    def _replay_view_control(self, text) -> bool:
+        return (text in self._REPLAY_VIEW_CONTROLS
+                and getattr(self, 'replay_steps', None) is not None
+                and getattr(self, 'live_session', None) is None
+                and not getattr(self, 'read_only_view', None))
+
+    # R2-RS-v068-P1-04: view controls usable in WATCH MODE (AI vs AI).
+    # Both seats are AI, so no hand is hidden; 'Switch Side' only flips
+    # current_side (the Hand listbox's source) and mutates nothing in
+    # self.state - the watch loop never reads current_side.  Never lifts
+    # the LIVE / ENGINE MIRROR refusals (hidden information, 1.261); trace
+    # replay has its own allowlist above.
+    _WATCH_VIEW_CONTROLS = ('Switch Side',)
+
+    def _watch_view_control(self, text) -> bool:
+        return (text in self._WATCH_VIEW_CONTROLS
+                and getattr(self, 'selfplay_running', False)
+                and getattr(self, 'live_session', None) is None
+                and getattr(self, 'replay_steps', None) is None
+                and not getattr(self, 'read_only_view', None))
+
+    def _manual_controls_refusal(self) -> Optional[str]:
+        """Why manual state-editing controls are refused right now, or
+        None when they may run (the hot-seat / legacy AI GUI).
+
+        P1-04: refusing only in LIVE mode left two read-only viewers
+        open.  The ENGINE MIRROR renders the FULL engine state, so 'Draw
+        Cards' popped the AI's deck, logged its draws and filled the Hand
+        listbox with the AI's real hand (1.261).  Trace replay swaps in
+        step['state'] without a copy, so every button rewrote the stored
+        snapshot.
+
+        R2-RS-v068-P1-04: watch mode (AI vs AI) set none of those flags,
+        only selfplay_running, so every button ran on the game the watch
+        loop drives ('End Turn' -> next_turn rolled the turn over an open
+        engine pending and both sides drew).  The watch loop opens no
+        _make_button dialog and no required _show_choice_dialog, so this
+        blocks nothing the loop needs; it clears with selfplay_running
+        (game end or halt) and 'Switch Side' stays usable
+        (_watch_view_control)."""
+        if getattr(self, 'live_session', None) is not None:
+            return ("manual controls are disabled in LIVE mode - use the "
+                    "decision panel (engine-legal actions only)")
+        if getattr(self, 'replay_steps', None) is not None:
+            return ("manual controls are disabled in trace replay - the "
+                    "recorded snapshots are read-only")
+        view = getattr(self, 'read_only_view', None)
+        if view:
+            return ("manual controls are disabled in the %s - it is a "
+                    "read-only view" % view)
+        if getattr(self, 'selfplay_running', False):
+            return ("manual controls are disabled in watch mode - the "
+                    "AI-vs-AI loop drives the game")
+        return None
 
     def _load_images(self):
         """Pre-load commonly used images."""
@@ -784,6 +867,13 @@ class WotrGUI:
     def refresh(self):
         """Refresh the entire display."""
         self._draw_board()
+        # P1-15: re-read the 'Selected Region' inspector from the snapshot
+        # _draw_board just recorded (_display_state).  Replay steps
+        # (_replay_goto) and live engine decisions (_live_refresh) swap or
+        # mutate self.state and only call refresh(); without this the panel
+        # kept the forces of the step at which the region was clicked.
+        if self.selected_region:
+            self._update_region_info(self.selected_region)
         self._draw_political_track()
         self._update_dice_display()
         self._update_hand_display()
@@ -1944,7 +2034,7 @@ class WotrGUI:
 
     def _check_victory_conditions(self):
         """Check all victory conditions and display victory message if met."""
-        from game_logic import check_all_victory_conditions
+        from game_logic import check_all_victory_conditions, should_game_end
 
         if self.replay_steps is not None:
             return  # Replay mode: outcome shown in the replay bar, no popups
@@ -1961,9 +2051,18 @@ class WotrGUI:
         if getattr(self, '_victory_announced', False):
             return
 
-        result = check_all_victory_conditions(self.state)
-        if not result["victory"]:
-            return
+        # P1-08 TIMING (rulebook p.17, ruling 1.212a): ring endings are
+        # immediate, mid-action; a MILITARY victory exists only once the
+        # engine's end-of-turn Victory Check (game_logic._settle_end_of_turn,
+        # run by next_turn / ai._safe_next_turn / the live driver's
+        # begin_turn_reset) has declared it and stored
+        # _search_endturn_victory.  A military threshold reached mid-turn
+        # can still be undone (recapture) before that check.
+        result = getattr(self.state, '_search_endturn_victory', None)
+        if result is None:
+            result = check_all_victory_conditions(self.state)
+            if not should_game_end(result, end_of_turn=False):
+                return
         self._victory_announced = True
 
         winner = result["victory"]  # "free_peoples" or "shadow"
@@ -2242,7 +2341,16 @@ class WotrGUI:
                 log_msg="Aragorn has been crowned King!")
 
     def _on_separate_companions(self):
-        """Handle companion separation from fellowship."""
+        """Separate the companions selected in the Fellowship list (one
+        Character / Will of the West die moves one companion or one GROUP;
+        range = Fellowship progress + the group's highest level).
+
+        P1-10 (I1): the destinations are the ENGINE's companion_separate
+        rows for exactly the selected group and die, and the move executes
+        through ai._execute_action - the engine owns the Mordor bar, the
+        siege/stronghold rules, nation activation and the guide change
+        (a decision driven by _drive_engine_decisions).  The GUI no longer
+        computes reachability or edits the Fellowship / state.armies."""
         if self.ai_playing:
             self.log('Wait for AI to finish its turn')
             return
@@ -2260,66 +2368,41 @@ class WotrGUI:
         if not selection:
             self.log("Select companion(s) to separate")
             return
-
-        # Get companion names and calculate max movement
         companions = self.state.fellowship.companions
-        selected_companions = []
-        for idx in selection:
-            if idx < len(companions):
-                selected_companions.append(companions[idx])
-
-        if not selected_companions:
+        names = sorted(companions[i].name for i in selection
+                       if i < len(companions))
+        if not names:
             self.log("No valid companions selected")
             return
 
-        # Movement = fellowship progress + highest level of separating companions
-        highest_level = max(c.level for c in selected_companions)
-        movement = self.state.fellowship.progress + highest_level
-        selected_names = [c.name for c in selected_companions]
-
-        self.log(f"Separation movement: {self.state.fellowship.progress} (progress) + {highest_level} (level) = {movement}")
-
-        # Ask for destination region
-        from game_logic import fellowship_region
-        start_region = fellowship_region(self.state)
-        dest = self._show_companion_movement_dialog(
-            "Separate Companions",
-            f"Move {', '.join(selected_names)} (max {movement} regions):",
-            start_region, movement
-        )
-        if not dest:
+        acts = self._engine_die_menu(Side.FREE_PEOPLES,
+                                     self.selected_die_idx,
+                                     ('companion_separate',))
+        if acts is None:
+            return
+        acts = [a for a in acts
+                if sorted(a.params.get('companions')
+                          or [a.params.get('companion')]) == names]
+        if not acts:
+            self.log(f"The engine offers no separation of "
+                     f"{', '.join(names)} with this die")
+            return
+        groups, _done = self._figure_move_groups(acts)
+        pick = self._pick_figure_move("Separate Companions", groups)
+        if pick is None:
             self.log("Separation cancelled")
             return
-
-        try:
-            # Remove companions from fellowship and place in destination
-            for comp in selected_companions:
-                self.state.fellowship.companions.remove(comp)
-                # Add to army at destination (as a leader)
-                dest_san = sanitize(dest)
-                # Armies ONLY via get_or_create_army: raw exact-key
-                # creation forges duplicates beside original-name keys.
-                from game_logic import get_or_create_army
-                get_or_create_army(self.state, dest_san).leaders.append(comp)
-
-            # Re-assign guide if needed
-            from game_logic import change_guide
-            try:
-                change_guide(self.state)
-            except:
-                pass
-
-            self._use_selected_die()
-            self.log(f"Separated {', '.join(selected_names)} to {dest}")
-        except Exception as e:
-            self.log(f"Separation failed: {e}")
-            import traceback
-            traceback.print_exc()
-
-        self.refresh()
+        self._run_figure_moves(pick, "Separated")
 
     def _on_move_companions(self):
-        """Move companions already on the board (not in fellowship)."""
+        """Move companions already on the board (not in fellowship) with
+        one Character / Will of the West die, each group within its own
+        allowance.
+
+        P1-10 (I1): the menu is the ENGINE's companion_move rows for the
+        die, each move executes through ai._execute_action, and further
+        groups on the SAME die are the engine's '__companion_moves__'
+        chain."""
         if self.ai_playing:
             self.log('Wait for AI to finish its turn')
             return
@@ -2332,270 +2415,285 @@ class WotrGUI:
         if not self._check_die_selected(valid):
             return
 
-        # Find all companions on the board (not in fellowship)
-        companions_on_board = []
-        for region_key, army in self.state.armies.items():
-            for leader in army.leaders:
-                if isinstance(leader, Companion):
-                    companions_on_board.append((region_key, leader))
-
-        if not companions_on_board:
-            self.log("No companions on the board to move")
+        acts = self._engine_die_menu(Side.FREE_PEOPLES,
+                                     self.selected_die_idx,
+                                     ('companion_move',))
+        if acts is None:
             return
+        if not acts:
+            self.log("No companion on the board can move with this die")
+            return
+        groups, _done = self._figure_move_groups(acts)
+        pick = self._pick_figure_move("Move Companions", groups)
+        if pick is None:
+            self.log("Companion move cancelled")
+            return
+        self._run_figure_moves(pick, "Moved companions")
 
-        # Show dialog to select which companions to move
-        self._show_companion_board_movement_dialog(companions_on_board)
+    # --- Character-die figure moves through the ENGINE (P1-10, I1) ---
 
-    def _show_companion_board_movement_dialog(self, companions_on_board):
-        """
-        Dialog to move companions that are already on the board.
-        Each companion can move INDEPENDENTLY to different destinations with 1 die.
-        Movement = companion's level.
-        """
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Move Companions")
-        dialog.configure(bg=COLORS["panel_bg"])
-        dialog.geometry("550x650")
-        dialog.transient(self.root)
-        dialog.grab_set()
+    def _engine_die_menu(self, side, die_idx, action_types):
+        """The engine's legal `action_types` rows for the selected die.
 
-        tk.Label(
-            dialog, text="Move Companions on Board",
-            bg=COLORS["panel_bg"], fg=COLORS["highlight"],
-            font=("Arial", 12, "bold")
-        ).pack(pady=10)
+        get_legal_actions lists a die FACE once (on the first unused die
+        showing it), so a second die with the same face is served that
+        face's rows re-stamped with its own index (the executors check
+        only the face of die_idx).  Returns None (logged) when no menu may
+        be served now (an open engine decision)."""
+        from ai import Action, get_legal_actions
+        if self._ai_mode_decision_open():       # P1-07: never mid-chain
+            return None
+        if self._engine_pending_side() is not None:
+            # manual mode: the engine serves only the open decision's menu
+            self.log("An open decision must be resolved first - "
+                     "action not taken")
+            return None
+        acts = get_legal_actions(self.state, side)
+        rows = [a for a in acts if a.action_type in action_types]
+        mine = [a for a in rows if a.die_idx == die_idx]
+        if mine:
+            return mine
+        dice = self.state.dice[side]
+        face = dice[die_idx].current
+        rep = next((a.die_idx for a in rows
+                    if isinstance(a.die_idx, int)
+                    and 0 <= a.die_idx < len(dice)
+                    and dice[a.die_idx].current == face), None)
+        if rep is None:
+            return []
+        return [Action(die_idx=die_idx, action_type=a.action_type,
+                       params=dict(a.params))
+                for a in rows if a.die_idx == rep]
 
-        tk.Label(
-            dialog, text="Each companion can move independently (1 die moves ALL).\nClick a companion to select their destination:",
-            bg=COLORS["panel_bg"], fg=COLORS["text"]
-        ).pack(pady=5)
+    def _region_display(self, region) -> str:
+        """Board display name of a (sanitized) region key."""
+        return board_module.regions.get(sanitize(str(region)), {}).get(
+            'orig', str(region))
 
-        # Scrollable frame for companions
-        canvas = tk.Canvas(dialog, bg=COLORS["panel_bg"], highlightthickness=0)
-        scrollbar = tk.Scrollbar(dialog, orient="vertical", command=canvas.yview)
-        scroll_frame = tk.Frame(canvas, bg=COLORS["panel_bg"])
+    def _figure_move_label(self, action):
+        """(figures, from, to) of an engine figure move - a Character-die
+        nazgul_move / mouth_move / companion_move / companion_separate row
+        or a same-die chain option - or None for the chain's Done
+        terminator."""
+        p = action.params or {}
+        at = action.action_type
 
-        scroll_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
+        def _army_at(region):
+            return next((a for k, a in self.state.armies.items()
+                         if sanitize(str(k)) == sanitize(str(region))), None)
 
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=5)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
-
-        # Track destinations for each companion
-        # Key: index in companions_on_board, Value: destination region or None (stay)
-        destinations = {}  # Will store {index: destination_region}
-        dest_labels = {}   # Will store {index: label_widget}
-
-        def select_destination(idx, region, comp):
-            """Open destination selection for this companion."""
-            movement = comp.level  # Movement = companion's level
-            dest = self._show_companion_movement_dialog(
-                f"Move {comp.name}",
-                f"Select destination (max {movement} regions):",
-                region, movement
-            )
-            if dest:
-                destinations[idx] = dest
-                dest_labels[idx].config(text=f"→ {dest}", fg=COLORS["success"])
+        if at == 'card_option':
+            c = p.get('choices') or {}
+            if c.get('_naz_done') or c.get('_comp_done'):
+                return None
+            src, dst = c.get('from_region'), c.get('to_region')
+            if c.get('include_mouth'):
+                who = "Mouth of Sauron"
+            elif c.get('include_wk'):
+                who = "Witch-king"
+            elif c.get('companions'):
+                who = ", ".join(c['companions'])
             else:
-                # Clear destination if cancelled
-                if idx in destinations:
-                    del destinations[idx]
-                dest_labels[idx].config(text="(staying)", fg=COLORS["text_dim"])
+                who = f"{int(c.get('count', 1))} Nazgul"
+        elif at == 'nazgul_move':
+            src, dst = p.get('from'), p.get('to')
+            army = _army_at(src)
+            n = sum(1 for l in (army.leaders if army else ())
+                    if isinstance(l, Nazgul))
+            k = n if p.get('count') is None else int(p['count'])
+            if p.get('include_wk'):
+                who = "Witch-king" + (f" + {k} Nazgul" if k else "")
+            else:
+                who = f"{k} Nazgul"
+        elif at == 'mouth_move':
+            src, dst = p.get('from'), p.get('to')
+            who = "Mouth of Sauron"
+        elif at == 'companion_move':
+            src, dst = p.get('from'), p.get('to')
+            names = p.get('companions')
+            if not names:
+                army = _army_at(src)
+                names = [l.name for l in (army.leaders if army else ())
+                         if isinstance(l, Companion)]
+            who = ", ".join(names)
+        elif at == 'companion_separate':
+            from game_logic import fellowship_region
+            src, dst = fellowship_region(self.state), p.get('to_region')
+            names = p.get('companions') or [p.get('companion')]
+            who = "Separate " + ", ".join(names)
+        else:
+            raise ValueError(f"not a figure move: {at}")
+        return who, src, dst
 
-        def clear_destination(idx):
-            """Clear a companion's destination."""
-            if idx in destinations:
-                del destinations[idx]
-            dest_labels[idx].config(text="(staying)", fg=COLORS["text_dim"])
+    def _figure_move_text(self, action) -> str:
+        lab = self._figure_move_label(action)
+        if lab is None:
+            return "no further moves"
+        who, src, dst = lab
+        return (f"{who}: {self._region_display(src)} -> "
+                f"{self._region_display(dst)}")
 
-        # Create row for each companion
-        for idx, (region, comp) in enumerate(companions_on_board):
-            row_frame = tk.Frame(scroll_frame, bg=COLORS["bg"], relief=tk.RAISED, bd=1)
-            row_frame.pack(fill=tk.X, padx=5, pady=3)
+    def _figure_move_groups(self, acts):
+        """Group engine figure-move rows for the two-list picker:
+        ([(figures label, [(destination label, action), ...]), ...],
+        done_action or None).  No state change."""
+        groups = {}
+        done = None
+        for a in acts:
+            lab = self._figure_move_label(a)
+            if lab is None:
+                done = a
+                continue
+            who, src, dst = lab
+            key = f"{who} from {self._region_display(src)}"
+            groups.setdefault(key, []).append((self._region_display(dst), a))
+        return ([(k, sorted(rows, key=lambda r: r[0]))
+                 for k, rows in sorted(groups.items())], done)
 
-            # Companion info
-            info_frame = tk.Frame(row_frame, bg=COLORS["bg"])
-            info_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5, pady=5)
-
-            tk.Label(
-                info_frame, text=f"{comp.name} (Lv.{comp.level})",
-                bg=COLORS["bg"], fg=COLORS["highlight"],
-                font=("Arial", 10, "bold")
-            ).pack(anchor="w")
-
-            tk.Label(
-                info_frame, text=f"Currently in: {region}",
-                bg=COLORS["bg"], fg=COLORS["text"]
-            ).pack(anchor="w")
-
-            # Destination label
-            dest_label = tk.Label(
-                info_frame, text="(staying)",
-                bg=COLORS["bg"], fg=COLORS["text_dim"]
-            )
-            dest_label.pack(anchor="w")
-            dest_labels[idx] = dest_label
-
-            # Buttons
-            btn_frame = tk.Frame(row_frame, bg=COLORS["bg"])
-            btn_frame.pack(side=tk.RIGHT, padx=5, pady=5)
-
-            self._make_button(
-                btn_frame, "Move",
-                lambda i=idx, r=region, c=comp: select_destination(i, r, c),
-                bg=COLORS["button_bg"]
-            ).pack(side=tk.LEFT, padx=2)
-
-            self._make_button(
-                btn_frame, "Clear",
-                lambda i=idx: clear_destination(i),
-                bg=COLORS["text_dim"]
-            ).pack(side=tk.LEFT, padx=2)
-
-        result = {"done": False, "moved": False}
-
-        def execute_moves():
-            if not destinations:
-                messagebox.showwarning("No Moves", "Select at least one destination to move companions")
-                return
-
-            # Execute all moves
-            moved_companions = []
-            for idx, dest in destinations.items():
-                region_key, comp = companions_on_board[idx]
-
-                # Remove from current army (drop the entry when emptied,
-                # matching the engine's companion_move executor)
-                _src_army = self.state.armies[region_key]
-                _src_army.leaders.remove(comp)
-                if not _src_army.units and not _src_army.leaders:
-                    del self.state.armies[region_key]
-
-                # Add to destination
-                dest_san = sanitize(dest)
-                # Armies ONLY via get_or_create_army: raw exact-key
-                # creation forges duplicates beside original-name keys.
-                from game_logic import get_or_create_army
-                get_or_create_army(self.state, dest_san).leaders.append(comp)
-
-                moved_companions.append(f"{comp.name} → {dest}")
-
-            self._use_selected_die()
-            self.log(f"Moved companions: {', '.join(moved_companions)}")
-            result["moved"] = True
-            result["done"] = True
-            dialog.destroy()
-
-        def cancel():
-            result["done"] = True
-            dialog.destroy()
-
-        # Bottom button frame
-        btn_frame = tk.Frame(dialog, bg=COLORS["panel_bg"])
-        btn_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        self._make_button(btn_frame, "Execute All Moves", execute_moves, bg=COLORS["success"]).pack(side=tk.LEFT, padx=5)
-        self._make_button(btn_frame, "Cancel", cancel).pack(side=tk.LEFT, padx=5)
-
-        dialog.wait_window()
-        if result["moved"]:
-            self.refresh()
-
-    def _show_companion_movement_dialog(self, title: str, prompt: str,
-                                        start_region: str, max_movement: int) -> Optional[str]:
-        """Show dialog to select destination for companion movement."""
+    def _pick_figure_move(self, title, groups, done_action=None):
+        """Two-list picker over the ENGINE's figure-move rows: the figures
+        (left), then a destination (right).  Returns the chosen engine
+        Action, `done_action` for Done, or None when cancelled/closed."""
         result = {"value": None}
 
         dialog = tk.Toplevel(self.root)
         dialog.title(title)
         dialog.configure(bg=COLORS["panel_bg"])
-        dialog.geometry("350x500")
+        dialog.geometry("640x480")
         dialog.transient(self.root)
         dialog.grab_set()
 
-        tk.Label(dialog, text=prompt, bg=COLORS["panel_bg"], fg=COLORS["text"]).pack(pady=10)
-
-        # Calculate reachable regions using BFS, stopping at shadow strongholds
-        reachable = self._get_companion_reachable_regions(start_region, max_movement)
-
         tk.Label(
-            dialog, text=f"Reachable from {start_region}:",
-            bg=COLORS["panel_bg"], fg=COLORS["text_dim"]
-        ).pack(pady=5)
+            dialog,
+            text=("Legal moves for this die: pick the figures, then the "
+                  "destination." + ("\nDone ends this die's moves."
+                                    if done_action is not None else "")),
+            bg=COLORS["panel_bg"], fg=COLORS["text"], justify=tk.LEFT,
+            wraplength=600
+        ).pack(pady=8, padx=10)
 
-        listbox = tk.Listbox(dialog, bg=COLORS["bg"], fg=COLORS["text"], height=15)
-        for r in sorted(reachable):
-            listbox.insert(tk.END, r)
-        listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        lists = tk.Frame(dialog, bg=COLORS["panel_bg"])
+        lists.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        left = tk.Listbox(lists, bg=COLORS["bg"], fg=COLORS["text"],
+                          exportselection=False, width=40)
+        lsb = tk.Scrollbar(lists, orient="vertical", command=left.yview)
+        left.configure(yscrollcommand=lsb.set)
+        right = tk.Listbox(lists, bg=COLORS["bg"], fg=COLORS["text"],
+                           exportselection=False, width=30)
+        rsb = tk.Scrollbar(lists, orient="vertical", command=right.yview)
+        right.configure(yscrollcommand=rsb.set)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        lsb.pack(side=tk.LEFT, fill=tk.Y)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0))
+        rsb.pack(side=tk.LEFT, fill=tk.Y)
 
-        def select():
-            sel = listbox.curselection()
-            if sel:
-                result["value"] = listbox.get(sel[0])
+        for label, _rows in groups:
+            left.insert(tk.END, label)
+
+        def show_dests(_e=None):
+            right.delete(0, tk.END)
+            sel = left.curselection()
+            if not sel:
+                return
+            for dest, _a in groups[sel[0]][1]:
+                right.insert(tk.END, dest)
+
+        left.bind("<<ListboxSelect>>", show_dests)
+        if len(groups) == 1:
+            left.selection_set(0)
+            show_dests()
+
+        def move(_e=None):
+            ls, rs = left.curselection(), right.curselection()
+            if not ls or not rs:
+                messagebox.showwarning(
+                    "Select", "Pick the figures and a destination",
+                    parent=dialog)
+                return
+            result["value"] = groups[ls[0]][1][rs[0]][1]
+            dialog.destroy()
+
+        def done():
+            result["value"] = done_action
             dialog.destroy()
 
         def cancel():
             dialog.destroy()
 
+        right.bind("<Double-Button-1>", move)
         btn_frame = tk.Frame(dialog, bg=COLORS["panel_bg"])
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
-        self._make_button(btn_frame, "Select", select, bg=COLORS["success"]).pack(side=tk.LEFT, padx=5)
-        self._make_button(btn_frame, "Cancel", cancel).pack(side=tk.LEFT, padx=5)
+        self._make_button(btn_frame, "Move", move,
+                          bg=COLORS["success"]).pack(side=tk.LEFT, padx=5)
+        if done_action is not None:
+            self._make_button(btn_frame, "Done", done).pack(side=tk.LEFT,
+                                                            padx=5)
+        else:
+            self._make_button(btn_frame, "Cancel", cancel).pack(
+                side=tk.LEFT, padx=5)
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
 
         dialog.wait_window()
         return result["value"]
 
-    def _get_companion_reachable_regions(self, start: str, max_steps: int) -> set:
-        """
-        Get all regions reachable by companions within max_steps.
-        Companions must stop at unconquered shadow strongholds.
-        """
-        from board import regions as board_regions
-        from collections import deque
-
-        start_san = sanitize(start)
-        reachable = set()
-        visited = {start_san: 0}  # region -> steps to reach
-        queue = deque([(start_san, 0)])
-
-        while queue:
-            current, steps = queue.popleft()
-
-            if steps > 0:  # Don't include starting region
-                reachable.add(current)
-
-            # Check if this is an unconquered shadow stronghold (must stop)
-            reg_info = board_regions.get(current, {})
-            is_shadow_stronghold = reg_info.get("is_stronghold", False)
-            # Check if shadow-controlled (would need to check army presence or owner)
-            # For now, check if shadow army present
-            army = self.state.armies.get(current)
-            shadow_controlled = False
-            if army and army.units:
-                shadow_nations = {Nation.ISENGARD, Nation.SAURON, Nation.SOUTHRON_EASTERLINGS}
-                shadow_controlled = army.units[0].nation in shadow_nations
-
-            if is_shadow_stronghold and shadow_controlled and steps > 0:
-                # Must stop here, can't continue
-                continue
-
-            if steps >= max_steps:
-                continue
-
-            # Explore adjacent regions
-            for adj in self.board.adjacent(current):
-                adj_san = sanitize(adj)
-                if adj_san not in visited or visited[adj_san] > steps + 1:
-                    visited[adj_san] = steps + 1
-                    queue.append((adj_san, steps + 1))
-
-        return reachable
+    def _run_figure_moves(self, first, title) -> bool:
+        """Execute a Character-die figure move through ai._execute_action
+        (the one execution authority), then let THIS seat play the
+        engine's same-die continuation ('__nazgul_moves__' /
+        '__companion_moves__' pending) on the same picker; any other
+        decision the moves open goes to _drive_engine_decisions.
+        Returns True when the first move executed."""
+        from ai import _execute_action, get_legal_actions
+        if self._ai_mode_decision_open():       # P1-07: never mid-chain
+            return False
+        side = self.current_side
+        try:
+            _execute_action(self.state, first)
+        except Exception as e:
+            self.log(f"Move failed: {e}")
+            import traceback
+            traceback.print_exc()
+            self.refresh()
+            return False
+        self.selected_die_idx = None
+        self.log(f"{title}: {self._figure_move_text(first)}")
+        while side != self.ai_side:
+            pco = getattr(self.state, 'pending_card_option', None) or {}
+            if (pco.get('card_name') not in ('__nazgul_moves__',
+                                             '__companion_moves__')
+                    or self._engine_pending_side() != side):
+                break
+            chain = [a for a in get_legal_actions(self.state, side)
+                     if a.action_type == 'card_option']
+            groups, done = self._figure_move_groups(chain)
+            if done is None:
+                raise RuntimeError(f"{pco.get('card_name')} chain has no "
+                                   f"Done option")
+            pick = self._pick_figure_move(f"{title} - same die", groups,
+                                          done)
+            if pick is None:
+                # Closing the picker ends this die's moves - visibly.
+                self.log("Picker closed - no further moves on this die")
+                pick = done
+            try:
+                _execute_action(self.state, pick)
+            except Exception as e:
+                self.log(f"Move failed: {e}")
+                import traceback
+                traceback.print_exc()
+                self.refresh()
+                return True
+            if pick is not done:
+                self.log(f"{title}: {self._figure_move_text(pick)}")
+        if self._engine_pending_side() is not None:
+            self._drive_engine_decisions()
+        if (self.ai_side and self.current_side != self.ai_side
+                and not self.ai_playing):
+            if hasattr(self, '_ai_after_id'):
+                self.root.after_cancel(self._ai_after_id)
+            self._ai_after_id = self.root.after(600, self._after_human_action)
+        self.refresh()
+        return True
 
     def _find_region(self, region_key: str) -> Optional[object]:
         """Find a region by name, handling various formats."""
@@ -2777,6 +2875,15 @@ class WotrGUI:
         reset the selection + drive any resulting pending decisions +
         schedule the AI reply.  Returns True on success."""
         from ai import _execute_action
+        # R2-SL-34: the second recruit of the human's own open Muster die
+        # is that window's continuation; any other top-level action is
+        # refused while a multi-step window is open
+        _cont = ('muster' if action.action_type == 'muster_recruit'
+                 and self.state.pending_muster_die is not None
+                 and action.die_idx == self.state.pending_muster_die
+                 else None)
+        if self._ai_mode_decision_open(continues=_cont):  # P1-07
+            return False
         try:
             _execute_action(self.state, action)
         except Exception as e:
@@ -2784,6 +2891,9 @@ class WotrGUI:
             import traceback
             traceback.print_exc()
             return False
+        # the engine owns the hands (a card play removes the card even
+        # when it opens no decision for _drive_engine_decisions to sync)
+        self._sync_hands()
         if log_msg:
             self.log(log_msg)
         self.selected_die_idx = None
@@ -2791,8 +2901,12 @@ class WotrGUI:
         # card-option/muster-double/etc.) through the same engine driver
         if self._engine_pending_side() is not None:
             self._drive_engine_decisions()
+        # R2-SL-34: no AI reply while the human's own multi-step window
+        # (the first recruit of a Muster die just opened it) is open - the
+        # second recruit, or the 'No' / Pass that declines it, arms it
         if (self.ai_side and self.current_side != self.ai_side
-                and not self.ai_playing):
+                and not self.ai_playing
+                and self._human_multistep_window() is None):
             if hasattr(self, '_ai_after_id'):
                 self.root.after_cancel(self._ai_after_id)
             self._ai_after_id = self.root.after(600, self._after_human_action)
@@ -2800,15 +2914,23 @@ class WotrGUI:
         return True
 
     def _use_selected_die(self):
-        """Mark the selected die as used."""
+        """Mark the selected die as used.  It no longer arms the AI's
+        reply (R2-SL-32): the callers still open modals after it (the
+        card's engine decisions, the hunt prompts) and Tk services after()
+        timers inside a modal's wait_window, so the AI ran in the middle
+        of the human's own decision.  Each caller arms the reply with
+        _arm_ai_reply at its very end."""
         if self.selected_die_idx is not None:
             self.state.dice[self.current_side][self.selected_die_idx].used = True
             self.selected_die_idx = None
-            # In AI mode: schedule AI to respond after human's action completes
-            if self.ai_side and self.current_side != self.ai_side and not self.ai_playing:
-                if hasattr(self, '_ai_after_id'):
-                    self.root.after_cancel(self._ai_after_id)
-                self._ai_after_id = self.root.after(600, self._after_human_action)
+
+    def _arm_ai_reply(self):
+        """R2-SL-32: arm the AI's reply to a finished human action, once,
+        after every modal the action opened has returned (AI mode only)."""
+        if self.ai_side and self.current_side != self.ai_side and not self.ai_playing:
+            if hasattr(self, '_ai_after_id'):
+                self.root.after_cancel(self._ai_after_id)
+            self._ai_after_id = self.root.after(600, self._after_human_action)
 
     def _on_roll_dice(self):
         """Roll all dice for both sides. In AI mode, Shadow AI allocates eyes first."""
@@ -2823,9 +2945,16 @@ class WotrGUI:
             self.log("Dice already rolled this turn")
             return
 
-        # If AI controls Shadow, let it decide on eye allocation before rolling
-        if self.ai_side == Side.SHADOW and self.ai_net:
-            self._ai_allocate_eyes()
+        # R2-SL-33: the turn-start Fellowship phase (discards, declaration,
+        # tail with Mordor entry, Guide) precedes the Hunt allocation
+        if not self._legacy_fellowship_phase():
+            return
+
+        # R2-RS-P1-09: the Shadow's Hunt allocation on the engine eye menu
+        # (AI search, or a human Shadow's 1.271 minimum); False = refused
+        # and logged, nothing rolled, the next ROLL DICE retries
+        if not self._pre_roll_hunt_allocation():
+            return
 
         # Roll dice for both sides
         roll_action_dice(self.state, pool=Side.FREE_PEOPLES)
@@ -2908,6 +3037,11 @@ class WotrGUI:
         double-move machinery.  The GUI no longer manages its own
         move-counter or calls game_logic.move_army directly."""
         from ai import Action, _execute_action
+        # R2-SL-34: the human's own open Army-die window is continued here
+        if self._ai_mode_decision_open(continues='army_move'):  # P1-07
+            self.pending_action = None
+            self.action_source = None
+            return
         src_key = self.action_source
         dest_key = dest_region
         try:
@@ -2944,15 +3078,19 @@ class WotrGUI:
             return
         self.pending_action = None
         self.action_source = None
+        # P1-07: resolve any engine decision the move opened through the
+        # same driver _run_engine_action uses
+        if self._engine_pending_side() is not None:
+            self._drive_engine_decisions()
         # A second move is available iff the engine left a pending die
         if self.state.pending_army_move_die is not None:
             self.log("  (1 move left - select another army, or click Done)")
             self._offer_second_move()
         else:
             self.selected_die_idx = None
-            if (self.ai_side and self.current_side != self.ai_side
-                    and not self.ai_playing):
-                self._ai_after_id = self.root.after(600, self._after_human_action)
+            # R2-SL-34: cancel-then-arm - a reply armed earlier never
+            # fires beside this one (two AI actions in a row)
+            self._arm_ai_reply()
             self.refresh()
 
     def _offer_second_move(self):
@@ -2965,7 +3103,8 @@ class WotrGUI:
                 "Second Movement",
                 "You have 1 more army movement.\n\nMove another army?",
                 parent=self.root):
-            self.log("Select another army, then Move Army (2nd move)")
+            self.log("Select another army, then Move Army (2nd move) - "
+                     "or press Pass to decline it")
             self.pending_action = "move"
             # the next _complete_move sees pending_army_move_die and the
             # engine applies it as the second move + consumes the die
@@ -2975,9 +3114,7 @@ class WotrGUI:
                 die_idx=self.state.pending_army_move_die,
                 action_type='pass', params={}))
             self.selected_die_idx = None
-            if (self.ai_side and self.current_side != self.ai_side
-                    and not self.ai_playing):
-                self._ai_after_id = self.root.after(600, self._after_human_action)
+            self._arm_ai_reply()        # R2-SL-34: cancel-then-arm
             self.refresh()
 
     def _on_attack(self):
@@ -3032,6 +3169,10 @@ class WotrGUI:
         then drives every resulting combat decision through
         get_legal_actions + _execute_action so the rules are identical."""
         from ai import Action, _execute_action
+        if self._ai_mode_decision_open():       # P1-07: never mid-chain
+            self.pending_action = None
+            self.action_source = None
+            return
         try:
             # Shadow attack-block by a persistent FP card (A Power too
             # Great / Tom Bombadil) — offer the discard, as before.
@@ -3075,7 +3216,7 @@ class WotrGUI:
         casualty/siege) through get_legal_actions + _execute_action — the
         one execution authority.  AI-controlled sides pick via the net;
         human sides are prompted with the legal actions."""
-        from ai import (get_legal_actions, _execute_action, mcts_action)
+        from ai import (get_legal_actions, _execute_action)
         guard = 0
         while guard < 400:
             guard += 1
@@ -3085,35 +3226,56 @@ class WotrGUI:
             acts = get_legal_actions(self.state, side)
             if not acts:
                 break
-            if len(acts) == 1:
-                _execute_action(self.state, acts[0])
-                continue
-            net = None
-            if self.ai_side is not None and side == self.ai_side:
-                net = self.ai_net
-            if net is not None:
-                # MCTS needs the true per-side pair: opponent nodes are
-                # evaluated with the opponent's own net.
-                fp_n = getattr(self, 'fp_net', None) or net
-                sh_n = getattr(self, 'sh_net', None) or net
-                a = mcts_action(self.state, side, fp_n, sh_n,
-                                num_simulations=100, temperature=0.1)
-                _execute_action(self.state, a or acts[0])
-                continue
-            # human: present the legal decisions
-            sidename = ('Free Peoples' if side == Side.FREE_PEOPLES
-                        else 'Shadow')
-            opts = [(self._describe_action(a), i) for i, a in enumerate(acts)]
-            pick = self._show_choice_dialog(
-                f"{sidename} decision", "Choose an action:", opts)
-            if pick is None:
-                # The pending must resolve; a cancelled dialog defaults to
-                # the first legal action, and that pick must be visible.
-                self.log(f"Dialog cancelled - defaulting to: "
-                         f"{self._describe_action(acts[0])}")
-            _execute_action(self.state, acts[0 if pick is None else pick])
+            _execute_action(self.state,
+                            self._choose_engine_decision(side, acts))
         self._sync_hands()
         self.refresh()
+
+    def _choose_engine_decision(self, side, acts):
+        """The pick for ONE open engine decision (`acts` = its legal menu):
+        a one-row menu is that row, an AI side searches, a human side is
+        asked in the required dialog.  Shared by _drive_engine_decisions
+        and the turn-start driver's open decisions / Fellowship effects
+        (_legacy_fellowship_phase, R3-LEGACY-GUI-TURN).  Raises, with
+        nothing chosen or run, when the search or the dialog gives no
+        answer."""
+        from ai import mcts_action
+        if len(acts) == 1:
+            return acts[0]
+        net = None
+        if self.ai_side is not None and side == self.ai_side:
+            net = self.ai_net
+        if net is not None:
+            # MCTS needs the true per-side pair: opponent nodes are
+            # evaluated with the opponent's own net.
+            fp_n = getattr(self, 'fp_net', None) or net
+            sh_n = getattr(self, 'sh_net', None) or net
+            a = mcts_action(self.state, side, fp_n, sh_n,
+                            num_simulations=100, temperature=0.1)
+            if a is None:
+                # P1-12: never substitute acts[0] - the search did not
+                # choose it (I1).  Stop loudly; the pending stays open.
+                raise RuntimeError(
+                    f"{side.value} AI search returned no action for "
+                    f"its open engine decision - no action taken, the "
+                    f"decision is still open")
+            return a
+        # human: present the legal decisions
+        sidename = ('Free Peoples' if side == Side.FREE_PEOPLES
+                    else 'Shadow')
+        opts = [(self._describe_action(a), i) for i, a in enumerate(acts)]
+        pick = self._show_choice_dialog(
+            f"{sidename} decision", "Choose an action:", opts)
+        if pick is None:
+            # P1-13: never substitute acts[0] - the human did not
+            # choose it (I1).  The dialog (required by default) has no
+            # Cancel and refuses the close, so None means it was
+            # destroyed with no choice (main window closing): stop
+            # loudly, run nothing; the pending stays open.
+            raise RuntimeError(
+                f"{sidename} decision dialog closed without a choice "
+                f"- no action taken, the decision is still open")
+        return acts[pick]
 
     def _on_muster(self):
         """Start muster action - click on region."""
@@ -3211,13 +3373,19 @@ class WotrGUI:
                 "Second Muster",
                 "You have 1 more recruit.\n\nMuster in another settlement?",
                 parent=self.root):
-            self.log("Click another settlement to muster (2nd recruit)")
+            self.log("Click another settlement to muster (2nd recruit) - "
+                     "or press Pass to decline it")
             self.pending_action = "muster"
+            # R2-SL-34: the AI reply is armed when the second recruit
+            # lands (_run_engine_action) or the window is declined (Pass)
         else:
             _execute_action(self.state, Action(
                 die_idx=self.state.pending_muster_die,
                 action_type='pass', params={}))
             self.selected_die_idx = None
+            # R2-SL-34: the human's Muster die is now spent - the AI
+            # replies (as _offer_second_move's 'No' does)
+            self._arm_ai_reply()
             self.refresh()
 
     def _on_political(self):
@@ -3270,6 +3438,8 @@ class WotrGUI:
         """Play a card from hand. Requires appropriate die to be selected."""
         if self.ai_playing:
             self.log("Wait for AI to finish its turn")
+            return
+        if self._ai_mode_decision_open():       # P1-07 / R2-SL-32
             return
         selection = self.hand_listbox.curselection()
         if not selection:
@@ -3325,19 +3495,13 @@ class WotrGUI:
             return
 
         try:
-            from event_effects import check_event_requirement, play_event_card
+            from event_effects import check_event_requirement
 
             # Check requirements first
             can_play, msg = check_event_requirement(self.state, card_id)
             if not can_play:
                 self.log(f"Cannot play: {msg}")
                 return
-
-            # play with empty choices and let the LEARNED option-spec
-            # pending (pending_card_option) surface the decision,
-            # exactly as in self-play (USER 2026-07-27: no legacy
-            # get_card_choices dialog).
-            choices = {}
 
             # GUI and engine hands must agree (kept in step by
             # _sync_hands); a missing card is a real desync and must
@@ -3346,54 +3510,33 @@ class WotrGUI:
                 self.log(f"Hand desync: {card_id} not in engine hand")
                 return
 
-            # Play the card with choices
-            result = play_event_card(self.state, self.current_side, card_id, choices)
-
-            if result["success"]:
-                # Save the die face before using
-                die_face = die.current
-
-                # Use the die
-                self._use_selected_die()
-                self.log(f"Played: {card.card_name}")
-                # Sync hands immediately
-                self._sync_hands()
-                # Log the effects
-                for effect in result.get("effects", []):
-                    self.log(f"  → {effect}")
-
-                # Check for Palantír of Orthanc card draw bonus (Shadow
-                # only; the Palantir never triggers on ITS OWN play -
-                # USER RULING 2026-08-15 no-self-trigger - and the
-                # bonus fires only on an EVENT die play, 1.208m)
-                if self.current_side == Side.SHADOW:
-                    self._check_palantir_card_draw(
-                        getattr(card, 'deck', None),
-                        played_card=card, die_face=die_face)
-
-                # Check for Gandalf's ability (FP only, Event/Will of the West die)
-                if self.current_side == Side.FREE_PEOPLES:
-                    self._check_gandalf_card_draw(
-                        die_face, getattr(card, 'deck', None))
-
-                # A card-driven hunt (e.g. Nazgul Strike!'s
-                # roll-for-the-Hunt) leaves tile damage in
-                # _pending_hunt_damage; settle it exactly like the
-                # engine executor does, or the corruption is lost.
-                import game_logic as _gl_phd
-                _phd = getattr(self.state, '_pending_hunt_damage', 0)
-                if _phd > 0 and self.state.pending_hunt is None:
-                    if not _gl_phd._offer_hunt_reduction(self.state):
-                        _gl_phd._settle_hunt_damage(self.state)
-
-                # a card played with empty
-                # choices may open a learned pending (pending_card_option
-                # e.g. __overstack__/bof_separation, pending_combat) —
-                # surface it NOW, not on the next unrelated action.
-                self._drive_engine_decisions()
-
-            else:
-                self.log(f"Failed: {result.get('message', 'Unknown error')}")
+            # R17-GUI-ENGINEPLAY (row 28): the play runs through the
+            # engine's play_event executor (_run_engine_action ->
+            # ai._execute_action), the one path self-play and live play
+            # use.  The executor spends the die, opens an optioned
+            # card's LEARNED card_option pending (USER 2026-07-27: no
+            # legacy get_card_choices dialog), settles a card-driven
+            # hunt, checks hand limits, and owns the bonus draws:
+            # Gandalf the Grey's OPTIONAL same-deck draw at the end of
+            # the action, after the first hand-limit discard, with the
+            # guide checked then (_maybe_open_gandalf_draw), and the
+            # Palantir of Orthanc's LEARNED which-deck draw once the
+            # action has fully resolved (1.208m, no self-trigger:
+            # _open_palantir_deck_choice).  The GUI used to call
+            # play_event_card itself and then force both draws (same
+            # deck, at once, before the card's own decisions) from its
+            # own superseded copy of the rule.  _run_engine_action
+            # drives every decision the play opens (the human's in the
+            # required dialog) and arms the AI reply only after them
+            # (R2-SL-32).
+            from ai import Action
+            self._run_engine_action(
+                Action(die_idx=self.selected_die_idx,
+                       action_type='play_event',
+                       params={'card_id': card_id,
+                               'side': ('fp' if self.current_side
+                                        == Side.FREE_PEOPLES else 'sh')}),
+                log_msg=f"Played: {card.card_name}")
 
         except Exception as e:
             self.log(f"Play card failed: {e}")
@@ -3402,12 +3545,32 @@ class WotrGUI:
 
         self.refresh()
 
-    def _show_choice_dialog(self, title: str, prompt: str, options: list) -> Optional[str]:
+    def _show_choice_dialog(self, title: str, prompt: str, options: list,
+                            allow_cancel: bool = False) -> Optional[str]:
         """
         Show a dialog for single selection.
         Options: list of (display_text, value) tuples
-        Returns the selected value, or None if cancelled.
+        Returns the selected value, or None if cancelled (allow_cancel).
+
+        P1-13: the options sit in a scrolled canvas.  The engine's legal
+        surface is uncapped (the nazgul chain offers ~300 options with
+        its Done LAST); the old fixed 300 x min(400, ...) window with no
+        scroll container clipped every option past about the 8th, and
+        the Cancel row with them.  Option texts wrap instead of clipping.
+        By default the choice is REQUIRED (an engine pending the human
+        must resolve): no Cancel and the window close is refused, so the
+        caller never runs an action the human did not choose; None then
+        means only that the dialog was destroyed without a choice (main
+        window closing).  allow_cancel=True restores Cancel / close.
         """
+        required = not allow_cancel
+        if required:
+            why = self._manual_controls_refusal()
+            if why is not None:
+                # every option click would be REFUSED by _make_button and
+                # the close is refused: a modal the human could not leave
+                raise RuntimeError("required decision '%s' cannot be "
+                                   "answered here: %s" % (title, why))
         result = {"value": None, "cancelled": False}
 
         dialog = tk.Toplevel(self.root)
@@ -3415,20 +3578,75 @@ class WotrGUI:
         dialog.configure(bg=COLORS["panel_bg"])
         dialog.transient(self.root)
         dialog.grab_set()
+        dialog.focus_set()
 
-        # Center the dialog
-        dialog.geometry("300x{}".format(min(400, 100 + len(options) * 40)))
+        # Grows with the menu up to most of the screen; longer menus scroll
+        width = 460
+        dialog.geometry("{}x{}".format(width, max(220, min(
+            int(dialog.winfo_screenheight() * 0.75),
+            140 + len(options) * 40))))
 
         # Prompt label
         tk.Label(
             dialog, text=prompt,
             bg=COLORS["panel_bg"], fg=COLORS["text"],
-            font=("Arial", 11), wraplength=280
-        ).pack(pady=10, padx=10)
+            font=("Arial", 11), wraplength=width - 20
+        ).pack(side=tk.TOP, pady=10, padx=10)
 
-        # Option buttons
-        btn_frame = tk.Frame(dialog, bg=COLORS["panel_bg"])
-        btn_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        # Bottom row - packed BEFORE the option list so pack never clips it
+        bottom = tk.Frame(dialog, bg=COLORS["panel_bg"])
+        bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=10)
+
+        def cancel():
+            result["cancelled"] = True
+            dialog.destroy()
+
+        if required:
+            def refuse_close():
+                self.log("A decision is required - choose one of the "
+                         "%d options" % len(options))
+                dialog.bell()
+            dialog.protocol("WM_DELETE_WINDOW", refuse_close)
+            tk.Label(
+                bottom, text="Decision required: %d options (scroll for "
+                             "more)" % len(options),
+                bg=COLORS["panel_bg"], fg=COLORS["text_dim"],
+                font=("Arial", 9)
+            ).pack()
+        else:
+            cancel_btn = self._make_button(bottom, "Cancel", cancel, width=10)
+            cancel_btn.pack()
+
+        # Option buttons, in a vertically scrolled canvas
+        list_frame = tk.Frame(dialog, bg=COLORS["panel_bg"])
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        canvas = tk.Canvas(list_frame, bg=COLORS["panel_bg"],
+                           highlightthickness=0, width=width - 40)
+        scrollbar = tk.Scrollbar(list_frame, orient=tk.VERTICAL,
+                                 command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        btn_frame = tk.Frame(canvas, bg=COLORS["panel_bg"])
+        frame_item = canvas.create_window((0, 0), window=btn_frame,
+                                          anchor="nw")
+
+        def sync_scrollregion(_e=None):
+            canvas.configure(scrollregion=(0, 0, btn_frame.winfo_reqwidth(),
+                                           btn_frame.winfo_reqheight()))
+        btn_frame.bind("<Configure>", sync_scrollregion)
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(
+            frame_item, width=e.width))
+
+        def on_wheel(event):
+            num = getattr(event, "num", None)
+            if num in (4, 5):
+                step = -1 if num == 4 else 1
+            else:
+                step = -1 if event.delta > 0 else 1
+            canvas.yview_scroll(2 * step, "units")
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            dialog.bind(seq, on_wheel)
 
         def select_option(value):
             result["value"] = value
@@ -3440,18 +3658,10 @@ class WotrGUI:
                 lambda v=value: select_option(v),
                 width=25
             )
-            btn.pack(pady=3)
-
-        # Cancel button
-        cancel_frame = tk.Frame(dialog, bg=COLORS["panel_bg"])
-        cancel_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        def cancel():
-            result["cancelled"] = True
-            dialog.destroy()
-
-        cancel_btn = self._make_button(cancel_frame, "Cancel", cancel, width=10)
-        cancel_btn.pack()
+            btn.configure(wraplength=width - 80, justify=tk.LEFT)
+            btn.pack(fill=tk.X, pady=3)
+        btn_frame.update_idletasks()
+        sync_scrollregion()
 
         # Wait for dialog to close
         dialog.wait_window()
@@ -3515,9 +3725,30 @@ class WotrGUI:
         self.refresh()
 
     def _on_fsp_move(self):
-        """Move the Fellowship and resolve hunt interactively."""
+        """Move the Fellowship with the selected Character / Will of the
+        West die.
+
+        R18-SRC-TOOLS (rows 31, 62; I1): the move is the ENGINE's
+        fellowship_move row for the die, executed through
+        _run_engine_action (ai._execute_action), and the Hunt it starts is
+        the engine's - the Shadow's Flocks of Crebain choice (decider
+        'sh'), the automatic re-rolls, the tile draw, the Wizard's Staff /
+        Mithril / Axe and Bow / Horn choices, the learned damage and
+        casualty choices (1.254), the Gollum-guide reveal rule (1.115),
+        the reveal placement (fellowship_reveal_place) and the Mordor
+        track; each open decision goes to its owner through
+        _drive_engine_decisions (the AI side by search, a human by the
+        required dialog).  The engine offers the row only while the
+        Fellowship is Hidden (rulebook p.38) and below progress 12 / the
+        last Mordor step.  The GUI's own Hunt copy is gone: it called
+        move_fellowship with no Hidden check, asked the Shadow's choices
+        as Yes/No boxes inside the human FP's action, ignored the Gollum
+        guide, placed a cancelled reveal in the first region
+        alphabetically and auto-sacrificed Mordor-track damage."""
         if self.ai_playing:
             self.log('Wait for AI to finish its turn')
+            return
+        if self._ai_mode_decision_open():       # P1-07 / R2-SL-32
             return
         valid = (ActionDieFace.CHARACTER, ActionDieFace.WILL_OF_WEST)
         if self.current_side != Side.FREE_PEOPLES:
@@ -3527,178 +3758,44 @@ class WotrGUI:
         if not self._check_die_selected(valid):
             return
 
-        try:
-            from game_logic import move_fellowship, get_hunt_params, roll_hunt_dice, reroll_hunt_dice
-
-            # Get hunt parameters BEFORE adding die to box (threshold based on existing FP dice)
-            hunt_params = get_hunt_params(self.state)
-
-            # Move fellowship with skip_hunt=True so we handle hunt interactively.
-            # skip_auto_sacrifice=False is EXPLICIT: the legacy manual GUI has no
-            # pending-decision loop, and its MORDOR branch relies on
-            # move_fellowship's internal tile resolution (incl. the
-            # auto-sacrifice policy) - outside Mordor skip_hunt=True keeps
-            # the internal roll (and thus damage) at zero, so the flag
-            # only bites on the Mordor track, exactly where this GUI
-            # needs it.
-            mv = move_fellowship(self.state, skip_hunt=True,
-                                 skip_auto_sacrifice=False)
-            if not mv.get("success", False):
-                self.log(f"Fellowship move failed: {mv.get('message', '')}")
-                self.refresh()
-                return
-            self.log(f"Fellowship moved. Progress: {self.state.fellowship.progress}")
-
-            # Add character die to hunt box AFTER move (per rules).
-            # 'The Last Battle' persistent card: FP movement dice bypass
-            # the box (mirrors the engine executor's guard).
-            from persistent_effects import should_add_dice_to_hunt_box
-            die = self.state.dice[self.current_side][self.selected_die_idx]
-            if should_add_dice_to_hunt_box(self.state) \
-                    and die not in self.state.hunt_box:
-                self.state.hunt_box.append(die)
-            self._use_selected_die()
-
-            # In Mordor the engine resolves the hunt tile inside
-            # move_fellowship; rolling again here would double the hunt.
-            if self.state.fellowship.mordor_entered:
-                self.log(f"  {mv.get('message', '')}")
-                self.refresh()
-                return
-
-            # Use pre-calculated hunt parameters
-            threshold = hunt_params["threshold"]
-            num_dice = hunt_params["num_dice"]
-            fp_dice = hunt_params["fp_dice_in_box"]
-            fp_mod = hunt_params["fp_modifier"]
-            reroll_sources = hunt_params["reroll_sources"]
-
-            self.log(f"Hunt: threshold {threshold}+, {num_dice} dice (hunt level {hunt_params['hunt_level']}), FP modifier +{fp_mod}")
-
-            if num_dice == 0:
-                self.log("Hunt: No dice in hunt box - no hunt roll")
-                self.refresh()
-                return
-
-            # Check for Flocks of Crebain (adds to FP modifier for total modifier)
-            hunt_dice_modifier = fp_mod
-            if self._has_persistent_card("Flocks of Crebain"):
-                if messagebox.askyesno(
-                    "Flocks of Crebain",
-                    "Shadow: Discard Flocks of Crebain to add +1 to all Hunt dice?\n\n"
-                    "(This includes re-rolls)",
-                    parent=self.root
-                ):
-                    hunt_dice_modifier += 1
-                    self._remove_persistent_card("Flocks of Crebain")
-                    self.log("  Flocks of Crebain used: +1 to all Hunt dice")
-
-            # Roll hunt dice (fp_modifier handles the FP dice bonus;
-            # Crebain is additional on top)
-            roll_result = roll_hunt_dice(num_dice, threshold, fp_modifier=hunt_dice_modifier)
-            rolls = roll_result["rolls"]
-            modified_rolls = roll_result["modified"]
-            hits = roll_result["hits"]
-
-            if hunt_dice_modifier > 0:
-                self.log(f"Hunt roll: {rolls} (+{hunt_dice_modifier} = {modified_rolls}) (threshold {threshold}+, nat 1 misses) = {hits} hit(s)")
-            else:
-                self.log(f"Hunt roll: {rolls} (threshold {threshold}+) = {hits} hit(s)")
-
-            # Offer re-rolls if sources available and there are misses
-            misses_count = num_dice - hits
-            if reroll_sources and misses_count > 0:
-                for src in reroll_sources:
-                    self.log(f"  Re-roll available: {src}")
-
-                rerolls_available = min(len(reroll_sources), misses_count)
-                if messagebox.askyesno(
-                    "Hunt Re-rolls",
-                    f"Shadow has {rerolls_available} re-roll(s) available.\n"
-                    f"Hits so far: {hits}/{num_dice}\n\nRe-roll misses?",
-                    parent=self.root
-                ):
-                    reroll_result = reroll_hunt_dice(rerolls_available, threshold,
-                                                     fp_modifier=hunt_dice_modifier)
-                    reroll_rolls = reroll_result["rolls"]
-                    modified_rerolls = reroll_result["modified"]
-                    new_hits = reroll_result["hits"]
-                    hits += new_hits
-                    if hunt_dice_modifier > 0:
-                        self.log(f"  Re-roll: {reroll_rolls} (+{hunt_dice_modifier} = {modified_rerolls}) = {new_hits} additional hit(s)")
-                    else:
-                        self.log(f"  Re-roll: {reroll_rolls} = {new_hits} additional hit(s)")
-
-            # If hit, draw hunt tile
-            if hits > 0:
-                self._draw_hunt_tile(hits)
-            else:
-                self.log("Hunt: No hits - fellowship safe")
-
-        except Exception as e:
-            self.log(f"FSP move failed: {e}")
-            import traceback
-            traceback.print_exc()
-
-        self.refresh()
-
-    def _draw_hunt_tile(self, hunt_hits: int):
-        """Draw a hunt tile and resolve its effect."""
-        from game_logic import draw_hunt_tile, remove_persistent_card
-
-        if not self.state.hunt_pool:
-            self.log("Hunt pool empty!")
+        acts = self._engine_die_menu(Side.FREE_PEOPLES,
+                                     self.selected_die_idx,
+                                     ('fellowship_move',))
+        if acts is None:
             return
-
-        # Check for Wizard's Staff first
-        if self._has_persistent_card("Wizard's Staff"):
-            if messagebox.askyesno(
-                "Wizard's Staff",
-                "Use Wizard's Staff to cancel the hunt tile draw?",
-                parent=self.root
-            ):
-                self.log("Wizard's Staff used - tile draw cancelled!")
-                remove_persistent_card(self.state, "Wizard's Staff")
-                return
-
-        # Draw tile using game_logic (handles randomness)
-        result = draw_hunt_tile(self.state, hunt_hits)
-
-        if not result["success"]:
-            self.log(result.get("message", "Failed to draw tile"))
+        if not acts:
+            self.log(self._fellowship_move_refusal())
             return
+        if len(acts) != 1:
+            # one fellowship_move row per die: anything else is an engine
+            # defect - refuse loudly, never pick one
+            self.log(f"The engine served {len(acts)} Fellowship moves for "
+                     f"this die - action not taken")
+            return
+        fs = self.state.fellowship
+        mordor = fs.mordor_entered
+        corruption0 = fs.corruption
+        # R2-SL-32: _run_engine_action arms the AI reply only after every
+        # decision of the Hunt resolution has returned
+        if not self._run_engine_action(acts[0]):
+            return
+        where = (f"Mordor step {fs.mordor_step}/5" if mordor
+                 else f"progress {fs.progress}")
+        self.log(f"Fellowship moved: {where}, corruption {fs.corruption}"
+                 f" ({fs.corruption - corruption0:+d}), "
+                 f"{'hidden' if fs.hidden else 'REVEALED'}")
 
-        tile = result["tile"]
-        damage = result["damage"]
-        reveal = result["reveal"]
-
-        self.log(f"Hunt tile drawn: {result['tile_name']}")
-        if result["is_eye"]:
-            self.log(f"  Eye tile: {damage} damage (= hunt hits)")
-        else:
-            self.log(f"  Damage: {damage}")
-
-        if reveal:
-            self.log("  Fellowship must be revealed!")
-
-        # Show hunt resolution dialog.  draw_hunt_tile already filed the
-        # tile into hunt_discard (drawn = used pile); a Mithril redraw
-        # moves it back to the pool inside the dialog.
-        self._resolve_hunt_damage(damage, reveal, tile, hunt_hits)
-
-    def _has_persistent_card(self, card_name: str) -> bool:
-        """Check if a persistent card is in play.  state.persistent_cards
-        is always a PersistentCardState (typed field with a default
-        factory); no dict format exists."""
-        return self.state.persistent_cards.has_card(card_name)
-
-    def _remove_persistent_card(self, card_name: str):
-        """Remove a persistent card from play."""
-        from game_logic import remove_persistent_card
-
-        result = remove_persistent_card(self.state, card_name)
-        if result["success"]:
-            self.log(f"  {card_name} discarded from table")
+    def _fellowship_move_refusal(self) -> str:
+        """Why the engine offers no fellowship_move row for the die."""
+        fs = self.state.fellowship
+        if not fs.hidden:
+            return ("The Fellowship is revealed - it must be hidden again "
+                    "before it can move (rulebook p.38)")
+        if fs.mordor_entered and fs.mordor_step >= 5:
+            return "The Fellowship is at the end of the Mordor track"
+        if not fs.mordor_entered and fs.progress >= 12:
+            return "The Fellowship cannot move further (progress 12)"
+        return "The engine offers no Fellowship move with this die"
 
     def _check_shadow_movement_blocked(self, region: str) -> tuple:
         """
@@ -3709,417 +3806,71 @@ class WotrGUI:
         ok, blocker = can_shadow_move_to(self.state, region)
         return (not ok), blocker
 
-    def _check_palantir_card_draw(self, played_deck=None,
-                                  played_card=None, die_face=None):
-        """
-        The Palantír of Orthanc bonus draw for the GUI play path.
-        Rules (1.208m + USER 2026-08-15, superseding the 2026-07-08
-        immediate-draw model): fires only when the play used an EVENT
-        die, and NEVER on the Palantír's own play (no self-trigger).
-        The GUI keeps the same-deck default; the engine's learned
-        which-deck decision (_open_palantir_deck_choice) governs
-        self-play/live.
-        """
-        from persistent_effects import should_draw_extra_card_on_event
-
-        if not should_draw_extra_card_on_event(self.state):
-            return
-        # no self-trigger (USER 2026-08-15): the just-played Palantir
-        # is already on the table when this check runs
-        _pname = str(getattr(played_card, 'card_name', '') or '').lower()
-        if 'palant' in _pname:
-            return
-        # 1.208m: the bonus keys on an EVENT die play
-        if die_face is not None and die_face != ActionDieFace.EVENT:
-            return
-
-        from game_logic import draw_event_card
-        deck = str(played_deck).lower() if played_deck else "character"
-        if deck not in ("character", "strategy"):
-            deck = "character"
-
-        try:
-            draw_event_card(self.state, Side.SHADOW, deck)
-            self.log(f"  Palantír bonus: Drew {deck.title()} card")
-            # Sync to GUI hand
-            self._sync_hands()
-        except RuntimeError as e:
-            self.log(f"  Palantír bonus: Could not draw ({e})")
-
-    def _check_gandalf_card_draw(self, die_face, played_deck=None):
-        """
-        Gandalf the Grey's guide ability (USER RULE 2026-07-08): when FP
-        plays a card with an Event or Will of the West die, draw a card
-        of the SAME DECK as the one just played — no deck prompt.
-        """
-        # Check if Gandalf the Grey is the guide
-        guide = self.state.fellowship.guide
-        if not guide or guide.name != "Gandalf the Grey":
-            return
-
-        # Check if the die was Event or Will of the West
-        if die_face not in (ActionDieFace.EVENT, ActionDieFace.WILL_OF_WEST):
-            return
-
-        from game_logic import draw_event_card
-        deck = str(played_deck).lower() if played_deck else "character"
-        if deck not in ("character", "strategy"):
-            deck = "character"
-
-        try:
-            draw_event_card(self.state, Side.FREE_PEOPLES, deck)
-            self.log(f"  Gandalf's Wisdom: Drew {deck.title()} card")
-            # Sync to GUI hand
-            self._sync_hands()
-        except RuntimeError as e:
-            self.log(f"  Gandalf's Wisdom: Could not draw ({e})")
-
     def _sync_hands(self):
         """Synchronize GUI hands with game state hands."""
         for side in [Side.FREE_PEOPLES, Side.SHADOW]:
             self.hands[side] = list(self.state.hands[side].hand)
 
-    def _resolve_hunt_damage(self, damage: int, reveal: bool, tile,
-                             hunt_hits: int = 0) -> bool:
-        """Show dialog for FP to resolve hunt damage.  Returns True when
-        Mithril Coat replaced the tile (it went back to the pool, so the
-        caller must not file it into a used pile)."""
-        if damage == 0 and not reveal:
-            self.log("  No damage to resolve")
-            return False
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Hunt Damage Resolution")
-        dialog.configure(bg=COLORS["panel_bg"])
-        dialog.geometry("450x500")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        remaining_damage = [damage]  # Use list for mutable reference
-        reveal_flag = [reveal]       # Gollum's guidance can force a reveal
-        tile_replaced = [False]      # Mithril Coat drew a replacement tile
-
-        # Header
-        tk.Label(
-            dialog, text=f"Hunt Damage: {damage}",
-            bg=COLORS["panel_bg"], fg=COLORS["error"],
-            font=("Arial", 14, "bold")
-        ).pack(pady=10)
-
-        status_var = tk.StringVar(value=f"Remaining damage: {damage}")
-        status_label = tk.Label(dialog, textvariable=status_var,
-                               bg=COLORS["panel_bg"], fg=COLORS["highlight"])
-        status_label.pack(pady=5)
-
-        def update_status():
-            status_var.set(f"Remaining damage: {remaining_damage[0]}")
-
-        options_frame = tk.Frame(dialog, bg=COLORS["panel_bg"])
-        options_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        # Mithril Coat option (draw another tile)
-        if self._has_persistent_card("Mithril Coat and Sting"):
-            def use_mithril():
-                self.log("  Mithril Coat used - drawing replacement tile")
-                # Put current tile back (it was filed into hunt_discard
-                # at draw time — conservation: one pile at a time)
-                tile_replaced[0] = True
-                if tile in self.state.hunt_discard:
-                    self.state.hunt_discard.remove(tile)
-                self.state.hunt_pool.append(tile)
-                self._remove_persistent_card("Mithril Coat and Sting")
-                dialog.destroy()
-                # Re-trigger with the ORIGINAL hunt hits (an Eye
-                # replacement tile's damage = hunt hits, not this
-                # tile's possibly-reduced damage).
-                self._draw_hunt_tile(hunt_hits)
-
-            self._make_button(options_frame, "Use Mithril Coat (draw new tile)",
-                            use_mithril, width=35).pack(pady=3)
-
-        # Axe and Bow (-1 damage)
-        if self._has_persistent_card("Axe and Bow") and remaining_damage[0] > 0:
-            def use_axe_bow():
-                remaining_damage[0] = max(0, remaining_damage[0] - 1)
-                self.log("  Axe and Bow: -1 damage")
-                self._remove_persistent_card("Axe and Bow")
-                update_status()
-
-            self._make_button(options_frame, "Use Axe and Bow (-1 damage)",
-                            use_axe_bow, width=35).pack(pady=3)
-
-        # Horn of Gondor (-1 damage)
-        if self._has_persistent_card("Horn of Gondor") and remaining_damage[0] > 0:
-            def use_horn():
-                remaining_damage[0] = max(0, remaining_damage[0] - 1)
-                self.log("  Horn of Gondor: -1 damage")
-                self._remove_persistent_card("Horn of Gondor")
-                update_status()
-
-            self._make_button(options_frame, "Use Horn of Gondor (-1 damage)",
-                            use_horn, width=35).pack(pady=3)
-
-        # Sacrifice guide (absorbs the guide's LEVEL, not all damage;
-        # engine twin: _apply_fellowship_damage sacrifice_guide=True)
-        guide = self.state.fellowship.guide
-        if guide and guide.name != "Gollum" and remaining_damage[0] > 0:
-            def sacrifice_guide():
-                from game_logic import _on_companion_casualty, change_guide
-                guide_name = guide.name
-                absorbed = getattr(guide, 'level', 1)
-                self.state.fellowship.companions.remove(guide)
-                # USER 2026-08-15: hobbit guide = separation, no WWSAT
-                _on_companion_casualty(
-                    self.state, guide_name,
-                    casualty=guide_name not in ('Meriadoc', 'Peregrin'))
-                try:
-                    change_guide(self.state, allow_pending=True)
-                except Exception as e:
-                    self.log(f"  Guide reassignment failed: {e}")
-                self.log(f"  {guide_name} sacrificed as casualty "
-                         f"(absorbs {absorbed})")
-                remaining_damage[0] = max(0, remaining_damage[0] - absorbed)
-                update_status()
-
-            self._make_button(options_frame, f"Sacrifice Guide ({guide.name})",
-                            sacrifice_guide, width=35).pack(pady=3)
-
-        # Sacrifice random companion (absorbs the victim's LEVEL)
-        companions = [c for c in self.state.fellowship.companions if c.name != "Gollum"]
-        if companions and remaining_damage[0] > 0:
-            def sacrifice_random():
-                from game_logic import sacrifice_random_companion
-                levels = {c.name: getattr(c, 'level', 1)
-                          for c in self.state.fellowship.companions}
-                result = sacrifice_random_companion(self.state)
-                if result["success"]:
-                    self.log(f"  {result['message']}")
-                    absorbed = levels.get(result.get("victim"), 1)
-                    remaining_damage[0] = max(0,
-                                              remaining_damage[0] - absorbed)
-                    update_status()
-
-            self._make_button(options_frame, "Sacrifice Random Companion",
-                            sacrifice_random, width=35).pack(pady=3)
-
-        # Gollum's ability (if guide and not eye tile): single use,
-        # and using it reveals the Fellowship.
-        if guide and guide.name == "Gollum" and not tile.is_eye:
-            _gollum_used = [False]
-
-            def use_gollum():
-                if _gollum_used[0]:
-                    return
-                _gollum_used[0] = True
-                remaining_damage[0] = max(0, remaining_damage[0] - 1)
-                reveal_flag[0] = True
-                self.log("  Gollum guides safely: -1 damage, reveals")
-                update_status()
-
-            self._make_button(options_frame, "Gollum's Guidance (-1, reveals)",
-                            use_gollum, width=35).pack(pady=3)
-
-        # Take corruption damage
-        def take_damage():
-            self.state.fellowship.corruption += remaining_damage[0]
-            self.log(f"  Fellowship takes {remaining_damage[0]} corruption (total: {self.state.fellowship.corruption})")
-            if self.state.fellowship.corruption >= 12:
-                messagebox.showwarning("Corruption!", "Fellowship has 12+ corruption!\nRing-bearers corrupted - Shadow wins!")
-            remaining_damage[0] = 0
-            update_status()
-
-        self._make_button(options_frame, "Take Corruption Damage (remaining)",
-                        take_damage, width=35).pack(pady=3)
-
-        # Handle reveal warning
-        if reveal:
-            progress = self.state.fellowship.progress
-            tk.Label(options_frame, text=f"Fellowship MUST be revealed!\n(Must move up to {progress} steps, cannot end in FP stronghold/city)",
-                    bg=COLORS["panel_bg"], fg=COLORS["error"],
-                    font=("Arial", 10, "bold"), wraplength=400).pack(pady=10)
-
-        # Done button
-        def done():
-            # Apply any remaining damage as corruption
-            if remaining_damage[0] > 0:
-                self.state.fellowship.corruption += remaining_damage[0]
-                self.log(f"  Remaining {remaining_damage[0]} taken as corruption")
-
-            dialog.destroy()
-
-            # Handle reveal - show destination dialog
-            if reveal_flag[0]:
-                self._handle_reveal_destination()
-
-        self._make_button(options_frame, "Done", done, bg=COLORS["success"],
-                        width=15).pack(pady=20)
-
-        dialog.wait_window()
-        return tile_replaced[0]
-
-    def _handle_reveal_destination(self):
-        """Handle fellowship reveal - must choose destination and reset progress."""
-        from game_logic import fellowship_region
-        from board import regions as board_regions
-
-        progress = self.state.fellowship.progress
-        current = fellowship_region(self.state)
-
-        self.log(f"  Fellowship revealed! Must move up to {progress} step(s)")
-
-        if progress == 0:
-            # No progress, just reveal in place
-            self.state.fellowship.hidden = False
-            self.log(f"  Fellowship revealed in {current} (no progress to move)")
-            return
-
-        # Calculate reachable regions (cannot end in FP cities/strongholds when revealed)
-        reachable = self._get_reveal_reachable_regions(current, progress)
-
-        if not reachable:
-            # Shouldn't happen, but fallback to staying in place
-            self.state.fellowship.hidden = False
-            self.state.fellowship.progress = 0
-            self.log(f"  No valid destinations - revealed in {current}")
-            return
-
-        # Show destination dialog
-        dest = self._show_destination_dialog(
-            "Reveal Destination",
-            f"Fellowship revealed! Select destination (up to {progress} steps):\n"
-            "(Cannot end in FP stronghold/city when revealed)",
-            sorted(reachable)
-        )
-
-        if not dest:
-            # User cancelled - pick first available
-            dest = sorted(reachable)[0]
-            self.log(f"  No selection - defaulting to {dest}")
-
-        try:
-            # Build path to destination (simple: just set destination)
-            # For proper path, would need pathfinding
-            self.state.fellowship.region = self.board.region(sanitize(dest))
-            self.state.fellowship.progress = 0
-            self.state.fellowship.hidden = False
-
-            self.log(f"  Fellowship revealed in {dest}")
-
-            # Check for shadow stronghold (extra tile).  The stronghold
-            # must still be SHADOW-controlled (not FP-captured).
-            from game_logic import is_shadow_region
-            _dest_san = sanitize(dest)
-            _ec = getattr(self.state, 'enemy_controlled', {}) or {}
-            dest_meta = board_regions.get(_dest_san, {})
-            if (dest_meta.get("is_stronghold") and is_shadow_region(dest)
-                    and _dest_san not in _ec.get(Side.FREE_PEOPLES, set())):
-                self.log("  Revealed in Shadow stronghold - drawing extra tile!")
-                self._draw_extra_shadow_stronghold_tile()
-
-        except Exception as e:
-            self.log(f"  Reveal failed: {e}")
-            # Fallback - just reveal in place
-            self.state.fellowship.hidden = False
-            self.state.fellowship.progress = 0
-
-    def _get_reveal_reachable_regions(self, start: str, max_steps: int) -> set:
-        """
-        Get regions reachable for fellowship reveal.
-        When revealed, fellowship CANNOT end in FP cities/strongholds.
-        """
-        from board import regions as board_regions
-        from game_logic import is_shadow_region
-        from collections import deque
-
-        start_san = sanitize(start)
-        reachable = set()
-        visited = {start_san: 0}
-        queue = deque([(start_san, 0)])
-
-        while queue:
-            current, steps = queue.popleft()
-
-            if steps > 0:
-                # Valid reveal destination = not an FP-CONTROLLED
-                # city/stronghold.  Control, not native faction: a
-                # Shadow-captured FP city is legal, an FP-captured
-                # Shadow settlement is not.
-                ec = getattr(self.state, 'enemy_controlled', {}) or {}
-                meta = board_regions.get(current, {})
-                is_settlement = meta.get("is_city") or meta.get("is_stronghold")
-                fp_controlled = ((not is_shadow_region(current)
-                                  and current not in ec.get(Side.SHADOW, set()))
-                                 or current in ec.get(Side.FREE_PEOPLES, set()))
-                if not (is_settlement and fp_controlled):
-                    reachable.add(current)
-
-            if steps >= max_steps:
-                continue
-
-            for neighbor in self.board.adjacent(current):
-                neighbor_san = sanitize(neighbor)
-                if neighbor_san not in visited or visited[neighbor_san] > steps + 1:
-                    visited[neighbor_san] = steps + 1
-                    queue.append((neighbor_san, steps + 1))
-
-        return reachable
-
-    def _draw_extra_shadow_stronghold_tile(self):
-        """Draw extra hunt tile when revealed in/passing through shadow stronghold."""
-        from game_logic import draw_extra_stronghold_tile
-        result = draw_extra_stronghold_tile(self.state)
-
-        self.log(f"  {result['message']}")
-        if result["success"] and result["damage"] > 0:
-            self.log(f"  Corruption now: {self.state.fellowship.corruption}")
-
     def _on_fsp_hide(self):
-        """Hide the Fellowship. Strider as guide allows hiding with any die."""
+        """Hide the Fellowship with the selected die.
+
+        R18-SRC-TOOLS (row 31; I1): the hide is the ENGINE's
+        fellowship_hide row for the die (a Character / Will of the West
+        die, or any die under the Strider Guide's ability), executed
+        through _run_engine_action.  The engine offers it only while the
+        Fellowship is revealed; the old button called hide_fellowship,
+        ignored its refusal ('Fellowship already hidden') and still spent
+        the die."""
         if self.ai_playing:
             self.log('Wait for AI to finish its turn')
+            return
+        if self._ai_mode_decision_open():       # P1-07 / R2-SL-32
             return
         if self.current_side != Side.FREE_PEOPLES:
             self.log("Only Free Peoples can hide the Fellowship")
             return
 
-        # Check if Strider/Aragorn is the guide (allows any die)
-        guide = self.state.fellowship.guide
-        strider_is_guide = guide and guide.name in ("Strider", "Aragorn")
+        # any rolled, unused die: the engine menu decides which may hide
+        if not self._check_die_selected(tuple(ActionDieFace)):
+            return
 
-        if strider_is_guide:
-            # Strider's ability: can hide with any die
-            if self.selected_die_idx is None:
-                self.log("Select any die to hide (Strider's ability)")
-                return
-            dice = self.state.dice.get(self.current_side, [])
-            if self.selected_die_idx >= len(dice) or dice[self.selected_die_idx].used:
-                self.log("Select an unused die")
-                return
-        else:
-            # Normal: requires Character or Will of the West
-            valid = (ActionDieFace.CHARACTER, ActionDieFace.WILL_OF_WEST)
-            if not self._check_die_selected(valid):
-                return
-
-        try:
-            from game_logic import hide_fellowship
-            hide_fellowship(self.state)
-            self._use_selected_die()
-            if strider_is_guide:
-                self.log("Fellowship hidden (Strider's ability - any die)")
+        acts = self._engine_die_menu(Side.FREE_PEOPLES,
+                                     self.selected_die_idx,
+                                     ('fellowship_hide',))
+        if acts is None:
+            return
+        if not acts:
+            if self.state.fellowship.hidden:
+                self.log("The Fellowship is already hidden - no die spent")
             else:
-                self.log("Fellowship hidden")
-        except Exception as e:
-            self.log(f"FSP hide failed: {e}")
-
-        self.refresh()
+                self.log("This die cannot hide the Fellowship (a Character "
+                         "or Will of the West die; any die with Strider "
+                         "as Guide)")
+            return
+        if len(acts) != 1:
+            # one fellowship_hide row per die: anything else is an engine
+            # defect - refuse loudly, never pick one
+            self.log(f"The engine served {len(acts)} Fellowship hides for "
+                     f"this die - action not taken")
+            return
+        # R2-SL-32: _run_engine_action arms the AI reply after the action
+        self._run_engine_action(
+            acts[0], "Fellowship hidden (Strider's ability - any die)"
+            if acts[0].params.get('strider_ability') else "Fellowship hidden")
 
     def _on_move_nazgul(self):
-        """
-        Move Nazgûl (and Mouth of Sauron) independently with 1 character die.
-        - Nazgûl can move anywhere (unless FP army there)
-        - Witch King has infinite movement
-        - Mouth of Sauron moves 3 spaces (subject to companion rules - stops at enemy strongholds)
+        """Shadow Character die: fly Nazgul - the Witch-king included (he
+        is a Nazgul for all rules) - and/or move the Mouth of Sauron.
+
+        P1-10 (I1): the menu is the ENGINE's (get_legal_actions'
+        nazgul_move / mouth_move rows for the selected die), every move
+        executes through ai._execute_action, and further flights on the
+        SAME die are the engine's '__nazgul_moves__' chain.  Destinations
+        are the engine's: any region except an FP-controlled Stronghold
+        not besieged by the Shadow (ruling 1.251: a Nazgul MAY end on an
+        FP field army); the Mouth moves up to 3 regions companion-style
+        (1.262).  The GUI no longer computes reachability or edits
+        state.armies itself.
         """
         if self.ai_playing:
             self.log('Wait for AI to finish its turn')
@@ -4133,259 +3884,20 @@ class WotrGUI:
         if not self._check_die_selected(valid):
             return
 
-        # Find all Nazgûl and Mouth of Sauron on board
-        nazgul_on_board = []  # (region, nazgul_obj)
-        mouth_on_board = None  # (region, minion_obj)
-
-        from game_logic import Minion
-
-        for region_key, army in self.state.armies.items():
-            for leader in army.leaders:
-                if isinstance(leader, Nazgul):
-                    nazgul_on_board.append((region_key, leader))
-                elif isinstance(leader, Minion) and leader.name == "Mouth of Sauron":
-                    mouth_on_board = (region_key, leader)
-
-        if not nazgul_on_board and not mouth_on_board:
-            self.log("No Nazgûl or Mouth of Sauron on board")
+        acts = self._engine_die_menu(Side.SHADOW, self.selected_die_idx,
+                                     ('nazgul_move', 'mouth_move'))
+        if acts is None:
             return
-
-        self._show_nazgul_movement_dialog(nazgul_on_board, mouth_on_board)
-
-    def _show_nazgul_movement_dialog(self, nazgul_on_board, mouth_on_board):
-        """Dialog to move Nazgûl and Mouth of Sauron independently."""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Move Nazgûl")
-        dialog.configure(bg=COLORS["panel_bg"])
-        dialog.geometry("550x600")
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        tk.Label(
-            dialog, text="Move Nazgûl & Minions",
-            bg=COLORS["panel_bg"], fg=COLORS["highlight"],
-            font=("Arial", 12, "bold")
-        ).pack(pady=10)
-
-        tk.Label(
-            dialog, text="1 Character die moves ALL Nazgûl independently.\nNazgûl can go anywhere (no FP armies).\nMouth of Sauron: 3 spaces, stops at enemy strongholds.",
-            bg=COLORS["panel_bg"], fg=COLORS["text"], justify=tk.LEFT
-        ).pack(pady=5)
-
-        # Scrollable frame
-        canvas = tk.Canvas(dialog, bg=COLORS["panel_bg"], highlightthickness=0)
-        scrollbar = tk.Scrollbar(dialog, orient="vertical", command=canvas.yview)
-        scroll_frame = tk.Frame(canvas, bg=COLORS["panel_bg"])
-
-        scroll_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=5)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
-
-        # Track destinations
-        destinations = {}
-        dest_labels = {}
-        all_movers = []  # (index, region, obj, name, max_move)
-
-        idx = 0
-        for region, naz in nazgul_on_board:
-            all_movers.append((idx, region, naz, "Nazgûl", 99))  # Infinite movement
-            idx += 1
-
-        if mouth_on_board:
-            region, mouth = mouth_on_board
-            all_movers.append((idx, region, mouth, "Mouth of Sauron", 3))
-
-        def get_nazgul_reachable(start_region, max_move, is_mouth=False):
-            """Get regions Nazgûl/Mouth can reach."""
-            from collections import deque
-            from board import adj, regions as board_regions
-
-            start_san = sanitize(start_region)
-            reachable = set()
-            visited = {start_san: 0}
-            queue = deque([(start_san, 0)])
-
-            while queue:
-                current, steps = queue.popleft()
-
-                if current != start_san:
-                    # Check if FP army present (Nazgûl can't go there)
-                    has_fp_army = False
-                    if current in self.state.armies:
-                        army = self.state.armies[current]
-                        for unit in army.units:
-                            if unit.nation in [Nation.ELVES, Nation.DWARVES, Nation.GONDOR,
-                                              Nation.THE_NORTH, Nation.ROHAN]:
-                                has_fp_army = True
-                                break
-                    if not has_fp_army:
-                        reachable.add(current)
-
-                if steps >= max_move:
-                    continue
-
-                for neighbor in adj.get(current, []):
-                    if neighbor not in visited or visited[neighbor] > steps + 1:
-                        # Mouth of Sauron stops on ENTERING an enemy
-                        # (FP-CONTROLLED) stronghold: native FP and not
-                        # Shadow-captured, or Shadow-native but
-                        # FP-captured.  Never passes through one.
-                        if is_mouth:
-                            from game_logic import is_shadow_region
-                            info = board_regions.get(neighbor, {})
-                            ec = getattr(self.state, 'enemy_controlled',
-                                         {}) or {}
-                            fp_ctrl = ((not is_shadow_region(neighbor)
-                                        and neighbor not in ec.get(
-                                            Side.SHADOW, set()))
-                                       or neighbor in ec.get(
-                                           Side.FREE_PEOPLES, set()))
-                            if info.get("is_stronghold") and fp_ctrl:
-                                visited[neighbor] = steps + 1
-                                reachable.add(neighbor)  # Can stop here
-                                continue  # But can't continue past
-                        visited[neighbor] = steps + 1
-                        queue.append((neighbor, steps + 1))
-
-            return reachable
-
-        def select_destination(idx, region, obj, name, max_move):
-            is_mouth = name == "Mouth of Sauron"
-            reachable = get_nazgul_reachable(region, max_move, is_mouth)
-
-            # Show selection dialog
-            dest_dialog = tk.Toplevel(dialog)
-            dest_dialog.title(f"Move {name}")
-            dest_dialog.configure(bg=COLORS["panel_bg"])
-            dest_dialog.geometry("300x400")
-            dest_dialog.transient(dialog)
-            dest_dialog.grab_set()
-
-            tk.Label(dest_dialog, text=f"Move {name} from {region}",
-                    bg=COLORS["panel_bg"], fg=COLORS["text"]).pack(pady=10)
-
-            listbox = tk.Listbox(dest_dialog, bg=COLORS["bg"], fg=COLORS["text"], height=15)
-            for r in sorted(reachable):
-                listbox.insert(tk.END, r)
-            listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-            def select():
-                sel = listbox.curselection()
-                if sel:
-                    dest = listbox.get(sel[0])
-                    destinations[idx] = dest
-                    dest_labels[idx].config(text=f"→ {dest}", fg=COLORS["success"])
-                dest_dialog.destroy()
-
-            def cancel():
-                dest_dialog.destroy()
-
-            btn_frame = tk.Frame(dest_dialog, bg=COLORS["panel_bg"])
-            btn_frame.pack(fill=tk.X, padx=10, pady=10)
-            self._make_button(btn_frame, "Select", select, bg=COLORS["success"]).pack(side=tk.LEFT, padx=5)
-            self._make_button(btn_frame, "Cancel", cancel).pack(side=tk.LEFT, padx=5)
-
-            dest_dialog.wait_window()
-
-        def clear_destination(idx):
-            if idx in destinations:
-                del destinations[idx]
-            dest_labels[idx].config(text="(staying)", fg=COLORS["text_dim"])
-
-        # Create row for each mover
-        for idx, region, obj, name, max_move in all_movers:
-            row_frame = tk.Frame(scroll_frame, bg=COLORS["bg"], relief=tk.RAISED, bd=1)
-            row_frame.pack(fill=tk.X, padx=5, pady=3)
-
-            info_frame = tk.Frame(row_frame, bg=COLORS["bg"])
-            info_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5, pady=5)
-
-            tk.Label(
-                info_frame, text=name,
-                bg=COLORS["bg"], fg=COLORS["shadow_primary"],
-                font=("Arial", 10, "bold")
-            ).pack(anchor="w")
-
-            tk.Label(
-                info_frame, text=f"Currently in: {region}",
-                bg=COLORS["bg"], fg=COLORS["text"]
-            ).pack(anchor="w")
-
-            dest_label = tk.Label(
-                info_frame, text="(staying)",
-                bg=COLORS["bg"], fg=COLORS["text_dim"]
-            )
-            dest_label.pack(anchor="w")
-            dest_labels[idx] = dest_label
-
-            btn_frame = tk.Frame(row_frame, bg=COLORS["bg"])
-            btn_frame.pack(side=tk.RIGHT, padx=5, pady=5)
-
-            self._make_button(
-                btn_frame, "Move",
-                lambda i=idx, r=region, o=obj, n=name, m=max_move: select_destination(i, r, o, n, m),
-                bg=COLORS["button_bg"]
-            ).pack(side=tk.LEFT, padx=2)
-
-            self._make_button(
-                btn_frame, "Clear",
-                lambda i=idx: clear_destination(i),
-                bg=COLORS["text_dim"]
-            ).pack(side=tk.LEFT, padx=2)
-
-        result = {"done": False, "moved": False}
-
-        def execute_moves():
-            if not destinations:
-                messagebox.showwarning("No Moves", "Select at least one destination")
-                return
-
-            moved_items = []
-            for idx, dest in destinations.items():
-                _, region, obj, name, _ = all_movers[idx]
-
-                # Remove from current army (drop the entry when emptied,
-                # matching the engine's mover executors)
-                _src_army = self.state.armies[region]
-                _src_army.leaders.remove(obj)
-                if not _src_army.units and not _src_army.leaders:
-                    del self.state.armies[region]
-
-                # Add to destination
-                dest_san = sanitize(dest)
-                # Armies ONLY via get_or_create_army: raw exact-key
-                # creation forges duplicates beside original-name keys.
-                from game_logic import get_or_create_army
-                get_or_create_army(self.state, dest_san).leaders.append(obj)
-
-                moved_items.append(f"{name} → {dest}")
-
-            self._use_selected_die()
-            self.log(f"Moved: {', '.join(moved_items)}")
-            result["moved"] = True
-            result["done"] = True
-            dialog.destroy()
-
-        def cancel():
-            result["done"] = True
-            dialog.destroy()
-
-        btn_frame = tk.Frame(dialog, bg=COLORS["panel_bg"])
-        btn_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        self._make_button(btn_frame, "Execute All Moves", execute_moves, bg=COLORS["success"]).pack(side=tk.LEFT, padx=5)
-        self._make_button(btn_frame, "Cancel", cancel).pack(side=tk.LEFT, padx=5)
-
-        dialog.wait_window()
-        if result["moved"]:
-            self.refresh()
+        if not acts:
+            self.log("No Nazgûl, Witch-king or Mouth of Sauron can move "
+                     "with this die")
+            return
+        groups, _done = self._figure_move_groups(acts)
+        pick = self._pick_figure_move("Move Nazgûl", groups)
+        if pick is None:
+            self.log("Nazgûl move cancelled")
+            return
+        self._run_figure_moves(pick, "Moved")
 
     def _on_fsp_declare(self):
         """
@@ -4411,6 +3923,16 @@ class WotrGUI:
         # _get_declare_actions returns [] when not hidden).
         if not self.state.fellowship.hidden:
             self.log("Revealed fellowship must spend a die to hide")
+            return
+
+        # R2-SL-33: one declaration per Fellowship phase, before its tail
+        if getattr(self.state, '_fellowship_tail_phase', False):
+            self.log("The Fellowship already declared this turn - "
+                     "ROLL DICE finishes the Fellowship phase")
+            return
+        if self._fellowship_phase_closed():
+            self.log("The Fellowship phase is over for this turn - "
+                     "declare before the Hunt allocation and the roll")
             return
 
         # Progress 0 / declaring IN PLACE is legal RAW (Mordor entry from
@@ -4443,6 +3965,7 @@ class WotrGUI:
             self.log("Declaration cancelled")
             return
 
+        declared = False
         try:
             # Route through the engine (fellowship_declare is a free
             # action, die_idx=-1) so the Mordor-entry check + rules match
@@ -4451,6 +3974,7 @@ class WotrGUI:
             _execute_action(self.state, Action(
                 die_idx=-1, action_type='fellowship_declare',
                 params={'region': sanitize(dest)}))
+            declared = True
             self.log(f"Fellowship declared in {dest}")
             meta = board_regions.get(sanitize(dest), {})
             is_settlement = meta.get("is_city") or meta.get("is_stronghold")
@@ -4459,6 +3983,11 @@ class WotrGUI:
         except Exception as e:
             self.log(f"Declaration failed: {e}")
 
+        # R2-SL-33: the declaration opened the engine's Fellowship tail
+        # (_fellowship_tail_phase); drive it now - Mordor entry, the
+        # declaration's effects, the Guide - never leave the bare flag
+        if declared:
+            self._legacy_fellowship_phase()
         self.refresh()
 
     def _get_declare_reachable_regions(self, start: str, max_steps: int) -> set:
@@ -4538,51 +4067,39 @@ class WotrGUI:
             self.log("Cannot allocate eyes after rolling - eyes are auto-allocated on roll")
             return
 
-        # Show dialog to select dice to allocate as eyes
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Allocate Eyes (Pre-Roll)")
-        dialog.configure(bg=COLORS["panel_bg"])
-        dialog.transient(self.root)
-        dialog.grab_set()
-        dialog.geometry("400x400")
+        # R2-RS-P1-09: the Shadow AI makes its own Hunt allocation at ROLL
+        # DICE (a human one would stack on it), and there is one Hunt
+        # allocation per turn (the engine eye menu does not subtract eyes
+        # already allocated)
+        if self.ai_side == Side.SHADOW:
+            self.log("The Shadow AI allocates its own Hunt eyes at ROLL "
+                     "DICE - no human allocation")
+            return
+        if getattr(self.state, 'eyes_allocated', 0) > 0:
+            self.log(f"Eyes already allocated this turn "
+                     f"({self.state.eyes_allocated}) - one Hunt allocation "
+                     f"per turn")
+            return
 
-        tk.Label(
-            dialog, text="Select Shadow dice to allocate as Eyes\n(before rolling)",
-            bg=COLORS["panel_bg"], fg=COLORS["text"],
-            font=("Arial", 11)
-        ).pack(pady=10)
+        # R2-SL-33: the Fellowship phase (an AI FP's declaration, the
+        # tail, the Guide) precedes the Hunt allocation
+        if not self._legacy_fellowship_phase():
+            return
 
-        # Show checkboxes for each unused Shadow die
-        check_vars = []
-        checks_frame = tk.Frame(dialog, bg=COLORS["panel_bg"])
-        checks_frame.pack(pady=10)
-
-        for i, die in enumerate(self.state.dice[Side.SHADOW]):
-            if not die.used:
-                var = tk.BooleanVar(value=False)
-                check_vars.append((i, var))
-                tk.Checkbutton(
-                    checks_frame, text=f"Die {i+1}",
-                    variable=var, bg=COLORS["panel_bg"], fg=COLORS["text"],
-                    selectcolor=COLORS["shadow_secondary"]
-                ).pack(anchor=tk.W)
-
-        def confirm():
-            indices = [i for i, var in check_vars if var.get()]
-            if indices:
-                from game_logic import allocate_eyes
-                try:
-                    allocate_eyes(self.state, len(indices), indices=indices)
-                    self.log(f"Pre-allocated {len(indices)} eye(s) to hunt box")
-                except RuntimeError as e:
-                    self.log(f"Allocation failed: {e}")
-            dialog.destroy()
-            self.refresh()
-
-        btn_frame = tk.Frame(dialog, bg=COLORS["panel_bg"])
-        btn_frame.pack(pady=20)
-        self._make_button(btn_frame, "Allocate", confirm).pack(side=tk.LEFT, padx=5)
-        self._make_button(btn_frame, "Cancel", dialog.destroy).pack(side=tk.LEFT, padx=5)
+        # R2-RS-P1-09: the choices are the ENGINE's eye menu (companion
+        # maximum, ruling 1.271 minimum), executed through _execute_action;
+        # the old per-die tick list went straight to allocate_eyes (no
+        # rule).  A decision still open is driven first, as at ROLL DICE.
+        import traceback
+        try:
+            if self._engine_pending_side() is not None:
+                self._drive_engine_decisions()
+            self._human_eye_allocation(required=False)
+        except Exception as e:
+            self.log(f"Hunt allocation failed "
+                     f"({type(e).__name__}: {e})")
+            traceback.print_exc()
+        self.refresh()
 
     def _on_recover_dice(self):
         """Recover all dice to unrolled state (for pre-roll eye allocation)."""
@@ -4600,6 +4117,14 @@ class WotrGUI:
 
     def _on_use_ring(self):
         """Use an Elven Ring to change a die face."""
+        # R2-S4-ENGINE-AI-TOOLS (rescan v069): like every other human
+        # action button - never while the AI plays, never inside an open
+        # engine decision (P1-07 guard: it is driven first, then refused)
+        if self.ai_playing:
+            self.log("Wait for AI to finish its turn")
+            return
+        if self._ai_mode_decision_open():
+            return
         # Check if current side has a ring
         if self.current_side == Side.FREE_PEOPLES:
             rings = self.state.fp_elven_rings
@@ -4700,79 +4225,586 @@ class WotrGUI:
                 self.log(f"Ring use failed: {e}")
 
     def _on_change_guide(self):
-        """Change the Fellowship guide."""
+        """Answer the engine's open Guide choice.
+
+        R18-SRC-TOOLS (row 31; I1): the Guide changes only through the
+        engine's choose_guide rows - at the end of the Fellowship phase
+        (turn_start's Guide step, which ROLL DICE and FSP Declare run) or
+        when the Guide leaves the Fellowship (pending_guide_change).  The
+        old button wrote fellowship.guide directly at any moment of any
+        phase; it now drives an open Guide choice through
+        _drive_engine_decisions and otherwise refuses, naming when the
+        choice comes."""
+        if self.ai_playing:
+            self.log('Wait for AI to finish its turn')
+            return
         if self.current_side != Side.FREE_PEOPLES:
             self.log("Only Free Peoples can change guide")
             return
-
-        companions = self.state.fellowship.companions
-        if not companions:
-            self.log("No companions in Fellowship")
+        if getattr(self.state, 'pending_guide_change', None) is None:
+            self.log("No Guide choice is open - the Guide is chosen at the "
+                     "end of the Fellowship phase (ROLL DICE) or when the "
+                     "Guide leaves the Fellowship")
             return
+        try:
+            self._drive_engine_decisions()
+        except Exception as e:
+            self.log(f"Could not resolve the Guide choice ({e})")
+            import traceback
+            traceback.print_exc()
+        guide = self.state.fellowship.guide
+        self.log(f"Guide: {getattr(guide, 'name', None)}")
+        self.refresh()
 
-        # Find highest level
-        max_level = max(c.level for c in companions)
-        eligible = [c for c in companions if c.level == max_level]
+    # R3-LEGACY-GUI-TURN: the _turn_end_blockers names End Turn settles
+    # itself (the half-spent Army/Muster windows, closed below through
+    # their engine rows); every other name is an open obligation.
+    _END_TURN_WINDOW_BLOCKERS = ('pending_army_move_die', 'pending_muster_die')
 
-        if len(eligible) == 1:
-            # Only one choice
-            new_guide = eligible[0]
-            self.state.fellowship.guide = new_guide
-            self.log(f"Guide changed to {new_guide.name}")
-            self.refresh()
-            return
-
-        # Multiple choices - show dialog
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Change Guide")
-        dialog.configure(bg=COLORS["panel_bg"])
-        dialog.transient(self.root)
-        dialog.grab_set()
-        dialog.geometry("300x300")
-
-        tk.Label(
-            dialog, text=f"Select new guide (Level {max_level}):",
-            bg=COLORS["panel_bg"], fg=COLORS["text"],
-            font=("Arial", 12, "bold")
-        ).pack(pady=10)
-
-        current_guide = self.state.fellowship.guide
-
-        for comp in eligible:
-            def select(c=comp):
-                self.state.fellowship.guide = c
-                self.log(f"Guide changed to {c.name}")
-                dialog.destroy()
-                self.refresh()
-
-            text = f"{comp.name}"
-            if comp == current_guide:
-                text += " (current)"
-
-            self._make_button(dialog, text, select, width=25).pack(pady=5)
-
-        self._make_button(dialog, "Cancel", dialog.destroy).pack(pady=10)
+    # An obligation forced to expire (_expire_turn_obligations) takes the
+    # empty value ai._safe_next_turn's rollover gives it: None for the
+    # object-valued ones _turn_end_blockers tests with 'is not None',
+    # else the falsy value of its own type.
+    _EXPIRE_TO_NONE = ('pending_combat', 'pending_hunt',
+                       'pending_guide_change', 'pending_card_option',
+                       'pending_card_followup', 'pending_discard',
+                       '_wormtongue_attack_pending',
+                       '_fellowship_move_die_pending',
+                       '_gandalf_draw_pending', '_mithril_stash',
+                       '_fellowship_route_event')
 
     def _on_end_turn(self):
-        """End the current turn."""
-        from game_logic import next_turn
+        """End the current turn (hot-seat and --ai GUI).
 
-        # Use game_logic's next_turn for proper state management
-        next_turn(self.state)
-        # next_turn drew for both sides; latch so Draw Cards refuses a
-        # duplicate draw this turn.
-        self._cards_drawn_turn = self.state.turn
+        R3-LEGACY-GUI-TURN (R2-RS-v068-P1-04 follow-up): the rollover is
+        ai._safe_next_turn behind ai._turn_end_blockers - the boundary the
+        watch loop, engine_play and the self-play episode loop use - never
+        a bare game_logic.next_turn, which in hot-seat rolled the turn over
+        an open engine decision (it crossed into the next turn, e.g. a
+        hand-limit discard grown by the turn-start draws).
+          1. an open engine decision is driven through the one driver
+             (human dialog / AI search) and this click is refused; the
+             next End Turn continues;
+          2. an obligation no engine decision answers (an engine defect: a
+             queued draw, a decision whose menu is empty) refuses the
+             rollover by name and ASKS - No (the default) keeps the turn
+             open, Yes lets it expire with the turn, logged as a DEFECT
+             (USER 2026-08-28 LOG -> ASK -> repair -> announce: never a
+             refusal without an exit);
+          3. a half-spent Army/Muster window closes through its engine
+             row (F-2);
+          4. R4-GUI-SKIP-DIE-BUTTON (rule 1.67; USER A2-06a/b, ruling
+             1.276): a HUMAN seat's usable non-Event die refuses the
+             rollover, naming its exits and offering the engine's rows
+             that spend it (_refuse_end_turn_for_usable_dice); an AI
+             seat's unplayed dice with a legal use (an Event die too:
+             the AI's choice) ASK (_ask_forfeit_ai_dice: No keeps the
+             turn and asks the AI again, Yes forfeits them as a
+             DEFECT); every die left (an Event die, a die with no legal
+             use) is discarded through the engine's die-discard row and
+             named in the log (_end_turn_discard).  Skip Die
+             (_on_skip_die) discards one such die mid-turn;
+          5. next_turn's AUTO-boundary control heal, then
+             ai._safe_next_turn; a terminal end-of-turn Victory Check keeps
+             the turn and refresh() announces it."""
+        import ai
+        import combat
+        import game_logic
+        import traceback
+
+        # R2-S4-ENGINE-AI-TOOLS (rescan v069): never while the AI plays
+        if getattr(self, 'ai_playing', False):
+            self.log("Wait for AI to finish its turn")
+            return
+        state = self.state
+
+        # 1. never over an open engine decision (v069 in AI mode; now in
+        # hot-seat too): driven through the one driver first, this click
+        # refused.  (An open multi-step die window is not a decision:
+        # closed in step 3.)
+        if self._engine_pending_side() is not None:
+            self.log("An open decision must be resolved first - action "
+                     "not taken")
+            try:
+                self._drive_engine_decisions()
+            except Exception as e:
+                self.log(f"Could not resolve the open decision ({e})")
+                traceback.print_exc()
+            self.refresh()
+            if self._engine_pending_side() is None:
+                return
+            # still open after the driver: no engine choice resolves it -
+            # step 2 names it and asks
+
+        # 2. obligations no engine decision answers
+        owed = [b for b in self._end_turn_blockers()
+                if b not in self._END_TURN_WINDOW_BLOCKERS
+                and not b.startswith('unused_action_dice:')]
+        if owed and not self._ask_expire_turn_obligations(owed):
+            return
+
+        # 3. R2-SL-34 / F-2 (USER 2026-07-19): an Army-die / Muster-die chain
+        # dies with the turn (ai._safe_next_turn clears it; next_turn does
+        # not) - closed through its owner's engine window-closing row, so
+        # it never hands the leftover half to next turn's first action.
+        for win in self._multistep_windows():
+            try:
+                self._close_multistep_window(*win, why='End Turn')
+            except Exception as e:
+                # F-2 holds even then: the chain is cleared field by field
+                # exactly as ai._safe_next_turn does (no die spent) - loud,
+                # never carried into the next turn
+                self.log(f"DEFECT: could not close the open "
+                         f"{self._multistep_text(win[0])} at End Turn "
+                         f"({e}) - cleared without its closing row (F-2)")
+                import traceback
+                traceback.print_exc()
+                pre = ('pending_army_move_' if win[0] == 'army_move'
+                       else 'pending_muster_')
+                for f in (('die', 'from', 'side', 'preexist')
+                          if win[0] == 'army_move'
+                          else ('die', 'first_type', 'region', 'side')):
+                    setattr(self.state, pre + f, None)
+
+        # 4. the unused action dice - the only blockers left once 1-3 have
+        # run.  R4-GUI-SKIP-DIE-BUTTON (rule 1.67; USER A2-06a/b): nothing
+        # is mutated until every side's dice are classified from its own
+        # engine menu (an isolated-clone probe, _die_menu_probe).
+        left = self._end_turn_blockers()
+        stuck = [b for b in left if not b.startswith('unused_action_dice:')]
+        if stuck:
+            self.log(f"End Turn not taken - closing the die window left "
+                     f"{', '.join(stuck)} open; press End Turn again")
+            self.refresh()
+            return
+        reported = {b.split(':', 1)[1].split('=', 1)[0] for b in left}
+        probes = {}         # side -> (menu, must_use, playable)
+        for side in (Side.FREE_PEOPLES, Side.SHADOW):
+            if side.name not in reported:
+                continue
+            try:
+                probes[side] = self._die_menu_probe(side)
+            except Exception as e:
+                # an engine defect in a legal menu: loud, and End Turn
+                # never wedges on it (as _end_turn_blockers)
+                self.log(f"DEFECT: the {side.value} legal menu raised while "
+                         f"End Turn checked rule 1.67 ({type(e).__name__}: "
+                         f"{e}) - its dice are forfeited without it")
+                traceback.print_exc()
+        # a human seat's usable non-Event die refuses (rule 1.67); its own
+        # Event dice are its End Turn's to discard (A2-06a)
+        for side in (Side.FREE_PEOPLES, Side.SHADOW):
+            if side == self.ai_side or side not in probes:
+                continue
+            menu, keep, _playable = probes[side]
+            if keep and not self._refuse_end_turn_for_usable_dice(
+                    side, menu, keep):
+                return
+        # an AI seat: every die with a legal use, an Event die too - using
+        # or discarding it is the AI's choice, never the human's End Turn
+        if self.ai_side in probes and probes[self.ai_side][2] and \
+                not self._ask_forfeit_ai_dice(self.ai_side,
+                                              probes[self.ai_side][2]):
+            return
+        for side in (Side.FREE_PEOPLES, Side.SHADOW):
+            self._end_turn_discard(side, side in probes)
+
+        # 5. the engine boundary (next_turn's AUTO-boundary control heal
+        # first, as next_turn did: self-play only, never under the teacher)
+        try:
+            if combat.FINAL_HITS_HOOK is None:
+                game_logic.enforce_settlement_control(state)
+            terminal = ai._safe_next_turn(state)
+        except Exception as e:
+            self.log(f"End Turn FAILED ({type(e).__name__}: {e}) - the turn "
+                     f"was not advanced cleanly; see the console")
+            traceback.print_exc()
+            self.refresh()
+            return
 
         self.selected_die_idx = None
         self.pending_action = None
         self.action_source = None
-
-        # Sync hands after card draw
         self._sync_hands()
-
+        if terminal:
+            # _settle_end_of_turn kept the turn; refresh() announces it
+            self.log("End of turn: the Victory Check ends the game")
+            self.refresh()
+            return
+        # the rollover drew for both sides; latch so Draw Cards refuses a
+        # duplicate draw this turn.
+        self._cards_drawn_turn = self.state.turn
         self.log(f"=== Turn {self.state.turn} ===")
         self.log("  Cards drawn for both sides")
         self.refresh()
+
+    def _end_turn_blockers(self):
+        """ai._turn_end_blockers for End Turn (R3-LEGACY-GUI-TURN).  The
+        engine check returns the open obligation names first and probes
+        the unused dice' legal menus only when there are none, so a raise
+        can only come from that probe (an engine defect in a legal menu):
+        it is logged as a DEFECT and reported as no blocker - the dice are
+        then forfeited and the rollover's own check (every die spent, no
+        probe) decides.  End Turn never wedges on it."""
+        import ai
+        import traceback
+        try:
+            return ai._turn_end_blockers(self.state)
+        except Exception as e:
+            self.log(f"DEFECT: the engine's turn-end check raised while "
+                     f"probing the unused dice ({type(e).__name__}: {e}) - "
+                     f"they are forfeited without it")
+            traceback.print_exc()
+            return []
+
+    # ---- R4-GUI-SKIP-DIE-BUTTON: the engine's die-discard rows ----------
+    # USER decisions A2-06a ("yes, players can discard event dice if they
+    # wish" / "yes, any time") and A2-06b ("yes, those dice can be
+    # discarded if no legal use"), ruling 1.276: an Event die may be
+    # discarded for no effect at any time; a non-Event die only when it
+    # has no legal use (one engine 'skip' row per distinct face,
+    # ai._die_discard_rows); 1.67 stands for a usable non-Event die.
+    _END_TURN_167_TITLE = 'End Turn refused - rule 1.67'
+    _END_TURN_AI_DICE_TITLE = 'End Turn - AI dice unplayed'
+    _SKIP_DIE_TITLE = 'Skip Die'
+
+    def _die_menu_probe(self, side):
+        """(menu, must_use, playable) for `side` from ONE engine menu built
+        on an isolated clone (get_legal_actions; the read-only way
+        ai._turn_end_blockers probes too):
+          menu      the side's legal rows;
+          must_use  [(index, die)] of its unused non-Event, non-Eye dice
+                    whose face the menu gives no die-discard row - the
+                    dice rule 1.67 says must be used (an Event die and a
+                    die with no legal use carry a 'skip' row);
+          playable  [(index, die)] of its unused non-Eye dice whose face
+                    an ordinary row spends (ai._menu_spent_die_indices) -
+                    every die with a legal use, an Event die included."""
+        import ai
+        menu = ai.get_legal_actions(ai.clone_state(self.state), side)
+        skip_faces = {a.params.get('face') for a in menu
+                      if a.action_type == 'skip'
+                      and a.params.get('side') is not None}
+        pool = self.state.dice.get(side, [])
+        spent = {pool[i].current for i in ai._menu_spent_die_indices(menu)
+                 if 0 <= i < len(pool)}
+        unused = [(i, d) for i, d in enumerate(pool)
+                  if not d.used and d.current is not None
+                  and d.current != ActionDieFace.EYE]
+        must_use = [(i, d) for i, d in unused
+                    if d.current != ActionDieFace.EVENT
+                    and d.current.name not in skip_faces]
+        playable = [(i, d) for i, d in unused if d.current in spent]
+        return menu, must_use, playable
+
+    @staticmethod
+    def _dice_text(dice):
+        """'2 action dice (Army, Character)': the count and faces of
+        [(index, die)]."""
+        n = len(dice)
+        return (f"{n} action {'die' if n == 1 else 'dice'} "
+                f"({', '.join(d.current.value for _i, d in dice)})")
+
+    def _refuse_end_turn_for_usable_dice(self, side, menu, dice) -> bool:
+        """End Turn is refused while `side` (a HUMAN seat) still holds a
+        usable non-Event die (rule 1.67; USER A2-06b: no discard row for
+        it).  The refusal names its exits and offers the engine's own rows
+        that spend those dice, so it always has one the human can take
+        here even where no manual button builds that row (I1: the engine
+        menu, run through _run_engine_action).  'No - keep the turn open'
+        is the default; Cancel / the window close keep it open too.
+        Engine-defect exit (USER 2026-08-28 LOG -> ASK -> kill the die ->
+        announce): once an offered row has FAILED to execute this turn,
+        the refusal also offers to forfeit those dice as a DEFECT, so a
+        broken executor cannot wedge the turn.  True only for that
+        consented forfeit (the rollover may proceed)."""
+        import ai
+        pool = self.state.dice.get(side, [])
+        faces = {d.current for _i, d in dice}
+        rows = [a for a in menu
+                if isinstance(a.die_idx, int) and 0 <= a.die_idx < len(pool)
+                and a.action_type not in ai._DIE_DISCARD_NONSPENDING
+                and pool[a.die_idx].current in faces]
+        what = self._dice_text(dice)
+        self.log(f"End Turn refused - rule 1.67: {side.value} still hold "
+                 f"{what} with a legal use, and a usable die must be used. "
+                 f"Use it (the action buttons, or one of its engine-legal "
+                 f"actions offered now); Skip Die discards only an Event "
+                 f"die or a die with no legal use")
+        prompt = (f"{side.value} still hold {what} with a legal use.  Rule "
+                  f"1.67: a usable action die must be used - it cannot be "
+                  f"discarded (Skip Die discards only an Event die or a die "
+                  f"with no legal use).\n\nUse one now, or keep the turn "
+                  f"open and play it with the action buttons.")
+        opts = [("No - keep the turn open", None)]
+        opts += [(f"Use the {pool[a.die_idx].current.value} die: "
+                  f"{self._describe_action(a)}", k)
+                 for k, a in enumerate(rows)]
+        failed = (getattr(self, '_end_turn_row_failed', None)
+                  == (self.state.turn, side))
+        if failed:
+            opts.append(("End the turn anyway - an engine action for this "
+                         "die failed; forfeit it (logged as a DEFECT)",
+                         'forfeit'))
+        pick = self._show_choice_dialog(self._END_TURN_167_TITLE, prompt,
+                                        opts, allow_cancel=True)
+        if pick is None:
+            self.log("End Turn not taken - the turn stays open")
+            self.refresh()
+            return False
+        if pick == 'forfeit':
+            for _i, d in dice:
+                d.used = True
+            self._end_turn_row_failed = None
+            self.log(f"DEFECT: End Turn forced over the {side.value} "
+                     f"{what} with a legal use - forfeited with the turn "
+                     f"after an engine action for it failed (rule 1.67)")
+            return True
+        action = rows[pick]
+        if not self._run_engine_action(
+                action,
+                log_msg=f"{side.value}: {self._describe_action(action)}"):
+            # nothing else is open here, so False is an executor failure
+            # (logged by _run_engine_action): the next End Turn offers the
+            # DEFECT forfeit beside the rows
+            self._end_turn_row_failed = (self.state.turn, side)
+            self.log("End Turn not taken - that action failed; press End "
+                     "Turn again to choose another, or to forfeit the die "
+                     "as a DEFECT")
+        return False
+
+    def _ask_forfeit_ai_dice(self, side, dice) -> bool:
+        """The AI seat `side` still holds dice with a legal use that it
+        has not played (`dice`: _die_menu_probe's playable - an Event die
+        too, since using or discarding it is the AI's choice; a failed
+        search, or a reply not yet due).  Rule 1.67 forbids ending the
+        turn over a usable die and a failing search is a bug (USER
+        2026-10-23): no move is substituted.  LOG -> ASK (USER
+        2026-08-28): No (the default; Cancel / the window close too)
+        keeps the turn open and asks the AI to play them; Yes forfeits
+        them with the turn, logged as a DEFECT - the refusal always has
+        an exit.  True when the rollover may proceed."""
+        what = self._dice_text(dice)
+        self.log(f"End Turn refused - rule 1.67: the {side.value} AI still "
+                 f"holds {what} with a legal use that it has not played")
+        prompt = (f"The {side.value} AI still holds {what} with a legal "
+                  f"use that it has not played (rule 1.67: a usable die "
+                  f"must be used; using or discarding an Event die is the "
+                  f"AI's choice).\n\nNo keeps the turn open and asks the "
+                  f"AI to play them (Skip Die discards your own Event or "
+                  f"unusable dice).  Yes ends the turn anyway: those dice "
+                  f"are forfeited (logged as a DEFECT).")
+        pick = self._show_choice_dialog(
+            self._END_TURN_AI_DICE_TITLE, prompt,
+            [("No - keep the turn open; the AI plays them", False),
+             ("Yes - end the turn; the AI's usable dice are forfeited",
+              True)],
+            allow_cancel=True)
+        if pick is not True:
+            self.log(f"End Turn not taken - the turn stays open; the "
+                     f"{side.value} AI is asked to play its dice")
+            self._arm_ai_reply()
+            self.refresh()
+            return False
+        for _i, d in dice:
+            d.used = True
+        self.log(f"DEFECT: End Turn forced over the {side.value} AI's "
+                 f"unplayed {what} - forfeited with the turn (rule 1.67; "
+                 f"the AI did not play them)")
+        return True
+
+    def _end_turn_discard(self, side, probed):
+        """Step 4 of End Turn for one side, after the 1.67 checks: every
+        unused die left may be discarded by the rules (an Event die,
+        A2-06a; a die with no legal use, A2-06b) - each through the
+        engine's own die-discard row (I1), the lot named in the log.
+        `probed` False (the engine's dice probe raised, logged as a
+        DEFECT, or reported nothing for this side): forfeited without
+        the rows, as before.  A die no row discards (an executor refusal,
+        an unused Eye) is forfeited loudly - End Turn never wedges here."""
+        import ai
+        import traceback
+        pool = self.state.dice.get(side, [])
+        discarded = []
+        if probed:
+            for _ in range(len(pool) + 1):
+                try:
+                    rows = [a for a in ai.get_legal_actions(
+                                ai.clone_state(self.state), side)
+                            if a.action_type == 'skip'
+                            and a.params.get('side') is not None]
+                    if not rows:
+                        break
+                    face = pool[rows[0].die_idx].current
+                    ai._execute_action(self.state, rows[0])
+                except Exception as e:
+                    self.log(f"DEFECT: End Turn could not discard a "
+                             f"{side.value} die through its engine row "
+                             f"({type(e).__name__}: {e}) - forfeited "
+                             f"without it")
+                    traceback.print_exc()
+                    break
+                discarded.append(face)
+        rest = [d for d in pool if not d.used and d.current is not None]
+        for d in rest:
+            d.used = True
+        if discarded:
+            n = len(discarded)
+            self.log(f"End Turn: {side.value} forfeits {n} unused action "
+                     f"{'die' if n == 1 else 'dice'} "
+                     f"({', '.join(f.value for f in discarded)}) - "
+                     f"discarded for no effect through the engine's "
+                     f"die-discard row (an Event die, or no legal use)")
+        if rest:
+            n = len(rest)
+            self.log(f"End Turn: {side.value} forfeits {n} unused action "
+                     f"{'die' if n == 1 else 'dice'} "
+                     f"({', '.join(d.current.value for d in rest)})"
+                     + (" without an engine discard row" if probed
+                        else ""))
+
+    def _on_skip_die(self):
+        """'Skip Die': discard one of the current side's action dice for
+        no effect through the engine's own die-discard rows (USER A2-06a
+        / A2-06b, ruling 1.276; ai._die_discard_rows): an Event die at any
+        time; a non-Event die only when it has no legal use.  The
+        selected die is discarded when its face has a row; with no die
+        selected the rows are offered (Cancel = nothing discarded).  A
+        usable non-Event die is refused by name (rule 1.67).  The exit
+        End Turn's 1.67 refusal names; watch / replay / LIVE / mirror
+        refuse it at the button (_make_button)."""
+        from ai import Action
+        import traceback
+        if self.ai_playing:
+            self.log("Wait for AI to finish its turn")
+            return
+        side = self.current_side
+        if self.ai_side is not None and side == self.ai_side:
+            self.log(f"Skip Die: the {side.value} dice are the AI's - "
+                     f"nothing discarded")
+            return
+        if self._ai_mode_decision_open():        # P1-07 / R2-SL-34
+            return
+        if self._engine_pending_side() is not None:
+            self.log("An open decision must be resolved first - action "
+                     "not taken")
+            return
+        wins = self._multistep_windows()
+        if wins:
+            self.log(f"The open {self._multistep_text(wins[0][0])} must be "
+                     f"made, or declined with Pass, first - action not "
+                     f"taken")
+            return
+        try:
+            menu, must_use, _playable = self._die_menu_probe(side)
+        except Exception as e:
+            self.log(f"Skip Die: the {side.value} legal menu raised "
+                     f"({type(e).__name__}: {e}) - nothing discarded")
+            traceback.print_exc()
+            return
+        rows = [a for a in menu if a.action_type == 'skip'
+                and a.params.get('side') is not None]
+        pool = self.state.dice.get(side, [])
+        sel = self.selected_die_idx
+        if sel is not None:
+            die = pool[sel] if 0 <= sel < len(pool) else None
+            if die is None or die.used or die.current is None:
+                self.log("Skip Die: the selected die is not an unused "
+                         "action die")
+                return
+            if die.current == ActionDieFace.EYE:
+                self.log("Skip Die: an Eye die is never discarded")
+                return
+            match = next((a for a in rows
+                          if a.params.get('face') == die.current.name), None)
+            if match is None:
+                self.log(f"Skip Die refused - rule 1.67: the {side.value} "
+                         f"{die.current.value} die has a legal use and "
+                         f"must be used; only an Event die or a die with "
+                         f"no legal use may be discarded")
+                return
+            # the engine names the first unused die of a face; any die of
+            # that face pays (the executor checks only the named face)
+            action = Action(die_idx=sel, action_type='skip',
+                            params=dict(match.params))
+        else:
+            if not rows:
+                if must_use:
+                    self.log(f"Skip Die: no {side.value} die can be "
+                             f"discarded - rule 1.67: "
+                             f"{self._dice_text(must_use)} with a legal "
+                             f"use must be used")
+                else:
+                    self.log(f"Skip Die: {side.value} have no unused "
+                             f"action die")
+                return
+            pick = self._show_choice_dialog(
+                self._SKIP_DIE_TITLE,
+                f"{side.value}: discard which die for no effect?  (An "
+                f"Event die may be discarded at any time; any other die "
+                f"only when it has no legal use - rule 1.67.)",
+                [(self._describe_action(a), k) for k, a in enumerate(rows)],
+                allow_cancel=True)
+            if pick is None:
+                self.log("Skip Die cancelled - nothing discarded")
+                return
+            action = rows[pick]
+        self._run_engine_action(
+            action, log_msg=f"{side.value}: {self._describe_action(action)}")
+
+    def _ask_expire_turn_obligations(self, owed) -> bool:
+        """R3-LEGACY-GUI-TURN: End Turn found obligations no engine
+        decision answers (`owed`, _turn_end_blockers names).  LOG them,
+        ASK (No is the default and keeps the turn open; the window close
+        is No), and on Yes expire them (_expire_turn_obligations) with a
+        DEFECT line.  True when the rollover may proceed."""
+        names = ', '.join(owed)
+        self.log(f"End Turn refused - open engine obligation(s) that no "
+                 f"decision answers: {names}")
+        hint = ""
+        if (not getattr(self.state, 'dice_rolled', False)
+                and '_fellowship_tail_phase' in owed):
+            hint = " (ROLL DICE finishes the turn-start Fellowship phase)"
+        prompt = (f"The turn cannot end: {names} is still open and no "
+                  f"engine decision answers it{hint}.\n\nEnd the turn "
+                  f"anyway?  Each listed obligation then expires with the "
+                  f"turn (logged as a DEFECT).")
+        pick = self._show_choice_dialog(
+            "End Turn blocked", prompt,
+            [("No - keep the turn open", False),
+             ("Yes - end the turn; the obligation(s) expire with it",
+              True)],
+            allow_cancel=True)
+        if pick is not True:
+            self.log("End Turn not taken - the turn stays open")
+            self.refresh()
+            return False
+        self._expire_turn_obligations(owed)
+        self.log(f"DEFECT: End Turn forced over {names} - expired with the "
+                 f"turn (no engine decision answered it)")
+        return True
+
+    def _expire_turn_obligations(self, owed):
+        """Give each named obligation the empty value the rollover gives
+        it (_EXPIRE_TO_NONE -> None, else the falsy value of its type);
+        a name _turn_end_blockers still reports afterwards is set to None,
+        so the consented rollover always proceeds."""
+        st = self.state
+        for name in owed:
+            cur = getattr(st, name, None)
+            if name in self._EXPIRE_TO_NONE or cur is None:
+                new = None
+            elif isinstance(cur, bool):
+                new = False
+            elif isinstance(cur, int):
+                new = 0
+            elif isinstance(cur, (list, tuple, dict, set)):
+                new = type(cur)()
+            else:
+                new = None
+            setattr(st, name, new)
+        for name in set(self._end_turn_blockers()) & set(owed):
+            setattr(st, name, None)
 
     def _on_switch_side(self):
         """Switch active side."""
@@ -4871,11 +4903,247 @@ class WotrGUI:
         self.log("[STEP MODE] Press Space for next action, Enter for auto-play")
         self._selfplay_next_turn()
 
+    def _selfplay_turn_start(self):
+        """Pre-roll half of a watch-mode turn (P1-06), phase for phase the
+        twin of ai._run_single_episode_impl and engine_play's driver:
+        hand-limit discards -> gateway auto-declare (the sanctioned
+        self-play hardcode) -> declare phase (offered at progress >= 0:
+        in-place declaration is legal) -> begin/resume_fellowship_tail
+        (stationary Balrog, declaration Hunt effects, turn-start Mordor
+        entry + refill, FINAL ruling 2026-08-16) -> Guide choice -> Shadow
+        eye allocation on the engine's eye menu (companion maximum, ruling
+        1.271 min-1 flag).  Every decision is searched under the engine's
+        own phase flag, so its menu is the real one.  Returns False when
+        the game ended or watch mode halted on a missing required choice.
+
+        R3-LEGACY-GUI-TURN: the phases are THE shared turn-start driver
+        (turn_start.steps, also run by engine_play and the legacy GUI);
+        this method only answers its requests - the search budgets below
+        (discard 50 sims; declare / eyes noise-free argmax; tail and Guide
+        100 sims, temperature 0.1) and the watch log lines."""
+        import ai
+        import turn_start
+        state = self.state
+
+        def _label(side):
+            return "FP" if side == Side.FREE_PEOPLES else "Shadow"
+
+        def _search(side, sims=100, temperature=0.1, add_noise=True):
+            return ai.mcts_action(state, side, self.fp_net, self.sh_net,
+                                  num_simulations=sims,
+                                  temperature=temperature,
+                                  add_noise=add_noise)
+
+        def _halt(why):
+            self.log(f"Watch mode halted: {why}")
+            self.selfplay_running = False
+            self._sync_hands()
+            self.refresh()
+            return False
+
+        _what = {'discard': 'hand-limit discard', 'decision': 'decision',
+                 'declare': 'declaration', 'fellowship_tail':
+                 'Fellowship effect', 'guide': 'Guide choice',
+                 'eye': 'Hunt allocation'}
+
+        def _choose(req):
+            if req.kind == 'discard':
+                return _search(req.side, sims=50)
+            if req.kind in ('declare', 'eye'):
+                return _search(req.side, temperature=0.0, add_noise=False)
+            return _search(req.side)
+
+        def _execute(req):
+            act = req.action
+            if req.kind == 'discard':
+                self.log(f"{_label(req.side)} [hand limit]: discards "
+                         f"{act.params.get('card_id', '?')}")
+            elif req.kind == 'declare':
+                self.log(f"FP [Fellowship Phase]: Declares fellowship at "
+                         f"{act.params.get('region', '?')}", "fp")
+            elif req.kind == 'guide':
+                self.log(f"FP [Fellowship Phase]: Guide "
+                         f"{act.params.get('companion', '?')}", "fp")
+            elif req.kind != 'eye':
+                self.log(f"{_label(req.side)} [Fellowship Phase]: "
+                         f"{act.action_type} {act.params}")
+            try:
+                ai._execute_action(state, act)
+            except Exception as e:
+                _halt(f"{_label(req.side)} {_what.get(req.kind, req.kind)} "
+                      f"failed ({type(e).__name__}: {e})")
+                raise
+
+        def _event(ev):
+            if ev.kind == 'auto_declared':
+                self.log(f"FP [Fellowship Phase]: Declares fellowship at "
+                         f"{ev.detail['region']} (Mordor gateway)", "fp")
+            elif ev.kind == 'game_over':
+                result = ev.detail['result']
+                self.log(f"\n*** GAME OVER: {result['victory']} wins by "
+                         f"{result.get('victory_type', '')}! ***")
+            elif ev.kind == 'mordor_entered':
+                self.log("FP [Fellowship Phase]: Fellowship enters Mordor",
+                         "fp")
+
+        try:
+            outcome = turn_start.run(turn_start.steps(state), _choose,
+                                     _execute, _event)
+        except turn_start.TurnStartError as e:
+            return _halt(str(e))
+        if outcome == 'game_over':
+            self.selfplay_running = False
+            self._sync_hands()
+            self.refresh()
+            return False
+        return True
+
+    def _fellowship_phase_closed(self) -> bool:
+        """True once this turn's Fellowship-phase tail has run in the
+        hot-seat / --ai GUI (R2-SL-33): the declaration opportunity is
+        over, and begin_fellowship_tail must not run again this turn
+        (that would be a second stationary-Balrog opportunity and a
+        re-opened Guide choice)."""
+        done = getattr(self, '_fellowship_phase_done', None)
+        return (done is not None and done[0] is self.state
+                and done[1] == self.state.turn)
+
+    def _legacy_fellowship_phase(self) -> bool:
+        """Turn-start Fellowship phase for the hot-seat and --ai GUI
+        (R2-SL-33), the twin of _selfplay_turn_start (P1-06), engine_play's
+        driver and the episode loop: open engine decisions (the hand-limit
+        discards opened by the turn-start draws) -> an AI FP's gateway
+        auto-declare or declare search under _declare_phase (a human FP
+        declares with FSP Declare, which runs this phase straight after)
+        -> begin/resume_fellowship_tail (stationary Balrog, declaration
+        effects, turn-start Mordor entry + refill, FINAL ruling
+        2026-08-16), every open choice to its owner (human dialog or AI
+        search) -> the end-of-phase Guide choice -> _eye_allocation_phase
+        cleared (the AI Shadow then allocates in _ai_allocate_eyes, a human
+        Shadow with Allocate Eyes).  The tail runs once per turn.  Returns
+        True when the Hunt allocation and the roll may follow; False when
+        the game ended or a required choice failed (logged, nothing
+        rolled).  Engine flags are never cleared silently, so the next
+        ROLL DICE resumes from the decision still open.
+
+        R3-LEGACY-GUI-TURN: the phases are THE shared turn-start driver
+        (turn_start.steps, also run by engine_play and watch mode), with
+        eyes=False (the Hunt allocation follows in
+        _pre_roll_hunt_allocation / Alloc Eyes) and fellowship=False once
+        this turn's tail has run.  This method answers its requests: open
+        decisions and Fellowship effects through _choose_engine_decision
+        (the one driver's pick), an AI FP's declaration and the Guide by
+        search or the human's dialog."""
+        import ai
+        import traceback
+        import turn_start
+        state = self.state
+        if getattr(state, 'dice_rolled', False):
+            return True
+        fp_side = Side.FREE_PEOPLES
+        fp_net = getattr(self, 'fp_net', None) or self.ai_net
+        sh_net = getattr(self, 'sh_net', None) or self.ai_net
+
+        def _label(side):
+            return "Free Peoples" if side == fp_side else "Shadow"
+
+        def _is_ai(side):
+            return (self.ai_side is not None and side == self.ai_side
+                    and self.ai_net is not None)
+
+        def _ask(side, acts, what, temperature=0.1, add_noise=False):
+            if len(acts) == 1:
+                return acts[0]
+            if _is_ai(side):
+                act = ai.mcts_action(state, side, fp_net, sh_net,
+                                     num_simulations=100,
+                                     temperature=temperature,
+                                     add_noise=add_noise)
+                if act is None or act not in acts:
+                    raise RuntimeError(f"{_label(side)} AI {what} has no "
+                                       f"legal selection (got {act})")
+                return act
+            opts = [(self._describe_action(a), i)
+                    for i, a in enumerate(acts)]
+            pick = self._show_choice_dialog(f"{_label(side)} decision",
+                                            f"{what}:", opts)
+            if pick is None:
+                raise RuntimeError(f"{_label(side)} {what} dialog closed "
+                                   f"without a choice - no action taken, "
+                                   f"the decision is still open")
+            return acts[pick]
+
+        def _choose(req):
+            if req.kind == 'declare':
+                # 1.142c noise-free argmax
+                return _ask(req.side, req.actions, "Fellowship declaration",
+                            temperature=0.0)
+            if req.kind == 'guide':
+                return _ask(req.side, req.actions,
+                            "Guide at the end of the Fellowship phase")
+            return self._choose_engine_decision(req.side, req.actions)
+
+        def _execute(req):
+            act = req.action
+            if req.kind == 'declare':
+                self.log(f"FP AI [Fellowship Phase]: declares at "
+                         f"{act.params.get('region', '?')}", "fp")
+            elif req.kind == 'guide':
+                self.log(f"FP [Fellowship Phase]: Guide "
+                         f"{act.params.get('companion', '?')}", "fp")
+            ai._execute_action(state, act)
+
+        def _event(ev):
+            if ev.kind == 'auto_declared':
+                self.log(f"FP AI [Fellowship Phase]: declares at "
+                         f"{ev.detail['region']} (Mordor gateway)", "fp")
+            elif ev.kind == 'fellowship_tail_done':
+                # the tail runs once per turn (no second stationary-Balrog
+                # opportunity, no re-opened Guide choice)
+                self._fellowship_phase_done = (state, state.turn)
+            elif ev.kind == 'game_over':
+                result = ev.detail['result']
+                self.log(f"Game over in the Fellowship phase "
+                         f"({result.get('victory')} by "
+                         f"{result.get('victory_type', '')}) - dice not "
+                         f"rolled")
+            elif ev.kind == 'mordor_entered':
+                self.log("FP [Fellowship Phase]: the Fellowship enters "
+                         "Mordor", "fp")
+
+        try:
+            phase = not self._fellowship_phase_closed()
+            if (phase and getattr(state, '_eye_allocation_phase', False)
+                    and not getattr(state, '_fellowship_tail_phase', False)):
+                # left by an earlier turn whose phase ended without its
+                # roll; begin_fellowship_tail would skip this turn's tail
+                # behind it
+                self.log("Fellowship phase: clearing a Hunt-allocation "
+                         "flag left open by an earlier turn")
+                state._eye_allocation_phase = False
+            outcome = turn_start.run(
+                turn_start.steps(state, auto_declare=_is_ai(fp_side),
+                                 declare=_is_ai(fp_side), fellowship=phase,
+                                 eyes=False, fallback=self.current_side),
+                _choose, _execute, _event)
+            self._sync_hands()
+            if outcome == 'game_over':
+                self.refresh()
+                return False
+            return True
+        except Exception as e:
+            self.log(f"Fellowship phase not finished - dice not rolled "
+                     f"({type(e).__name__}: {e})")
+            traceback.print_exc()
+            self.refresh()
+            return False
+
     def _selfplay_next_turn(self):
-        """Start a new turn: eye allocation, dice roll, then actions."""
+        """Start a new turn: Fellowship phase, eye allocation, dice roll,
+        then actions."""
         if not self.selfplay_running:
             return
-        from ai import _safe_next_turn, _ai_eye_allocation
+        from ai import _safe_next_turn
         import game_logic
 
         if self.selfplay_turn > 0:
@@ -4898,24 +5166,11 @@ class WotrGUI:
         self.log(f"=== TURN {self.selfplay_turn} ===", "turn")
         self.log(f"{'='*40}", "turn")
 
-        # Phase 2: Fellowship Phase — FP may declare fellowship position
-        from ai import _get_declare_actions, mcts_action, _execute_action, Action
-        if self.state.fellowship.progress > 0 and not self.state.fellowship.mordor_entered:
-            declare_actions = _get_declare_actions(self.state)
-            if declare_actions:
-                declare_actions.append(Action(die_idx=-1, action_type='pass', params={}))
-                dec = mcts_action(self.state, Side.FREE_PEOPLES, self.fp_net, self.sh_net,
-                                  num_simulations=100, temperature=0.1)
-                if dec and dec.action_type == 'fellowship_declare':
-                    region = dec.params.get('region', '?')
-                    self.log(f"FP [Fellowship Phase]: Declares fellowship at {region}", "fp")
-                    try:
-                        _execute_action(self.state, dec)
-                    except Exception as e:
-                        self.log(f"  Declaration failed: {e}")
-
-        # Eye allocation (always uses Shadow net)
-        _ai_eye_allocation(self.state, self.sh_net)
+        # P1-06: Fellowship phase (discards, auto-declare, declare, tail
+        # with turn-start Mordor entry, Guide) + eye allocation, exactly as
+        # the self-play episode loop runs them
+        if not self._selfplay_turn_start():
+            return
         eyes_allocated = getattr(self.state, 'eyes_allocated', 0)
         eyes_in_box = len(self.state.hunt_box)
 
@@ -4933,6 +5188,7 @@ class WotrGUI:
             self.log(f"Eyes allocated: {eyes_allocated} -> hunt box ({eyes_in_box} total)", "die")
 
         self.selfplay_active_side = Side.FREE_PEOPLES
+        self.selfplay_turn_owner = None
         self.refresh()
         # In auto mode, schedule first action; in step mode, wait for space
         if not self.selfplay_paused:
@@ -4947,49 +5203,81 @@ class WotrGUI:
             return
         self.selfplay_step_pending = False
 
-        from ai import get_legal_actions, _execute_action, mcts_action
+        from ai import (get_legal_actions, _execute_action, mcts_action,
+                        _pending_decision_side, _turn_owner_after,
+                        search_turn_owner)
         import game_logic
+
+        # P1-05: an open engine pending decision (card option / followup,
+        # discard, hunt-reveal placement, combat, hunt, guide...) belongs
+        # to ONE side and costs no die: route it to its owner through the
+        # shared cascade BEFORE any dice check, exactly like
+        # _run_single_episode (pre-ask routing).  Plain alternation asked
+        # the non-owner (RuntimeError from get_legal_actions) or let the
+        # Shadow pick the FP's reveal placement.
+        pending_side = _pending_decision_side(
+            self.state, fallback=self.selfplay_active_side)
+        if pending_side is not None:
+            self.selfplay_active_side = pending_side
 
         active = self.selfplay_active_side
         other = Side.SHADOW if active == Side.FREE_PEOPLES else Side.FREE_PEOPLES
 
         fp_left = self._count_unused_dice(Side.FREE_PEOPLES)
         sh_left = self._count_unused_dice(Side.SHADOW)
-
-        # If both sides out of dice, next turn
-        if fp_left == 0 and sh_left == 0:
-            # _selfplay_next_turn settles inactivity before military victory.
-            if self.selfplay_paused:
-                # In step mode, go to next turn immediately on this step
-                self._selfplay_next_turn()
-            else:
-                self.root.after(self.selfplay_speed, self._selfplay_next_turn)
-            return
-
-        # Skip side if no dice left (transparent, don't consume a step)
         my_left = self._count_unused_dice(active)
-        if my_left == 0:
-            self.selfplay_active_side = other
-            self.root.after(50, self._selfplay_one_action)
-            return
+
+        if pending_side is None:
+            # If both sides out of dice, next turn
+            if fp_left == 0 and sh_left == 0:
+                # _selfplay_next_turn settles inactivity before military victory.
+                if self.selfplay_paused:
+                    # In step mode, go to next turn immediately on this step
+                    self._selfplay_next_turn()
+                else:
+                    self.root.after(self.selfplay_speed, self._selfplay_next_turn)
+                return
+
+            # Skip side if no dice left (transparent, don't consume a step)
+            if my_left == 0:
+                self.selfplay_active_side = other
+                self.root.after(50, self._selfplay_one_action)
+                return
 
         actions = get_legal_actions(self.state, active)
         if not actions:
+            if pending_side is not None:
+                # the owner MUST resolve its pending; handing the turn over
+                # would just route back here (silent 50 ms spin) - halt loudly
+                self.log(f"Watch mode halted: {active.value} owns an open "
+                         f"pending decision but has no legal action")
+                self.selfplay_running = False
+                return
             self.selfplay_active_side = other
             self.root.after(50, self._selfplay_one_action)
             return
 
-        # Use MCTS for strongest play (200 sims)
-        action = mcts_action(self.state, active, self.fp_net, self.sh_net,
-                             num_simulations=200, temperature=0.1)
+        # Use MCTS for strongest play (200 sims); C02: the search knows
+        # whose action an answered root pending belongs to
+        _owner9 = getattr(self, 'selfplay_turn_owner', None)
+        with search_turn_owner(_owner9):
+            action = mcts_action(self.state, active, self.fp_net, self.sh_net,
+                                 num_simulations=200, temperature=0.1)
         if action is None:
+            if pending_side is not None:
+                self.log(f"Watch mode halted: search returned no action for "
+                         f"{active.value}'s open pending decision")
+                self.selfplay_running = False
+                return
             self.selfplay_active_side = other
             self.root.after(50, self._selfplay_one_action)
             return
 
         # Pass guard (mirrors _run_single_episode's pass gate)
         opp_left = self._count_unused_dice(other)
-        is_pending = (self.state.pending_army_move_die is not None or
+        # P1-05: an engine pending decision routed here is never rewritten
+        is_pending = (pending_side is not None or
+                      self.state.pending_army_move_die is not None or
                       self.state.pending_muster_die is not None)
         if (action.action_type == 'pass' and not is_pending
                 and opp_left <= my_left):
@@ -5018,10 +5306,24 @@ class WotrGUI:
         _pre_prog = self.state.fellowship.progress
         _pre_companions = [c.name for c in self.state.fellowship.companions]
 
+        # C02: the turn owner is read off the PRE-action state (the burst's
+        # combat / hunt / guide answers below keep it)
+        _owner9 = _turn_owner_after(self.state, active, _owner9)
+        self.selfplay_turn_owner = _owner9
         try:
             _execute_action(self.state, action)
         except Exception as e:
-            self.log(f"{side_label}: Action failed ({e})")
+            # P1-12: the engine refused a searched legal action - an
+            # engine/search bug.  Halt loudly; carrying on (no die spent,
+            # the side bounces back) re-picks the refused action forever.
+            import traceback
+            traceback.print_exc()
+            self.log(f"{side_label}: Action failed ({e}) - watch mode "
+                     f"halted")
+            self.selfplay_running = False
+            self._sync_hands()
+            self.refresh()
+            return
 
         # Log hunt results after fellowship move
         if action.action_type == 'fellowship_move':
@@ -5100,21 +5402,35 @@ class WotrGUI:
             burst_actions = get_legal_actions(self.state, burst_side)
             if not burst_actions:
                 break
-            burst_action = mcts_action(self.state, burst_side,
-                                       self.fp_net, self.sh_net,
-                                       num_simulations=100, temperature=0.1)
-            if burst_action is None:
-                burst_action = burst_actions[0]
+            with search_turn_owner(_owner9):
+                burst_action = mcts_action(self.state, burst_side,
+                                           self.fp_net, self.sh_net,
+                                           num_simulations=100, temperature=0.1)
             bl = "FP" if burst_side == Side.FREE_PEOPLES else "Shadow"
+            if burst_action is None:
+                # P1-12: never substitute burst_actions[0] - nobody chose
+                # it.  Halt loudly; the pending stays open (I1).
+                self.log(f"Watch mode halted: search returned no action "
+                         f"for {bl}'s open pending decision")
+                self.selfplay_running = False
+                self._sync_hands()
+                self.refresh()
+                return
             self.log(f"  {bl} [free]: {self._describe_action(burst_action)}")
             try:
                 _execute_action(self.state, burst_action)
             except Exception as e:
-                self.log(f"  {bl}: Burst action failed ({e})")
-                self.state.pending_combat = None
-                self.state.pending_hunt = None
-                self.state.pending_guide_change = None
-                break
+                # P1-12: an engine refusal is an engine/search bug - halt
+                # loudly and leave the battle / hunt / guide change exactly
+                # as the engine left it (never force-clear a pending).
+                import traceback
+                traceback.print_exc()
+                self.log(f"  {bl}: Burst action failed ({e}) - watch mode "
+                         f"halted")
+                self.selfplay_running = False
+                self._sync_hands()
+                self.refresh()
+                return
             # Log combat details if a round just happened
             last_result = getattr(self.state, '_last_battle_result', None)
             if last_result:
@@ -5146,12 +5462,16 @@ class WotrGUI:
         self._sync_hands()
         self.refresh()
 
-        # Switch sides unless pending multi-step die action
-        if (self.state.pending_army_move_die is not None or
-                self.state.pending_muster_die is not None):
-            pass  # Same side continues (multi-step die action)
-        else:
-            self.selfplay_active_side = other
+        # P1-05: post-action routing IS _run_single_episode's (single
+        # source of truth, never plain alternation): ai._active_after_action
+        # - ring use keeps the seat (the burst may have re-seated
+        # selfplay_active_side), a multi-step die action its owner, an open
+        # pending goes to its decider, else alternation from the TURN OWNER
+        # (C02: never from the side that answered a cross-side decision; a
+        # just-resolved battle passes control to the non-attacker).
+        from ai import _active_after_action
+        self.selfplay_active_side = _active_after_action(self.state, action, active,
+                                                         _owner9)
 
         # In auto mode, schedule next; in step mode, wait for space
         if not self.selfplay_paused:
@@ -5191,48 +5511,183 @@ class WotrGUI:
         self.log(f"Speed: {self.selfplay_speed}ms per action")
 
     def _ai_allocate_eyes(self):
-        """AI decides how many Shadow dice to pre-allocate as eyes before rolling."""
-        from ai import clone_state, encode_state
-        import torch, numpy as np
-        from game_logic import allocate_eyes
-
-        shadow_dice = [d for d in self.state.dice[Side.SHADOW] if not d.used]
-        n_dice = len(shadow_dice)
-        if n_dice == 0:
+        """AI Shadow pre-roll Hunt allocation (P1-09) on the ENGINE's eye
+        menu, the twin of the episode loop / watch-mode turn start: the
+        search runs under the engine's own _eye_allocation_phase flag, so
+        its menu is get_legal_actions' (0..min(max(companions, 1), unused),
+        ruling 1.271 mandatory 1-eye minimum after an FP Hunt Box
+        retrieval), and the pick executes through ai._execute_action (I1).
+        1.142: noise-free argmax.  Raises when no legal selection comes
+        back, so the dice are never rolled on a skipped allocation.
+        R2-RS-P1-09: one Hunt allocation per turn (the engine eye menu does
+        not subtract eyes already allocated), and refuses by name while
+        another engine decision is open - get_legal_actions serves that
+        decision AHEAD of the eye menu, so the search would be handed its
+        menu (callers drive it first: _pre_roll_hunt_allocation)."""
+        import ai
+        state = self.state
+        if not any(not d.used for d in state.dice.get(Side.SHADOW, [])):
             return
+        if getattr(state, 'eyes_allocated', 0) > 0:
+            self.log(f"Shadow AI: Hunt allocation already made this turn "
+                     f"({state.eyes_allocated} eye(s))")
+            return
+        kind, owner = ai._pending_decision_kind_side(state, self.current_side)
+        if kind is not None and kind != 'eye':
+            raise RuntimeError(
+                f"an open engine decision ({kind}, "
+                f"{owner.value if owner is not None else '?'}) must be "
+                f"resolved before the Shadow AI Hunt allocation")
+        fp_net = getattr(self, 'fp_net', None) or self.ai_net
+        sh_net = getattr(self, 'sh_net', None) or self.ai_net
+        state._eye_allocation_phase = True
+        try:
+            menu = [a.params.get('count') for a in
+                    ai.get_legal_actions(state, Side.SHADOW)
+                    if a.action_type == 'eye_allocate']
+            eye = ai.mcts_action(state, Side.SHADOW, fp_net, sh_net,
+                                 num_simulations=200, temperature=0.0,
+                                 add_noise=False)
+        finally:
+            state._eye_allocation_phase = False
+        if (eye is None or eye.action_type != 'eye_allocate'
+                or eye.params.get('count') not in menu):
+            raise RuntimeError(
+                f"Shadow AI Hunt allocation has no legal selection "
+                f"(menu {menu}, got {eye})")
+        ai._execute_action(state, eye)
+        n_eyes = eye.params.get('count', 0)
+        self.log(f"Shadow AI: Pre-allocated {n_eyes} die(s) as eyes "
+                 f"to hunt box")
 
-        # Evaluate allocating 0 to min(3, n_dice) eyes using value net
-        max_eyes = min(3, n_dice)
-        best_eyes = 0
-        best_val = None
+    def _pre_roll_hunt_allocation(self) -> bool:
+        """R2-RS-P1-09: ROLL DICE's step between the turn-start Fellowship
+        phase and the roll (hot-seat / --ai GUI).
+        1) Every engine decision still open is driven through the one
+           driver first (the AI searches its own, the human is asked for
+           theirs).  The Fellowship phase drives the turn-start ones (the
+           hand-limit discards); this also covers one opened after that
+           phase closed.  get_legal_actions serves an open decision AHEAD
+           of the eye menu, so an eye search on top of it is handed that
+           decision's menu (the AI Shadow's own discard wedged ROLL DICE).
+        2) The Shadow's Hunt allocation on the engine eye menu: the AI
+           Shadow searches it (_ai_allocate_eyes); a human Shadow
+           allocates with Alloc Eyes and is asked here (required) only
+           when the ruling 1.271 minimum is owed and nothing is allocated
+           - with no minimum, rolling unallocated is the legal 0-eye pick.
+        True when the roll may follow.  Every failure is logged in the GUI
+        and returns False with nothing rolled - never raised into the Tk
+        callback; the next ROLL DICE retries from the decision still
+        open."""
+        import traceback
+        what = "an open decision"
+        try:
+            if self._engine_pending_side() is not None:
+                self._drive_engine_decisions()
+            if self._engine_pending_side() is not None:
+                raise RuntimeError("an open engine decision has no legal "
+                                   "choice")
+            what = "the Hunt allocation"
+            if self.ai_side == Side.SHADOW:
+                if self.ai_net:
+                    self._ai_allocate_eyes()
+            elif getattr(self.state, 'eyes_allocated', 0) == 0:
+                acts = self._engine_eye_menu()
+                if acts and min(a.params.get('count', 0)
+                                for a in acts) >= 1:
+                    self._human_eye_allocation(required=True)
+        except Exception as e:
+            self.log(f"Roll refused - {what} is not finished, dice not "
+                     f"rolled ({type(e).__name__}: {e})")
+            traceback.print_exc()
+            self.refresh()
+            return False
+        return True
 
-        sh_net = getattr(self, 'sh_net', self.ai_net)
-        sh_net.eval()
-        for n_eyes in range(max_eyes + 1):
-            s2 = clone_state(self.state)
-            if n_eyes > 0:
-                indices = [i for i, d in enumerate(s2.dice[Side.SHADOW])
-                           if not d.used][:n_eyes]
-                allocate_eyes(s2, n_eyes, indices=indices)
-            vec = encode_state(s2, Side.SHADOW)
-            with torch.no_grad():
-                val = sh_net(
-                    torch.from_numpy(np.array(vec, dtype=np.float32)).unsqueeze(0)
-                ).item()
-            if best_val is None or val > best_val:
-                best_val = val
-                best_eyes = n_eyes
+    def _engine_eye_menu(self) -> list:
+        """The engine's Shadow Hunt-allocation menu (R2-RS-P1-09): the
+        eye_allocate rows of get_legal_actions under _eye_allocation_phase
+        (0..min(max(companions, 1), unused Shadow dice); ruling 1.271
+        minimum of 1 after an FP Hunt Box retrieval).  [] when no Shadow
+        die is unused.  Raises when the engine serves anything else there
+        (an open decision comes first in get_legal_actions)."""
+        import ai
+        state = self.state
+        if not any(not d.used for d in state.dice.get(Side.SHADOW, [])):
+            return []
+        state._eye_allocation_phase = True
+        try:
+            acts = ai.get_legal_actions(state, Side.SHADOW)
+        finally:
+            state._eye_allocation_phase = False
+        if not acts or any(a.action_type != 'eye_allocate' for a in acts):
+            raise RuntimeError(
+                "the engine eye menu is unavailable (served %s)"
+                % sorted({a.action_type for a in acts}))
+        return acts
 
-        if best_eyes > 0:
-            indices = [i for i, d in enumerate(self.state.dice[Side.SHADOW])
-                       if not d.used][:best_eyes]
-            allocate_eyes(self.state, best_eyes, indices=indices)
-            self.log(f"Shadow AI: Pre-allocated {best_eyes} die(s) as eyes to hunt box")
+    def _human_eye_allocation(self, required: bool) -> bool:
+        """A human Shadow's Hunt allocation (R2-RS-P1-09): the choices are
+        the ENGINE's eye_allocate menu and the pick executes through
+        ai._execute_action (I1) - never a per-die tick list handed to
+        game_logic.allocate_eyes, which applies no rule.  required=True
+        (ROLL DICE, 1.271 minimum owed) has no Cancel; Alloc Eyes may
+        cancel.  True when an allocation was executed; raises when a
+        required choice gets no answer (nothing allocated or rolled)."""
+        import ai
+        acts = self._engine_eye_menu()
+        if not acts:
+            self.log("No unused Shadow die to allocate as an Eye")
+            return False
+        counts = [a.params.get('count', 0) for a in acts]
+        note = (" - ruling 1.271: the Free Peoples took a die from the "
+                "Hunt Box last turn, so at least 1" if counts[0] >= 1
+                else "")
+        opts = [(f"{n} eye(s) to the Hunt Box", n) for n in counts]
+        pick = self._show_choice_dialog(
+            "Shadow Hunt allocation",
+            f"Shadow dice to allocate as Eyes before the roll{note}:",
+            opts, allow_cancel=not required)
+        if pick is None:
+            if required:
+                raise RuntimeError("Shadow Hunt allocation dialog closed "
+                                   "without a choice - nothing allocated")
+            self.log("Hunt allocation cancelled - nothing allocated")
+            return False
+        ai._execute_action(self.state, acts[counts.index(pick)])
+        self.log(f"Shadow: Pre-allocated {pick} eye(s) to the Hunt Box")
+        return True
 
     def _on_pass_turn(self):
         """Pass without using a die (only when opponent has more unused dice)."""
         if self.ai_playing:
             self.log("Wait for AI to finish its turn")
+            return
+        # R2-SL-34: Pass while this side's own second army move / second
+        # recruit is open DECLINES it through the engine's window-closing
+        # row (that die) - never a hand-over that leaves the window open
+        # for the AI to take.  Hot-seat too: after 'Yes' it is the
+        # window's only decline.  (An owner-less legacy window - side None,
+        # served to either side - is declined by whoever passes.)
+        own = [w for w in self._multistep_windows()
+               if w[1] in (None, self.current_side)]
+        if own:
+            if self._ai_mode_decision_open(continues=own[0][0]):
+                return
+            try:
+                self._close_multistep_window(*own[0], why='Pass')
+            except Exception as e:
+                self.log(f"Could not decline the "
+                         f"{self._multistep_text(own[0][0])} ({e})")
+                import traceback
+                traceback.print_exc()
+                self.refresh()
+                return
+            self.selected_die_idx = None
+            self.pending_action = None
+            self.action_source = None
+            self._arm_ai_reply()
+            self.refresh()
             return
         if not self.ai_side:
             self.log("Pass is only available in AI mode")
@@ -5251,6 +5706,8 @@ class WotrGUI:
         """After human acts or passes, check dice state and trigger one AI action."""
         if not self.ai_side or not self.ai_net or self.ai_playing:
             return
+        if self._ai_waits_for_human_window():   # R2-SL-34
+            return
         human_side = Side.FREE_PEOPLES if self.ai_side == Side.SHADOW else Side.SHADOW
         ai_unused = self._count_unused_dice(self.ai_side)
         human_unused = self._count_unused_dice(human_side)
@@ -5258,12 +5715,98 @@ class WotrGUI:
             self.log("All dice used - action phase complete")
             return
         if ai_unused > 0:
+            # R2-SL-32: never start the AI inside a decision the human
+            # owns (get_legal_actions refuses to ask the AI for it)
+            open_side = self._engine_pending_side()
+            if open_side is not None and open_side != self.ai_side:
+                self._defer_ai_reply(open_side)
+                return
+            self._ai_reply_deferred = None
             self.ai_playing = True
             self.root.after(500, self._ai_play_one_action)
 
+    def _defer_ai_reply(self, open_side):
+        """R2-SL-32: a decision the HUMAN owns is still open, so the AI
+        does not act.  ai_playing stays False (every human button keeps
+        working): the human resolves the decision in its dialog or, on
+        their next action button, through _ai_mode_decision_open.  The
+        reply looks again in 1 s and runs once the decision is resolved;
+        it never carries into the next turn.  Logged once per wait."""
+        self.ai_playing = False
+        if getattr(self, '_ai_reply_deferred', None) is None:
+            self.log(f"{open_side.value} decision still open - the "
+                     f"{self.ai_side.value} AI replies once it is resolved")
+        self._ai_reply_deferred = open_side
+        if hasattr(self, '_ai_after_id'):
+            self.root.after_cancel(self._ai_after_id)
+        self._ai_after_id = self.root.after(1000, self._retry_ai_reply,
+                                            self.state.turn)
+
+    def _retry_ai_reply(self, turn):
+        """R2-SL-32: the deferred AI reply (armed by _defer_ai_reply)."""
+        if self.state.turn != turn:
+            self._ai_reply_deferred = None
+            self.log(f"AI reply from turn {turn} dropped - that turn "
+                     f"has ended")
+            return
+        self._after_human_action()
+
+    # R5-DOC-COMMENTS-3 (R4-GUI-SKIP-DIE-BUTTON FU1): the exits the logs name
+    # once the AI stopped without acting (ai_playing cleared, nothing
+    # re-armed).  A finished human action arms the AI reply (_arm_ai_reply);
+    # Pass works while the AI holds more unused dice (_on_pass_turn); End
+    # Turn does not simply end the turn over the AI's usable dice - it asks
+    # first (_ask_forfeit_ai_dice, rule 1.67: No asks the AI again, Yes
+    # forfeits them as a DEFECT).
+    _AI_STOPPED_EXITS = ("you have control: your next action, or Pass while "
+                         "the AI holds more unused dice, asks the AI again; "
+                         "End Turn asks before it forfeits the AI's usable "
+                         "dice")
+
     def _ai_play_one_action(self):
-        """AI plays exactly ONE action, then returns control to the human."""
+        """AI plays exactly ONE action, then returns control to the human.
+
+        R2-SL-32: this runs as a Tk after() callback.  An exception that
+        escaped it (a raising legal menu or search) was printed and
+        swallowed by Tk with ai_playing still True, and every human button
+        then answered 'Wait for AI to finish its turn' for the rest of the
+        session.  A failure now always clears the flag and is shown in the
+        GUI log; no other action is substituted (I1 / P1-12).  Every
+        normal exit of _ai_play_one_action_body clears the flag itself or
+        deliberately re-arms the AI's next die."""
+        try:
+            self._ai_play_one_action_body()
+        except Exception as e:
+            self.ai_playing = False
+            self.log(f"{getattr(self.ai_side, 'value', self.ai_side)} AI: "
+                     f"its action FAILED ({type(e).__name__}: {e}) - no "
+                     f"action taken, {self._AI_STOPPED_EXITS}")
+            import traceback
+            traceback.print_exc()
+            self.refresh()
+
+    def _ai_play_one_action_body(self):
+        """The AI's one action; called only through _ai_play_one_action."""
         from ai import mcts_action, get_legal_actions, _execute_action
+
+        # R2-SL-32: never inside a decision the human owns; an AI-owned
+        # decision left open is finished through the one driver first,
+        # never searched as a fresh top-level menu
+        open_side = self._engine_pending_side()
+        if open_side is not None and open_side != self.ai_side:
+            self._defer_ai_reply(open_side)
+            return
+        if open_side is not None:
+            self._drive_engine_decisions()
+            left = self._engine_pending_side()
+            if left is not None:
+                raise RuntimeError(
+                    f"{left.value} decision still open after the engine "
+                    f"driver - the {self.ai_side.value} AI cannot act")
+        # R2-SL-34: never inside the human's own open multi-step window
+        # (a reply armed before it opened); ai_playing cleared, logged
+        if self._ai_waits_for_human_window():
+            return
 
         actions = get_legal_actions(self.state, self.ai_side)
         if not actions:
@@ -5276,36 +5819,239 @@ class WotrGUI:
                              num_simulations=200, temperature=0.1,
                              add_noise=False)
         if action is None:
+            # R2-S4-ENGINE-AI-TOOLS (rescan v070, P1-12 sibling): never a
+            # silent skip - the AI did not act; say so and stop (state
+            # untouched, nothing re-armed; Pass asks the AI again)
             self.ai_playing = False
+            self.log(f"{self.ai_side.value} AI search returned no action - "
+                     f"AI stopped, no action taken, {self._AI_STOPPED_EXITS}")
             return
 
         self.log(f"{self.ai_side.value} AI: {self._describe_action(action)}")
 
+        failed = False      # R2-SL-32: re-arm below only on success
         try:
             _execute_action(self.state, action)
         except Exception as e:
-            self.log(f"{self.ai_side.value} AI: Action failed ({e}), skipping")
+            failed = True
+            self.log(f"{self.ai_side.value} AI: Action failed ({e}) - no "
+                     f"action taken, {self._AI_STOPPED_EXITS}")
+            import traceback
+            traceback.print_exc()
+        else:
+            # P1-07: the AI's action is not over until every engine
+            # decision it opened (its own chain AND the human's decisions
+            # inside it: defender cards, retreats, casualties) and its own
+            # multi-step die are resolved.  ai_playing stays True until
+            # then, so no human button can run mid-chain.
+            try:
+                self._ai_finish_action()
+            except Exception as e:
+                failed = True
+                self.log(f"{self.ai_side.value} AI: could not finish "
+                         f"its action ({e})")
+                import traceback
+                traceback.print_exc()
 
         self._sync_hands()
         self.refresh()
         self.ai_playing = False
 
-        # If human has no dice left, AI continues playing remaining dice
+        # If human has no dice left, AI continues playing remaining dice.
+        # R2-SL-32: never after a failure - that retried the same failing
+        # action every 800 ms with ai_playing True between tries; the
+        # human keeps control: a human action, or Pass while the AI holds
+        # more unused dice, asks the AI again; End Turn asks first
+        # (_ask_forfeit_ai_dice, rule 1.67: No asks the AI again, Yes
+        # forfeits its usable dice as a DEFECT) - _AI_STOPPED_EXITS
         human_side = Side.FREE_PEOPLES if self.ai_side == Side.SHADOW else Side.SHADOW
         human_unused = self._count_unused_dice(human_side)
         ai_unused = self._count_unused_dice(self.ai_side)
+        if failed:
+            return
         if human_unused == 0 and ai_unused > 0:
             self.ai_playing = True
             self.root.after(800, self._ai_play_one_action)
         elif ai_unused == 0 and human_unused == 0:
             self.log("All dice used - action phase complete")
 
+    def _ai_multistep_open(self) -> bool:
+        """True while the AI's just-taken action still holds an engine
+        multi-step die (second army move / second muster recruit) or an
+        Elven Ring free action: the non-pending part of the engine's
+        'required decision' set (ai._next_acting_side keeps the acting
+        side's seat for exactly these).  R2-SL-34: only a window the AI
+        OWNS (pending_*_side) - the human's half-spent Muster/Army die
+        made the AI play its whole pool inside the human's window."""
+        if any(owner == self.ai_side
+               for _k, owner, _d in self._multistep_windows()):
+            return True
+        rfs = getattr(self.state, '_ring_free_side', None)
+        return rfs == self.ai_side and self._count_unused_dice(rfs) > 0
+
+    def _multistep_windows(self):
+        """R2-SL-34: every open engine multi-step die window as
+        (kind, owner side, die index) - 'army_move' = the Army die's
+        second move, 'muster' = the Muster die's second recruit.  The
+        owner is the engine's pending_*_side; get_legal_actions serves
+        the window's menu (and its closing pass row) to that side only."""
+        st = self.state
+        wins = []
+        if st.pending_army_move_die is not None:
+            wins.append(('army_move',
+                         getattr(st, 'pending_army_move_side', None),
+                         st.pending_army_move_die))
+        if st.pending_muster_die is not None:
+            wins.append(('muster', getattr(st, 'pending_muster_side', None),
+                         st.pending_muster_die))
+        return wins
+
+    def _human_multistep_window(self):
+        """R2-SL-34 (AI mode): the open multi-step window a non-AI side
+        owns, as (kind, owner, die), else None."""
+        if self.ai_side is None:
+            return None
+        return next((w for w in self._multistep_windows()
+                     if w[1] != self.ai_side), None)
+
+    @staticmethod
+    def _multistep_text(kind):
+        return 'second army move' if kind == 'army_move' else 'second recruit'
+
+    def _ai_waits_for_human_window(self) -> bool:
+        """R2-SL-34: True (logged, ai_playing cleared) while the human's
+        own multi-step window is open - the AI never acts inside it.  No
+        retry timer: every exit of the window re-arms the reply (the
+        second move / recruit, the 'No' answer, Pass); End Turn closes it."""
+        win = self._human_multistep_window()
+        if win is None:
+            return False
+        self.ai_playing = False
+        self.log(f"Your {self._multistep_text(win[0])} is still open - "
+                 f"make it, or press Pass to decline it; the "
+                 f"{self.ai_side.value} AI replies after that")
+        return True
+
+    def _close_multistep_window(self, kind, owner, die_idx, why):
+        """R2-SL-34: close an open multi-step window through the engine's
+        own window-closing row (pass on the window's die - the row
+        get_legal_actions serves its owner): the die is spent and the
+        unused half forfeited."""
+        from ai import Action, _execute_action
+        _execute_action(self.state, Action(die_idx=die_idx,
+                                           action_type='pass', params={}))
+        self.log(f"{getattr(owner, 'value', owner)}: "
+                 f"{self._multistep_text(kind)} declined ({why})")
+
+    def _multistep_blocks(self, continues=None) -> bool:
+        """R2-SL-34 half of the P1-07 guard (AI mode): no top-level human
+        action while a multi-step window is open, except that window's
+        own continuation (`continues` = its kind).  The engine would run
+        it as the window's second half or beside it.  A human-owned
+        window is refused with its exits named; an AI-owned one (left by
+        a failed AI action) is finished by the AI first."""
+        for kind, owner, _die in self._multistep_windows():
+            if owner == self.ai_side:
+                self.log(f"The {self.ai_side.value} AI's "
+                         f"{self._multistep_text(kind)} is still open - "
+                         f"the AI finishes it first; action not taken")
+                self.ai_playing = True
+                try:
+                    self._ai_finish_action()
+                except Exception as e:
+                    self.log(f"{self.ai_side.value} AI: could not finish "
+                             f"its {self._multistep_text(kind)} ({e})")
+                    import traceback
+                    traceback.print_exc()
+                finally:
+                    self.ai_playing = False
+                self.refresh()
+                return True
+            if continues != kind:
+                self.log(f"Your {self._multistep_text(kind)} is still "
+                         f"open - make it, or press Pass to decline it; "
+                         f"action not taken")
+                self.refresh()
+                return True
+        return False
+
+    def _ai_finish_action(self):
+        """Drive the AI's just-executed action to completion (P1-07).
+        Every open engine decision goes through _drive_engine_decisions
+        (the AI picks its own, the human is prompted for theirs); an open
+        multi-step die of the AI is played by the AI itself.  Raises when
+        an AI-owned decision cannot be resolved; a human-owned decision
+        left open is logged and re-driven by _ai_mode_decision_open before
+        any new human action."""
+        from ai import mcts_action, _execute_action
+        for _ in range(400):
+            if self._engine_pending_side() is not None:
+                self._drive_engine_decisions()
+                left = self._engine_pending_side()
+                if left is None:
+                    continue
+                if left != self.ai_side:
+                    self.log(f"{left.value} decision still open - "
+                             f"resolve it before acting")
+                    return
+                raise RuntimeError(
+                    f"{self.ai_side.value} AI decision left open by the "
+                    f"engine driver")
+            if not self._ai_multistep_open():
+                return
+            action = mcts_action(self.state, self.ai_side,
+                                 self.fp_net, self.sh_net,
+                                 num_simulations=200, temperature=0.1,
+                                 add_noise=False)
+            if action is None:
+                raise RuntimeError(
+                    f"{self.ai_side.value} AI search returned no action "
+                    f"for its open multi-step die")
+            self.log(f"{self.ai_side.value} AI: "
+                     f"{self._describe_action(action)}")
+            _execute_action(self.state, action)
+        raise RuntimeError(
+            f"{self.ai_side.value} AI action still open after 400 steps")
+
+    def _ai_mode_decision_open(self, continues=None) -> bool:
+        """P1-07 guard for top-level human actions in AI mode: none may
+        start while an engine decision is open (ai._execute_action has no
+        owner guard, so the engine would run it inside the AI's chain or
+        battle).  The open decision is driven through the one driver
+        instead; returns True when the caller must refuse the action.
+        R2-SL-34: nor while a multi-step die window is open, unless the
+        action is that window's continuation (`continues` = 'army_move' /
+        'muster', the caller's own second half) - see _multistep_blocks."""
+        if self.ai_side is None:
+            return False
+        if self._engine_pending_side() is None:
+            return self._multistep_blocks(continues)
+        self.log("An open decision must be resolved first - "
+                 "action not taken")
+        try:
+            self._drive_engine_decisions()
+        except Exception as e:
+            self.log(f"Could not resolve the open decision ({e})")
+            import traceback
+            traceback.print_exc()
+        self.refresh()
+        return True
+
     def _describe_action(self, action):
         """Return a human-readable string for an AI action."""
         t = action.action_type
         p = action.params
         if t == 'army_move':
-            return f"Moves army {p['from']} -> {p['to']}"
+            # R3-COSMETIC-BRIDGE-TEXT (R2-E5-01-SURFACE FU3): the split (units,
+            # the named leader set, Nazgul) - one menu holds a row per figure
+            # set since D5, and the human choice dialog labels rows with this
+            import engine_play
+            return (f"Moves army {p['from']} -> {p['to']}"
+                    + engine_play.army_move_split_text(p))
+        elif t == 'skip':
+            # R3-COSMETIC-BRIDGE-TEXT: the die-discard row (USER A2-06)
+            import engine_play
+            return engine_play.die_discard_text(p)
         elif t == 'army_attack':
             return f"Attacks {p['to']} from {p['from']}"
         elif t == 'advance_political':
@@ -5328,8 +6074,32 @@ class WotrGUI:
             return "Crowns Aragorn"
         elif t == 'fellowship_declare':
             return f"Declares fellowship at {p.get('region', '?')}"
+        elif t == 'choose_guide':
+            return f"Guide: {p.get('companion', '?')}"
         elif t == 'pass':
             return "Passes (wastes die)"
+        # R18-SRC-TOOLS: the Hunt decisions FSP Move opens through the
+        # engine (the removed hunt dialog's buttons carried this text)
+        elif t == 'hunt_take_corruption':
+            return "Take the Hunt damage as Corruption"
+        elif t == 'hunt_sacrifice_guide':
+            return ("Eliminate the Guide (absorbs Hunt damage up to his "
+                    "level)")
+        elif t == 'hunt_sacrifice_random':
+            return ("A random Companion takes the Hunt damage (absorbs up "
+                    "to his level)")
+        elif t == 'hunt_guide_separate':
+            return (f"Separate the Guide {p.get('companion', '?')} "
+                    f"(Hunt damage -1)")
+        elif t == 'hunt_gollum_reveal':
+            return "Gollum: reveal the Fellowship (Hunt damage -1)"
+        elif t == 'hunt_gollum_no_reveal':
+            return "Gollum: stay hidden (full Hunt damage)"
+        elif t == 'fellowship_reveal_place':
+            region = str(p.get('region', '?'))
+            name = board_module.regions.get(sanitize(region), {}).get(
+                'orig', region)
+            return f"Reveal the Fellowship in {name}"
         return str(action)
 
     # --- Zoom Controls ---
@@ -5375,6 +6145,25 @@ class WotrGUI:
             self.log_text.insert(tk.END, f"> {message}\n")
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
+
+    def _report_callback_exception(self, exc_type, exc, tb):
+        """Tk's report_callback_exception for this window (installed in
+        __init__; R3-LEGACY-GUI-TURN, R2-RS-P1-09 FU2).  Tk's default
+        printed an exception escaping a callback to stderr only, so the
+        user saw a button do nothing.  The traceback still goes to stderr
+        and the failure is named in the GUI log.  Nothing is retried or
+        substituted and no flag is touched: the handlers that hold a flag
+        (ai_playing, an engine phase flag) clear it themselves."""
+        import sys
+        import traceback
+        traceback.print_exception(exc_type, exc, tb)
+        try:
+            self.log(f"UI callback FAILED ({exc_type.__name__}: {exc}) - "
+                     f"nothing was substituted; traceback on the console")
+        except Exception as log_err:
+            print(f"[gui] the callback failure above could not be shown in "
+                  f"the GUI log ({type(log_err).__name__}: {log_err})",
+                  file=sys.stderr)
 
     def run(self):
         """Start the GUI main loop."""
@@ -5500,6 +6289,14 @@ class WotrGUI:
             log=lambda s: self._live_logq.put(str(s)))
         try:
             fp_net, sh_net = ep.load_nets(net_tag)
+            # R2-MODEL-CANDIDATES: inside the dialog block - attach_nets
+            # refuses an AI seat net with an all-zero value head (INV-RING-1)
+            session.attach_nets(fp_net, sh_net)
+            # R17-GUI-ENGINEPLAY (row 75): the AI seats search with the
+            # live AI's own contract (engine_play.SEARCH_CONTRACTS, on the
+            # WOTR_LIVE_SEARCH_BACKEND the bat sets); a seat or native box
+            # that search refuses fails here, before play, in this dialog
+            session.prepare_search()
         except BaseException as e:
             # visible even under pythonw (no console)
             try:
@@ -5508,7 +6305,6 @@ class WotrGUI:
             except Exception:
                 pass
             raise
-        session.attach_nets(fp_net, sh_net)
         self.live_session = session
         # adopt the session's state (same swap the replay viewer does)
         self.state = session.state
@@ -5550,13 +6346,23 @@ class WotrGUI:
                  % init_sims,
             bg=COLORS['panel_bg'], fg=COLORS['text'], anchor='w')
         self.live_sims_label.pack(side=tk.LEFT, padx=8)
+        # P1-14: the slider must hold the requested --sims EXACTLY.  Tk's
+        # scale 'set' rounds to -resolution and clamps to [from, to], and
+        # at its first redraw runs -command with that altered value, which
+        # _live_sims_changed wrote into sims_override: --sims 2000 searched
+        # 1000, --sims 10 searched 30, --sims 305 searched 310, while the
+        # title claimed the requested budget.  Widen the range to contain
+        # the requested value and use resolution 1 when it is off the
+        # 10-grid, so set() is an identity and the slider never overrides.
+        init_sims = int(init_sims)
         self.live_sims_scale = tk.Scale(
-            bar, from_=30, to=1000, resolution=10,
+            bar, from_=min(30, init_sims), to=max(1000, init_sims),
+            resolution=(10 if init_sims % 10 == 0 else 1),
             orient=tk.HORIZONTAL, showvalue=0, length=260,
             bg=COLORS['panel_bg'], fg=COLORS['text'],
             highlightthickness=0, troughcolor=COLORS['bg'],
             command=self._live_sims_changed)
-        self.live_sims_scale.set(int(init_sims))
+        self.live_sims_scale.set(init_sims)
         self.live_sims_scale.pack(side=tk.LEFT, padx=8, pady=2)
 
     def _live_sims_changed(self, val):
@@ -5692,18 +6498,36 @@ class WotrGUI:
             return
         if kind == 'err':
             self.log('AI search FAILED: %s - game halted' % got)
-            self._live_finish(error=got)
+            self._live_finish(error='AI error: %s' % got)
             return
         s = self.live_session
         dp = s.current()
         if dp is None:
             self._live_finish()
             return
+        # P1-01: masked for the human seat (the AI's face-down discards,
+        # committed attacker combat card, table-kill payment pair)
         desc = self._ep.describe_action(s.state, dp.side,
-                                        dp.actions[got])
+                                        dp.actions[got],
+                                        viewer=self.live_human)
         nm = 'FP' if dp.side is Side.FREE_PEOPLES else 'SH'
         _n9 = s.last_pick_sims  # what ai_pick actually used (slider-live)
-        s.submit(got, dp.side)
+        try:
+            s.submit(got, dp.side)
+        except Exception as e:
+            # P1-03: never let an engine exception escape this Tk
+            # callback (the after() chain died, status stuck on
+            # 'thinking').  An error inside the decision halts the
+            # session (EngineSession.halt_error): halt the game loudly.
+            _c = getattr(s, 'halt_error', None) or e
+            self.log('T%d %s (AI): %s [sims=%s] - FAILED, game halted'
+                     % (dp.turn, nm, desc, _n9),
+                     'fp' if nm == 'FP' else 'sh')
+            self._live_finish(
+                error=('engine refused the AI move: %s' % e
+                       if isinstance(e, self._ep.IllegalPlay) else
+                       'engine error: %s: %s' % (type(_c).__name__, _c)))
+            return
         self.log('T%d %s (AI): %s [sims=%s]' % (dp.turn, nm, desc, _n9),
                  'fp' if nm == 'FP' else 'sh')
         self.root.after(30, self._live_next)
@@ -5777,6 +6601,21 @@ class WotrGUI:
         except self._ep.IllegalPlay as e:
             self.log('REFUSED: %s' % e)
             return False
+        except Exception as e:
+            # P1-03: an engine error inside the decision halts the
+            # session (EngineSession.halt_error; engine_play.EngineHalted)
+            # - not a retryable refusal.  Clear the stale menu and halt
+            # the game loudly instead of letting it escape the callback.
+            _c = getattr(s, 'halt_error', None) or e
+            self.log('T%d %s (you): %s - FAILED, game halted'
+                     % (dp.turn, 'FP' if dp.side is Side.FREE_PEOPLES
+                        else 'SH', desc))
+            self.live_play_btn.configure(state=tk.DISABLED)
+            self.live_list.delete(0, tk.END)
+            self.live_current_dp = None
+            self._live_finish(error='engine error: %s: %s'
+                              % (type(_c).__name__, _c))
+            return False
         nm = 'FP' if dp.side is Side.FREE_PEOPLES else 'SH'
         self.log('T%d %s (you): %s' % (dp.turn, nm, desc),
                  'fp' if nm == 'FP' else 'sh')
@@ -5798,8 +6637,15 @@ class WotrGUI:
             pass
         self._live_refresh()
         res = self.live_session.result_info or {}
+        # P1-03: a halted session (or one that ended with no result) is
+        # a HALT, never a 'LIVE GAME OVER: ? wins by ?' announcement
+        _halt = getattr(self.live_session, 'halt_error', None)
+        if error is None and _halt is not None:
+            error = 'engine error: %s: %s' % (type(_halt).__name__, _halt)
+        elif error is None and not res:
+            error = 'engine error: the session ended with no result'
         if error is not None:
-            msg = 'game halted on AI error: %s' % error
+            msg = 'game halted on %s' % error
         elif res.get('winner') == 'timeout':
             # never the bare word 'timeout' in front of a human (USER
             # 2026-08-14): a capped run is a STOP, not a game ending
@@ -5817,7 +6663,8 @@ class WotrGUI:
                       res.get('turns', '?')))
             if res.get('message'):
                 msg += '\n%s' % res['message']
-        _head = ('LIVE GAME STOPPED'
+        _head = ('LIVE GAME HALTED' if error is not None
+                 else 'LIVE GAME STOPPED'
                  if res.get('winner') in ('timeout', 'abandoned')
                  else 'LIVE GAME OVER')
         self.log('=== %s: %s ===' % (_head, msg.replace('\n', ' ')),

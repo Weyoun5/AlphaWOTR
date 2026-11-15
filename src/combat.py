@@ -1050,6 +1050,27 @@ def _defender_first_initiative(combat: CombatState) -> bool:
     return def_init <= atk_init
 
 
+def _drop_saruman_elite_leadership(combat: CombatState, is_attacker: bool,
+                                   casualties: List[Unit]) -> None:
+    """Saruman in play: every Isengard Elite is also a Leader (+1 Shadow
+    Leadership, counted by _recompute_round_leadership at setup and between
+    rounds).  An Isengard Elite removed OR downgraded MID-ROUND (pre-combat
+    attacks, Relentless Assault self-hits) is no longer a Leader for this
+    round's Leader re-roll, so its point leaves the side's Leadership now -
+    the RoundCursor payment (combat_round_resume._payment) and the native
+    ce_payment do the same per paid figure (fix wave E2-02).  `casualties`
+    is apply_casualties' return list: a downgraded or removed Elite is
+    listed as the ELITE unit itself."""
+    if not getattr(combat, '_saruman_in_play', False):
+        return
+    n = sum(1 for u in casualties
+            if u.kind == UnitKind.ELITE and u.nation == Nation.ISENGARD)
+    if n:
+        role = 'attacker' if is_attacker else 'defender'
+        setattr(combat, role + '_leadership',
+                max(0, getattr(combat, role + '_leadership') - n))
+
+
 def _resolve_pre_combat(combat: CombatState, choices: dict = None) -> None:
     """Pre-combat additional attacks (Sudden Strike / Charge / Durin's
     Bane — all initiative 2) resolved in initiative order (lower first;
@@ -1076,10 +1097,11 @@ def _resolve_pre_combat(combat: CombatState, choices: dict = None) -> None:
             _apply_pre_combat_for_side(combat, is_attacker=True)
             _delta = combat.attacker_pre_combat_hits - _before
             if _delta > 0:
-                combat.defender_casualties.extend(
-                    apply_casualties(combat.defender_army, _delta,
-                                     _pc.get('def_casualty_policy',
-                                             'preserve_elites')))
+                _cas = apply_casualties(combat.defender_army, _delta,
+                                        _pc.get('def_casualty_policy',
+                                                'preserve_elites'))
+                combat.defender_casualties.extend(_cas)
+                _drop_saruman_elite_leadership(combat, False, _cas)
                 if is_army_destroyed(combat.defender_army):
                     combat.defender_destroyed = True
                     combat.battle_over = True
@@ -1088,10 +1110,11 @@ def _resolve_pre_combat(combat: CombatState, choices: dict = None) -> None:
             _apply_pre_combat_for_side(combat, is_attacker=False)
             _delta = combat.defender_pre_combat_hits - _before
             if _delta > 0:
-                combat.attacker_casualties.extend(
-                    apply_casualties(combat.attacker_army, _delta,
-                                     _pc.get('atk_casualty_policy',
-                                             'preserve_elites')))
+                _cas = apply_casualties(combat.attacker_army, _delta,
+                                        _pc.get('atk_casualty_policy',
+                                                'preserve_elites'))
+                combat.attacker_casualties.extend(_cas)
+                _drop_saruman_elite_leadership(combat, True, _cas)
                 if is_army_destroyed(combat.attacker_army):
                     combat.attacker_destroyed = True
                     combat.battle_over = True
@@ -1351,6 +1374,8 @@ def apply_relentless_assault(combat: CombatState, choices: dict = None) -> None:
                     k = max(0, min(int(fc), 2, _cap_ra))
                     if k > 0:
                         casualties = apply_casualties(army, k)
+                        _drop_saruman_elite_leadership(combat, is_atk,
+                                                       casualties)
                         if is_atk:
                             combat.attacker_casualties.extend(casualties)
                             combat.attacker_dice_mod += k
@@ -1369,6 +1394,7 @@ def apply_relentless_assault(combat: CombatState, choices: dict = None) -> None:
                 max_sacrifice = min(2, max(0, len(army.units) - 2))
                 if max_sacrifice > 0:
                     casualties = apply_casualties(army, max_sacrifice)
+                    _drop_saruman_elite_leadership(combat, is_atk, casualties)
                     # card text: +1 per HIT inflicted — an elite absorbs
                     # 2 hits as ONE removal, so count hits, not figures
                     if is_atk:
@@ -1962,9 +1988,23 @@ def _apply_bb_hd(combat: CombatState, atk_reroll_hits: int,
         rh = atk_reroll_hits if is_attacker else def_reroll_hits
         apply_fateful_strike(combat, rh, is_attacker, choices=choices)
         apply_blade_of_westernesse(combat, rh, is_attacker, choices=choices)
+        # E2-01: record the FP figures Black Breath / Heroic Death remove
+        # on combat._round_card_fp_dead -- the same roster diff the
+        # RoundCursor's _initiative6 keeps -- so _publish_round_casualties
+        # books them (FP Leader = permanent casualty, Companion upkeep) on
+        # this plain path too.
+        before = (list(combat.attacker_army.leaders)
+                  + list(combat.defender_army.leaders))
         apply_black_breath(combat, rh, is_attacker=is_attacker,
                            choices=choices)
         _heroic_death_for_side(combat, is_attacker, choices)
+        after = combat.attacker_army.leaders + combat.defender_army.leaders
+        dead = getattr(combat, '_round_card_fp_dead', None)
+        if dead is None:
+            dead = combat._round_card_fp_dead = []
+        dead.extend(figure for figure in before
+                    if _combat_leader_side(figure) == Side.FREE_PEOPLES
+                    and not any(figure is remaining for remaining in after))
 
     if _defender_first_initiative(combat):
         _side(False)
@@ -3129,7 +3169,10 @@ def _consume_downgrade_source(state, nation, dgc,
             dgc[nation] = dgc.get(nation, 0) + 1
         return 'pool'
     if src == 'cas':
-        state.fp_casualties[nation]['regular'] -= 1
+        # BL-156: per-key safe (an adopted ledger may lack a kind key)
+        _box = state.fp_casualties.setdefault(
+            nation, {'regular': 0, 'elite': 0, 'leader': 0})
+        _box['regular'] = int(_box.get('regular', 0) or 0) - 1
     elif src == 'pool':
         if dgc is not None:
             dgc[nation] = dgc.get(nation, 0) + 1
@@ -3368,8 +3411,13 @@ def _track_fp_casualties(state: "GameState", casualties: List[Unit], army_side: 
         state.fp_casualties = {}
     for unit in casualties:
         nat = unit.nation
-        if nat not in state.fp_casualties:
-            state.fp_casualties[nat] = {'regular': 0, 'elite': 0, 'leader': 0}
+        # BL-156 (2026-11-01 Woodland Realm): a skip-adopted ledger entry
+        # arrived as the partial {'elite': 1}; the `nat not in` guard let the
+        # increments below raise KeyError('regular') and drop a whole combat
+        # round.  Every kind key is guaranteed here, whatever the dict held.
+        _box = state.fp_casualties.setdefault(nat, {})
+        for _k in ('regular', 'elite', 'leader'):
+            _box[_k] = int(_box.get(_k, 0) or 0)
         # USER RULING 2026-07-20 (supersedes the 1.188-era pool-swap
         # doctrine): a downgraded FREE PEOPLES elite is a PERMANENT
         # elite casualty — it does NOT return to reinforcements. Only

@@ -1,22 +1,40 @@
-# AlphaWOTR - session artifacts the live stack writes into the client dir
-# (the launcher clears them each session; never commit them)
+# AlphaWOTR - the repository tracks the release without its Python runtime.
+# Everything below is local to a folder the game is played or installed in.
+
+# what a game played from this folder writes into the client dir
 wotr_bridge/play_client/ai_*
+wotr_bridge/play_client/core_*
+wotr_bridge/play_client/core-*
+wotr_bridge/play_client/own_search_calls*
+wotr_bridge/play_client/play_settings.json
 wotr_bridge/play_client/*.prev
+wotr_bridge/play_client/*.tmp
+wotr_bridge/play_client/*_backup_*
 wotr_bridge/play_client/logs/**/*.log
 wotr_bridge/play_client/logs/**/*.vlog
+# the unpatched third-party client jar (not used by the launchers)
+wotr_bridge/play_client/WOTR-GandalfV8.jar
 # the bundled Python runtime (ships in the GitHub Release zip, not the repo)
 python/
-# the launcher's own step log (overwritten each start)
-launcher.log
-# python bytecode
+# logs
+*.log
+# python bytecode, extensions built for one Python version
 __pycache__/
 *.pyc
+src/*.pyd
 # editor / OS litter
 .DS_Store
 Thumbs.db
-
-# Local installation evidence and live search traces
+# tests and their data
+src/test_*
+src/testdata*/
+data/live_fixtures/
+# local installs: before-images, receipts, the September candidate probe
+_*_backup_*/
 LOCAL_*
 CANDIDATE_*
-launcher.log
-wotr_bridge/play_client/own_search_calls.jsonl
+verify_staged_candidate.py
+# nets: only the pairs the launchers and the protocol adapter load are
+# tracked (added with git add -f); superseded pairs stay local
+/wotr_fp_*.pt
+/wotr_sh_*.pt

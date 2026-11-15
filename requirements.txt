@@ -1,5 +1,6 @@
 # AlphaWOTR play path - Python 3.10+ (verified with 3.11 / 3.12)
-# CPU torch is enough: the play path runs the nets on CPU (CUDA_VISIBLE_DEVICES=-1).
+# CPU torch is enough.  With a CUDA build of torch and an NVIDIA GPU the turn search uses the GPU
+# (wotr_bridge/gpu_torch.py switches the build); everything else runs the nets on the processor.
 #   pip install -r requirements.txt
 torch>=2.1
 numpy>=1.26

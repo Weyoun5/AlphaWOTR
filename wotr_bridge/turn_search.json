@@ -1,0 +1,11 @@
+{
+ "enabled": true,
+ "kit": "turn_search",
+ "workers": "auto",
+ "policy": "turn_search/nets/policy",
+ "values": "turn_search/nets/values",
+ "log_dir": "turn_search",
+ "decision_seconds": 75,
+ "start_seconds": 120,
+ "note": "rest-of-turn search on top of the ordinary search; set enabled to false to switch it off"
+}

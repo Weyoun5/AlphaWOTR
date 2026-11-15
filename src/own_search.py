@@ -11,7 +11,7 @@ import random
 
 from reply_evaluation import (evaluate_panel, menu, own_value_context, root_value,
                               transition_rng, validate_root_context)
-from reply_selection import ReplySelector
+from reply_selection import HandReplies, ReplySelector, SharedReplySelector
 from root_hand import sample_worlds
 from portable_reply_identity import (NodeTokens, PolicyKeyEncoder, actions_bytes,
                                     logical_charge, worlds_bytes)
@@ -56,16 +56,48 @@ class SearchContext:
         self.cache=OrderedDict();self.cache_bytes=0;self.stats=Counter()
         self.node_tokens=NodeTokens()
         self.action_encoder=PolicyKeyEncoder()
+        # SEARCHFIX FIX R: read once per search (one context per search); the real
+        # engine always has the switch (a unit test's stub engine means off)
+        self.reply_shared=bool(getattr(ai,'_REPLY_SHARED',0))
 
-    def value(self, state, previous_actor):
+    def shared_selector(self,node,actor,keys):
+        """This visit's hand view of the reply node's one table: same LRU, 64 entries and 8 MiB logical charge as
+        the per-world selectors; a table that grew is re-charged. Native twin: own_choose (own_reply_methods.inc)."""
+        wires=tuple(self.action_encoder.encode(key) for key in keys)
+        cache_key=(self.node_tokens.token(node),actor)
+        entry=self.cache.get(cache_key)
+        if entry is not None:
+            table,size=entry;self.cache.move_to_end(cache_key);self.stats['reply_cache_hits']+=1
+        else:
+            table=SharedReplySelector(seed=self.stream.getrandbits(128));size=0
+            self.stats['reply_cache_misses']+=1;self.stats['reply_shared_tables']+=1
+        arms=len(table.stats)
+        hand=HandReplies(table,keys,wires)
+        self.stats['reply_shared_arms']+=len(table.stats)-arms
+        charge=logical_charge(0,table.wire_bytes,len(table.stats))
+        if charge!=size:
+            if entry is not None:
+                del self.cache[cache_key];self.cache_bytes-=size
+            if charge<=8*1024*1024:
+                while self.cache and (len(self.cache)>=64 or self.cache_bytes+charge>8*1024*1024):
+                    _,old=self.cache.popitem(last=False);self.cache_bytes-=old[1]
+                    self.stats['reply_shared_evictions']+=1
+                self.cache[cache_key]=(table,charge);self.cache_bytes+=charge
+        return hand
+
+    def value(self, state, previous_actor, owner=None):
         # Match MCTS's mandatory single-policy closure before its next learned
         # leaf. All transitions remain the real executor and resume functions.
+        # C02 (round 18): route from the turn owner (ai._turn_owner_after; the
+        # reply's own owner comes from choose), never from the side that just
+        # answered a cross-side decision; None routes from previous_actor.
+        # Native twin: rp::evaluate's closure (reply_panel.inc).
         for _ in range(128):
             result=self.ai.game_logic.check_all_victory_conditions(state)
             if (getattr(state,'_search_endturn_victory',None) is not None
                     or self.ai.game_logic.should_game_end(result,end_of_turn=False)):
                 break
-            actor=self.ai._next_acting_side(state,previous_actor)
+            actor=self.ai._next_acting_side(state,owner if owner is not None else previous_actor)
             if actor is None:break
             policy=self.ai.get_ai_policy(state,actor)
             if not policy.forced_reason:break
@@ -78,6 +110,7 @@ class SearchContext:
                 actions.setdefault(action_policy_key(candidate),candidate)
             if len(actions)!=1:raise RuntimeError('Fixed policy requires exactly one action')
             action=next(iter(actions.values()))
+            owner=self.ai._turn_owner_after(state,actor,owner)
             successor=self.ai.apply_action(state,action)
             self.ai._resume_preaction_for_search(state,successor,action)
             state=successor;previous_actor=actor;self.stats['forced_reply_transitions']+=1
@@ -108,21 +141,31 @@ class SearchContext:
         # forgets root secrets; fresh value panels below remain independent.
         # Monotonic weak node tokens prohibit cross-node reuse without relying
         # on CPython address allocation. Retain bytes and statistics, no worlds.
-        worldwire=worlds_bytes((world.state,world.weight) for world in worlds)
-        actionwire=actions_bytes(first,encoder=self.action_encoder)
-        key=(self.node_tokens.token(node),actor,worldwire,actionwire)
-        entry=self.cache.get(key)
-        if entry is not None:
-            selector,size=entry;self.cache.move_to_end(key);self.stats['reply_cache_hits']+=1
+        # SEARCHFIX FIX R: a reply node keeps one table (no world bytes in its key).
+        # Calls without a node (turn_action) have no node identity to share over.
+        if self.reply_shared and node is not None:
+            selector=self.shared_selector(node,actor,first)
         else:
-            selector=ReplySelector(first,seed=self.stream.getrandbits(128))
-            size=logical_charge(len(worldwire),len(actionwire),len(first))
-            # Shared portable logical charge, explicitly separate from RSS.
-            if size<=8*1024*1024:
-                while self.cache and (len(self.cache)>=64 or self.cache_bytes+size>8*1024*1024):
-                    _,old=self.cache.popitem(last=False);self.cache_bytes-=old[1]
-                self.cache[key]=(selector,size);self.cache_bytes+=size
-            self.stats['reply_cache_misses']+=1
+            worldwire=worlds_bytes((world.state,world.weight) for world in worlds)
+            actionwire=actions_bytes(first,encoder=self.action_encoder)
+            key=(self.node_tokens.token(node),actor,worldwire,actionwire)
+            entry=self.cache.get(key)
+            if entry is not None:
+                selector,size=entry;self.cache.move_to_end(key);self.stats['reply_cache_hits']+=1
+            else:
+                selector=ReplySelector(first,seed=self.stream.getrandbits(128))
+                size=logical_charge(len(worldwire),len(actionwire),len(first))
+                # Shared portable logical charge, explicitly separate from RSS.
+                if size<=8*1024*1024:
+                    while self.cache and (len(self.cache)>=64 or self.cache_bytes+size>8*1024*1024):
+                        _,old=self.cache.popitem(last=False);self.cache_bytes-=old[1]
+                    self.cache[key]=(selector,size);self.cache_bytes+=size
+                self.stats['reply_cache_misses']+=1
+        panels_before=selector.table.completed if isinstance(selector,HandReplies) else None
+        # C02 (round 18): the turn owner once this reply lands - the reply
+        # node's owner when it answers a pending, else the replying actor
+        # (native: own_choose sets rp::Contract.turn_owner the same way).
+        owner=self.ai._turn_owner_after(state,actor,getattr(node,'turn_owner',None))
         for _ in range(self.panels):
             action_key=selector.select()
             try:
@@ -131,13 +174,17 @@ class SearchContext:
                 self.stats['belief_worlds_sampled']+=len(samples)
                 values,weights=evaluate_panel(self.ai,samples,action_key,actor=actor,
                     root_side=self.side,own_net=self.net,seed=self.stream.getrandbits(128),
-                    value_fn=lambda ai,s,root,net:self.value(s,actor),
+                    value_fn=lambda ai,s,root,net:self.value(s,actor,owner),
                     menu_contract=(first,forced),allowed_keys=allowed_keys,
                     _owned_worlds=True)
                 selector.complete(action_key,values,weights)
             except BaseException:
                 selector.cancel();raise
             self.stats['reply_panels']+=1
+        if panels_before is not None:
+            done=selector.table.completed
+            self.stats['reply_shared_max_panels']=max(self.stats['reply_shared_max_panels'],done)
+            if panels_before<=2<done:self.stats['reply_shared_tables_over_2_panels']+=1
         self.stats['reply_cache_estimated_bytes']=self.cache_bytes
         self.stats['reply_choices']+=1
         return selector.best()

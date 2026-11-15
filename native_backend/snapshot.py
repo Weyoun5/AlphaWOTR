@@ -2114,6 +2114,9 @@ class NativeSnapshot:
 
     def encode_state_into(self, ai, side, output):
         """Full v52 network input, computed entirely from resident native data."""
+        if getattr(ai, '_V53_CONTEXT_ON', False):
+            # R2-D5-V53-NATIVE: never hand a v53 engine the 4647-wide v52 vector
+            raise ValueError('ai runs observation generation v53 (4745 floats): use encode_state_v53_into')
         if type(side) is not int or side not in (0, 1):
             raise ValueError('Side must be integer 0=FP or 1=SH')
         if not isinstance(output, np.ndarray) or output.dtype != np.dtype(np.float32) or output.shape != (4647,) or not output.flags.c_contiguous or not output.flags.writeable or not output.flags.aligned:
@@ -2128,6 +2131,36 @@ class NativeSnapshot:
 
     def encode_state(self, ai, side):
         return self.encode_state_into(ai, side, np.empty(4647, dtype=np.float32))
+
+    def encode_state_v53_into(self, ai, side, output):
+        """R2-D5-V53-NATIVE: the full v53 network input (4745) = the native
+        v52 observation (4647, unchanged) ++ the encoding_v53 state tail (98),
+        computed entirely from resident native data.  Refuses a v52 engine and
+        a resident DLL built before the v53 export existed."""
+        if not getattr(ai, '_V53_CONTEXT_ON', False):
+            raise ValueError('encode_state_v53 requires an ai running observation generation v53 (WOTR_ACT_GEN=v53)')
+        import encoding_v53
+        width = 4647 + encoding_v53.STATE_TAIL_DIM
+        if type(side) is not int or side not in (0, 1):
+            raise ValueError('Side must be integer 0=FP or 1=SH')
+        if not isinstance(output, np.ndarray) or output.dtype != np.dtype(np.float32) or output.shape != (width,) or not output.flags.c_contiguous or not output.flags.writeable or not output.flags.aligned:
+            raise ValueError('Output must be writable aligned contiguous float32 with exact size')
+        function = getattr(self._lib, 'wotr_snapshot_encode_state_v53', None)
+        if function is None:
+            raise RuntimeError('Resident native library lacks wotr_snapshot_encode_state_v53; rebuild the DLL (R2-D5-V53-NATIVE)')
+        function.argtypes = [C.c_void_p, C.c_void_p, C.c_int32, C.POINTER(C.c_float), C.c_size_t]
+        function.restype = C.c_int
+        import observation_tables
+        tables = observation_tables.native_tables(ai)
+        with self._lock:
+            self._require_open()
+            if function(self._pointer, tables._pointer, side, output.ctypes.data_as(C.POINTER(C.c_float)), output.size):
+                raise _error(self._lib)
+        return output
+
+    def encode_state_v53(self, ai, side):
+        import encoding_v53
+        return self.encode_state_v53_into(ai, side, np.empty(4647 + encoding_v53.STATE_TAIL_DIM, dtype=np.float32))
 
     def ring_waiver_active(self, side):
         if type(side) is not int or side not in (0, 1):

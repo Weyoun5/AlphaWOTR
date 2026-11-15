@@ -16,7 +16,14 @@ def current_learning_context():
     """Semantic versions for newly encoded AI learning data, independent of shape."""
     import ai
     validate_active_width(ai.ACTION_ENCODING_DIM)
-    from ai_policies import POLICY_VERSION
+    from ai_policies import POLICY_VERSION, policy_version_for_generation
+    from action_schema import ACTION_GENERATION
+    # D6P-POLICY-VERSION: the policy version is keyed by WOTR_ACT_GEN at import,
+    # like the action contract; never stamp one generation's data with the other's.
+    if POLICY_VERSION != policy_version_for_generation(ACTION_GENERATION):
+        raise RuntimeError('ai_policies.POLICY_VERSION %r does not belong to the engine generation '
+                           'WOTR_ACT_GEN=%r: modules were imported under different generations'
+                           % (POLICY_VERSION, ACTION_GENERATION))
     return {'observation_contract': ai.OBSERVATION_CONTRACT,
             'ai_policy_contract': POLICY_VERSION,
             'action_encoding_contract': ACTION_ENCODING_CONTRACT}

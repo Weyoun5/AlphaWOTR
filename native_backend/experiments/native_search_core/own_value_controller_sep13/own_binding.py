@@ -7,10 +7,13 @@ import controller_binding as base
 class WotrOwnValueConfig(C.Structure):
     _fields_=[('struct_size',C.c_uint32),('version',C.c_uint32),
               ('reply_panels',C.c_uint64),('belief_worlds',C.c_uint64),
-              ('seed_words',C.c_uint32),('reserved',C.c_uint32),('seed',C.c_uint32*8)]
+              ('seed_words',C.c_uint32),('flags',C.c_uint32),('seed',C.c_uint32*8)]
 
 
-def own_configuration(seed,reply_panels=2,belief_worlds=2):
+OWN_FLAG_REPLY_SHARED=1   # SEARCHFIX FIX R (the former must-be-zero `reserved`: an old box refuses it)
+
+
+def own_configuration(seed,reply_panels=2,belief_worlds=2,reply_shared=False):
     if type(seed) is not int or not 0<=seed<2**256:
         raise ValueError('Own-value seed must be an unsigned integer of at most 256 bits')
     for value in (reply_panels,belief_worlds):
@@ -18,6 +21,7 @@ def own_configuration(seed,reply_panels=2,belief_worlds=2):
             raise ValueError('Own-value panel/world counts must be positive uint64 integers')
     cfg=WotrOwnValueConfig();cfg.struct_size=C.sizeof(cfg);cfg.version=1
     cfg.reply_panels=reply_panels;cfg.belief_worlds=belief_worlds
+    cfg.flags=OWN_FLAG_REPLY_SHARED if reply_shared else 0
     cfg.seed_words=(seed.bit_length()+31)//32
     for index in range(cfg.seed_words):cfg.seed[index]=(seed>>(32*index))&0xffffffff
     return cfg
@@ -39,7 +43,9 @@ def configure(lib):
 class OwnController(base.Controller):
     """Fresh native search with private reply RNG; no partner-model parameter."""
     def __init__(self,lib,root_state,observation_tables,action_tables,menu_tables,hunt_tables,rng,config,
-                 *,seed,reply_panels=2,belief_worlds=2):
+                 *,seed,reply_panels=2,belief_worlds=2,reply_shared=False,widths=None):
+        # widths: controller_binding.encoding_widths(ai) of the tables' engine (None = v52); the created
+        # controller must report the same request widths (R3-V53-FOLLOWONS), else it is destroyed and refused
         import snapshot,random_stream,observation_tables as table_module
         configure(lib)
         handles=(root_state,observation_tables,action_tables,menu_tables,hunt_tables)
@@ -53,10 +59,10 @@ class OwnController(base.Controller):
             raise ValueError('Own-value search RNG must belong to the controller library')
         if not isinstance(config,base.WotrSearchConfig):raise ValueError('Invalid search configuration type')
         config=base.WotrSearchConfig.from_buffer_copy(config)
-        config.struct_size=C.sizeof(config)
+        config.struct_size=base.config_wire_size(config)
         if config.opponent_policy_mode!=2 or config.leaf_batch!=1 or config.determinize!=1:
             raise ValueError('Own-value v0 requires mode 2, sequential leaves and hidden-hand sampling')
-        own=own_configuration(seed,reply_panels,belief_worlds)
+        own=own_configuration(seed,reply_panels,belief_worlds,reply_shared)
         self._lib=lib;self._config=config;self._own_config=own
         self.capabilities={**base.capabilities(lib),'own_value':True,'tree_reuse':False}
         if config.add_noise and not self.capabilities.get('root_priors_exchange'):
@@ -69,4 +75,7 @@ class OwnController(base.Controller):
             pointer=lib.wotr_search_controller_create_own_value(
                 *(s._pointer for s in states),rng._pointer,C.byref(config),C.byref(own))
         if not pointer:raise base._error(lib)
+        try:self.widths=base.controller_widths(lib,pointer,self.capabilities,widths)
+        except BaseException:
+            lib.wotr_search_controller_destroy(pointer);raise
         self._pointer=pointer

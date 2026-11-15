@@ -10,15 +10,23 @@ engine surfaces -- nothing here re-implements rules:
     game_logic.roll_action_dice / allocate_eyes / draw_event_card
     ai.get_legal_actions              (the ONLY source of offered actions)
     ai._traced_execute -> ai._execute_action   (the ONLY mutator)
-    ai._pending_decision_side / ai._post_action_active   (side routing --
-        the same single-source-of-truth routers self-play and MCTS use)
+    ai._pending_decision_side / ai._turn_owner_after /
+        ai._active_after_action   (side routing -- the same single-source-
+        of-truth routers self-play and MCTS use; C02: alternation runs
+        from the turn owner, ai.search_turn_owner scopes the AI's search)
     ai._auto_enter_mordor / ai._balrog_stationary_turn_start
     ai._safe_next_turn                (turn boundary)
+    turn_start.steps                  (THE turn-start phases: discards ->
+        declare -> Fellowship tail -> Guide -> eyes; the GUI watch mode
+        and the legacy GUI run the same driver)
     game_logic.check_all_victory_conditions / should_game_end
-    ai.mcts_action_with_policy        (the per-decision helper
-        ai._run_single_episode uses internally; arena/eval config)
-    ai.load_value_net                 (current-generation nets:
-                                       corpus_live / v41 chain)
+    wotr_bridge/live/own_model.OwnModelSearch   (the AI's search: the
+        live AI's own contract, one per AI seat; R17-GUI-ENGINEPLAY)
+    ai.mcts_action_with_policy        (search='legacy_puct' only: the
+        per-decision helper ai._run_single_episode uses internally;
+        arena/eval config)
+    ai.load_value_net                 (the running generation's nets:
+                                       net_tags.auto_tags)
 
 The turn/phase skeleton in _game_gen() mirrors ai._run_single_episode
 block-for-block (each block is annotated with its source lines); the
@@ -50,7 +58,9 @@ os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', '-1')
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
+# insert only when absent (one copy per process; src/ module names are unique on sys.path)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
 
 import argparse
 import random
@@ -63,6 +73,7 @@ from game_state import Side
 import game_logic
 import game_trace
 import ai
+import turn_start
 
 
 FP = Side.FREE_PEOPLES
@@ -90,6 +101,40 @@ def _p(text=''):
 IllegalPlay = ai.IllegalPlay
 
 
+class EngineHalted(RuntimeError):
+    """P1-03: an exception raised INSIDE the game generator while it ran
+    a submitted decision (an execution failure re-raised by _execute,
+    'unfinished_turn' at the turn boundary, a Fellowship-tail error, an
+    engine IllegalPlay).  The generator is closed and the session is
+    HALTED (session.halt_error holds the original, chained as
+    __cause__).  Deliberately NOT an IllegalPlay: the state is not
+    untouched and the decision cannot be retried."""
+
+
+# R17-GUI-ENGINEPLAY (row 75): the AI's search contract.
+#   'own_value'   (default) the live AI's own search: one
+#                 wotr_bridge/live/own_model.OwnModelSearch per AI seat
+#                 (own_search.active, 2 reply panels x 2 belief worlds, only
+#                 the seat's own model, temperature 0, no root noise, on the
+#                 backend WOTR_LIVE_SEARCH_BACKEND names) - the AI a person
+#                 plays or watches here is the one Play_vs_AI.bat serves.
+#   'legacy_puct' the arena/eval route: ai.mcts_action_with_policy with the
+#                 module's WOTR_OPPONENT_POLICY default (opponent replies
+#                 from the other seat's net) at `temperature`.
+SEARCH_CONTRACTS = ('own_value', 'legacy_puct')
+
+
+def _live_own_model():
+    """wotr_bridge/core/own_model.py under the package name the AI server
+    imports it by (python -m core.server, from wotr_bridge/).  Appended
+    to sys.path, so no module already resolvable from src/ changes."""
+    bridge = os.path.join(os.path.dirname(HERE), 'wotr_bridge')
+    if bridge not in sys.path:
+        sys.path.append(bridge)
+    from core import own_model
+    return own_model
+
+
 def _sims_for_kind(kind, base):
     """Per-decision-class search budget -- the SAME scaling
     _run_single_episode applies (discard sims//4, declare sims//3,
@@ -113,11 +158,17 @@ class DecisionPoint(object):
     actions: the FULL legal menu (ai.get_legal_actions output)
     note: display-only context (pending battle/hunt/card phase)
     sims/temp/noise: the exact search config _run_single_episode uses
-        for this decision class (consumed by EngineSession.ai_pick).
+        for this decision class (consumed by EngineSession.ai_pick; on
+        the default 'own_value' route the session stamps temp 0 / no
+        noise, the only values the live AI's search uses).
+    turn_owner: the side whose die action is being resolved (C02, round
+        18: ai._turn_owner_after); ai_pick scopes the search with it
+        (ai.search_turn_owner) so a pending answered at the root routes
+        on from that side.  None outside the action phase.
     """
 
     def __init__(self, kind, side, actions, note='', sims=100,
-                 temp=0.0, noise=False, turn=0):
+                 temp=0.0, noise=False, turn=0, turn_owner=None):
         self.kind = kind
         self.side = side
         self.actions = actions
@@ -126,6 +177,7 @@ class DecisionPoint(object):
         self.temp = temp
         self.noise = noise
         self.turn = turn
+        self.turn_owner = turn_owner
 
 
 class _ConsoleAnnotator(object):
@@ -137,19 +189,55 @@ class _ConsoleAnnotator(object):
 
     buffering = False
 
-    def __init__(self, log):
+    def __init__(self, log, viewer=None):
         self._log = log
+        # P1-01: the seat these lines are shown to (EngineSession's
+        # human_side); None = spectator (AI vs AI), nothing masked
+        self._viewer = viewer
+        # P2-03: TraceRecorder's meta dict.  ai._traced_execute writes
+        # meta['failure_action'] before re-raising an execution error;
+        # without it that write raised AttributeError, which replaced
+        # the real engine exception (log, VIOLATIONS, GUI/console).
+        self.meta = {}
+        # R2-S4-ENGINE-AI-TOOLS (rescan v067): lines held while a masked
+        # combat-card commit executes (EngineSession._execute), so the
+        # reveal is narrated before a round fought inside that execution
+        self._held = None
 
     def begin_action_buffer(self):
         pass  # print immediately; console order = execution order
 
+    def hold(self):
+        self._held = []
+
+    def release(self):
+        held, self._held = (self._held or []), None
+        return held
+
+    def _emit(self, line):
+        if self._held is not None:
+            self._held.append(line)
+        else:
+            self._log(line)
+
     def record_action(self, state, side, action, note='', **kw):
         try:
+            params = dict(action.params or {})
+            if (action.action_type == 'card_drawn'
+                    and self._viewer is not None
+                    and params.get('side')
+                    != game_trace._side_tag(self._viewer)):
+                # P1-01 (1.261): a drawn card is its drawer's private
+                # knowledge - the human sees the deck, never the card
+                self._emit('    . T%s %s: card_drawn (%s deck, identity '
+                           'hidden)' % (state.turn, params.get('side', '?'),
+                                        params.get('deck', '?')))
+                return
             step = {'kind': 'action', 'turn': state.turn,
                     'side': game_trace._side_tag(side),
                     'action_type': action.action_type,
-                    'params': dict(action.params or {})}
-            self._log('    . ' + game_trace.describe_step(step))
+                    'params': params}
+            self._emit('    . ' + game_trace.describe_step(step))
         except Exception:
             pass
 
@@ -178,27 +266,104 @@ def _die_prefix(state, side, action):
     return '[die %d:%s] ' % (di, letter)
 
 
-def describe_action(state, side, action):
-    """Compact human-readable line for a legal action (display only)."""
+def _deck_phrase(card_id):
+    deck = game_logic.card_deck_of(card_id)
+    return '%s card' % deck if deck else 'card'
+
+
+def _masked_private_body(state, side, action, viewer):
+    """P1-01: the display body of `side`'s action when it names a card
+    the `viewer` seat may not see; None when nothing is private to it.
+    viewer None = spectator (AI vs AI): never masked.  Private:
+    face-down hand discards and the 1.149 table-kill payment pair
+    (1.261), and the attacker's combat card while it is committed face
+    down (1.246 / USER 2026-08-16: identity hidden, type visible, until
+    the defender's own commit reveals both - EngineSession logs that
+    reveal).  The defender's commit reveals both, so it is not masked."""
+    if viewer is None or side == viewer:
+        return None
+    t = action.action_type
+    p = action.params or {}
+    if t == 'discard_card':
+        return 'Discard a %s (face down)' % _deck_phrase(p.get('card_id'))
+    if t == 'combat_card_play' and not p.get('from_table'):
+        pc = getattr(state, 'pending_combat', None) or {}
+        if (pc.get('phase') == 'attacker_combat_card'
+                and pc.get('attacker_side') == side):
+            # R2-S4-ENGINE-AI-TOOLS (rescan v067): with no defender card
+            # window (Grond / Fighting Uruk-hai round 1, no Companion) no
+            # defender commit ever comes - the wording holds in both paths
+            return ('Commit a combat card face down (%s; revealed before '
+                    'the round is fought)'
+                    % _deck_phrase(p.get('card_id')))
+        return None
+    if t == 'card_option':
+        ch = p.get('choices') or {}
+        if 'army_card' in ch and 'character_card' in ch:
+            return ('Card option [%s]: pay with one Army card + one '
+                    'Character card (both face down)' % _card_name(p))
+    return None
+
+
+def army_move_split_text(p):
+    """The composition suffix of an army_move row's label, e.g.
+    ' (2r/0e, +1 leader(s): Boromir, 1 nazgul)', or '' when the row names
+    none.  ONE builder for describe_action and the legacy GUI's
+    _describe_action (R3-COSMETIC-BRIDGE-TEXT, R2-E5-01-SURFACE FU3): since
+    D5 (2026-10-22) one menu holds a row per named figure set, so a label
+    without the split shows several different moves as the same line."""
+    comp = []
+    if p.get('n_regular') is not None or p.get('n_elite') is not None:
+        comp.append('%sr/%se' % (p.get('n_regular', 0),
+                                 p.get('n_elite', 0)))
+    if p.get('take_leaders') and p.get('n_leaders') is not None:
+        # R2-E5-01-SURFACE (D5 2026-10-22): a which-figure row names
+        # its leader figures ('leader_set'); the count alone would show
+        # several rows with one label
+        _ls9 = p.get('leader_set')
+        comp.append('+%s leader(s)%s' % (
+            p['n_leaders'], (': ' + ', '.join(
+                ('%s x%d' % (r[1], r[3]) if r[3] > 1 else str(r[1]))
+                for r in _ls9)) if _ls9 else ''))
+    elif p.get('take_leaders'):
+        comp.append('+leaders')
+    if p.get('n_nazgul'):
+        comp.append('%s nazgul' % p.get('n_nazgul'))
+    return (' (%s)' % ', '.join(comp)) if comp else ''
+
+
+def die_discard_text(p):
+    """The label of a die-discard 'skip' row (USER A2-06, to be ruling
+    1.276; ai._die_discard_rows: params face=<ActionDieFace name>, side):
+    R3-COSMETIC-BRIDGE-TEXT (R2-DICE-ENGINE FU6)."""
+    face = str(p.get('face', '?'))
+    member = getattr(gs.ActionDieFace, face, None)
+    return 'Discard the %s die for no effect' % (
+        member.value if member is not None else face)
+
+
+def describe_action(state, side, action, viewer=None):
+    """Compact human-readable line for a legal action (display only).
+    `viewer`: the seat the line is shown to (None = spectator); card
+    identities private to `side` are masked for any other seat
+    (_masked_private_body)."""
+    masked = _masked_private_body(state, side, action, viewer)
+    if masked is not None:
+        return _die_prefix(state, side, action) + masked
     t = action.action_type
     p = action.params or {}
     body = None
     if t == 'pass':
         body = 'Pass (no die spent; legal while holding fewer dice)'
     elif t == 'army_move':
-        body = 'Move army %s -> %s' % (p.get('from', '?'), p.get('to', '?'))
-        comp = []
-        if p.get('n_regular') is not None or p.get('n_elite') is not None:
-            comp.append('%sr/%se' % (p.get('n_regular', 0),
-                                     p.get('n_elite', 0)))
-        if p.get('take_leaders'):
-            comp.append('+leaders')
-        if p.get('n_nazgul'):
-            comp.append('%s nazgul' % p.get('n_nazgul'))
-        if comp:
-            body += ' (%s)' % ', '.join(comp)
+        body = ('Move army %s -> %s' % (p.get('from', '?'), p.get('to', '?'))
+                + army_move_split_text(p))
         if p.get('mouth_muster'):
             body += ' (Mouth: muster die as army)'
+    elif t == 'skip':
+        # R3-COSMETIC-BRIDGE-TEXT (R2-DICE-ENGINE FU6): the die-discard row
+        # (USER A2-06, to be ruling 1.276; ai._die_discard_rows)
+        body = die_discard_text(p)
     elif t == 'army_attack':
         body = 'Attack %s from %s' % (p.get('to', '?'), p.get('from', '?'))
     elif t == 'advance_political':
@@ -289,6 +454,23 @@ def describe_action(state, side, action):
     elif t == 'victor_advance':
         body = 'Advance victorious army into %s' % p.get('to',
                                                          p.get('region', '?'))
+        # R2-E5-01-SURFACE (D5 2026-10-22): the composition, incl. the
+        # named figures / nation mix a which-figure row carries
+        _cv9 = []
+        if p.get('n_regular') is not None or p.get('n_elite') is not None:
+            _cv9.append('%sr/%se' % (p.get('n_regular', 0), p.get('n_elite', 0)))
+        if p.get('unit_set'):
+            _cv9.append('units: ' + ', '.join(
+                '%d %s %s' % (r[3], r[1], r[2].lower()) for r in p['unit_set']))
+        if p.get('n_leaders') is not None:
+            _cv9.append('+%s leader(s)%s' % (p['n_leaders'], (': ' + ', '.join(
+                str(r[1]) for r in p['leader_set'])) if p.get('leader_set') else ''))
+        elif p.get('take_leaders'):
+            _cv9.append('+leaders')
+        if p.get('n_nazgul'):
+            _cv9.append('%s nazgul' % p.get('n_nazgul'))
+        if _cv9:
+            body += ' (%s)' % ', '.join(_cv9)
     elif t == 'victor_stay':
         body = 'Stay (do not advance after victory)'
     elif t == 'casualty_allocate':
@@ -346,9 +528,9 @@ class EngineSession(object):
     """
 
     def __init__(self, seed=None, mcts_sims=300, max_turns=40,
-                 shadow_vp=10, temperature=0.02, add_noise=False,
+                 shadow_vp=10, temperature=None, add_noise=False,
                  selfplay_temps=False, log=None, human_side=None,
-                 max_turn_decisions=10000):
+                 max_turn_decisions=10000, search='own_value'):
         # human_side: the seat a HUMAN plays (None = watch / AI-vs-AI).
         # Player-owned learned decisions on that seat are never taken
         # by a self-play hardcode (the gateway auto-declare).
@@ -361,12 +543,40 @@ class EngineSession(object):
         if type(max_turn_decisions) is not int or max_turn_decisions < 1:
             raise ValueError('max_turn_decisions must be a positive integer')
         self.max_turn_decisions = max_turn_decisions
+        # R17-GUI-ENGINEPLAY (row 75): see SEARCH_CONTRACTS.  The live
+        # AI's search always runs at temperature 0 with no root noise, so
+        # 'own_value' refuses any other setting instead of stamping
+        # DecisionPoints with values its search never uses.
+        if search not in SEARCH_CONTRACTS:
+            raise ValueError('unknown search contract %r (one of %s)'
+                             % (search, ', '.join(SEARCH_CONTRACTS)))
+        self.search = search
+        if search == 'own_value':
+            if ((temperature is not None and float(temperature) != 0.0)
+                    or add_noise or selfplay_temps):
+                raise ValueError(
+                    "search='own_value' is the live AI's search: temperature "
+                    "0, no root noise and no self-play temperature schedule "
+                    "(search='legacy_puct' takes those)")
+            temperature = 0.0
+        elif temperature is None:
+            temperature = 0.02
+        self._seat_searches = {}    # Side -> OwnModelSearch ('own_value')
         self.temperature = float(temperature)
         self.add_noise = bool(add_noise)
         self.selfplay_temps = bool(selfplay_temps)
         self.log = log if log is not None else (lambda s: None)
-        self._annotator = _ConsoleAnnotator(self.log)
+        # P1-01: the log is shown to the human seat - mask the AI's
+        # private card identities (spectator: human_side None, unmasked)
+        self._annotator = _ConsoleAnnotator(self.log, viewer=human_side)
+        # (side, card_id) of an AI attacker's combat card masked at its
+        # face-down commit, until the reveal is logged (_execute)
+        self._masked_commit = None
         self.result_info = None
+        # P1-03: the exception that closed the game generator (None while
+        # the game runs).  A halt is not a game result: result_info stays
+        # None and current() is None.
+        self.halt_error = None
         self.decisions = 0
         self.action_log = []      # compact executed-action lines
         self._nets = None         # (fp_net, sh_net) once attached
@@ -429,6 +639,11 @@ class EngineSession(object):
         side picking a valid index into the live legal menu."""
         dp = self._current
         if dp is None:
+            if self.halt_error is not None:
+                raise IllegalPlay(
+                    'game halted on an engine error (%s: %s) - no '
+                    'decision is open' % (type(self.halt_error).__name__,
+                                          self.halt_error))
             raise IllegalPlay('game is over - no decision is open')
         if side is not dp.side:
             raise IllegalPlay(
@@ -451,6 +666,18 @@ class EngineSession(object):
             self._current = self._gen.send(index)
         except StopIteration:
             self._current = None
+        except BaseException as err:
+            # P1-03: the exception closed the generator.  Its last
+            # DecisionPoint must not stay open: a resubmit would hit
+            # StopIteration and 'end' the game with result_info None.
+            # Halt the session and fail loudly (never an IllegalPlay -
+            # the state is not untouched and nothing can be retried).
+            self._current = None
+            self.halt_error = err
+            if not isinstance(err, Exception):
+                raise
+            raise EngineHalted('engine error - session halted: %s: %s'
+                               % (type(err).__name__, err)) from err
 
     def abandon(self):
         """Close the game generator (quit mid-game)."""
@@ -468,7 +695,51 @@ class EngineSession(object):
     # -- AI controller ------------------------------------------------
 
     def attach_nets(self, fp_net, sh_net):
+        # INV-RING-1 per seat (R2-MODEL-CANDIDATES, rescan v087): at an AI
+        # root every learned leaf value comes from that seat's net
+        # (ai._expand_node -> _mcts_eval_state), so a seat net whose final
+        # value layer is all zero makes every leaf the same constant.
+        # Refuse it for every seat the AI plays (watch mode: both); the
+        # human's seat net only gives opponent priors and is never checked
+        # (human-Shadow vs AI-FP still loads).  None nets are skipped.
+        for _seat9, _net9 in ((FP, fp_net), (SH, sh_net)):
+            if _net9 is not None and _seat9 is not self.human_side:
+                ai.assert_state_dependent_value_head(
+                    _net9, getattr(_net9, 'checkpoint_path', None)
+                    or 'for the AI %s seat' % _side_name(_seat9))
         self._nets = (fp_net, sh_net)
+        self._seat_searches = {}    # searches of the previous nets retire
+
+    def prepare_search(self):
+        """Build the search of every AI seat now, as the live server builds
+        its OwnModelSearch at startup: a seat net the live search refuses
+        (no net, a profile mismatch, trained self-play modules on the native
+        route) or a native box that does not load fails before play starts,
+        not at the first AI decision.  ai_pick builds a seat's search on
+        demand when this was not called.  No-op for 'legacy_puct'."""
+        if self.search != 'own_value':
+            return
+        for side in (FP, SH):
+            if side is not self.human_side:
+                self._seat_search(side)
+
+    def _seat_search(self, side):
+        """The seat's OwnModelSearch (the live AI's own contract), seeded
+        from the session seed exactly as the live AI vs AI seats are
+        (own_model.seat_seed), so a --seed game replays."""
+        search = self._seat_searches.get(side)
+        if search is None:
+            if self._nets is None:
+                raise RuntimeError('no nets attached (attach_nets first)')
+            net = self._nets[0 if side is FP else 1]
+            if net is None:
+                raise RuntimeError('no net attached for the AI %s seat'
+                                   % _side_name(side))
+            own_model = _live_own_model()
+            search = own_model.OwnModelSearch(
+                side, net, seed=own_model.seat_seed(self.seed, side))
+            self._seat_searches[side] = search
+        return search
 
     def sims_for_current(self):
         """The simulation count ai_pick would use RIGHT NOW: the live
@@ -483,12 +754,13 @@ class EngineSession(object):
         return _sims_for_kind(dp.kind, base)
 
     def ai_pick(self):
-        """MCTS choice for the current decision -- the SAME per-decision
-        helper self-play uses (ai.mcts_action_with_policy), with the
-        per-phase search config _run_single_episode applies.  The sims
-        budget is re-read from sims_for_current() at call time, so a
-        live sims_override takes effect at the NEXT decision.  Returns
-        a menu index for submit()."""
+        """MCTS choice for the current decision.  'own_value' (default):
+        the live AI's own search (the seat's OwnModelSearch.choose, as
+        live_server calls it); 'legacy_puct': ai.mcts_action_with_policy
+        with the per-phase temperature/noise _run_single_episode applies.
+        The sims budget is re-read from sims_for_current() at call time,
+        so a live sims_override takes effect at the NEXT decision.
+        Returns a menu index for submit()."""
         dp = self._current
         if dp is None:
             raise RuntimeError('game is over')
@@ -497,10 +769,15 @@ class EngineSession(object):
         fp_net, sh_net = self._nets
         n_sims = self.sims_for_current()
         self.last_pick_sims = n_sims
-        action, _visit = ai.mcts_action_with_policy(
-            self.state, dp.side, fp_net, sh_net,
-            num_simulations=n_sims, temperature=dp.temp,
-            add_noise=dp.noise)
+        with ai.search_turn_owner(dp.turn_owner):
+            if self.search == 'own_value':
+                action, _visit = self._seat_search(dp.side).choose(
+                    self.state, dp.side, num_simulations=n_sims)
+            else:
+                action, _visit = ai.mcts_action_with_policy(
+                    self.state, dp.side, fp_net, sh_net,
+                    num_simulations=n_sims, temperature=dp.temp,
+                    add_noise=dp.noise)
         idx = None
         if action is not None:
             for i, a in enumerate(dp.actions):
@@ -509,6 +786,15 @@ class EngineSession(object):
                         and a.params == action.params):
                     idx = i
                     break
+            if idx is None:
+                # live_server's B4-08 identity (R17-GUI-ENGINEPLAY): a row
+                # differing only in optional UI labels (card_name, a card
+                # option's idx) is the same choice - the native search
+                # returns decoded rows that may lack those labels
+                from ai_policies import action_policy_key
+                key = action_policy_key(action)
+                idx = next((i for i, a in enumerate(dp.actions)
+                            if action_policy_key(a) == key), None)
         if idx is None:
             raise IllegalPlay('Search did not return a legal current decision')
         return idx
@@ -517,13 +803,51 @@ class EngineSession(object):
 
     def _execute(self, action, side):
         """Execute the selected public action; errors stop the session."""
+        st = self.state
+        # P1-01 (1.246): an AI attacker's face-down combat card is masked
+        # for the human; the defender's commit reveals both cards, so
+        # name it as that commit is made (before the round's rolls)
+        masks_commit = (action.action_type == 'combat_card_play'
+                        and _masked_private_body(st, side, action,
+                                                 self.human_side)
+                        is not None)
+        if (self._masked_commit is not None
+                and action.action_type in ('combat_card_play',
+                                           'combat_card_none')
+                and (st.pending_combat or {}).get('phase')
+                == 'defender_combat_card'):
+            self._log_commit_reveal()
+        if masks_commit:
+            # R2-S4-ENGINE-AI-TOOLS (rescan v067): with no defender window
+            # the round is fought INSIDE this execution; its rolls are held
+            # and narrated after the reveal line below
+            self._annotator.hold()
         try:
             ai._traced_execute(self.state, action, self._annotator)
-            return action
         except Exception as err:
+            for line in self._annotator.release():
+                self.log(line)
             ai._record_exec_failure(self.state, action, err)
             self.log('! execution failed (%s: %s)' % (type(err).__name__, err))
             raise
+        held = self._annotator.release() if masks_commit else []
+        if masks_commit:
+            self._masked_commit = (side, (action.params or {}).get('card_id'))
+        if (self._masked_commit is not None
+                and ai._hidden_commit_card(st, self.human_side) is None):
+            # no defender window opened (e.g. a forced decline): the
+            # round was fought, so the card is public now
+            self._log_commit_reveal()
+        for line in held:
+            self.log(line)
+        return action
+
+    def _log_commit_reveal(self):
+        side, cid = self._masked_commit
+        self._masked_commit = None
+        self.log("  %s attacker's combat card revealed: %s"
+                 % ('FP' if side is FP else 'SH',
+                    _card_name({'card_id': cid})))
 
     def _note_pending(self):
         """Display-only context line for the open pending phase."""
@@ -588,126 +912,88 @@ class EngineSession(object):
             self.log('')
             self.log('========== TURN %d ==========' % state.turn)
 
-            # Phase 1b: hand-limit discards (episode 14727-14756)
-            _d_guard = 0
-            while (getattr(state, 'pending_discard', None) is not None
-                   and _d_guard < 12):
-                _d_guard += 1
-                d_side = state.pending_discard['side']
-                acts = ai.get_legal_actions(state, d_side)
-                if not acts or getattr(state, 'pending_discard',
-                                       None) is None:
-                    continue
-                d_temp = fp_temp if d_side is FP else sh_temp
-                idx = yield DecisionPoint(
-                    'discard', d_side, acts,
-                    note='hand over 6 cards - discard down',
-                    sims=_sims_for_kind('discard', sims), temp=d_temp,
-                    noise=self.add_noise, turn=state.turn)
-                act = self._execute(acts[idx], d_side)
-                self._record(d_side, act)
-
-            # Declaration finishes before begin_fellowship_tail exposes
-            # the stationary Balrog opportunity (Almanac C17).
-
-            # Gateway auto-declare, TURN-START only (episode twin).
-            # Self-play hardcode: never on a human FP seat - the declare
-            # DecisionPoint below already offers the gateway declare.
-            _auto_declared = False
-            if not state.fellowship.mordor_entered \
-                    and self.human_side is not FP:
-                _auto_declared = ai._auto_enter_mordor(state)
-                if _auto_declared:
-                    self.log('  Fellowship declared at the gateway')
-
-            # Phase 2: Fellowship declare phase (episode 14784-14824).
-            # Same gate: only offered when a declare is actually
-            # available; the menu is get_legal_actions under the
-            # engine's own _declare_phase flag (declares + pass).
-            if (not _auto_declared and state.fellowship.progress >= 0
-                    and not state.fellowship.mordor_entered
-                    and ai._get_declare_actions(state,
-                                                allow_in_place=True)):
-                state._declare_phase = True
-                try:
-                    acts = ai.get_legal_actions(state, FP)
-                    idx = yield DecisionPoint(
-                        'declare', FP, acts,
-                        note='Fellowship phase - declare or pass '
-                             '(noise-free, argmax: 1.142c)',
-                        sims=_sims_for_kind('declare', sims),
-                        temp=0.0, noise=False, turn=state.turn)
-                finally:
-                    state._declare_phase = False
-                act = acts[idx]
-                if act.action_type == 'fellowship_declare':
-                    act = self._execute(act, FP)
-                    self._record(FP, act)
-
-            was_mordor = state.fellowship.mordor_entered
-            game_logic.begin_fellowship_tail(state)
-            for _tail_step in range(128):
-                if not getattr(state, '_fellowship_tail_phase', False):
-                    break
-                owner = ai._pending_decision_side(state)
-                if owner is None:
-                    raise RuntimeError('Unresolved Fellowship tail has no decision owner')
-                acts = ai.get_legal_actions(state, owner)
-                if not acts:
-                    raise RuntimeError('Required Fellowship effect has no legal choice')
-                idx = yield DecisionPoint(
-                    'fellowship_tail', owner, acts, note=self._note_pending(),
-                    sims=_sims_for_kind('fellowship_tail', sims),
-                    temp=fp_temp if owner is FP else sh_temp,
-                    noise=self.add_noise, turn=state.turn)
-                act = self._execute(acts[idx], owner)
-                self._record(owner, act)
-                game_logic.resume_fellowship_tail(state)
-            if getattr(state, '_fellowship_tail_phase', False):
-                raise RuntimeError('Fellowship tail exceeded 128 decisions')
-            if game_logic.should_game_end(game_logic.check_all_victory_conditions(state), end_of_turn=False):
+            # Phases 1b-3 (episode 14727-14876): THE shared turn-start
+            # driver (R3-LEGACY-GUI-TURN; the GUI watch mode and the
+            # legacy GUI run the same one) - hand-limit discards ->
+            # gateway auto-declare (self-play hardcode: never on a human
+            # FP seat, whose declare DecisionPoint already offers the
+            # gateway declare) -> the declare menu under the engine's own
+            # _declare_phase flag (1.142c noise-free) -> Fellowship tail
+            # (stationary Balrog, Almanac C17; turn-start Mordor entry)
+            # -> Guide -> Shadow eye allocation under
+            # _eye_allocation_phase (1.142 noise-free).  Each Choose is
+            # yielded as a DecisionPoint; each Execute runs through
+            # self._execute.  The driver is closed on every exit, so a
+            # session closed mid-decision clears the phase flag.
+            _ts = turn_start.steps(state,
+                                   auto_declare=self.human_side is not FP)
+            _ts_out = None
+            _reply = None
+            try:
+                while True:
+                    try:
+                        req = _ts.send(_reply)
+                    except StopIteration as _stop:
+                        _ts_out = _stop.value
+                        break
+                    _reply = None
+                    if isinstance(req, turn_start.Choose):
+                        k, side = req.kind, req.side
+                        side_temp = fp_temp if side is FP else sh_temp
+                        if k == 'declare':
+                            dp = DecisionPoint(
+                                'declare', side, req.actions,
+                                note='Fellowship phase - declare or pass '
+                                     '(noise-free, argmax: 1.142c)',
+                                sims=_sims_for_kind('declare', sims),
+                                temp=0.0, noise=False, turn=state.turn)
+                        elif k == 'eye':
+                            dp = DecisionPoint(
+                                'eye', side, req.actions,
+                                note='allocate eyes to the Hunt Box before '
+                                     'rolling (noise-free: 1.142)',
+                                sims=sims, temp=0.0, noise=False,
+                                turn=state.turn)
+                        elif k == 'guide':
+                            dp = DecisionPoint(
+                                'guide', side, req.actions,
+                                note='End Fellowship phase - keep or '
+                                     'choose a highest-level Guide',
+                                sims=_sims_for_kind('guide', sims),
+                                temp=side_temp, noise=self.add_noise,
+                                turn=state.turn)
+                        elif k == 'discard':
+                            dp = DecisionPoint(
+                                'discard', side, req.actions,
+                                note='hand over 6 cards - discard down',
+                                sims=_sims_for_kind('discard', sims),
+                                temp=side_temp, noise=self.add_noise,
+                                turn=state.turn)
+                        else:   # 'fellowship_tail' / an open 'decision'
+                            dp = DecisionPoint(
+                                k, side, req.actions,
+                                note=self._note_pending(),
+                                sims=_sims_for_kind(k, sims),
+                                temp=side_temp, noise=self.add_noise,
+                                turn=state.turn)
+                        idx = yield dp
+                        _reply = req.actions[idx]
+                    elif isinstance(req, turn_start.Execute):
+                        act = self._execute(req.action, req.side)
+                        self._record(req.side, act)
+                    elif req.kind == 'auto_declared':
+                        self.log('  Fellowship declared at the gateway')
+                    elif req.kind == 'mordor_entered':
+                        self.log('  Fellowship enters Mordor (turn start)')
+                    elif req.kind == 'eyes_allocated':
+                        self.log('  Shadow allocates %d eye(s) to the '
+                                 'Hunt Box' % req.detail['count'])
+            finally:
+                _ts.close()
+            if _ts_out == 'game_over':
                 game_over = True
                 break
-            if state.fellowship.mordor_entered and not was_mordor:
-                self.log('  Fellowship enters Mordor (turn start)')
-            if state.pending_guide_change is not None:
-                acts = ai.get_legal_actions(state, FP)
-                if not acts or any(a.action_type != 'choose_guide' for a in acts):
-                    raise RuntimeError('Required Fellowship Guide menu is unavailable')
-                idx = yield DecisionPoint(
-                    'guide', FP, acts,
-                    note='End Fellowship phase - keep or choose a highest-level Guide',
-                    sims=_sims_for_kind('guide', sims), temp=fp_temp,
-                    noise=self.add_noise, turn=state.turn)
-                act = self._execute(acts[idx], FP)
-                self._record(FP, act)
-                if state.pending_guide_change is not None:
-                    raise RuntimeError('Fellowship Guide selection did not resolve')
 
-            # Phase 3: Shadow eye allocation, pre-roll (episode
-            # 14827-14876); menu/executor are the engine's own.
-            shadow_unused = [d for d in state.dice.get(SH, [])
-                             if not d.used]
-            if len(shadow_unused) > 0:
-                state._eye_allocation_phase = True
-                try:
-                    acts = ai.get_legal_actions(state, SH)
-                    idx = yield DecisionPoint(
-                        'eye', SH, acts,
-                        note='allocate eyes to the Hunt Box before '
-                             'rolling (noise-free: 1.142)',
-                        sims=sims, temp=0.0, noise=False,
-                        turn=state.turn)
-                finally:
-                    state._eye_allocation_phase = False
-                act = acts[idx]
-                n_eyes = act.params.get('count', 0)
-                act = self._execute(act, SH)
-                self._record(SH, act)
-                self.log('  Shadow allocates %d eye(s) to the Hunt Box'
-                         % n_eyes)
-
-            state._eye_allocation_phase = False
             # Phase 3: roll action dice (episode 14878-14879)
             game_logic.roll_action_dice(state, pool=FP)
             game_logic.roll_action_dice(state, pool=SH)
@@ -722,6 +1008,9 @@ class EngineSession(object):
             # Action resolution uses a diagnostic cap, never a victory trigger.
             # Long combat/casualty chains remain in this same action phase.
             active = FP
+            # C02 (round 18): the side whose die action is being resolved
+            # (episode twin _turn_owner9); answers to its pendings keep it
+            owner = None
             _empty9 = set()   # MC6: sides whose menu came back empty
             for _ in range(self.max_turn_decisions):
                 has_pending = (
@@ -775,13 +1064,16 @@ class EngineSession(object):
                 idx = yield DecisionPoint(
                     'action', active, actions,
                     note=self._note_pending(), sims=sims, temp=temp,
-                    noise=self.add_noise, turn=state.turn)
+                    noise=self.add_noise, turn=state.turn,
+                    turn_owner=owner)
                 action = actions[idx]
-                other = SH if active is FP else FP
 
                 self.log('  %s: %s' % ('FP' if active is FP else 'SH',
-                                       describe_action(state, active,
-                                                       action)))
+                                       describe_action(
+                                           state, active, action,
+                                           viewer=self.human_side)))
+                # C02: the turn owner is read off the PRE-action state
+                owner = ai._turn_owner_after(state, active, owner)
                 action = self._execute(action, active)
                 self._record(active, action)
 
@@ -793,18 +1085,11 @@ class EngineSession(object):
                     game_over = True
                     break
 
-                # Turn-order routing (episode 15042-15052)
-                if action.action_type == 'elven_ring':
-                    pass  # ring use is NOT an action - same side acts
-                elif (state.pending_army_move_die is not None
-                        or state.pending_muster_die is not None):
-                    pass  # same side continues (multi-step die action)
-                else:
-                    _ps9 = ai._pending_decision_side(state,
-                                                     fallback=active)
-                    active = (_ps9 if _ps9 is not None
-                              else ai._post_action_active(state, active,
-                                                          other))
+                # Turn-order routing (the episode's ONE post-action router,
+                # ai._active_after_action): ring use keeps the seat, a
+                # multi-step die action its owner, a pending goes to its
+                # decider, otherwise alternation from the TURN OWNER (C02)
+                active = ai._active_after_action(state, action, active, owner)
 
             if game_over:
                 break
@@ -1039,12 +1324,11 @@ def _human_choose(session, dp, human_side):
 def _resolve_net_tag(tag):
     if tag != 'auto':
         return tag
-    # CURRENT generation first (v41 = brain everywhere, USER
-    # 2026-08-22; corpus_live IS the v41 pair the live head runs),
-    # then the retired v37 chain for old checkouts.
-    for cand in ('corpus_live', 'corpus_v41jt', 'corpus_v41td',
-                 'corpus_v41', 'corpus_v37jt', 'corpus_v37td',
-                 'corpus_v37'):
+    # the deployed pair of the running generation first (a checkpoint
+    # loads only under its own WOTR_ACT_GEN), then the legacy chain
+    import net_tags
+    for cand in net_tags.auto_tags(getattr(ai, '_OBSERVATION_GENERATION',
+                                           '')):
         if os.path.exists(ai._resolve_model_path('wotr_fp_%s.pt'
                                                  % cand)):
             return cand
@@ -1052,19 +1336,23 @@ def _resolve_net_tag(tag):
 
 
 def load_nets(tag='auto'):
-    """Load the packaged FP/SH nets via ai.load_value_net (current
-    generation first: corpus_live / v41, then the retired v37 chain).
+    """Load the packaged FP/SH nets via ai.load_value_net ('auto' =
+    net_tags.auto_tags of the running generation).
     Fails LOUDLY -- no silent fallback policy."""
     tag = _resolve_net_tag(tag)
     if tag is None:
         raise SystemExit('no nets found next to the project root - '
-                         'expected wotr_{fp,sh}_corpus_live.pt (the '
-                         'v41 pair) or wotr_fp_corpus_v41*/v37*.pt')
+                         'expected wotr_{fp,sh}_<tag>.pt for one of '
+                         'the tags of this generation (src/net_tags.py)')
     fp_net = ai.load_value_net('wotr_fp_%s.pt' % tag, 'fp')
     sh_net = ai.load_value_net('wotr_sh_%s.pt' % tag, 'sh')
     if fp_net is None or sh_net is None:
         raise SystemExit('net load failed for tag %r (file missing or '
                          'torch unavailable)' % tag)
+    # R2-MODEL-CANDIDATES: the per-seat INV-RING-1 refusal in
+    # EngineSession.attach_nets names the file it refuses
+    fp_net.checkpoint_path = ai._resolve_model_path('wotr_fp_%s.pt' % tag)
+    sh_net.checkpoint_path = ai._resolve_model_path('wotr_sh_%s.pt' % tag)
     from reward_contract import current_contract, PROFILE, validate_net_profile
     if current_contract() == PROFILE:
         # Validate the complete pair before replacing an existing objective.
@@ -1080,14 +1368,14 @@ def load_nets(tag='auto'):
 
 def run_game(mode='hvai', human='fp', seed=None, sims=300, max_turns=40,
              shadow_vp=10, net_tag='auto', selfplay_temps=False,
-             dump_actions=None):
+             dump_actions=None, search='own_value'):
     human_side = None
     if mode == 'hvai':
         human_side = FP if human == 'fp' else SH
     session = EngineSession(seed=seed, mcts_sims=sims,
                             max_turns=max_turns, shadow_vp=shadow_vp,
                             selfplay_temps=selfplay_temps, log=_p,
-                            human_side=human_side)
+                            human_side=human_side, search=search)
     _p('WOTR engine-play console -- engine is the sole arbiter')
     _p('mode: %s%s | seed: %d%s | sims: %d | max turns: %d'
        % (mode,
@@ -1098,6 +1386,7 @@ def run_game(mode='hvai', human='fp', seed=None, sims=300, max_turns=40,
           sims, max_turns))
     fp_net, sh_net = load_nets(net_tag)
     session.attach_nets(fp_net, sh_net)
+    session.prepare_search()
 
     while not session.game_over():
         dp = session.current()
@@ -1120,7 +1409,7 @@ def run_game(mode='hvai', human='fp', seed=None, sims=300, max_turns=40,
             idx = session.ai_pick()
             _p('  AI picks: %s'
                % describe_action(session.state, dp.side,
-                                 dp.actions[idx]))
+                                 dp.actions[idx], viewer=human_side))
             session.submit(idx, dp.side)
 
     res = session.result_info or {}
@@ -1156,18 +1445,27 @@ def main(argv=None):
     ap.add_argument('--shadow-vp', type=int, default=10,
                     help='Shadow military victory threshold (default 10)')
     ap.add_argument('--net', default='auto',
-                    help='net tag (default auto: corpus_live, then '
-                         'the v41/v37 chains)')
+                    help='net tag (default auto: the deployed pair '
+                         'of WOTR_ACT_GEN, src/net_tags.py)')
+    ap.add_argument('--search', choices=SEARCH_CONTRACTS,
+                    default='own_value',
+                    help='AI search contract (default own_value: the live '
+                         'AI\'s own search, as Play_vs_AI.bat serves it; '
+                         'legacy_puct: the arena/eval search)')
     ap.add_argument('--selfplay-temps', action='store_true',
                     help='use the self-play temperature schedule '
-                         '(0.6/0.3/0.15) instead of eval temp 0.02')
+                         '(0.6/0.3/0.15) instead of eval temp 0.02 '
+                         '(--search legacy_puct only)')
     ap.add_argument('--dump-actions', default=None,
                     help='write the executed-action log to this file')
     a = ap.parse_args(argv)
+    if a.selfplay_temps and a.search == 'own_value':
+        ap.error('--selfplay-temps needs --search legacy_puct (the live '
+                 'AI\'s own search always runs at temperature 0)')
     run_game(mode=a.mode, human=a.human, seed=a.seed, sims=a.sims,
              max_turns=a.max_turns, shadow_vp=a.shadow_vp,
              net_tag=a.net, selfplay_temps=a.selfplay_temps,
-             dump_actions=a.dump_actions)
+             dump_actions=a.dump_actions, search=a.search)
 
 
 if __name__ == '__main__':

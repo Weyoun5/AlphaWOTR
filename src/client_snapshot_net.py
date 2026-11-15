@@ -189,7 +189,10 @@ def rendered_snapshot_kind(record):
         return op + 's'
     if op in ('alloc_eye', 'add_eye'):
         return 'allocates'
-    if re.fullmatch(r'\S+ randomly discards a (?:Free|Shadow) (?:Character|Strategy) Card\.',
+    # R6-UNDO-MODEL-ADD-EYE: cf_ay.h() (Interpreter.50 'draws', k() first)
+    # renders a random discard as Interpreter.148 '.. a Free Character Card.'
+    # or Interpreter.87 '.. a Free Story Card.'
+    if re.fullmatch(r'\S+ randomly discards a (?:Free|Shadow) (?:Character|Strategy|Story) Card\.',
                     str(record.get('body') or '')):
         return 'draws'
     return None

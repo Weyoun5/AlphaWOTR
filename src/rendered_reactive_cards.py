@@ -62,9 +62,12 @@ class Timeline:
                      and rr.parse_piece(str(r.get('what', '')))
                      and rr.parse_piece(str(r.get('what', '')))[0] == 'tile']
             boundary = min(tiles, default=10**12)
+            # R4B-FELLOWSHIP-STRONGHOLD-BOX-MOVES: a Stronghold box is its
+            # region (zone_kind gives the region key for both)
             moves = [r for r in pre if r.get('op') == 'move'
                      and str(r.get('obj', '')).lower() == 'the fellowship'
-                     and r['line'] < boundary and rr.zone_kind(r.get('to', ''))[0] == 'region']
+                     and r['line'] < boundary
+                     and rr.zone_kind(r.get('to', ''))[0] in ('region', 'stronghold')]
             snap, anchor = None, None
             if moves and (moves[0].get('decision_truth') or {}).get('fel', {}).get('hidden'):
                 snap = copy.deepcopy(moves[0]['decision_truth'])
@@ -102,11 +105,17 @@ class Timeline:
                         Side.FREE_PEOPLES if cid.startswith('FREE_PEOPLES') else Side.SHADOW)
                 except ValueError:
                     continue
-                if (op == 'move' and table_slot(record.get('to', ''))
-                        and not table_slot(record.get('from', ''))):
+                origin_table = table_slot(record.get('from', ''))
+                target_table = table_slot(record.get('to', ''))
+                if op == 'move' and origin_table and target_table:
+                    # C9-01: a Board->Board drag only rearranges the table;
+                    # the card stays in play (as in _TableLedger,
+                    # crebain_choice and drain_worn).
+                    continue
+                if op == 'move' and target_table:
                     events.append((int(record['line']), 'on', card))
                 elif op == 'kill' or (op == 'move' and
-                        (table_slot(record.get('from', '')) or
+                        (origin_table or
                          rr.zone_kind(record.get('to', ''))[0] in ('cas', 'reinf', 'hand'))):
                     events.append((int(record['line']), 'off', card))
         self.lines, self.states = [], []
@@ -235,11 +244,13 @@ def prepare_worn_trigger(state, batch, lower, upper, timeline):
 
 
 def worn_casualty_window(batch, victim_line, exits, tiles, timeline):
-    """Bound one casualty's payment without treating EOF as a decline.
+    """Bound one casualty's mandatory payment window.
 
     A later casualty, Hunt tile, die stage or turn proves progression. Batch
     end alone does not. The exclusive upper endpoint includes a payment on
     the last record line, while stopping before the next casualty's window.
+    Worn has no decline (1.210g, 1.274): a complete window only lets
+    drain_worn say loudly that the mandatory payment is missing.
     """
     lower = int(victim_line)
     victims = [int(line) for line in exits.values()]
@@ -258,13 +269,58 @@ def worn_casualty_window(batch, victim_line, exits, tiles, timeline):
     return lower, upper, upper in boundaries
 
 
-def drain_worn(state, batch, stats, lower, upper, *, complete_window=False):
+def _apply_window_guide(state, batch, lower, upper, stats=None, record_hunt_guide=False):
+    """Apply the FP's literal tied-Guide nomination inside one casualty window.
+
+    C9-02: the casualty that owes Worn can also open a tied Guide choice,
+    which the engine cascade resolves before the Shadow's payment. Only one
+    move to 'Guide Of The Fellowship' names it; silence or several moves
+    cannot. The choose_guide training row belongs to the Guide emitter.
+
+    R2-RS-C9-02: inside the Hunt resolver (record_hunt_guide) this replaces
+    the resolver's own Guide branch, which no longer runs. Keep its
+    bookkeeping: a marked clone of the driven pre-Guide state keyed by the
+    nomination line (_emit_guides labels compulsory replacements from it)
+    and the huntres_guide_applied count. The live state is not re-marked.
+    """
+    import ai
+    import rendered_replay as rr
+    from game_state import Side
+    proof = [record for record in batch['records'] if record.get('op') == 'move'
+             and lower < int(record['line']) < upper
+             and str(record.get('to', '')).strip().lower() == 'guide of the fellowship']
+    if len(proof) != 1:
+        raise Unproven('worn_guide_change_unproven')
+    matched = [action for action in ai.get_legal_actions(state, Side.FREE_PEOPLES)
+               if action.action_type == 'choose_guide'
+               and rr._named_eq(str(action.params.get('companion', '')), str(proof[0].get('obj', '')))]
+    if len(matched) != 1:
+        raise Unproven('worn_guide_change_not_legal')
+    if record_hunt_guide:
+        from rendered_hunt_observation import mark
+        line = int(proof[0]['line'])
+        snapshot = ai.clone_state(state)
+        mark(snapshot, line, 'after_draw')
+        batch.setdefault('_rx_hunt_guide_predecision', {})[line] = snapshot
+    state = ai.apply_action(state, matched[0])
+    if record_hunt_guide:
+        stats['detected']['huntres_guide_applied'] += 1
+    return state
+
+
+def drain_worn(state, batch, stats, lower, upper, *, complete_window=False,
+               record_hunt_guide=False):
     """Resolve the engine-opened payment using its actual recorded source.
 
     Named discarded table cards are public; a random hand discard's identity
     is used only to restore the owner's hand after the decision is encoded.
-    Silence proves decline only when the caller certifies a completed physical
-    decision window. An incomplete table-card gesture never proves decline.
+    The payment is mandatory (1.210g, USER ruling 1.274): silence never
+    proves a decline. With no payment gesture, an incomplete window raises
+    worn_no_payment_gesture, an unfinished table-card discard raises
+    worn_unclosed_table_discard, and a caller-certified complete window
+    raises worn_mandatory_payment_missing (an unprovable divergence).
+    Only the Hunt resolver passes record_hunt_guide (see _apply_window_guide);
+    the card-hunt callers run after _emit_guides.
     """
     import ai
     import game_logic as gl
@@ -276,6 +332,12 @@ def drain_worn(state, batch, stats, lower, upper, *, complete_window=False):
         pending = getattr(state, 'pending_card_option', None) or {}
         if pending.get('card_name') != '__wwsat_discard__':
             return state, output
+        if ai._pending_decision_kind_side(state)[0] == 'guide_change':
+            # C9-02: the engine resolves a coexisting tied Guide choice first
+            # and gives the Shadow an empty menu until then.
+            state = _apply_window_guide(state, batch, lower, upper, stats,
+                                        record_hunt_guide=record_hunt_guide)
+            continue
         menu = ai.get_legal_actions(state, Side.SHADOW)
         candidates = []
         for record in batch['records']:
@@ -305,7 +367,9 @@ def drain_worn(state, batch, stats, lower, upper, *, complete_window=False):
                 if any(rx._title_to_cid(title) in table_targets
                        for title in rx._group_tokens(record.get('obj', ''))):
                     raise Unproven('worn_unclosed_table_discard')
-            candidates = [(upper, {'wwsat_source': 'decline'}, None)]
+            # R2-RS-C9-02: no decline exists (1.210g, 1.274), so a closed
+            # window without a payment is an unpaid mandatory debt.
+            raise Unproven('worn_mandatory_payment_missing')
         line = min(item[0] for item in candidates)
         evidence = [item for item in candidates if item[0] == line]
         if len(evidence) != 1:
@@ -382,7 +446,8 @@ def emit_foul_worn(batch, stats, timeline):
             raise Unproven('foul_worn_multiple_or_unproved_casualties')
         lower, upper, complete = worn_casualty_window(batch, victim_line, exits, tiles, timeline)
         # Prefer the ordinary immediate window. Extend only for an explicit
-        # hand payment; silence after another tile never means "decline".
+        # hand payment; Worn has no decline (1.210g, 1.274), so silence is
+        # never evidence of one.
         try:
             payment_line, _ = recorded_hand_discard(batch, lower, upper)
         except Unproven as error:
@@ -474,7 +539,11 @@ def emit_foul_worn(batch, stats, timeline):
                 state = ai.apply_action(state, plays[0])
                 for _ in range(12):
                     option = getattr(state, 'pending_card_option', None) or {}
-                    if option.get('card_name') == '__wwsat_discard__':
+                    # C9-02: a coexisting tied Guide choice precedes the Worn
+                    # option in the engine cascade; the Guide branch below
+                    # resolves it first.
+                    if (option.get('card_name') == '__wwsat_discard__'
+                            and not getattr(state, 'pending_guide_change', None)):
                         break
                     pending = getattr(state, 'pending_hunt', None) or {}
                     menu = ai.get_legal_actions(state, gs.Side.FREE_PEOPLES)
@@ -521,7 +590,8 @@ def emit_foul_worn(batch, stats, timeline):
                 raise Unproven('foul_worn_funding_changes_observation')
         # Foul's physical tail can defer this payment beyond a reveal tile.
         # Until that whole tail has a separate completion certificate, require
-        # an explicit hand/table payment rather than inferring a decline.
+        # an explicit hand/table payment (the payment is mandatory, 1.210g /
+        # 1.274; a missing one stays the loud worn_no_payment_gesture).
         resumed_tiles = []
         def resume_tile(current):
             index = 1 + len(resumed_tiles)
@@ -532,7 +602,9 @@ def emit_foul_worn(batch, stats, timeline):
                       if record.get('op') == 'flip'
                       and str(record.get('obj', '')).lower() == 'the fellowship'
                       and victim_line < int(record['line']) < int(item['line'])]
-            if (len(reveal) != 1 or rr.sanitize(str(reveal[0].get('region', '')))
+            # R4B-FELLOWSHIP-STRONGHOLD-BOX-MOVES: a flip in a Stronghold box
+            # names its region (rr.pawn_zone_key)
+            if (len(reveal) != 1 or rr.pawn_zone_key(str(reveal[0].get('region', '')))
                     != rr.sanitize(gl.fellowship_region(current))):
                 raise Unproven('foul_worn_reveal_region_unproven')
             obj = census._tile_obj(gs, str(item['value']).lower())
@@ -719,20 +791,50 @@ def _shadow_reaction_decision(state,batch,tiles,drawn):
         selected={'wizardstaff_prevent':use}
         boundary,timing=(next_line if next_line!=hi else tile_line),'before_draw'
     elif key=='mithril_redraw':
-        use=rx._TABLE.killed_in('MITHRIL_COAT',tile_line,next_line)
-        if use and next_line==hi:
-            raise Unproven('shadow_hunt_mithril_replacement_unproven')
-        if not use and not rx._TABLE.on_at('MITHRIL_COAT',next_line):
-            raise Unproven('shadow_hunt_mithril_unclosed_discard')
+        # R18-CORPUS row 5: the FP emitter's and the card interior's rule
+        # (rx._mithril_redraw_choice).  The kill-in-window reading missed
+        # the common spend: the card moved to a Current card zone (table to
+        # the ledger) before the replacement draw and killed after it.
+        index=len(drawn)-1 if drawn else 0
+        use=rx._mithril_redraw_choice(
+            batch['records'],[(int(t['line']),t.get('value')) for t in tiles],index,lo-1,hi)
+        if isinstance(use,str):
+            raise Unproven('shadow_hunt_'+use)
         if not use and not _shadow_hunt_resolution_proved(batch,tile_line,next_line):
             raise Unproven('shadow_hunt_mithril_keep_unproven')
         selected={'mithril_redraw':use}
         boundary,timing=tile_line+1,'after_draw'
     else:
-        exits=[int(line) for line in rx._comp_exit_lines(batch).values() if int(line)>tile_line]
-        payment_end=min([next_line]+exits)
-        paid=[kind for kind in ('AXE_AND_BOW','HORN_OF_GONDOR')
-              if rx._TABLE.killed_in(kind,tile_line,payment_end)]
+        # R18-CORPUS row 6: the payment window runs to the next tile.  It
+        # used to end at the first exit of ANY companion, but the common
+        # group-kill dialect drags the casualty out first and kills card,
+        # tile and companion together (2023-01-05 GenericPie/Spartako L559
+        # Strider out, L560 Horn off Board1, L562 group kill, Boromir stays),
+        # so the use was stored as a decline.  Only the card's OWN forced
+        # discard (Horn: Boromir leaves; Axe and Bow: both Gimli and Legolas
+        # have left) can explain the kill otherwise: a kill before that
+        # exit is a use, after it ambiguous; a card that left the table with
+        # no kill in the window is an unclosed discard.
+        import rendered_replay as rr
+        owners={'AXE_AND_BOW':('Gimli','Legolas'),'HORN_OF_GONDOR':('Boromir',)}
+        company=[str(getattr(c,'name',c)) for c in
+                 (getattr(getattr(state,'fellowship',None),'companions',None) or [])]
+        exits=rx._comp_exit_lines(batch)
+        paid=[]
+        for kind in ('AXE_AND_BOW','HORN_OF_GONDOR'):
+            kills=[line for line,ptype,event in rx._TABLE.events
+                   if ptype==kind and event=='off_kill' and tile_line<=line<next_line]
+            if not kills:
+                if rx._TABLE.on_at(kind,tile_line+1) and not rx._TABLE.on_at(kind,next_line):
+                    raise Unproven('shadow_hunt_reduction_unclosed_discard')
+                continue
+            held=[name for name in owners[kind] if any(rr._named_eq(name,c) for c in company)]
+            left=[exits.get(name) for name in held]
+            forced=(max(left) if held and all(line is not None and tile_line<int(line)<next_line
+                                              for line in left) else None)
+            if forced is not None and min(kills)>int(forced):
+                raise Unproven('shadow_hunt_reduction_forced_discard_ambiguous')
+            paid.append(kind)
         if len(paid)>1:
             raise Unproven('shadow_hunt_multiple_reduction_payments')
         if paid:
@@ -781,18 +883,20 @@ def _observed_reveal_route(state, batch, after_line, before_line):
     import rendered_replay as rr
     records = [record for record in batch['records']
                if after_line < int(record['line']) < before_line]
+    # R4B-FELLOWSHIP-STRONGHOLD-BOX-MOVES: a pawn dragged into or out of a
+    # Stronghold box is in its region (rr.pawn_zone_key)
     moves = [record for record in records if record.get('op') == 'move'
              and str(record.get('obj', '')).lower() == 'the fellowship'
-             and rr.zone_kind(record.get('to', ''))[0] == 'region']
+             and rr.zone_kind(record.get('to', ''))[0] in ('region', 'stronghold')]
     if len(moves) != 1:
         raise Unproven('axebow_reveal_placement_unproven')
     move = moves[0]
     actors = {record.get('player') for record in batch['records'] if record.get('die_stage')}
     if len(actors) != 1 or move.get('player') not in actors:
         raise Unproven('axebow_reveal_actor_unproven')
-    if rr.sanitize(move.get('from', '')) != gl.fellowship_region(state):
+    if rr.pawn_zone_key(move.get('from', '')) != gl.fellowship_region(state):
         raise Unproven('axebow_reveal_origin_unproven')
-    target = rr.sanitize(move['to'])
+    target = rr.pawn_zone_key(move['to'])
     hints = [record for record in records if record.get('op') == 'route_hint']
     if (len(hints) > 1 or any(record.get('player') != move.get('player')
                               for record in hints)):

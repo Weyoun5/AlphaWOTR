@@ -234,6 +234,12 @@ class CardDecoder:
         self.fp_strat_deck = {}  # 24 positions
         self.sa_char_deck = {}   # 24 positions
         self.sa_strat_deck = {}  # 24 positions
+        # R2-S4-EXTRACT (X1-02 server half): the decode result of the LAST
+        # parsed claim line per deck table: deck attribute name ->
+        # (positions recovered, commitment pairs parsed).  Absent = no claim
+        # parsed yet; recovered < pairs = the claim does not decode with
+        # this side's password (consumers name it instead of a generic wait)
+        self.claim_decode = {}
 
         # Cards in hand: list of card info dicts
         self.fp_hand = []
@@ -334,6 +340,10 @@ class CardDecoder:
                 if fp_char_pairs or fp_strat_pairs:
                     self.fp_char_deck = self._brute_force_deck(fp_char_pairs, self.fp_password)
                     self.fp_strat_deck = self._brute_force_deck(fp_strat_pairs, self.fp_password)
+                    self.claim_decode['fp_char_deck'] = (
+                        len(self.fp_char_deck), len(fp_char_pairs))
+                    self.claim_decode['fp_strat_deck'] = (
+                        len(self.fp_strat_deck), len(fp_strat_pairs))
                 else:
                     print('[card_decoder] WARNING: Controls.464 line '
                           'failed commitment parse; decks kept')
@@ -342,6 +352,10 @@ class CardDecoder:
                 if sa_char_pairs or sa_strat_pairs:
                     self.sa_char_deck = self._brute_force_deck(sa_char_pairs, self.sa_password)
                     self.sa_strat_deck = self._brute_force_deck(sa_strat_pairs, self.sa_password)
+                    self.claim_decode['sa_char_deck'] = (
+                        len(self.sa_char_deck), len(sa_char_pairs))
+                    self.claim_decode['sa_strat_deck'] = (
+                        len(self.sa_strat_deck), len(sa_strat_pairs))
                 else:
                     print('[card_decoder] WARNING: Controls.479 line '
                           'failed commitment parse; decks kept')

@@ -64,6 +64,85 @@ def token_cargo(token):
     if kind=='named':name=named(name)
     return (kind,name,subtype),int(count)
 
+def _shadow_drag(record):
+    """The (origin, target) edge and the Shadow army cargo a move record drags
+    between two regions, or None when it drags none."""
+    if record.get('op')!='move':return None
+    origin,target=rr.zone_kind(record.get('from','')),rr.zone_kind(record.get('to',''))
+    if origin[0] not in ('region','stronghold') or target[0] not in ('region','stronghold'):return None
+    if origin[1]==target[1]:return None
+    cargo=Counter()
+    for token in rx._group_tokens(record.get('obj','')):
+        key,count=token_cargo(token)
+        if key is not None and (key[0] == 'nazgul'
+            or key[0] == 'named' and key[1] in ('Witch King','Mouth of Sauron')
+            or key[0] in ('unit','leader') and key[1] in ('SAURON','ISENGARD','SOUTHRON_EASTERLINGS')):
+            cargo[key]+=count
+    if not cargo:return None
+    return (origin[1],target[1]),cargo
+
+
+def _identical_swap(timeline, state):
+    """R3-TSL-IDENTICAL-SWAP: The Shadow Lengthens' forced reciprocal swap.
+
+    USER D2 / ruling 1.279 makes both moves mandatory while a join exists and
+    USER R2-TSL (2026-10-23) keeps the reciprocal swap, so 'X -> Y' followed by
+    'Y -> X' with equal cargo can be Y's own army trading places, not a
+    drag-back. Figure IDs cannot tell the two apart; the swap reading is taken
+    only when the window moved exactly those two records and BOTH regions'
+    start-of-action Shadow armies can supply that cargo (otherwise the returning
+    figures can only be the provisional move dragged back). Returns the two
+    plans, or None for the drag-back reading.
+    """
+    if len(timeline) != 2:
+        return None
+    (edge, info), (back, back_info) = timeline
+    if back != (edge[1], edge[0]) or info['cargo'] != back_info['cargo']:
+        return None
+    cargo = info['cargo']
+    if not any(key[0] == 'unit' and count > 0 for key, count in cargo.items()):
+        return None
+    plans = []
+    for (source, target), line in ((edge, info['line']), (back, back_info['line'])):
+        available = army_cargo(state, source)
+        if any(count > available[key] for key, count in cargo.items()):
+            return None
+        plans.append({'from': source, 'to': target,
+                      'regular': sum(n for k, n in cargo.items() if k[0] == 'unit' and k[2] == 'REGULAR'),
+                      'elite': sum(n for k, n in cargo.items() if k[0] == 'unit' and k[2] == 'ELITE'),
+                      'whole': cargo == available, 'cargo': Counter(cargo), 'path': (source, target),
+                      'paths': ((source, target),), 'line': line})
+    return tuple(plans)
+
+
+def _piecewise_swap(timeline, state):
+    """R4-EXTRACT-COVERAGE-DROPS (R3-TSL-IDENTICAL-SWAP FU3): the same forced
+    reciprocal swap dragged in pieces (e.g. 'X -> Y' as two drags of one
+    Regular each, then 'Y -> X' as one drag of two). No drag-back cancels, the
+    merged walk reads the returning cargo as the first army forwarded back to
+    its own origin and refuses with tsl_origin_or_through_ambiguous. The swap
+    reading is taken only when EVERY movement of the window lies on the two
+    reciprocal edges, both directions carry the same total cargo (with a unit)
+    and both regions' start-of-action Shadow armies can supply it - the
+    _identical_swap test on the per-direction totals. Returns the two plans
+    (first drag of each direction gives its order), or None.
+    """
+    if len(timeline) < 3:
+        return None
+    edge = timeline[0][0]
+    back = (edge[1], edge[0])
+    totals, lines = {edge: Counter(), back: Counter()}, {}
+    for moved, info in timeline:
+        if moved not in totals:
+            return None
+        totals[moved].update(info['cargo'])
+        lines.setdefault(moved, info['line'])
+    if back not in lines or totals[edge] != totals[back]:
+        return None
+    return _identical_swap(((edge, {'cargo': totals[edge], 'line': lines[edge]}),
+                            (back, {'cargo': totals[back], 'line': lines[back]})), state)
+
+
 def literal_plan(batch,state,title):
     name=str(title).split('/')[0].strip().lower()
     if name not in NAMES:raise Unproven('wrong_card')
@@ -85,24 +164,27 @@ def literal_plan(batch,state,title):
         commitments = subsequent + [int(r['line']) for r in batch.get('rng', ())
             if int(r.get('line',0)) > play_line and r.get('kind') == 'roll_num']
         boundary = min([first_close] + commitments)
-    edges=OrderedDict();timeline=[];last_move=play_line
+    timeline=[]
     for record in batch['records']:
-        if record.get('op')!='move' or not play_line < int(record.get('line',0)) < boundary:continue
-        origin,target=rr.zone_kind(record.get('from','')),rr.zone_kind(record.get('to',''))
-        if origin[0] not in ('region','stronghold') or target[0] not in ('region','stronghold'):continue
-        if origin[1]==target[1]:continue
-        cargo=Counter()
-        for token in rx._group_tokens(record.get('obj','')):
-            key,count=token_cargo(token)
-            if key is not None and (key[0] == 'nazgul'
-                or key[0] == 'named' and key[1] in ('Witch King','Mouth of Sauron')
-                or key[0] in ('unit','leader') and key[1] in ('SAURON','ISENGARD','SOUTHRON_EASTERLINGS')):
-                cargo[key]+=count
-        if not cargo:continue
-        edge=edges.setdefault((origin[1],target[1]),{'cargo':Counter(),'line':int(record['line'])})
-        edge['cargo'].update(cargo);last_move=max(last_move,int(record['line']))
-        timeline.append(((origin[1],target[1]),{'cargo':cargo,'line':int(record['line'])}))
-    if not any(line>last_move for line in closed):raise Unproven('movement_after_closure')
+        if not play_line < int(record.get('line',0)) < boundary:continue
+        drag=_shadow_drag(record)
+        if drag is None:continue
+        timeline.append((drag[0],{'cargo':drag[1],'line':int(record['line'])}))
+    # R17-CORPUS-CENSUS: the window ends at the card's first closing kill, so
+    # a Shadow army drag logged after the discard in the same batch, before
+    # anything else commits (a later card play; for Corsairs also its battle
+    # roll), is this card's movement or a correction of it that the plan
+    # cannot see. Refuse the window rather than label the truncated movement.
+    # A Corsairs window cut by its battle roll keeps its post-battle moves out.
+    if boundary == first_close:
+        later = [int(line) for line, _ in plays[1:] if int(line) > first_close]
+        if name == 'corsairs of umbar':
+            later += [int(r['line']) for r in batch.get('rng', ())
+                      if int(r.get('line',0)) > first_close and r.get('kind') == 'roll_num']
+        end = min(later, default=float('inf'))
+        if any(first_close < int(r.get('line',0)) < end and _shadow_drag(r) is not None
+               for r in batch['records']):
+            raise Unproven('movement_after_closure')
     # Literal drag-backs cancel a provisional move only when no intervening
     # movement touched that category at either endpoint. Figure IDs are not
     # inferred across a merge or an intervening transfer.
@@ -126,6 +208,10 @@ def literal_plan(batch,state,title):
         combined=edges.setdefault(edge,{'cargo':Counter(),'line':info['line']})
         combined['cargo'].update(info['cargo'])
     if not edges:
+        if name == 'the shadow lengthens':
+            swap = _identical_swap(timeline, state)
+            if swap:
+                return swap
         if name in ('the shadow lengthens','the shadow is moving'):
             return ()
         raise Unproven('no_movement')
@@ -150,40 +236,65 @@ def literal_plan(batch,state,title):
     limit = 1 if name == 'shadows gather' else 2 if join else 4
     hops = 3 if name == 'shadows gather' else 2
 
-    routes=[];used_sources=set();reserved=Counter()
-    movements=edges.items()
-    for (source,target),edge in movements:
-        cargo=edge['cargo']
-        if not any(key[0]=='unit' and count>0 for key,count in cargo.items()):
-            raise Unproven('leader_route_without_army')
-        if source==target:raise Unproven('return_correction')
-        available=army_cargo(state,source)
-        if join:
-            # Reserve only original cargo. Arriving figures cannot become a
-            # new source army merely because the client drags them again.
-            can_supply=all(count<=available[key]-reserved[(source,key)] for key,count in cargo.items())
-        else:
-            can_supply=source not in used_sources and all(count<=available[key] for key,count in cargo.items())
-        incoming=[route for route in routes if route['path'][-1]==source and route['cargo']==cargo and len(route['path'])<hops + 1]
-        if name=='the shadow is moving':
-            # One-region movements cannot legally forward an arriving group.
-            if not can_supply:raise Unproven('tsim_original_cargo_unproven')
-            routes.append({'path':[source,target],'cargo':cargo,'line':edge['line']});used_sources.add(source)
-        elif can_supply and incoming:
-            # Once two distinct original armies are committed, selecting a
-            # third original source is illegal. A single matching incoming
-            # route can therefore prove the second hop without unit IDs.
-            if source not in used_sources and len(used_sources)==limit and len(incoming)==1 and target!=incoming[0]['path'][0]:
+    def _walk(movements):
+        # Uses only fresh locals, so a second walk starts from a clean slate.
+        routes=[];used_sources=set();reserved=Counter()
+        for (source,target),edge in movements:
+            cargo=edge['cargo']
+            if not any(key[0]=='unit' and count>0 for key,count in cargo.items()):
+                raise Unproven('leader_route_without_army')
+            if source==target:raise Unproven('return_correction')
+            available=army_cargo(state,source)
+            if join:
+                # Reserve only original cargo. Arriving figures cannot become a
+                # new source army merely because the client drags them again.
+                can_supply=all(count<=available[key]-reserved[(source,key)] for key,count in cargo.items())
+            else:
+                can_supply=source not in used_sources and all(count<=available[key] for key,count in cargo.items())
+            incoming=[route for route in routes if route['path'][-1]==source and route['cargo']==cargo and len(route['path'])<hops + 1]
+            if name=='the shadow is moving':
+                # One-region movements cannot legally forward an arriving group.
+                if not can_supply:raise Unproven('tsim_original_cargo_unproven')
+                routes.append({'path':[source,target],'cargo':cargo,'line':edge['line']});used_sources.add(source)
+            elif can_supply and incoming:
+                # Once two distinct original armies are committed, selecting a
+                # third original source is illegal. A single matching incoming
+                # route can therefore prove the second hop without unit IDs.
+                if source not in used_sources and len(used_sources)==limit and len(incoming)==1 and target!=incoming[0]['path'][0]:
+                    incoming[0]['path'].append(target)
+                else:
+                    raise Unproven('tsl_origin_or_through_ambiguous')
+            elif can_supply:
+                routes.append({'path':[source,target],'cargo':cargo,'line':edge['line']});used_sources.add(source)
+                for key,count in cargo.items():reserved[(source,key)]+=count
+            elif len(incoming)==1 and target!=incoming[0]['path'][0]:
                 incoming[0]['path'].append(target)
             else:
-                raise Unproven('tsl_origin_or_through_ambiguous')
-        elif can_supply:
-            routes.append({'path':[source,target],'cargo':cargo,'line':edge['line']});used_sources.add(source)
-            for key,count in cargo.items():reserved[(source,key)]+=count
-        elif len(incoming)==1 and target!=incoming[0]['path'][0]:
-            incoming[0]['path'].append(target)
-        else:
-            raise Unproven('tsl_cargo_route_unproven')
+                raise Unproven('tsl_cargo_route_unproven')
+        return routes
+    try:
+        # Merged edges stay primary: they explain one army dragged in pieces.
+        routes=_walk(edges.items())
+    except Unproven as error:
+        # R2 (2026-10-22): two armies converging on one edge (East Rhun and
+        # North Rhun both Vale of the Carnen -> Dale) merge into one edge
+        # carrying both cargoes before the second army's first hop exists,
+        # so no source or incoming route explains it. For that refusal only,
+        # on a join card, re-walk the drag-back-corrected timeline in literal
+        # order (the Sep-13 chronological TSL walk). Every other refusal and
+        # every shape the merged walk plans is unchanged.
+        if name == 'the shadow lengthens' and str(error) == 'tsl_origin_or_through_ambiguous':
+            # R4-EXTRACT-COVERAGE-DROPS: a forced swap dragged in pieces
+            swap = _piecewise_swap(timeline, state)
+            if swap:
+                return swap
+        if not join or str(error)!='tsl_cargo_route_unproven':raise
+        try:
+            routes=_walk(corrected)
+        except Unproven:
+            # The timeline walk is a recovery attempt only: a window it cannot
+            # plan either keeps the merged walk's refusal reason.
+            raise error from None
     if join:
         # The client may drag a selected army in pieces. Merge only original
         # source fragments proven to finish at the same destination. Keep

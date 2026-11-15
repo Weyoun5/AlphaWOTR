@@ -36,6 +36,9 @@ def normalize(records, all_records, raw_lines, rr):
     known={};seen=set();candidates=[];initial_setup_line=None
     kill_re=re.compile(r'<~Controls\.(?:296|304|644)~>([\d\s]+)<~Controls\.(?:297|305|645)~><~([\w.]+)~>')
     commands={}
+    kill_rest={}
+    def board_zone(code):
+        return code in locations and rr.zone_kind(locations[code])[0] in ('region','stronghold')
     for number,line in enumerate(net,1):
         if '<~Controls.408~>' in line or '<~Controls.72~>' in line:
             known.clear()
@@ -63,6 +66,15 @@ def normalize(records, all_records, raw_lines, rr):
         ids=(move or kill).group(1).split()
         origin=(move or kill).group(2);target=move.group(3) if move else None
         actor=line.split('<~',1)[0].lstrip('$').replace('<auto>','auto>')
+        rest=[]
+        if kill:
+            # R6-KILL-PAYLOAD-FIGURE-SUBSET: the standard 'clear Current Action'
+            # kill names the die, the card and the figures in one payload (raw
+            # '099 199 086'). Dice, cards and tiles carry no figure transport:
+            # pair the kill on its figure subset; the rest is matched by count.
+            figure_ids=[pid for pid in ids if pid in descriptors]
+            if figure_ids and len(figure_ids)<len(ids):
+                rest=[pid for pid in ids if pid not in descriptors];ids=figure_ids;kill_rest[number]=rest
         commands[number]=(ids,origin,target,actor)
         supported=bool(ids and len(set(ids))==len(ids) and all(pid in descriptors for pid in ids)
                        and origin in locations and (target is None or target in locations))
@@ -71,6 +83,18 @@ def normalize(records, all_records, raw_lines, rr):
         changed=any(p and p['target']!=origin for p in previous.values())
         duplicate_kill=bool(kill and any(p and p.get('killed') for p in previous.values()))
         fellowship_group=bool(move and len(ids)>1 and any(descriptors.get(pid)==('fellowship',None,None) for pid in ids))
+        if rest and supported:
+            # R6-KILL-PAYLOAD-FIGURE-SUBSET: rewrite a mixed kill only where an
+            # army figure's proved location changes the Mirror's kill: a unit
+            # back on the board that the printed off-board zone would skip (03451
+            # L62), or a printed board zone the unit had left. Slot to slot
+            # (dragged to Current FP Card, killed in Current Action) and re-kills
+            # keep the printed record; the Mirror already books those. A named
+            # figure is one piece the Mirror re-seats from a stale origin itself
+            # (named_stale_origin); rewriting its kill only costs rows.
+            supported=any(p and not p.get('killed') and p['target']!=origin
+                          and descriptors[pid][0] in ('unit','leader','nazgul')
+                          and (board_zone(p['target']) or board_zone(origin)) for pid,p in previous.items())
         # The existing physical recruit-run normalizer owns reserve-origin
         # transcripts and their count pairing. Do not rewrite its input census.
         if supported and rr.zone_kind(locations[origin])[0]!='reinf' and (changed or fellowship_group):
@@ -109,7 +133,7 @@ def normalize(records, all_records, raw_lines, rr):
     rendered=[r for r in all_records if rendered_snapshot_kind(r)]
     paired=dict(zip(visible,rendered));retained={r['line']:r for r in records}
     updates={}
-    def pieces(record):
+    def pieces(record,rest=None):
         obj=record.get('obj','')
         tokens=(record.get('pieces',[]) if record.get('op')=='kill' else
                 rr.split_group(obj[7:-1]) if obj.startswith('group (') and obj.endswith(')') else [obj])
@@ -121,27 +145,43 @@ def normalize(records, all_records, raw_lines, rr):
                 key=('fellowship',None,None);count=1
             elif piece and piece[0] in ('unit','leader','nazgul','named'):
                 key=identity_key(piece);count=piece[3]
+            elif rest is not None:
+                # R6-KILL-PAYLOAD-FIGURE-SUBSET: a mixed kill's die/card/tile token
+                rest.append(token);continue
             else:return None,None
             actual[key]+=count;captions[key]=clean
         return actual,captions
-    def payload(record,ids,origin,target,actor):
+    def payload(record,ids,origin,target,actor,n_rest=0):
         if record is None or record.get('op')!=('kill' if target is None else 'move') or record.get('player')!=actor:return False
         if rr.zone_kind(record.get('zone' if target is None else 'from',''))!=rr.zone_kind(locations[origin]):return False
         if target is not None and rr.zone_kind(record.get('to',''))!=rr.zone_kind(locations[target]):return False
-        actual,_=pieces(record)
+        rest=[] if n_rest else None
+        actual,_=pieces(record,rest)
+        if n_rest and sum((rr.parse_piece(token) or (None,None,None,1))[3] for token in rest)!=n_rest:return False
         return actual==Counter(descriptors[pid] for pid in ids)
     for number,ids,origin,target,groups,actor,prior_lines,initial in candidates:
         record=paired.get(number)
         if record is None or record['line'] not in retained:continue
-        if not payload(record,ids,origin,target,actor):
+        if not payload(record,ids,origin,target,actor,len(kill_rest.get(number,()))):
             raise rr.PhysicalRecruitIdentityError({'detail':'region_transport_pair_payload','raw_line':number})
         for prior in prior_lines:
             prior_ids,prior_origin,prior_target,prior_actor=commands[prior]
             if (prior_origin not in locations or (prior_target is not None and prior_target not in locations)
                     or not all(pid in descriptors for pid in prior_ids)
-                    or not payload(paired.get(prior),prior_ids,prior_origin,prior_target,prior_actor)):
+                    or not payload(paired.get(prior),prior_ids,prior_origin,prior_target,prior_actor,len(kill_rest.get(prior,())))):
                 raise rr.PhysicalRecruitIdentityError({'detail':'region_transport_prior_payload','raw_line':prior})
-        _,captions=pieces(record);parts=[]
+        rest_tokens=[] if number in kill_rest else None
+        _,captions=pieces(record,rest_tokens);parts=[]
+        if rest_tokens:
+            # R6-KILL-PAYLOAD-FIGURE-SUBSET: the die/card/tile tokens stay one kill
+            # in the printed zone, ahead of the figure parts, so their effects and
+            # the record's pre-kill decision board are unchanged.
+            residual=dict(retained[record['line']]);residual['pieces']=rest_tokens
+            residual['_physical_region_transport']={'raw_line':number,'physical_ids':list(kill_rest[number]),
+                'prior_raw_lines':[],'initial_physical_ids':[],'printed_origin':locations[origin],
+                'actual_origin':locations[origin],'destination':None,'original_record':dict(record),
+                'kind':'physical_kill_non_figure_rest'}
+            parts.append(residual)
         for (source,family),group in groups.items():
             if source not in locations:raise rr.PhysicalRecruitIdentityError({'detail':'region_transport_unknown_actual_zone','raw_line':number})
             update=dict(retained[record['line']])

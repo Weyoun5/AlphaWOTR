@@ -77,6 +77,9 @@ EXPECTED_DECORATORS = ('@search_collection_scope', '@_companion_search_cache.sea
                        '@_search_lattice.search_scope', '@_search_failure_scope')
 PROFILE_CODES = {'fp': {None: 0, 'ring': 1, 'military': 2, 'mixed': 3},
                  'sh': {None: 0, 'corruption': 1, 'military': 2, 'mixed': 3}}
+# SEARCHCOR (2026-11-01): Shadow code 4 = corruption target with an off-target (military) win worth 0.0, the league
+# SH-CORRUPTION reward table (search_controller.inc profile_terminal; reward_contract.league_off_target).
+OFF_TARGET_CODES = {('sh', 'corruption', 0.0): 4}
 REWARD_CODES = {'predecision_profile_v1': 2}
 OBSERVER_PHASES = ('attacker_combat_card', 'defender_combat_card', 'combat_effect_choice')
 
@@ -101,8 +104,11 @@ class Resources:
         # table construction and root materialization work on any resident library.
         self.lib = snapshot.library()
         random_stream.library()
-        self.tables = observation_tables.native_tables(ai)
-        self.features = ActionFeatures(ai)
+        observation_tables.native_tables(ai)   # build now (fail fast); see the tables property
+        # R3-V53-FOLLOWONS: the action tables / encoder AND the request widths follow the engine's
+        # encoding generation (v52: ActionFeatures 157; v53: ActionFeaturesV53 199, observation 4745)
+        self.features = binding.action_features(ai)
+        self.widths = binding.encoding_widths(ai)
         self.menu = MenuQuery(ai)
         forcing = _load('native_search_core_inference_forcing', 'experiments/forced_hunt/native_forcing.py')
         self.chance = forcing.chance_table(ai, self.lib)
@@ -117,6 +123,13 @@ class Resources:
                 raise RuntimeError('Table handle does not belong to the resident native library')
         if self.features.lib is not self.lib:
             raise RuntimeError('Action feature tables do not belong to the resident native library')
+
+    @property
+    def tables(self):
+        # Re-resolved per use: native_tables is keyed on the live game_logic VP victory
+        # thresholds (episodes / engine_play change SHADOW_VP_VICTORY), so each search's
+        # controller gets the terminal check and vp_limit feature Python uses (Q1-03).
+        return observation_tables.native_tables(self.ai)
 
 
 _RESOURCES = {}
@@ -197,6 +210,21 @@ def verify_decorator_chain(ai):
             ai._search_lattice.search_scope, ai._search_failure_scope)
 
 
+def profile_code(ai, key):
+    """SEARCHCOR: the controller profile code of seat `key`: its profile, and its off-target win weight when that
+    is not the contract weight (reward_contract.OFF_TARGET); a weight no controller code scores is refused."""
+    profile = ai.PLAYER_PROFILES.get(key)
+    if profile not in PROFILE_CODES[key]:
+        raise Unsupported('unknown %s profile %r' % (key, profile))
+    off = ai.PLAYER_OFF_TARGET.get(key)
+    if off is None or profile in (None, 'mixed') or float(off) == importlib.import_module('reward_contract').OFF_TARGET[key]:
+        return PROFILE_CODES[key][profile]
+    code = OFF_TARGET_CODES.get((key, profile, float(off)))
+    if code is None:
+        raise Unsupported('%s profile %r with off-target win weight %r has no controller profile code' % (key, profile, off))
+    return code
+
+
 def refuse_unsupported(ai, add_noise, hot_regions, bonus_sims, determinize, noise_capable=False, reuse_capable=False):
     rc = importlib.import_module('reward_contract')
     if add_noise and not noise_capable:
@@ -227,8 +255,7 @@ def refuse_unsupported(ai, add_noise, hot_regions, bonus_sims, determinize, nois
     if float(ai._PHI_RINGS_RHO) != 0.0:
         raise Unsupported('milestone 1 refuses _PHI_RINGS_RHO=%r (must be 0.0)' % (ai._PHI_RINGS_RHO,))
     for key in ('fp', 'sh'):
-        if ai.PLAYER_PROFILES.get(key) not in PROFILE_CODES[key]:
-            raise Unsupported('unknown %s profile %r' % (key, ai.PLAYER_PROFILES.get(key)))
+        profile_code(ai, key)
     if int(ai._LEAF_BATCH) < 1:
         raise Unsupported('_LEAF_BATCH must be >= 1')
     if not determinize:
@@ -284,10 +311,16 @@ def build_config(ai, root_side_index, num_simulations, c_puct, determinize, trac
     cfg.add_noise = int(bool(add_noise))
     cfg.overlay_assert = int(bool(ai.OVERLAY_ASSERT))
     cfg.reward_contract = REWARD_CODES[importlib.import_module('reward_contract').current_contract()]
-    cfg.fp_profile = PROFILE_CODES['fp'][ai.PLAYER_PROFILES.get('fp')]
-    cfg.sh_profile = PROFILE_CODES['sh'][ai.PLAYER_PROFILES.get('sh')]
+    cfg.fp_profile = profile_code(ai, 'fp')
+    cfg.sh_profile = profile_code(ai, 'sh')
     cfg.phi_rings_rho = float(ai._PHI_RINGS_RHO)
     cfg.trace = int(bool(trace))
+    # C02 (round 18): the root's turn owner, scoped by the caller with ai.search_turn_owner
+    # (the root's MCTSNode.turn_owner in ai.mcts_search): 0 = not given, 1 = FP, 2 = SH
+    owner = ai._SEARCH_TURN_OWNER
+    cfg.root_turn_owner = 0 if owner is None else 1 if owner == ai.Side.FREE_PEOPLES else 2
+    # SEARCHFIX FIX F: read per search, like ai._C_PUCT (binding: struct_size 192 while it is off)
+    cfg.fpu_parent = int(bool(ai._FPU_PARENT))
     return cfg
 
 
@@ -1221,6 +1254,10 @@ def _build(ai):
             if fp_net is not expected[0] or sh_net is not expected[1]:
                 raise ValueError('Own-value orchestration accepts only the root model')
             bridge = RootNumericInferenceBridge(ai, context.net, side)
+            # LIVE1104 S03: a root plan provider (wotr_bridge/live/l1104_root_breadth.RootBreadth, WOTR_ROOT_BREADTH=1)
+            # bound to this search's context by the live seat; None = the search exactly as before.
+            plan_provider = getattr(context, 'root_breadth', None)
+            planned = False
             noised_once = False
             priors_clean_py = None
             deferred_exact = []
@@ -1234,7 +1271,9 @@ def _build(ai):
             with random_stream.NativeRandom(random.getstate()) as rng, \
                     OwnController(res.lib, _native, res.tables, res.features.constants, res.menu.tables,
                                   res.chance, rng, config, seed=context.native_seed,
-                                  reply_panels=context.panels, belief_worlds=context.world_count) as ctl:
+                                  reply_panels=context.panels, belief_worlds=context.world_count,
+                                  reply_shared=context.reply_shared,      # SEARCHFIX FIX R (read per search)
+                                  widths=res.widths) as ctl:
                 reused = bool(ctl.reused)
                 reuse_record['reused'] = reused
                 if reused != adopt:
@@ -1248,11 +1287,30 @@ def _build(ai):
                 roots = RootActions(ai, res, ctl, _native, side_index)
                 if _session is not None:
                     _session.capabilities = dict(ctl.capabilities)
+                if plan_provider is not None:
+                    # LIVE1104 S03: no fallback - a library without the root plan exports refuses the switch by name
+                    if not ctl.capabilities.get('root_plan'):
+                        raise Unsupported('WOTR_ROOT_BREADTH=1 needs the LIVE1104 S03 root plan exports (status 3, '
+                                          'set_root_plan); this controller library lacks them')
+                    ctl.request_root_plan()
                 while True:
                     guard.before_advance(ctl)
                     status = ctl.advance()
                     if status == binding.STATUS_COMPLETE:
                         break
+                    if status == binding.STATUS_ROOT_PLAN:
+                        # LIVE1104 S03: once, after root expansion and before any simulation (where the Python route's
+                        # RootBreadth admits inside _expand_node): the provider screens the root children Python-side
+                        # and returns (admitted child indices, floor, probe, drop) for the controller's forced floor.
+                        if plan_provider is None or planned:
+                            raise RuntimeError('Controller paused for a root plan it was not asked for (or twice)')
+                        plan_view = ctl.root_plan_view()
+                        with ctl.root_plan_menu() as plan_menu:
+                            plan_actions, _ = materialize_root_actions(ai, res.menu, plan_menu, plan_view.children)
+                        ctl.set_root_plan(*plan_provider.native_plan(plan_actions, plan_view.priors.tolist(),
+                                                                      plan_view.is_free.astype(bool).tolist()))
+                        planned = True
+                        continue
                     if status == binding.STATUS_ROOT_PRIORS:
                         # 9.4 / source 17440, 17489-17495: priors_clean = float32 capture BEFORE noise,
                         # one Dirichlet draw from the search NumPy stream, _apply_root_noise in place.
@@ -1307,6 +1365,9 @@ def _build(ai):
                     if observer is not None:
                         replay_observer_events(ai, observer, events, root_actions, state, side)
                 region_indices = np.array([ai._get_action_region_index(a) for a in root_actions], dtype=np.int32)
+                if plan_provider is not None:
+                    # LIVE1104 S03: the root statistics for the provider's Q gate (it wraps ai.select_root_action)
+                    plan_provider.native_finish(root, root_actions, ctl.root_plan_result() if planned else None)
                 # temperature > 0: select_root_action samples with np.random.choice on the search
                 # NumPy stream (the decorator swapped it in); same function, same inputs as the source.
                 idx, visit_info = build_visit_info(ai, root, root_actions, action_encs, region_indices, temperature)

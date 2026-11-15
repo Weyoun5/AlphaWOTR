@@ -25,23 +25,73 @@ class Nation(C.Structure):_fields_=[('side',C.c_int32),('box',C.c_int32),('activ
 
 def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
+_LOADED_REFERENCE=None   # (engine module, resolved pin path) recorded by load_reference() (R2-RS-REFPIN-ENV)
+
+def loaded_reference_path():
+    """The pin load_reference() verified for the engine module currently imported as 'ai', else None. The record is tied to
+    that module object, so a caller that restores sys.modules (drops the engine) also drops it: no stale pin outlives it."""
+    if _LOADED_REFERENCE is not None and sys.modules.get('ai') is _LOADED_REFERENCE[0]:return _LOADED_REFERENCE[1]
+    return None
+
+PIN_SHIMS=('PROD_REFERENCE','R5_REFERENCE','R4_REFERENCE')   # set on this module by run_pinned_prod's prod_pin / r5_pin / r4_pin
+
+def shim_reference_path():
+    """The pin an active run_pinned_prod shim (prod_pin / r5_pin / r4_pin) recorded on this module when it replaced
+    load_reference(), else None; more than one active shim refuses. Shared by active_reference_path() (verify.py provenance)
+    and census_prod.engine_pin() so both name the same pin (R3-TOOLS-MISC, R2-RS-REFPIN-ENV FU)."""
+    module=sys.modules[__name__]
+    shims=sorted({str(Path(getattr(module,name)).resolve()) for name in PIN_SHIMS if getattr(module,name,None) is not None})
+    if len(shims)>1:raise RuntimeError('More than one engine pin shim is active: '+', '.join(shims))
+    return Path(shims[0]) if shims else None
+
+def active_reference_path():
+    """The Python-oracle pin load_reference() uses; verify.py provenance must record this same file.
+    An active run_pinned_prod shim's pin first (the shim replaced load_reference() with a body that reads that pin, so the env /
+    default pin is not what the process loads: R3-TOOLS-MISC); else WOTR_NATIVE_SEARCH_REFERENCE when set; else the pin
+    load_reference() already loaded in this process (its WOTR_* wipe deletes that variable and no pin's environment re-sets it,
+    so this used to fall back to the r2 default after an in-process load: R2-RS-REFPIN-ENV); else the r2 default."""
+    return shim_reference_path() or Path(os.environ.get('WOTR_NATIVE_SEARCH_REFERENCE') or loaded_reference_path() or (HERE/'reference_sep16_own_current_v3_r2.json'))
+
+def manifest_binary_path(manifest,base=None):
+    """The binary a build manifest names; 'binary_relative' (box-style) wins over the absolute 'binary'.
+    base defaults to the module global HERE read AT CALL TIME, so the `bridge.HERE = box; bridge.library()` idiom resolves a
+    box's binary_relative inside that box (R2-RS-BRIDGE-HERE: a `base=HERE` default froze the root at definition)."""
+    base=HERE if base is None else base
+    return (Path(base)/manifest['binary_relative']).resolve() if manifest.get('binary_relative') else Path(manifest['binary']).resolve()
+
+def reference_source_hashes(reference,reference_path=None):
+    """The src/*.py identities a pin certifies for the engine (R7-NATIVE-GATE-SUITE-POST-BUILD, coordinator call round-7
+    decisions (2)): its runtime projection `runtime_source_sha256` when it records one - the projection
+    wotr_bridge/live/native_search.verify_reference already checks, every shipped engine dependency and no test file - else
+    the full `source_sha256`. A projection must agree with the full map, as the live verify requires. Editing or adding a
+    src test file therefore no longer drifts the engine pin; any runtime file drift still refuses."""
+    full=reference['source_sha256'];projection=reference.get('runtime_source_sha256')
+    if projection is None:return full
+    if not projection.get('ai.py') or any(full.get(name)!=digest for name,digest in projection.items()):
+        raise RuntimeError('Reference runtime projection disagrees with the pinned sources: '+str(reference_path))
+    return projection
+
 def load_reference():
-    reference_path=Path(os.environ.get('WOTR_NATIVE_SEARCH_REFERENCE') or (HERE/'reference_sep16_own_current_v3_r2.json'))
+    global _LOADED_REFERENCE
+    reference_path=active_reference_path()
     reference=json.loads(reference_path.read_text(encoding='utf-8'))
     from rule_data import reference_rule_data
     reference_rule_data(reference)
     source=Path(reference['runtime'])/'src'
-    for name,expected in reference['source_sha256'].items():
+    for name,expected in reference_source_hashes(reference,reference_path).items():   # R7-NATIVE-GATE-SUITE-POST-BUILD
         if sha(source/name)!=expected:raise RuntimeError('Reference source drift: '+name)
     if 'ai' in sys.modules:
         if Path(sys.modules['ai'].__file__).resolve()!=source/'ai.py':
             raise RuntimeError('Different engine already imported; use a fresh process')
+        # Record the pin for an engine imported without a recorded pin; keep the pin it was first loaded under (its environment).
+        if loaded_reference_path() is None:_LOADED_REFERENCE=(sys.modules['ai'],reference_path.resolve())
         return sys.modules['ai']
     for name in list(os.environ):
         if name.startswith('WOTR_'):del os.environ[name]
     os.environ.update(reference['environment'])
     sys.path.insert(0,str(source));sys.dont_write_bytecode=True
     import ai
+    _LOADED_REFERENCE=(ai,reference_path.resolve())   # the wipe above deleted WOTR_NATIVE_SEARCH_REFERENCE (R2-RS-REFPIN-ENV)
     return ai
 
 def library():
@@ -52,7 +102,7 @@ def library():
         if manifest.get('passed') is not True:raise RuntimeError('No successful native build')
         for name,expected in manifest['sources'].items():
             if sha(HERE/name)!=expected:raise RuntimeError('Native source changed; rebuild required: '+name)
-        path=(HERE/manifest['binary_relative']).resolve() if manifest.get('binary_relative') else Path(manifest['binary']).resolve()
+        path=manifest_binary_path(manifest)
         if not path.is_relative_to((HERE/'build').resolve()):raise RuntimeError('Binary escaped isolated build folder')
         if sha(path)!=manifest['binary_sha256']:raise RuntimeError('Native binary drift')
         lib=C.CDLL(str(path))
