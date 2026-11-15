@@ -2,7 +2,8 @@
 # .github/mac_release.py makes it: this checkout, a Python of its own with the packages, the two search libraries
 # built here.  It is then unzipped somewhere else and run with its own Python and nothing of this job's environment:
 # the AI server must start, and on saved positions the library and the Python engine must pick the same move
-# (wotr_bridge/selftest.py).  No game client is started.  The Windows zip is made and checked on the Windows PC.
+# (wotr_bridge/selftest.py).  Then the real game client is started from it and its AI menu looked at.
+# The Windows zip is made and checked on the Windows PC.
 name: mac
 on:
   push:
@@ -28,6 +29,30 @@ jobs:
       - name: Both searches on saved positions
         working-directory: ${{ runner.temp }}/fresh/AlphaWOTR
         run: env -i HOME="$HOME" TMPDIR="$TMPDIR" JAVA_HOME="$JAVA_HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin ./python/bin/python3 -B wotr_bridge/selftest.py --out "$RUNNER_TEMP/made/selftest_mac.json"
+      # The real client, started as a person starts it (AI vs AI, so that nobody has to click): its window must come
+      # up with the AI menu, and the strength slider must be in that menu and show when it is open.  The look is
+      # .github/mac_look/MenuLook.java's (a java agent); what it saw and its pictures are kept below.
+      - name: The game client and its AI menu
+        working-directory: ${{ runner.temp }}/fresh/AlphaWOTR
+        timeout-minutes: 12
+        run: |
+          LOOK="$RUNNER_TEMP/look"
+          JDK="${JAVA_HOME:-$(/usr/libexec/java_home)}"
+          mkdir -p "$LOOK/classes"
+          "$JDK/bin/javac" -d "$LOOK/classes" "$GITHUB_WORKSPACE/.github/mac_look/MenuLook.java"
+          printf 'Premain-Class: MenuLook\n' > "$LOOK/manifest.txt"
+          "$JDK/bin/jar" cfm "$LOOK/MenuLook.jar" "$LOOK/manifest.txt" -C "$LOOK/classes" .
+          set +e
+          env -i HOME="$HOME" TMPDIR="$TMPDIR" JAVA_HOME="$JDK" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            JAVA_TOOL_OPTIONS="-javaagent:$LOOK/MenuLook.jar=$LOOK" \
+            ./python/bin/python3 -B wotr_bridge/play.py AUTO > "$LOOK/session.log" 2>&1
+          echo "the session ended with $?"
+          set -e
+          tail -n 40 "$LOOK/session.log"
+          cat "$LOOK/look.json"
+          grep -q '"ai_menu": true' "$LOOK/look.json"
+          grep -q '"slider_in_menu": true' "$LOOK/look.json"
+          grep -q '"slider_showing": true' "$LOOK/look.json"
       - name: Keep the download and what was logged
         if: always()
         uses: actions/upload-artifact@v4
@@ -38,5 +63,9 @@ jobs:
             ${{ runner.temp }}/made/AlphaWOTR-mac.zip
             ${{ runner.temp }}/made/AlphaWOTR-mac.zip.sha256
             ${{ runner.temp }}/made/selftest_mac.json
+            ${{ runner.temp }}/look/look.json
+            ${{ runner.temp }}/look/session.log
+            ${{ runner.temp }}/look/*.png
             ${{ runner.temp }}/fresh/AlphaWOTR/turn_search/turn_search_service.log
             ${{ runner.temp }}/fresh/AlphaWOTR/wotr_bridge/play_client/ai_server_console.log
+            ${{ runner.temp }}/fresh/AlphaWOTR/wotr_bridge/play_client/ai_boot.log
