@@ -233,7 +233,7 @@ def improve(ai, state, side, owner, seed, menu, own, setting):
         _say('keeps %s - out of time before anything was decided (%s)' % (own.action_type, how))
         if _S['slow'][setting] >= 3:
             _say('this PC is too slow for the setting %s: it is not asked again this session '
-                 '(a lower position of the AI menu\'s strength slider needs less)' % setting)
+                 '(a lower position of the AI panel\'s strength slider needs less)' % setting)
         return own
     _S['slow'][setting] = 0
     if not ans.get('switched'):

@@ -2,42 +2,45 @@ import java.awt.Component;
 import java.awt.Container;
 import java.awt.Dimension;
 import java.awt.Frame;
-import java.awt.Graphics2D;
 import java.awt.Rectangle;
 import java.awt.Robot;
 import java.awt.Toolkit;
 import java.awt.Window;
-import java.awt.image.BufferedImage;
+import java.awt.event.MouseEvent;
 import java.io.File;
 import java.lang.instrument.Instrumentation;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import javax.imageio.ImageIO;
 import javax.swing.AbstractButton;
 import javax.swing.JFrame;
-import javax.swing.JLabel;
 import javax.swing.JMenu;
 import javax.swing.JMenuBar;
-import javax.swing.JPopupMenu;
-import javax.swing.JSlider;
-import javax.swing.MenuSelectionManager;
+import javax.swing.JMenuItem;
+import javax.swing.JSeparator;
 import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
 
 /**
- * TEST ONLY (the Mac workflow): what the game client's AI menu holds and shows on this Mac.
+ * TEST ONLY (the Mac workflow): the game client as a person finds it - its AI menu and the AI panel's strength knob.
  *
  * A java agent (-javaagent:MenuLook.jar=FOLDER through JAVA_TOOL_OPTIONS) in the REAL client, started as a person
- * starts it (Play_vs_AI.command's wotr_bridge/play.py).  It waits for the game's window and its "AI" menu, writes
- * what is there to FOLDER/look.json (the look and feel, whether the menu bar is drawn in the game's window - a bar
- * macOS draws at the top of the screen leaves the slider out -, every entry of the AI menu, the strength slider:
- * found, at which place, showing when the menu is open), opens the menu from the window's bar and keeps
- * three pictures of it (menu_paint.png: the open menu painted into an image; screen_robot.png and
- * screen_capture.png: the screen, by Java and by macOS), and then ends the client: 0 = looked, 3 = no AI menu came.
- * Nothing here knows the client's classes: the menu is found by its title, the slider by its name.
+ * starts it (Play_vs_AI.command's wotr_bridge/play.py).  It waits for the game's window and its "AI" menu and writes
+ * to FOLDER/look.json:
+ *   the AI menu's entries, and that they are entries only (on a Mac the menus are drawn by macOS in the bar at the
+ *     top of the screen, which shows nothing else);
+ *   the strength knob (the component named "ai.strength") of the AI panel: showing, where, the words over it;
+ *   the knob pressed and let go on another position, by mouse events put into the client's own event queue: the
+ *     file play_settings.json beside the client must then state that position.
+ * It keeps two pictures of the screen (screen_robot.png by Java, screen_capture.png by macOS) and ends the client:
+ * 0 = looked, 3 = no AI menu came, 4 = the look itself failed.
+ * It knows two things of the client: the menu's title and the knob's name; the knob's stops are read from its own
+ * fields (min, max, value, pad()).
  */
 public class MenuLook {
-    static final String SLIDER = "ai.strength";
+    static final String KNOB = "ai.strength";
     static final int WAIT_S = 240;
     static File dir;
     static final StringBuilder json = new StringBuilder("{\n");
@@ -84,41 +87,56 @@ public class MenuLook {
         return null;
     }
 
-    static JSlider slider(Component c) {
-        if (c instanceof JSlider && SLIDER.equals(c.getName())) return (JSlider) c;
+    static Component named(Component c, String name) {
+        if (name.equals(c.getName())) return c;
         if (c instanceof Container) {
             Component[] kids = ((Container) c).getComponents();
             for (int i = 0; i < kids.length; i++) {
-                JSlider s = slider(kids[i]);
-                if (s != null) return s;
+                Component hit = named(kids[i], name);
+                if (hit != null) return hit;
             }
         }
         return null;
     }
 
-    static String label(Component c) {
-        if (c instanceof JLabel) return ((JLabel) c).getText();
-        if (c instanceof Container) {
-            Component[] kids = ((Container) c).getComponents();
-            for (int i = 0; i < kids.length; i++) {
-                String s = label(kids[i]);
-                if (s != null) return s;
-            }
-        }
-        return null;
-    }
-
-    static String windows() {
-        StringBuilder b = new StringBuilder("[");
+    static Component knob() {
         Window[] all = Window.getWindows();
         for (int i = 0; i < all.length; i++) {
-            Window w = all[i];
-            String title = w instanceof Frame ? ((Frame) w).getTitle()
-                    : w instanceof java.awt.Dialog ? ((java.awt.Dialog) w).getTitle() : "";
-            b.append(i == 0 ? "" : ", ").append(q(w.getClass().getName() + " | " + title + " | showing=" + w.isShowing()
-                    + " | " + w.getBounds().width + "x" + w.getBounds().height));
+            if (!all[i].isShowing()) continue;
+            Component hit = named(all[i], KNOB);
+            if (hit != null) return hit;
         }
-        return b.append("]").toString();
+        return null;
+    }
+
+    static Field field(Class<?> c, String name) throws Exception {
+        for (; c != null; c = c.getSuperclass()) {
+            try {
+                Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f;
+            } catch (NoSuchFieldException e) { /* the class above */ }
+        }
+        throw new NoSuchFieldException(name);
+    }
+
+    static Object call(Object o, String name) throws Exception {
+        for (Class<?> c = o.getClass(); c != null; c = c.getSuperclass()) {
+            try {
+                Method m = c.getDeclaredMethod(name);
+                m.setAccessible(true);
+                return m.invoke(o);
+            } catch (NoSuchMethodException e) { /* the class above */ }
+        }
+        throw new NoSuchMethodException(name);
+    }
+
+    static String settings() {
+        try {
+            return new String(Files.readAllBytes(new File("play_settings.json").toPath()), StandardCharsets.UTF_8).trim();
+        } catch (Throwable t) {
+            return "(" + t + ")";
+        }
     }
 
     static void pictures(String stem) {
@@ -128,11 +146,13 @@ public class MenuLook {
         } catch (Throwable t) {
             put(stem + "_robot_error", q(String.valueOf(t)));
         }
-        try {
-            new ProcessBuilder("/usr/sbin/screencapture", "-x", new File(dir, stem + "_capture.png").getPath())
-                    .inheritIO().start().waitFor();
-        } catch (Throwable t) {
-            put(stem + "_capture_error", q(String.valueOf(t)));
+        if (new File("/usr/sbin/screencapture").isFile()) {
+            try {
+                new ProcessBuilder("/usr/sbin/screencapture", "-x", new File(dir, stem + "_capture.png").getPath())
+                        .inheritIO().start().waitFor();
+            } catch (Throwable t) {
+                put(stem + "_capture_error", q(String.valueOf(t)));
+            }
         }
     }
 
@@ -147,9 +167,6 @@ public class MenuLook {
                 if (menu == null) Thread.sleep(2000);
             }
             put("look_and_feel", q(UIManager.getLookAndFeel().getClass().getName()));
-            put("swing.defaultlaf", q(System.getProperty("swing.defaultlaf")));
-            put("apple.laf.useScreenMenuBar", q(System.getProperty("apple.laf.useScreenMenuBar")));
-            put("windows", windows());
             if (menu == null) {
                 put("ai_menu", "false");
                 pictures("screen");
@@ -157,61 +174,66 @@ public class MenuLook {
             }
             put("ai_menu", "true");
             final JMenu ai = menu;
-            Thread.sleep(3000);                                      // the menu's own build has ended
+            Thread.sleep(5000);                                      // the menu and the panel have been built
+            final int[] target = new int[1];
             SwingUtilities.invokeAndWait(new Runnable() {
                 public void run() {
-                    JMenuBar bar = (JMenuBar) ai.getParent();
-                    // a bar macOS draws at the top of the screen has no height in the window, and shows menu
-                    // entries only: what this agent opens below is then NOT what a person's click opens
-                    put("menu_bar_in_window", String.valueOf(bar.isShowing() && bar.getHeight() > 0));
-                    put("menu_bar_ui", q(bar.getUI().getClass().getName()));
-                    put("menu_bar_bounds", q(String.valueOf(bar.getBounds())));
-                    StringBuilder entries = new StringBuilder("[");
-                    int at = -1;
-                    Component[] kids = ai.getMenuComponents();
-                    for (int i = 0; i < kids.length; i++) {
-                        Component c = kids[i];
-                        String words = c instanceof AbstractButton ? ((AbstractButton) c).getText() : label(c);
-                        if (slider(c) != null) at = i;
-                        entries.append(i == 0 ? "" : ", ").append(q(c.getClass().getSimpleName() + (words == null ? "" : ": " + words)
-                                + (slider(c) != null ? " [the strength slider]" : "")));
+                    try {
+                        JMenuBar bar = (JMenuBar) ai.getParent();
+                        put("menu_bar_in_window", String.valueOf(bar.isShowing() && bar.getHeight() > 0));
+                        StringBuilder entries = new StringBuilder("[");
+                        boolean only = true, legacy = false;
+                        Component[] kids = ai.getMenuComponents();
+                        for (int i = 0; i < kids.length; i++) {
+                            Component c = kids[i];
+                            only &= c instanceof JMenuItem || c instanceof JSeparator;
+                            String words = c instanceof AbstractButton ? ((AbstractButton) c).getText() : c.getClass().getSimpleName();
+                            legacy |= words != null && words.toLowerCase().contains("legacy");
+                            entries.append(i == 0 ? "" : ", ").append(q(words));
+                        }
+                        put("entries", entries.append("]").toString());
+                        put("menu_entries_only", String.valueOf(only));
+                        put("legacy_entry", String.valueOf(legacy));
+                        Component knob = knob();
+                        put("knob_found", String.valueOf(knob != null));
+                        put("knob_showing", String.valueOf(knob != null && knob.isShowing()));
+                        if (knob == null || !knob.isShowing()) return;
+                        put("knob_on_screen", q(String.valueOf(knob.getLocationOnScreen()) + " " + knob.getWidth() + "x" + knob.getHeight()));
+                        put("knob_words", q(String.valueOf(call(knob.getParent(), "words"))));
+                        int min = field(knob.getClass(), "min").getInt(knob), max = field(knob.getClass(), "max").getInt(knob);
+                        int value = field(knob.getClass(), "value").getInt(knob);
+                        int pad = ((Integer) call(knob, "pad")).intValue();
+                        put("knob_stands_at", q(value + " of " + min + ".." + max));
+                        put("settings_before", q(settings()));
+                        target[0] = value == 2 ? 3 : 2;
+                        int x = pad + (int) Math.round((target[0] - min) / (double) Math.max(1, max - min) * (knob.getWidth() - 2 * pad));
+                        int y = knob.getHeight() / 2;
+                        long t = System.currentTimeMillis();
+                        knob.dispatchEvent(new MouseEvent(knob, MouseEvent.MOUSE_PRESSED, t, 0, x, y, 1, false, MouseEvent.BUTTON1));
+                        knob.dispatchEvent(new MouseEvent(knob, MouseEvent.MOUSE_RELEASED, t, 0, x, y, 1, false, MouseEvent.BUTTON1));
+                    } catch (Throwable t) {
+                        put("look_error", q(String.valueOf(t)));
                     }
-                    put("entries", entries.append("]").toString());
-                    put("slider_in_menu", String.valueOf(at >= 0));
-                    put("slider_entry", String.valueOf(at));
-                    ai.doClick();                                    // opens the menu as a click on its title does
                 }
             });
             Thread.sleep(1500);
-            SwingUtilities.invokeAndWait(new Runnable() {
-                public void run() {
-                    JPopupMenu popup = ai.getPopupMenu();
-                    put("menu_open", String.valueOf(popup.isShowing()));
-                    put("menu_size", q(popup.getWidth() + "x" + popup.getHeight()));
-                    JSlider s = slider(popup);
-                    put("slider_showing", String.valueOf(s != null && s.isShowing()));
-                    if (s != null) {
-                        put("slider_value", String.valueOf(s.getValue()));
-                        put("slider_size", q(s.getWidth() + "x" + s.getHeight()));
-                        if (s.isShowing()) put("slider_on_screen", q(String.valueOf(s.getLocationOnScreen())));
-                    }
-                    try {
-                        if (popup.getWidth() > 0 && popup.getHeight() > 0) {
-                            BufferedImage image = new BufferedImage(popup.getWidth(), popup.getHeight(), BufferedImage.TYPE_INT_RGB);
-                            Graphics2D g = image.createGraphics();
-                            popup.paint(g);
-                            g.dispose();
-                            ImageIO.write(image, "png", new File(dir, "menu_paint.png"));
+            if (target[0] > 0) {
+                String after = settings();
+                put("knob_moved_to", String.valueOf(target[0]));
+                put("settings_after", q(after));
+                put("knob_writes_file", String.valueOf(after.replace(" ", "").contains("\"strength\":" + target[0])));
+                SwingUtilities.invokeAndWait(new Runnable() {
+                    public void run() {
+                        try {
+                            Component knob = knob();
+                            if (knob != null) put("knob_words_after", q(String.valueOf(call(knob.getParent(), "words"))));
+                        } catch (Throwable t) {
+                            put("look_error_after", q(String.valueOf(t)));
                         }
-                    } catch (Throwable t) {
-                        put("menu_paint_error", q(String.valueOf(t)));
                     }
-                }
-            });
+                });
+            }
             pictures("screen");
-            SwingUtilities.invokeAndWait(new Runnable() {
-                public void run() { MenuSelectionManager.defaultManager().clearSelectedPath(); }
-            });
             finish(0);
         } catch (Throwable t) {
             put("error", q(String.valueOf(t)));

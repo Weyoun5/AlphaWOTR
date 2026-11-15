@@ -83,30 +83,11 @@ if os.name != 'nt':     # (not Windows: no development runtime to fall back on -
 # VNETINSTALL (2026-11-03): the two WIN nets search with a separately trained
 # value net and c_puct 1.5 (live/own_model.py SEARCH_VALUE_NETS); MILITARY and
 # CORRUPTION keep their own value head and c_puct 4 (the value nets learnt the
-# win objective).  The menu text says which ("c1.5" / "c4" = c_puct).  A text
-# of the bat may change its length freely: the file is written with CR LF line
-# ends (write_bat), and only in a file with bare LF does cmd's label search
-# depend on byte offsets (the same-length rule of the paragraphs below is the
-# history of that fault, no longer a rule).
-# LF050 (2026-11-03, USER "install the current nets here"): WIN on each side
-# is now the full-network league_full net at cycle 50 (500K learning games,
-# EVERY layer trained; FP 776d5d5e, SH 2eb37451), the default; MILITARY and
-# CORRUPTION stay league_main's c200 nets.  New tags lf050_fp*_sh* (one
-# file pair per combination as before); the lg200_* pairs stay on disk but
-# leave the menu: a third menu entry would change the bat's line layout
-# (see above), so the c200 WIN nets come back only by the LF050 rollback.
-# The tag prefix and the WIN texts keep their exact lengths, so every line
-# of both bats keeps its byte offset (lfinstall_1103 make_stage.py guard).
-# LF201 (2026-11-04, USER "install the 2M nets"): WIN on each side is now
-# the same league_full net trained on to cycle 201 (2,000,000 learning
-# games; FP 17dcfcc2, SH d5f7a332), the default; MILITARY and CORRUPTION
-# are unchanged.  New tags lf201_fp*_sh*; the lf050_* and lg200_* pairs
-# stay on disk (out of the menu; back only by the LF201 / LF050 rollback).
-# Same-length tag prefix and WIN texts (lfinstall_1104 make_stage.py guard).
-FP_NETS = (('win', 'FP-WIN', 'search-trained (c008); own judge c1.5'),
-           ('mil', 'FP-MILITARY', 'military win, full network 2M games; own head c4'))
-SH_NETS = (('win', 'SH-WIN', 'search-trained (c008); own judge c1.5'),
-           ('cor', 'SH-CORRUPTION', 'corruption, full network 2M games; own head c4'))
+# win objective).
+# The menu names the nets and nothing else.  (key, the name in the menu); the first of each side is
+# the default.
+FP_NETS = (('win', 'FP-WIN'), ('mil', 'FP-MILITARY'))
+SH_NETS = (('win', 'SH-WIN'), ('cor', 'SH-CORRUPTION'))
 NET_TAG_FORMAT = 'mc200_fp%s_sh%s'
 NET_TAGS = tuple(NET_TAG_FORMAT % (f[0], s[0]) for f in FP_NETS for s in SH_NETS)
 NET_TAG = NET_TAG_FORMAT % (FP_NETS[0][0], SH_NETS[0][0])
@@ -387,8 +368,7 @@ def stop_ours(client_dir):
 def _bat_net_prompt(var, title, nets):
     keys = ''.join(str(i + 1) for i in range(len(nets)))
     out = ['echo    Which %s AI?' % title, 'echo.']
-    out += ['echo      [%d]  %-15s %s' % (i + 1, name, what)
-            for i, (_, name, what) in enumerate(nets)]
+    out += ['echo      [%d]  %s' % (i + 1, name) for i, (_, name) in enumerate(nets)]
     out += ['echo.',
             'choice /c %s /n /m "    Press %s or %s: "'
             % (keys, ', '.join(keys[:-1]), keys[-1])]
@@ -401,7 +381,7 @@ def _bat_net_prompt(var, title, nets):
 
 def _bat_net_args(var, arg, ok, nets):
     out = ['if not defined %s set "%s=1"' % (arg, ok)]
-    for key, _, _ in nets:
+    for key, _ in nets:
         out += ['if /I "!%s!"=="%s" set "%s=%s"' % (arg, key, var, key),
                 'if /I "!%s!"=="%s" set "%s=1"' % (arg, key, ok)]
     return out
@@ -410,7 +390,7 @@ def _bat_net_args(var, arg, ok, nets):
 def _bat_net_names(var, name_var, nets):
     out = ['set "%s=%s"' % (name_var, nets[0][1])]
     out += ['if /I "!%s!"=="%s" set "%s=%s"' % (var, key, name_var, name)
-            for key, name, _ in nets[1:]]
+            for key, name in nets[1:]]
     return out
 
 
@@ -446,9 +426,9 @@ def bat_net_menu():
         'goto netschosen',
         ':netbad',
         'echo   [X] Unknown net in "!FPARG! !SHARG!".  Free Peoples nets: %s;'
-        % ' or '.join(k.upper() for k, _, _ in FP_NETS),
+        % ' or '.join(k.upper() for k, _ in FP_NETS),
         'echo       Shadow nets: %s.  Example: Play_vs_AI.bat %s MIL COR'
-        % (' or '.join(k.upper() for k, _, _ in SH_NETS), w),
+        % (' or '.join(k.upper() for k, _ in SH_NETS), w),
         'echo.',
         'pause',
         'exit /b 1',
@@ -460,7 +440,7 @@ def bat_net_menu():
         'if /I "%AISIDE%"=="FP" set "AINAMES=!FPNAME!"',
         'if /I "%AISIDE%"=="SA" set "AINAMES=!SHNAME!"',
         'if /I "%%AISIDE%%"=="%s" set "AINAMES=!FPNAME! vs !SHNAME!"' % w,
-        'echo    The AI plays !AINAMES! (net tag !NETTAG!).',
+        'echo    The AI plays !AINAMES!.',
         'echo.']
     return '\n'.join(lines) + '\n'
 
@@ -639,12 +619,10 @@ if /I "%AISIDE%"=="{WATCH_SIDE}" (
     set "AISIDE=FP"
     set "FEEDSIDE=FP"
     set "YOUSAY=You play SHADOW."
-    set "AIBUTTON=AI plays Free Peoples"
 ) else (
     set "AISIDE=SA"
     set "FEEDSIDE=SA"
     set "YOUSAY=You play FREE PEOPLES."
-    set "AIBUTTON=AI plays Shadow"
 )
 echo.
 echo    %YOUSAY%
@@ -743,8 +721,7 @@ echo         The AI server is running.
 :: ---------------------------------------------------------------------
 :: 2. the client, in the FOREGROUND: closing the game window comes
 ::    back here and tears the server down.  -Dai.feed.aiside is
-::    MANDATORY - it is what blinds the AI to your hand.  The client
-::    spawns the AI status panel itself (-Dai.python / -Dai.bridgedir).
+::    MANDATORY - it is what blinds the AI to your hand.
 :: ---------------------------------------------------------------------
 echo [step3] >> "!LAUNCHLOG!"
 echo   [3/3] Launching the game client...
@@ -753,32 +730,17 @@ echo   ----------------------------------------------------------------
 echo    IN THE GAME:
 echo.
 if "%AISIDE%"=="{WATCH_SIDE}" goto watchsteps
-echo      1. Start a new game as usual (2nd edition, both sides).
-echo      2. Menu  AI  ^>  "Play vs AI..."
-echo      3. The side is already set (%AIBUTTON%): read
-echo         the setup dialog and click Start Game.
+echo      1. Start a new game (2nd edition, both sides).
+echo      2. Menu  AI  ^>  "Play vs AI..."  ^>  Start Game.
 echo.
-echo    While playing: each turn the AI draws your cards and rolls your
-echo    action dice for you, and it ends the turn. You roll your combat
-echo    and Hunt dice when it asks. Answer each decision on the board by
-echo    moving your pieces, or click the option in the AI panel, or type
-echo    a word: "pass", "fp ok", "done", "nc", or an attack such as
-echo    "dale from erebor". "back" puts the board back as the game has
-echo    it, "undo" takes back your last decision, "help" lists the words.
+echo    Play on the board, or click your choice in the AI panel on the
+echo    right. Chat: "help" lists the words, "back" puts the board back,
+echo    "undo" takes back your last decision.
 goto stepsdone
 :watchsteps
-echo      1. No action is needed: the AI begins playing BOTH sides
-echo         automatically, cards and dice included, on the game the
-echo         client opens (the last game type played) once it has loaded.
-echo      2. Keep that game: File ^> New or Load stops the watch, and
-echo         watching again then requires a new Play_vs_AI.bat.
-echo         If the watch did not start, use Menu  AI  ^>  "AI vs AI (watch)".
-echo.
-echo    While it plays, do not move pieces, draw cards or roll dice
-echo    yourself: the AI does all of it. Menu  AI  ^>  "Stop AI"
-echo    ends the watch.
+echo      The AI plays both sides by itself.
+echo      Menu  AI  ^>  "Stop AI" ends it.
 :stepsdone
-echo    Sound: menu  AI  ^>  "Mute sounds".
 echo   ----------------------------------------------------------------
 echo.
 cd /d "!PLAY!"
@@ -873,13 +835,13 @@ def _render(template):
                      ('{JAVA_MIN}', str(JAVA_MIN)),
                      ('{ENV_LINES}', bat_env_lines()),
                      ('{NET_MENU}', bat_net_menu()),
-                     ('{FP_KEYS_BAR}', '|'.join(k.upper() for k, _, _ in FP_NETS)),
-                     ('{SH_KEYS_BAR}', '|'.join(k.upper() for k, _, _ in SH_NETS)),
-                     ('{FP_KEYS_BAR_ESC}', '^|'.join(k.upper() for k, _, _ in FP_NETS)),
-                     ('{SH_KEYS_BAR_ESC}', '^|'.join(k.upper() for k, _, _ in SH_NETS)),
+                     ('{FP_KEYS_BAR}', '|'.join(k.upper() for k, _ in FP_NETS)),
+                     ('{SH_KEYS_BAR}', '|'.join(k.upper() for k, _ in SH_NETS)),
+                     ('{FP_KEYS_BAR_ESC}', '^|'.join(k.upper() for k, _ in FP_NETS)),
+                     ('{SH_KEYS_BAR_ESC}', '^|'.join(k.upper() for k, _ in SH_NETS)),
                      ('{NET_TAG_PATTERN}', NET_TAG_FORMAT % (
-                         '[%s]' % '/'.join(k for k, _, _ in FP_NETS),
-                         '[%s]' % '/'.join(k for k, _, _ in SH_NETS))),
+                         '[%s]' % '/'.join(k for k, _ in FP_NETS),
+                         '[%s]' % '/'.join(k for k, _ in SH_NETS))),
                      ('{NET_TAG}', NET_TAG), ('{NET_GEN}', NET_GEN),
                      ('{JAR_NAME}', JAR_NAME),
                      ('{LEFTOVER_FILES}', ' '.join(LEFTOVER_FILES)),

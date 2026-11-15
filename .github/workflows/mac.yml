@@ -30,8 +30,8 @@ jobs:
         working-directory: ${{ runner.temp }}/fresh/AlphaWOTR
         run: env -i HOME="$HOME" TMPDIR="$TMPDIR" JAVA_HOME="$JAVA_HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin ./python/bin/python3 -B wotr_bridge/selftest.py --out "$RUNNER_TEMP/made/selftest_mac.json"
       # The real client, started as a person starts it (AI vs AI, so that nobody has to click): its window must come
-      # up with its menu bar drawn in the window (a bar macOS draws at the top of the screen leaves the slider out),
-      # and the strength slider must be the AI menu's first entry and show when the menu is open.  The look is
+      # up, its AI menu must hold entries only (macOS draws the menus and shows nothing else), and the AI panel's
+      # strength knob must show and, dragged, be written to play_settings.json.  The look is
       # .github/mac_look/MenuLook.java's (a java agent); what it saw and its pictures are kept below.
       - name: The game client and its AI menu
         working-directory: ${{ runner.temp }}/fresh/AlphaWOTR
@@ -52,9 +52,10 @@ jobs:
           tail -n 40 "$LOOK/session.log"
           cat "$LOOK/look.json"
           grep -q '"ai_menu": true' "$LOOK/look.json"
-          grep -q '"menu_bar_in_window": true' "$LOOK/look.json"
-          grep -q '"slider_entry": 0' "$LOOK/look.json"
-          grep -q '"slider_showing": true' "$LOOK/look.json"
+          grep -q '"menu_entries_only": true' "$LOOK/look.json"
+          grep -q '"legacy_entry": false' "$LOOK/look.json"
+          grep -q '"knob_showing": true' "$LOOK/look.json"
+          grep -q '"knob_writes_file": true' "$LOOK/look.json"
       - name: Keep the download and what was logged
         if: always()
         uses: actions/upload-artifact@v4

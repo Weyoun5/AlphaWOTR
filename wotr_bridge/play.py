@@ -12,8 +12,8 @@ Every name, file list and command line is launch_head's (the one head): this mod
   5  the last session's files are swept: game logs archived, coordination files removed, diagnostics kept as .prev
   6  the AI server is started (its console in ai_server_console.log) and waited for until its heartbeat file is there
   7  the client runs in the foreground; when its window closes the server is stopped
-On macOS the client gets Swing's own look (MAC_JAVA_OPTS), the look it has on Windows.  The menu bar is brought into
-the game's window by the client itself (AiBoot.keepBarInWindow): the bar macOS draws leaves the strength slider out.
+On macOS the client gets Swing's own look (MAC_JAVA_OPTS), the look it has on Windows; its menus stay in the bar at
+the top of the screen, where macOS draws them.
 The file that proves a live server (ai_server.alive) is never removed here: on these systems a file a process holds
 can be unlinked, and a server that survived would keep its lock on a file nobody sees.
 """
@@ -101,8 +101,7 @@ def choices(args):
     asked = not args
     try:
         side = lh._side(args[0] if args else ask('Which side does the AI play?', (
-            ('SA', 'the Shadow (you play the Free Peoples)'), ('FP', 'the Free Peoples (you play the Shadow)'),
-            (lh.WATCH_SIDE, 'both - watch AI vs AI'))))
+            ('SA', 'Shadow'), ('FP', 'Free Peoples'), (lh.WATCH_SIDE, 'both (watch AI vs AI)'))))
     except ValueError as error:
         raise SystemExit('   [X] %s' % error)
     fp_arg = args[1] if len(args) > 1 and side in ('FP', lh.WATCH_SIDE) else None
@@ -110,16 +109,16 @@ def choices(args):
 
     def net(arg, title, nets, plays):
         if arg is not None:
-            hit = [key for key, _name, _what in nets if key.upper() == arg.upper()]
+            hit = [key for key, _name in nets if key.upper() == arg.upper()]
             if not hit:
-                raise SystemExit('   [X] Unknown %s net %r: %s' % (title, arg, ' or '.join(k.upper() for k, _, _ in nets)))
+                raise SystemExit('   [X] Unknown %s net %r: %s' % (title, arg, ' or '.join(k.upper() for k, _ in nets)))
             return hit[0]
         if asked and plays:
-            return ask('Which %s AI?' % title, [(key, '%-15s %s' % (name, what)) for key, name, what in nets])
+            return ask('Which %s AI?' % title, list(nets))
         return nets[0][0]
     fp = net(fp_arg, 'Free Peoples', lh.FP_NETS, side in ('FP', lh.WATCH_SIDE))
     sh = net(sh_arg, 'Shadow', lh.SH_NETS, side in ('SA', lh.WATCH_SIDE))
-    names = {'FP': dict((k, n) for k, n, _ in lh.FP_NETS)[fp], 'SA': dict((k, n) for k, n, _ in lh.SH_NETS)[sh]}
+    names = {'FP': dict(lh.FP_NETS)[fp], 'SA': dict(lh.SH_NETS)[sh]}
     names[lh.WATCH_SIDE] = '%s vs %s' % (names['FP'], names['SA'])
     return side, lh.NET_TAG_FORMAT % (fp, sh), names[side]
 

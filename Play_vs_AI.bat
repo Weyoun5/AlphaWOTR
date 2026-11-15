@@ -170,12 +170,10 @@ if /I "%AISIDE%"=="AUTO" (
     set "AISIDE=FP"
     set "FEEDSIDE=FP"
     set "YOUSAY=You play SHADOW."
-    set "AIBUTTON=AI plays Free Peoples"
 ) else (
     set "AISIDE=SA"
     set "FEEDSIDE=SA"
     set "YOUSAY=You play FREE PEOPLES."
-    set "AIBUTTON=AI plays Shadow"
 )
 echo.
 echo    %YOUSAY%
@@ -200,8 +198,8 @@ if not defined ASKNETS goto netschosen
 if /I "%AISIDE%"=="SA" goto asksh
 echo    Which Free Peoples AI?
 echo.
-echo      [1]  FP-WIN          search-trained (c008); own judge c1.5
-echo      [2]  FP-MILITARY     military win, full network 2M games; own head c4
+echo      [1]  FP-WIN
+echo      [2]  FP-MILITARY
 echo.
 choice /c 12 /n /m "    Press 1 or 2: "
 if errorlevel 2 (set "FPNET=mil") else (set "FPNET=win")
@@ -210,8 +208,8 @@ if /I "%AISIDE%"=="FP" goto netschosen
 :asksh
 echo    Which Shadow AI?
 echo.
-echo      [1]  SH-WIN          search-trained (c008); own judge c1.5
-echo      [2]  SH-CORRUPTION   corruption, full network 2M games; own head c4
+echo      [1]  SH-WIN
+echo      [2]  SH-CORRUPTION
 echo.
 choice /c 12 /n /m "    Press 1 or 2: "
 if errorlevel 2 (set "SHNET=cor") else (set "SHNET=win")
@@ -248,7 +246,7 @@ if /I "!SHNET!"=="cor" set "SHNAME=SH-CORRUPTION"
 if /I "%AISIDE%"=="FP" set "AINAMES=!FPNAME!"
 if /I "%AISIDE%"=="SA" set "AINAMES=!SHNAME!"
 if /I "%AISIDE%"=="AUTO" set "AINAMES=!FPNAME! vs !SHNAME!"
-echo    The AI plays !AINAMES! (net tag !NETTAG!).
+echo    The AI plays !AINAMES!.
 echo.
 
 :: Fresh session.  An orphaned server or panel from a previous run
@@ -343,8 +341,7 @@ echo         The AI server is running.
 :: ---------------------------------------------------------------------
 :: 2. the client, in the FOREGROUND: closing the game window comes
 ::    back here and tears the server down.  -Dai.feed.aiside is
-::    MANDATORY - it is what blinds the AI to your hand.  The client
-::    spawns the AI status panel itself (-Dai.python / -Dai.bridgedir).
+::    MANDATORY - it is what blinds the AI to your hand.
 :: ---------------------------------------------------------------------
 echo [step3] >> "!LAUNCHLOG!"
 echo   [3/3] Launching the game client...
@@ -353,32 +350,17 @@ echo   ----------------------------------------------------------------
 echo    IN THE GAME:
 echo.
 if "%AISIDE%"=="AUTO" goto watchsteps
-echo      1. Start a new game as usual (2nd edition, both sides).
-echo      2. Menu  AI  ^>  "Play vs AI..."
-echo      3. The side is already set (%AIBUTTON%): read
-echo         the setup dialog and click Start Game.
+echo      1. Start a new game (2nd edition, both sides).
+echo      2. Menu  AI  ^>  "Play vs AI..."  ^>  Start Game.
 echo.
-echo    While playing: each turn the AI draws your cards and rolls your
-echo    action dice for you, and it ends the turn. You roll your combat
-echo    and Hunt dice when it asks. Answer each decision on the board by
-echo    moving your pieces, or click the option in the AI panel, or type
-echo    a word: "pass", "fp ok", "done", "nc", or an attack such as
-echo    "dale from erebor". "back" puts the board back as the game has
-echo    it, "undo" takes back your last decision, "help" lists the words.
+echo    Play on the board, or click your choice in the AI panel on the
+echo    right. Chat: "help" lists the words, "back" puts the board back,
+echo    "undo" takes back your last decision.
 goto stepsdone
 :watchsteps
-echo      1. No action is needed: the AI begins playing BOTH sides
-echo         automatically, cards and dice included, on the game the
-echo         client opens (the last game type played) once it has loaded.
-echo      2. Keep that game: File ^> New or Load stops the watch, and
-echo         watching again then requires a new Play_vs_AI.bat.
-echo         If the watch did not start, use Menu  AI  ^>  "AI vs AI (watch)".
-echo.
-echo    While it plays, do not move pieces, draw cards or roll dice
-echo    yourself: the AI does all of it. Menu  AI  ^>  "Stop AI"
-echo    ends the watch.
+echo      The AI plays both sides by itself.
+echo      Menu  AI  ^>  "Stop AI" ends it.
 :stepsdone
-echo    Sound: menu  AI  ^>  "Mute sounds".
 echo   ----------------------------------------------------------------
 echo.
 cd /d "!PLAY!"
