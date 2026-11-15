@@ -3,7 +3,9 @@
 # (wotr_bridge/gpu_torch.py switches the build); everything else runs the nets on the processor.
 #   pip install -r requirements.txt
 torch>=2.1
-numpy>=1.26
+# An Intel Mac gets torch 2.2 (the last build made for it), which was compiled for NumPy 1 and cannot use NumPy 2.
+numpy>=1.26 ; sys_platform != "darwin" or platform_machine != "x86_64"
+numpy>=1.26,<2 ; sys_platform == "darwin" and platform_machine == "x86_64"
 shapely>=2.0
 Pillow>=10
 matplotlib>=3.8
