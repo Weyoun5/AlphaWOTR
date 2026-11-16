@@ -46,7 +46,7 @@ jobs:
           "$JDK/bin/jar" cfm "$LOOK/MenuLook.jar" "$LOOK/manifest.txt" -C "$LOOK/classes" .
           set +e
           env -i HOME="$HOME" TMPDIR="$TMPDIR" JAVA_HOME="$JDK" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-            JAVA_TOOL_OPTIONS="-javaagent:$LOOK/MenuLook.jar=$LOOK" LOOK_PACE_S=780 \
+            JAVA_TOOL_OPTIONS="-javaagent:$LOOK/MenuLook.jar=$LOOK" \
             ./python/bin/python3 -B wotr_bridge/play.py AUTO > "$LOOK/session.log" 2>&1
           echo "the session ended with $?"
           set -e

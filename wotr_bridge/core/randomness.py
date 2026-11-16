@@ -705,10 +705,10 @@ class ClientRandomness(object):
         did NOT use, by name.  A result answers the step it came for and never a later one:
         left in the bank it is taken by the next step of its kind, which then shows no roll
         or draw of its own (and a tile whose face has left the pool since stops every
-        retry).  Only what the PERSON made before he was asked stays - he may roll, or draw
-        his card, for a request he sees coming, steps ahead (the card of an action whose die
-        an Elven Ring turns first), while the client makes nothing for the AI except on a
-        call; when his early result is void is the server's rule (drop_early)."""
+        retry).  Only what the PERSON made stays - he may roll for a request he sees coming,
+        steps ahead, and a card he draws is his whenever he draws it (the game reads what
+        his turn did, not in which order), while the client makes nothing for the AI except
+        on a call; when his early ROLL is void is the server's rule (drop_early)."""
         lost, early = Counter(), 0
         for kind, words, bank, used, passed, makers in self._lanes():
             stay = []
@@ -740,19 +740,18 @@ class ClientRandomness(object):
         return gone
 
     def drop_early(self, side):
-        """The server's rule ends the wait of `side`'s early results (the AI acts, a battle or a
-        Hunt opens): its dice leave the bank - returns how many (for the caller's sentence) -
-        and so does a card it drew early, which is dropped as unused (take_dropped).
+        """The server's rule ends the wait of `side`'s early roll (the AI acts, a battle or a
+        Hunt opens): its dice leave the bank; returns how many (for the caller's sentence).
+        A card it drew stays: only the order of his own doing differs, not what he did.
         Between attempts only: the cursors of a running attempt index the bank."""
         tag, n = _side_name(side), 0
         if self._feed_pos != _cursors():
             return 0
         for kind, _words, bank, _used, _passed, makers in self._lanes():
+            if kind == 'card':      # (a card he drew is his whenever he drew it: the draw of his action that
+                continue            #  spends a die on it, or else the turn's own draw of that deck, is that card)
             keep = [e for e, maker in zip(bank, makers) if maker != tag]
-            if kind == 'card':      # (a piece of the client's board: it goes back as every unused result)
-                self._dropped += [str(e[1]) if e[1] is not None else None for e, m in zip(bank, makers) if m == tag]
-            else:
-                n += len(bank) - len(keep)
+            n += len(bank) - len(keep)
             bank[:] = keep
         return n
 

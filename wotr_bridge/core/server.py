@@ -319,7 +319,9 @@ class Server(object):
         self.boards.took(moved, self.answers.open, rolling, moved if rolling and click.source != 'board' else late)
         # what the funnel handed back, and what no step used and has left the bank: said once -
         # and the piece of such a result is nobody's: the comparison carries it back with this reply
-        self._hand_back()
+        unused, self.inbox.unused = self.inbox.unused + self.rand.take_dropped(), []
+        if unused and self.human is not None:
+            self.boards.end(boardanswer.UNUSED, *self.link.ignored(unused))
         # (a die staged and the word typed in one poll: both seen.  THE ORDER of a word that ANSWERS - it gave his
         # answer, or closed his decision - and his moves: what the client's lines hold after it, that decision never read)
         for body, unseen, at in self.link.heard():
@@ -757,13 +759,6 @@ class Server(object):
         # searches work at this decision is strength.plan's word (the menu's slider; small decisions cheaply).
         return turn_search.improve(ai, handed, side, owner, seed, menu, hit, setting)
 
-    def _hand_back(self):
-        """What the funnel handed back, and what no step used and has left the bank: said once - and the
-        piece of such a result is nobody's: the comparison carries it back with this reply."""
-        unused, self.inbox.unused = self.inbox.unused + self.rand.take_dropped(), []
-        if unused and self.human is not None:
-            self.boards.end(boardanswer.UNUSED, *self.link.ignored(unused))
-
     def _decide(self, side, kind, flag=None, phase=None, after=None, sanctioned=None,
                 skip=None, route=None, stands=False):
         """One decision of either seat: choose (once per step), apply on a
@@ -778,7 +773,6 @@ class Server(object):
         if not self.probing and not human and not self.rand.step_open \
                 and base.pending_combat is None and base.pending_hunt is None:
             self.link.drop_early()          # the AI acts: they answer nothing of its step
-            self._hand_back()
         if flag is not None:
             state = ai.clone_state(base)
             setattr(state, flag, True)
@@ -859,7 +853,6 @@ class Server(object):
         self.voice.told(side, label, click)
         if opened:
             self.link.drop_early()          # they answer no combat or Hunt roll
-            self._hand_back()
             self.link.battle(not human and lines != [])     # (shown by this reply, or by the comparison)
         return [] if held else (lines or None)
 
