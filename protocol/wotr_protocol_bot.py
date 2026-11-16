@@ -9,11 +9,17 @@ closed list of legal options.  The bot answers with one option.
 
 This program puts AlphaWOTR in the bot's seat.  It adds NO rules of its
 own: every rule is the engine's (ai.get_legal_actions, ai._execute_action,
-the battle and hunt machinery) and every choice is the engine's search
-(ai.mcts_action_with_policy with the packaged corpus_live nets and the
-EngineSession defaults: 300 simulations, temperature 0.02 -- 0 for the
-Fellowship phase and the eye allocation --, no noise, the per-kind
-budget of engine_play._sims_for_kind).
+the battle and hunt machinery) and every choice is the AI server's
+(--engine league, the default: wotr_bridge/core/server.py _choose -- the
+seat's league net with its value net, the native tree search at 300
+simulations, the strength slider's plan, the certain line, the turn
+search from --strength 2 on, the seat's unit rule; --engine corpus: the
+v0.1.6 play, ai.mcts_action_with_policy with the corpus_live nets in
+Python, temperature 0.02 -- 0 for the Fellowship phase and the eye
+allocation --, the per-kind budget of engine_play._sims_for_kind).
+The native libraries are built once off Windows:
+    python native_backend/live_search_oct19/build_portable.py
+    python turn_search/native_w2x/box/build_portable.py
 
 One decision of the referee:
 
@@ -53,10 +59,26 @@ Usage (from the repository root; Python 3.10+ with requirements.txt):
       python -I protocol/wotr_protocol_bot.py \\
           --connect wss://wotr.behindmedia.com/referee --token TOKEN
 
+  As an online bot (a bot account's key; it waits in the referee's
+  lobby, plays people game after game and dials again after a drop):
+      python -I protocol/wotr_protocol_bot.py \\
+          --connect wss://wotr.behindmedia.com/referee \\
+          --token-file KEYFILE --reconnect \\
+          --seek '{"real_time":{"min_base_s":600,"max_base_s":7200}}'
+
 Options: --sims N (search budget, default 300; also a protocol option
 the referee may set), --max-seconds S (cap per decision, besides the
-referee's clock), --verbose (each decision on stderr), --log FILE (one
-JSON line per decision).
+referee's clock), --threads N (torch threads), --verbose (each decision
+on stderr), --log FILE (one JSON line per decision), --token-file FILE
+(the token from a file, out of the process list), --reconnect (dial
+again after a drop, for good: 5 s, doubling to 5 minutes; a connection
+silent for 2 minutes, without even the referee's ping, is given up),
+--seek JSON (the online seek of the hello), --version-label TEXT (the
+version the hello gives), --engine league|corpus, --strength 1-4 (the
+AI menu's slider: 1 the tree search alone, 2-4 the turn search on top),
+--nets TAG (the league pair, default mc200_fpwin_shwin), --workers N
+(the turn search's).  In a game with the whole game's clock (kind
+"game") the search spreads the time left over the game.
 
 MIT License (see LICENSE).  The WebSocket client is adapted from the
 protocol repository's example bot (examples/python/random_bot.py, MIT).
@@ -86,7 +108,8 @@ DEFAULT_SRC = os.path.join(os.path.dirname(HERE), 'src')
 
 
 def log(*args):
-    print(*args, file=sys.stderr, flush=True)
+    print(time.strftime('%Y-%m-%d %H:%M:%S'), *args, file=sys.stderr,
+          flush=True)
 
 
 # ---------------------------------------------------------------------
@@ -95,15 +118,32 @@ def log(*args):
 # ---------------------------------------------------------------------
 
 board = gs = gl = ai = engine_play = cards_mod = None
+LEAGUE_ENV = (
+    ('KMP_BLOCKTIME', '0'), ('OMP_WAIT_POLICY', 'PASSIVE'),
+    ('WOTR_ACT_GEN', 'v53'),
+    ('WOTR_REWARD_CONTRACT', 'predecision_profile_v1'),
+    ('WOTR_LIVE_SEARCH_BACKEND', 'native'),
+    ('WOTR_LIVE_INFERENCE_THREADS', '1'),
+    ('WOTR_LIVE_INFERENCE_CACHE', '1'),
+    ('WOTR_LIVE_POLICY_THREADS', '8'),
+    ('WOTR_FREE_CANDS', '1'), ('WOTR_FREE_FORCE', '12'),
+)
 FP = SH = None
 BOARD = None
 
 
-def import_engine(src):
+def import_engine(src, league=True):
     global board, gs, gl, ai, engine_play, cards_mod, FP, SH, BOARD
+    if league:
+        # wotr_bridge/launch_head.py's HEAD_ENV, as the AI server runs: the
+        # league nets' generation (v53), the native tree search (built by
+        # native_backend/live_search_oct19/build_portable.py off Windows)
+        for k, v in LEAGUE_ENV:
+            os.environ.setdefault(k, v)
+        os.environ['WOTR_NATIVE'] = '0'
     os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
     os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
-    # as wotr_bridge/launch_head.py's HEAD_ENV (the corpus_live nets' generation), the search in Python
+    # (the corpus_live nets' generation, the search in Python)
     os.environ.setdefault('WOTR_ACT_GEN', 'v52')
     os.environ.setdefault('WOTR_REWARD_CONTRACT', 'predecision_profile_v1')
     os.environ['WOTR_NATIVE'] = '0'
@@ -860,6 +900,160 @@ class Searcher(object):
         return action, {'sims': sims, 'secs': round(secs, 2), 'value': value}
 
 
+class LeagueSearcher(Searcher):
+    """The AI server's own decision (wotr_bridge/core/server.py _choose):
+    the seat's league net (FP-WIN / SH-WIN by default, their value nets
+    and c_puct; own_model.OwnModelSearch on the native tree search), the
+    strength slider's plan for the decision (core/strength.py), THE
+    CERTAIN LINE and, from strength 2 on, the TURN SEARCH (a service
+    process, core/turn_search.py), then the seat's unit rule
+    (core/ai_units.py).  Actions without a referee counterpart are taken
+    out of the menu the certain line and the turn search see; a search
+    pick among them falls back to the net's own choice among the rest."""
+
+    def __init__(self, sims, max_seconds, threads=1, strength=1,
+                 nets='mc200_fpwin_shwin', bridge=None, workers='auto'):
+        self.sims = int(sims)
+        self.max_seconds = max_seconds
+        self.rates = {}
+        self.recent = {}
+        self.position = int(strength)
+        self.net_tag = nets
+        bridge = os.path.abspath(bridge or os.path.join(
+            os.path.dirname(HERE), 'wotr_bridge'))
+        if bridge not in sys.path:
+            sys.path.insert(0, bridge)
+        from core import own_model, strength as strength_mod, ai_units
+        from core import turn_search
+        self.own_model, self.strength = own_model, strength_mod
+        self.ai_units, self.turn_search = ai_units, turn_search
+        if getattr(ai, 'HAS_TORCH', False):
+            try:
+                ai.torch.set_num_threads(int(threads))
+            except Exception:
+                pass
+        t0 = time.time()
+        self.searches = {}
+        for side in (FP, SH):
+            self.searches[side] = own_model.OwnModelSearch(
+                side, own_model.load_own_net(nets, side),
+                seed=random.getrandbits(64))
+        self.seats = own_model.SeatSearches(self.searches)
+        log('league nets %s loaded in %.1f s (search: %s)' % (
+            nets, time.time() - t0, self.seats.backend))
+        self.ts = False
+        if self.position >= 2:
+            cfg = turn_search.config()
+            if cfg is not None:
+                cfg['workers'] = str(workers)
+                self.ts = turn_search.start(nets)
+            log('turn search: %s' % ('starting (workers %s)' % workers
+                                     if self.ts else 'off'))
+
+    def budget(self, kind, left_ms):
+        n = self.sims
+        limit = self.max_seconds
+        if left_ms is not None:
+            room = max(0.5, (left_ms / 1000.0) * 0.4 - 0.2)
+            limit = room if limit is None else min(limit, room)
+        if limit is not None and self.rates:
+            rate = self.rates.get(kind) or min(self.rates.values())
+            n = min(n, max(8, int(rate * limit)))
+        return n
+
+    def choose(self, st, side, kind, banned, flag=None, left_ms=None):
+        from ai_policies import project_ai_actions, action_policy_key
+        with _Phase(st, flag):
+            legal = list(ai.get_legal_actions(st, side))
+            menu = list(project_ai_actions(st, side, legal).actions) or legal
+            allowed = [a for a in menu if act_key(a) not in banned]
+            if not allowed:
+                allowed = [a for a in legal if act_key(a) not in banned]
+            if not allowed:
+                return None, {'note': 'no allowed action'}
+            if len(allowed) == 1:
+                return allowed[0], {'sims': 0, 'secs': 0.0}
+            budget = self.budget(kind, left_ms)
+            sims, setting = self.strength.plan(self.position, allowed, budget)
+            if not self.ts:
+                setting = None
+            search = self.searches[side]
+            ai._TREE_CACHE['child'] = None
+            ai._TREE_CACHE['sig'] = None
+            t0 = time.time()
+            how = 'search'
+            value = None
+            if sims:
+                act, info = search.choose(st, side, num_simulations=sims)
+                try:
+                    if info is not None:
+                        value = float(info['q_values'][int(info['played'])])
+                except Exception:
+                    value = None
+            else:
+                act = search.raw(st, side, allowed)
+            secs = time.time() - t0
+            if sims >= 8 and secs > 0.05:
+                r = sims / secs
+                recent = (self.recent.get(kind) or [])[-2:] + [r]
+                self.recent[kind] = recent
+                self.rates[kind] = min(recent)
+            hit = None
+            if act is not None:
+                hit = next((a for a in allowed if act_key(a) == act_key(act)),
+                           None)
+                if hit is None:
+                    k = action_policy_key(act)
+                    hit = next((a for a in allowed
+                                if action_policy_key(a) == k), None)
+            if hit is None:
+                # the search's pick has no referee counterpart: the net's
+                # own choice among the allowed actions
+                hit = search.raw(st, side, allowed)
+                how = 'net (search pick %s not allowed)' % (
+                    act.action_type if act is not None else None)
+            t1 = time.time()
+            # (the turn search checks the menu against its fast engine's:
+            # the whole menu goes in, a switch to an action without a
+            # referee counterpart keeps the search's pick)
+            seats = self.turn_search.Seats(self._menu, self.seats)
+            outright = None
+            try:
+                outright, favoured = self.turn_search.certain(
+                    ai, seats, st, side, None, menu, hit)
+                pick = outright or self.turn_search.improve(
+                    ai, st, side, None, random.getrandbits(32), menu, hit,
+                    setting, favoured=favoured)
+            except Exception as e:
+                log('  certain line / turn search failed: %s: %s' % (
+                    type(e).__name__, e))
+                pick = hit
+            if act_key(pick) in banned:
+                log('  certain line / turn search chose %s, which has no '
+                    'referee counterpart: keeps %s' % (
+                        pick.action_type, hit.action_type))
+                pick = hit
+            if pick is not hit:
+                how += ' + %s' % ('certain line' if outright is not None
+                                  else 'turn search')
+            ts_secs = time.time() - t1
+            try:
+                units = self.ai_units.pick(ai, st, side, pick)
+                if units is not pick and act_key(units) not in banned:
+                    pick = units
+            except Exception as e:
+                log('  unit rule failed: %s: %s' % (type(e).__name__, e))
+        return pick, {'sims': sims, 'secs': round(secs, 2),
+                      'ts': setting, 'ts_secs': round(ts_secs, 2),
+                      'value': value, 'how': how}
+
+    @staticmethod
+    def _menu(st, side):
+        from ai_policies import project_ai_actions
+        legal = list(ai.get_legal_actions(st, side))
+        return list(project_ai_actions(st, side, legal).actions) or legal
+
+
 # ---------------------------------------------------------------------
 # Options of a decision
 # ---------------------------------------------------------------------
@@ -1252,11 +1446,18 @@ class Match(object):
 
 class AlphaWotrBot(object):
 
-    def __init__(self, searcher, names, verbose=False, decision_log=None):
+    def __init__(self, searcher, names, verbose=False, decision_log=None,
+                 seek=None):
         self.searcher = searcher
         self.names = names
         self.verbose = verbose
         self.decision_log = decision_log
+        self.seek = seek           # an online bot: what it takes (hello)
+        # an online bot: this process's id in every hello, the same on each
+        # reconnection, so the site gives it back its own game (not another
+        # copy's of the same bot account)
+        self.instance = base64.b32encode(os.urandom(10)).decode().lower()
+        self.clock_kind = None     # new_game's clock: per_decision, game, ...
         self.memo = None
         self.game = None
         self.plan = None
@@ -1273,12 +1474,19 @@ class AlphaWotrBot(object):
     def handle(self, m):
         t = m.get('type')
         if t == 'hello':
-            return {'type': 'hello', 'id': m.get('id'), 'protocol': PROTOCOL,
-                    'name': BOT_NAME, 'version': BOT_VERSION,
-                    'author': 'AlphaWOTR (protocol adapter)', 'events': True,
-                    'options': [{'name': 'sims', 'type': 'int',
-                                 'default': self.searcher.sims, 'min': 1,
-                                 'max': 100000}]}
+            log('connected to %s' % m.get('referee'))
+            hello = {'type': 'hello', 'id': m.get('id'), 'protocol': PROTOCOL,
+                     'name': BOT_NAME, 'version': BOT_VERSION,
+                     'author': 'AlphaWOTR (protocol adapter)', 'events': True,
+                     'options': [{'name': 'sims', 'type': 'int',
+                                  'default': self.searcher.sims, 'min': 1,
+                                  'max': 100000}]}
+            if self.seek is not None:
+                # online bots (the optional extension): the time controls
+                # this bot takes while it waits in the lobby
+                hello['seek'] = self.seek
+                hello['instance'] = self.instance
+            return hello
         if t == 'options':
             vals = m.get('values') or {}
             if 'sims' in vals:
@@ -1304,8 +1512,13 @@ class AlphaWotrBot(object):
             self.plan = None
             self.work = None
             self.stats = Stats()
-            log('game %d: %s as %s' % (self.score['games'] + 1, self.game,
-                                       m.get('side')))
+            # (an online game taken up again after a dropped connection is
+            # a new_game with the same id and every event from the start:
+            # the memo is simply built again)
+            self.clock_kind = (m.get('clock') or {}).get('kind')
+            log('game %d: %s as %s, clock %s' % (
+                self.score['games'] + 1, self.game, m.get('side'),
+                json.dumps(m.get('clock'))))
             return {'type': 'ready', 'id': m.get('id')}
         if t == 'event':
             if self.memo is not None:
@@ -1356,7 +1569,7 @@ class AlphaWotrBot(object):
         dec = m['decision']
         t0 = time.time()
         self.t0 = t0
-        left = (m.get('clock') or {}).get('left_ms')
+        left = self._decision_ms(m.get('clock') or {})
         how = 'search'
         info = {}
         o = None
@@ -1455,6 +1668,24 @@ class AlphaWotrBot(object):
             return ready.o, 'rule', {'note': 'engine rule'}
         label, flag = ready
         return self._search_and_map(st, dec, label, flag, left)
+
+    def _decision_ms(self, clock):
+        """The clock the search may use for this decision, as a time per
+        decision.  A per_decision clock is that already.  A game clock
+        (online games against people: the whole game's time left, and an
+        increment per hand-over) is spread over the game: about a
+        fortieth of the time left plus part of the increment, as the
+        search aims at 40% of what it gets.  Correspondence: no limit
+        but the simulations."""
+        left = clock.get('left_ms')
+        if left is None:
+            return None
+        if self.clock_kind == 'correspondence' or 'deadline' in clock:
+            return None
+        if self.clock_kind == 'game' or 'opponent_ms' in clock:
+            inc = clock.get('increment_ms') or 0
+            return min(left / 16.0 + inc / 2.0, left / 4.0)
+        return left
 
     def _left(self, left):
         """The clock left for this decision once the matching is done."""
@@ -1687,6 +1918,68 @@ def setup_discard(bot, st, dec, view):
     return ('discard', None)
 
 
+def _sail_in(bot, st, b, frm, reg, atk):
+    """Corsairs of Umbar: the referee's battle is fought from Umbar (the
+    attackers advance by themselves on a win); the engine moves the Army
+    into the region first and fights there (event_effects
+    _effect_corsairs_of_umbar: attacker_region = defender_region).  Moves
+    the attacking figures of [frm] into [reg] as that effect does and
+    returns the frozen Shadow garrison of [reg] for a relief landing (a
+    besieged Shadow Stronghold: the garrison stays inside, the landed
+    force fights the besiegers), else None."""
+    from army_card_cargo import inventory, freeze
+    from combat import garrison_side_for
+    names = bot.names
+    src = army_at(st, frm)
+    if src is None:
+        return None
+    relief = None
+    if (reg in st.besieged_strongholds
+            and garrison_side_for(st, reg) is atk and army_at(st, reg)):
+        relief = freeze(inventory(st, reg))
+    want = None
+    if b.get('attackers'):
+        want = {}
+        for p in b['attackers']:
+            k = (p.get('nation'), p.get('unit'))
+            want[k] = want.get(k, 0) + int(p.get('n', 0))
+
+    def take(k):
+        # without the referee's list: every figure of the attacker
+        if want is None:
+            return True
+        if want.get(k, 0) > 0:
+            want[k] -= 1
+            return True
+        return False
+
+    dst = gl.get_or_create_army(st, reg)
+    keep_units = []
+    for u in src.units:
+        unit = 'regular' if u.kind is gs.UnitKind.REGULAR else 'elite'
+        if (ai._side_of_nation(u.nation) is atk
+                and take((names.nation_out[u.nation], unit))):
+            dst.units.append(u)
+        else:
+            keep_units.append(u)
+    keep_leaders = []
+    for ld in src.leaders:
+        tn = type(ld).__name__
+        if gl._leader_side(ld) is not atk or gl._is_saruman(ld):
+            go = False
+        elif tn == 'Nazgul':
+            go = take(('SAURON', 'nazgul'))
+        elif tn == 'Leader':
+            go = take((names.nation_out[ld.nation], 'leader'))
+        else:
+            go = True           # a Minion goes with the Army
+        (dst.leaders if go else keep_leaders).append(ld)
+    src.units, src.leaders = keep_units, keep_leaders
+    if not (src.units or src.leaders):
+        st.armies = dict((k, a) for k, a in st.armies.items() if a is not src)
+    return relief
+
+
 def _battle(bot, st, view, phase, rounds_fought):
     """The engine's pending_combat for the referee's battle."""
     names = bot.names
@@ -1700,6 +1993,13 @@ def _battle(bot, st, view, phase, rounds_fought):
         return None
     kind = b.get('battle')
     meta = board.regions.get(reg, {})
+    sailed = frm != reg and reg not in BOARD.adjacent(frm)
+    relief = None
+    if sailed:
+        # only Corsairs of Umbar attacks a region not adjacent
+        relief = _sail_in(bot, st, b, frm, reg, atk)
+        pre_siege = reg in st.besieged_strongholds
+        frm = reg
     pc = {'attacker_region': frm, 'defender_region': reg,
           'attacker_side': atk, 'defender_side': other(atk),
           'is_siege': kind == 'siege',
@@ -1710,6 +2010,13 @@ def _battle(bot, st, view, phase, rounds_fought):
           'def_casualty_policy': 'preserve_elites'}
     if b.get('white_rider'):
         pc['gtw_shine'] = True
+    if sailed:
+        # as the engine's own landing: the Shadow may not cease the
+        # battle, unless it joins a siege already under way
+        pc['attacker_no_retreat'] = not pre_siege or relief is not None
+        if relief is not None:
+            pc['is_siege'] = False
+            pc['corsairs_relief_garrison'] = relief
     # A rearguard: the units of the attacker's region not in the attack
     if frm != reg and b.get('attackers'):
         want = {}
@@ -2958,14 +3265,20 @@ class WebSocket(object):
             pass
 
 
-def run_websocket(bot, url, token):
+def run_websocket(bot, url, token, idle=None):
+    """One connection, until the referee closes it.  Returns True when
+    the referee said quit (the match is over).  With [idle] seconds, a
+    connection that brought nothing (not even the referee's ping) for
+    that long is given up (OSError)."""
     ws = WebSocket(url)
+    if idle:
+        ws.sock.settimeout(idle)
     try:
         while True:
             text = ws.receive()
             if text is None:
                 log('the referee closed the connection')
-                return
+                return False
             for line in text.splitlines():
                 if not line.strip():
                     continue
@@ -2976,17 +3289,50 @@ def run_websocket(bot, url, token):
                         answer['token'] = token
                     ws.send(json.dumps(answer, separators=(',', ':')))
     except SystemExit:
-        pass
+        return True
     finally:
         ws.close()
 
 
+def run_online(bot, url, token, idle=120.0):
+    """An online bot (--reconnect): one connection after the other, for
+    good.  Between games a connection waits in the referee's lobby; after
+    a drop (a deploy, the network) it dials again after a pause: 5 s,
+    doubled after each failure up to 5 minutes, 5 s again once a game
+    was played.  A game in progress is taken up again by the referee
+    (new_game with the same id and every event from the start)."""
+    pause = 5.0
+    while True:
+        games = bot.score['games']
+        try:
+            if run_websocket(bot, url, token, idle):
+                return
+        except (OSError, EOFError, RuntimeError, ValueError) as e:
+            log('connection lost: %s: %s' % (type(e).__name__, e))
+        bot.memo = None
+        pause = 5.0 if bot.score['games'] > games else min(pause * 2, 300.0)
+        log('dialling again in %d s' % pause)
+        time.sleep(pause)
+
+
 def main(argv=None):
+    global BOT_VERSION
     ap = argparse.ArgumentParser(
         description='AlphaWOTR as a WotR Bot Protocol client (draft 0.1).')
     ap.add_argument('--connect', help="a referee's WebSocket URL (ws:// or "
                     'wss://); default: the protocol on stdin and stdout')
     ap.add_argument('--token', help='the seat token (or ?token= in the URL)')
+    ap.add_argument('--token-file', help='a file holding the token or bot '
+                    'key (kept out of the process list)')
+    ap.add_argument('--reconnect', action='store_true',
+                    help='an online bot: dial again after a drop or the '
+                    'end of a connection, for good (with --connect)')
+    ap.add_argument('--seek', help="an online bot's seek, the JSON object "
+                    'sent in its hello (the time controls it takes), e.g. '
+                    '{"real_time":{"min_base_s":600,"max_base_s":7200,'
+                    '"max_increment_s":60}}')
+    ap.add_argument('--version-label', help="the version in the bot's hello "
+                    '(default %s)' % BOT_VERSION)
     ap.add_argument('--sims', type=int, default=300,
                     help='search simulations per decision (default 300, '
                     "the engine's own default; scaled per kind as "
@@ -2996,12 +3342,38 @@ def main(argv=None):
                     'clock is respected as well)')
     ap.add_argument('--threads', type=int, default=1,
                     help='torch threads (default 1)')
+    ap.add_argument('--engine', choices=('league', 'corpus'), default='league',
+                    help="league (default): the AI server's decision - the "
+                    'league nets, native search, certain line and turn '
+                    'search; corpus: the v0.1.6 corpus_live nets, the '
+                    'search in Python')
+    ap.add_argument('--strength', type=int, default=1, choices=(1, 2, 3, 4),
+                    help="the AI menu's strength slider (league): 1 the tree "
+                    'search alone (the default without an NVIDIA GPU), 2-4 '
+                    'the turn search on top (wide, wide_advisers, '
+                    'wide_advisers_double)')
+    ap.add_argument('--nets', default='mc200_fpwin_shwin',
+                    help='the league net pair (league; mc200_fp{win,mil}_sh'
+                    '{win,cor})')
+    ap.add_argument('--workers', default='auto',
+                    help="the turn search service's workers (default auto)")
     ap.add_argument('--src', default=DEFAULT_SRC,
                     help="the engine's src folder (default: ../src)")
     ap.add_argument('--verbose', action='store_true',
                     help='each decision on stderr')
     ap.add_argument('--log', help='one JSON line per decision to this file')
     args = ap.parse_args(argv)
+    if args.version_label:
+        BOT_VERSION = args.version_label
+    token = args.token
+    if args.token_file:
+        with open(args.token_file, encoding='utf-8') as f:
+            token = f.read().strip()
+    seek = None
+    if args.seek:
+        seek = json.loads(args.seek)
+        if not isinstance(seek, dict):
+            ap.error('--seek takes a JSON object')
 
     # The protocol keeps the original stdout; everything the engine
     # prints goes to stderr.
@@ -3009,14 +3381,25 @@ def main(argv=None):
     os.dup2(2, 1)
     sys.stdout = sys.stderr
 
-    import_engine(args.src)
+    league = args.engine == 'league'
+    import_engine(args.src, league)
     names = Names()
-    searcher = Searcher(args.sims, args.max_seconds, args.threads)
+    if league:
+        searcher = LeagueSearcher(args.sims, args.max_seconds, args.threads,
+                                  args.strength, args.nets,
+                                  workers=args.workers)
+        if not args.version_label:
+            BOT_VERSION = '%s-s%d/protocol-2' % (args.nets, args.strength)
+    else:
+        searcher = Searcher(args.sims, args.max_seconds, args.threads)
     dlog = open(args.log, 'a', encoding='utf-8') if args.log else None
-    bot = AlphaWotrBot(searcher, names, verbose=args.verbose, decision_log=dlog)
+    bot = AlphaWotrBot(searcher, names, verbose=args.verbose, decision_log=dlog,
+                       seek=seek)
     try:
-        if args.connect:
-            run_websocket(bot, args.connect, args.token)
+        if args.connect and args.reconnect:
+            run_online(bot, args.connect, token)
+        elif args.connect:
+            run_websocket(bot, args.connect, token)
         else:
             try:
                 run_stdio(bot, proto)
