@@ -1,19 +1,14 @@
-"""What a typed attack names: the regions' short forms, and a word given with the attack.
+"""What a typed attack names: the regions' abbreviations, and a word given with the attack.
 
 Owner: "if there is only 1 army next to osgiliath, i can say osg nc. or osg from si nc."
 
 A typed attack is  [attack] <target> [from <source>] [nc | cc <card> | press | stop | continue].
-  * A region may be typed whole, by one of the players' own short words, or SHORT:
-      - the players' words are ONE list, the one the parser of their game logs reads
-        (log_replay.LogReplayer._REGION_ABBREVS: "wlr" - woodland realm, "west" - westemnet, "fords" - fords of
-        isen, "ofr", "mt" ...): community();
-      - short (short_for): its first letters, three or more ("osg"); the first letter of each of its words
-        ("si" - south ithilien); the first letters of each word in turn ("s ith", "min tir"); or the first
-        letters, three or more, of any ONE of its words ("tirith", "morgul").
+  * A region is typed whole or by one of the players' own abbreviations, and by nothing else (owner: "remove
+    the auto generated abbreviations you added, only do the ones i explicitly listed").  The abbreviations are
+    ONE list, the one the parser of the players' game logs reads (log_replay.LogReplayer._REGION_ABBREVS:
+    "osg" - osgiliath, "si" - south ithilien, "wlr" - woodland realm ...): community().  A new one is added there.
   * What is typed is read among the attacks that are legal NOW - the regions that can be attacked, and the armies
-    that can attack those.  In this order: the whole name; a word of the players' list whose region is among
-    them; a short form.  One that fits several is not guessed: the caller's verdict is "several" and the person
-    is told what he can type.
+    that can attack those: the whole name first, then the abbreviation.
   * The last word may be his answer to a question of the battle the attack opens (bundled): it is cut off here,
     and kept by the caller for that question.
 
@@ -22,7 +17,6 @@ regions are named; of the game this module knows the players' list alone.
 """
 import re
 
-SHORT_MIN = 3       # the fewest first letters of a name, or of one of its words, that are a short form of it
 _LIST = None
 
 
@@ -31,7 +25,7 @@ def _key(name):
 
 
 def community():
-    """{the players' short word: its region}, both as plain lower-case words."""
+    """{the players' abbreviation: its region}, both as plain lower-case words."""
     global _LIST
     if _LIST is None:
         import log_replay
@@ -39,25 +33,11 @@ def community():
     return _LIST
 
 
-def short_for(typed, name):
-    """Is `typed` a short form of the region `name`?"""
-    parts, said = name.split(), typed.split()
-    if len(typed) >= SHORT_MIN and name.startswith(typed):
-        return True
-    if len(parts) > 1 and typed == ''.join(p[0] for p in parts):
-        return True
-    if len(parts) > 1 and len(said) == len(parts) and all(p.startswith(s) for p, s in zip(parts, said)):
-        return True
-    return len(parts) > 1 and len(said) == 1 and len(typed) >= SHORT_MIN and any(p.startswith(typed) for p in parts)
-
-
 def meant(typed, places):
     """The names among `places` ({the name as it is typed: its region key}) that `typed` means: the one it spells
-    out; else the one the players' list gives that word; else every one it is a short form of."""
-    names = sorted(places)
+    out, else the one the players' list gives that abbreviation."""
     region = community().get(typed)
-    return [n for n in names if n == typed] or [n for n in names if region and _key(places[n]) == region] \
-        or [n for n in names if short_for(typed, n)]
+    return [n for n in sorted(places) if n == typed] or [n for n in sorted(places) if region and _key(places[n]) == region]
 
 
 def attacks(text, menu, name):

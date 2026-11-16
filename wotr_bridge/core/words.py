@@ -634,7 +634,7 @@ _OLD = {
     'help': 'You can type "back" (I put the board back), "undo" (take back your last decision), "finish" '
             '(I do what I left to your own hand), "pass", "fp ok", "done", "nc" or "cc" and a card name for a combat card, "field", '
             '"stand", "press", "continue", "stop", "0e" for no Eyes, an attack such as "dale from '
-            'erebor" (short forms and a combat card with it work too: "osg from si nc"), '
+            'erebor" (the usual abbreviations and a combat card with it work too: "osg from si nc"), '
             'and the name of a gate when I ask; everything else is a move on the board '
             'or a click in the panel.',
     'skip': 'There is no skip any more: answer with a move on the board or a click in the panel, '

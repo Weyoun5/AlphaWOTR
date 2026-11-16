@@ -19,8 +19,9 @@ PLAY
   Play on the board as against a person, or click your choice in the AI
   panel on the right.  In chat, "help" lists the words the AI
   understands; "back" puts the board back, "undo" takes back your last
-  decision, "pass" passes.  Attacks are typed, short forms work:
-  "osg from si nc" (nc = no combat card).
+  decision, "pass" passes.  Attacks are typed: "osg from si nc"
+  (nc = no combat card).  Abbreviations: ofr mt da pel mm gorg mg dg
+  lor riv wlr osg hd si west fords; any other region by its whole name.
   At the top of the AI panel: AI strength, 1 (fastest) to 4 (strongest),
   and the simulations of its search, from none to 1000.
   Without questions:  Play_vs_AI.bat SA COR   (the AI's side, SA or FP,
