@@ -21,8 +21,9 @@ PLAY
   understands; "back" puts the board back, "undo" takes back your last
   decision, "pass" passes.  Attacks are typed: "osg from si nc"
   (nc = no combat card).  Abbreviations: da dg ereb fords gh gorg hd
-  lor mg mm mt ofr osg pel riv shire si west wlr; any other region by
-  its whole name.
+  lor mg mm mt ni ofr osg pel riv shire si west wlr.  Any other
+  region: its name, or four or more letters that start it or its
+  words (osgi, dol g, w harondor).
   At the top of the AI panel: AI strength, 1 (fastest) to 4 (strongest),
   and the simulations of its search, from none to 1000.
   Without questions:  Play_vs_AI.bat SA COR   (the AI's side, SA or FP,
