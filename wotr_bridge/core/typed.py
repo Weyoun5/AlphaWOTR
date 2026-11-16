@@ -5,8 +5,9 @@ Owner: "if there is only 1 army next to osgiliath, i can say osg nc. or osg from
 A typed attack is  [attack] <target> [from <source>] [nc | cc <card> | press | stop | continue].
   * A region is typed whole or by one of the players' own abbreviations, and by nothing else (owner: "remove
     the auto generated abbreviations you added, only do the ones i explicitly listed").  The abbreviations are
-    ONE list, the one the parser of the players' game logs reads (log_replay.LogReplayer._REGION_ABBREVS:
-    "osg" - osgiliath, "si" - south ithilien, "wlr" - woodland realm ...): community().  A new one is added there.
+    the list the parser of the players' game logs reads (log_replay.LogReplayer._REGION_ABBREVS: "osg" -
+    osgiliath, "si" - south ithilien, "wlr" - woodland realm ...) and, beside it, the ones the published README
+    names that the parser's list lacks (CHAT_ONLY): community().  A new one is added to one of the two.
   * What is typed is read among the attacks that are legal NOW - the regions that can be attacked, and the armies
     that can attack those: the whole name first, then the abbreviation.
   * The last word may be his answer to a question of the battle the attack opens (bundled): it is cut off here,
@@ -18,6 +19,9 @@ regions are named; of the game this module knows the players' list alone.
 import re
 
 _LIST = None
+# the abbreviations of the published README ("Common aliases include dg, hd, mt, da, mg, mm, lor, wlr, ofr, pel,
+# shire, riv, ereb and gh") that the parser's list does not hold, and the other spelling of one name
+CHAT_ONLY = {'shire': 'the shire', 'ereb': 'erebor', 'gh': 'grey havens', 'gray havens': 'grey havens'}
 
 
 def _key(name):
@@ -29,7 +33,8 @@ def community():
     global _LIST
     if _LIST is None:
         import log_replay
-        _LIST = {_key(word): _key(region) for word, region in log_replay.LogReplayer._REGION_ABBREVS.items()}
+        both = dict(CHAT_ONLY, **log_replay.LogReplayer._REGION_ABBREVS)
+        _LIST = {_key(word): _key(region) for word, region in both.items()}
     return _LIST
 
 
