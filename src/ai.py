@@ -15713,7 +15713,8 @@ def _greedy_prior_action(state: GameState, side: Side, net,
             # options a search would consider (at most 40, the highest priors)
             order = sorted(range(len(actions)), key=lambda i: (-float(priors[i]), i))[:MCTS_MAX_CHILDREN or 40]
             better = _strictly_better(state, side, [actions[i] for i in order])
-            return actions[order[_move_to_better(0, better)]]
+            first = next((k for k in range(len(order)) if better is None or better[k] != BANNED), 0)   # (THE SIEGE BAN)
+            return actions[order[_move_to_better(first, better)]]
         return actions[int(np.argmax(priors))]
     except Exception:
         from reward_contract import uses_predecision
@@ -18362,13 +18363,66 @@ def _at_least_as_good(side, a, b):
     return ok and a != b
 
 
+# THE SIEGE BAN (owner, 2026-11-16: "just add a ban on lifting sieges that have only 1 regular on them. (1 regular +
+# nazgul is ok, sometimes that is good to preserve WK or nazgul lives)"; "also ban emptying a siege without leaving
+# at least 1 regular behind while there are 5 or more units in that army"; "free people AI has no such ban").
+# The SHADOW AI never plays a move that ends a siege it holds by walking away from it, when its besieging force
+# there is  (1) exactly one Regular and nothing else - no Nazgul, Minion or Leader, no second unit -  or
+#           (2) an army of _SIEGE_BAN_ARMY or more units (Regulars + Elites; figures do not count).
+# With a Nazgul / Minion / Leader beside the lone Regular, with a lone Elite, and with 2 to 4 units the move stays
+# allowed; so does every move that leaves a unit behind (any unit keeps the siege: a Regular where the army has
+# one, and nothing here forbids leaving an Elite instead).  Defined by OUTCOME like the rule above, on the same
+# applied options: before, the region is a besieged stronghold whose garrison is the enemy's and the Shadow's
+# force there is (1) or (2); after the option - applied with no random number - the siege is gone and no Shadow unit
+# stands in the region (a stronghold TAKEN leaves the units there: that is not walking away).  So a card or the
+# second half of an army die that walks the units out is caught like the plain move.  It marks the option BANNED in
+# _strictly_better's list; every place that decides a move reads that list (select_root_action: both searches;
+# _greedy_prior_action(decision=True): the net alone; the bridge's turn search: its switch).  If every option
+# handed in were banned the ban yields.  Inside the tree and in the turn search's playouts the move stays possible
+# for both sides: the look-ahead still imagines it, the AI never plays it.
+BANNED = -2
+_SIEGE_BAN_ARMY = 5
+
+
+def _sieges_held(state, side):
+    """The regions (sanitized) of the sieges the Shadow may not walk away from (THE SIEGE BAN); () for the Free Peoples."""
+    besieged = {sanitize(str(b)) for b in (getattr(state, 'besieged_strongholds', None) or ())}
+    if side != Side.SHADOW or not besieged:
+        return ()
+    from combat import garrison_side_for
+    held = []
+    for region, army in state.armies.items():
+        where = sanitize(str(region))
+        if where not in besieged or garrison_side_for(state, where) == side:
+            continue
+        units = [u for u in army.units if _side_of_nation(u.nation) == side]
+        figures = [l for l in army.leaders
+                   if (_side_of_nation(l.nation) == side if getattr(l, 'nation', None) is not None
+                       else not isinstance(l, Companion))]
+        if len(units) >= _SIEGE_BAN_ARMY or (len(units) == 1 and not figures and units[0].kind == UnitKind.REGULAR):
+            held.append(where)
+    return tuple(held)
+
+
+def _siege_left(after, side, held):
+    """Did the option walk away from one of the sieges `held`: the siege is gone and no unit of `side` stands there?"""
+    besieged = {sanitize(str(b)) for b in (getattr(after, 'besieged_strongholds', None) or ())}
+    for where in held:
+        if where not in besieged and not any(
+                sanitize(str(region)) == where and any(_side_of_nation(u.nation) == side for u in army.units)
+                for region, army in after.armies.items()):
+            return True
+    return False
+
+
 def _strictly_better(state, side, actions):
-    """For each option the index of an option of `actions` that is THE SAME BUT BETTER (see above), else -1.
-    None when nothing can be compared (fewer than two options, or the state is not the engine's own object)."""
+    """For each option the index of an option of `actions` that is THE SAME BUT BETTER (see above), BANNED for an
+    option THE SIEGE BAN forbids, else -1.  None when there is no verdict at all (fewer than two options, the state
+    is not the engine's own object, or nothing was found)."""
     if len(actions) < 2 or not isinstance(state, GameState) or _outcome(state, side) is None:
         return None                      # (_outcome on the root: also the one loud check of the key's layout)
     py_rng, np_rng = random.getstate(), np.random.get_state()
-    seen = {}
+    seen, banned, held = {}, set(), _sieges_held(state, side)
     try:
         for i, action in enumerate(actions):
             try:
@@ -18377,6 +18431,9 @@ def _strictly_better(state, side, actions):
                 if rolled or now[2] != np_rng[2] or not np.array_equal(now[1], np_rng[1]):
                     random.setstate(py_rng)
                     np.random.set_state(np_rng)
+                    continue
+                if held and _siege_left(after, side, held):
+                    banned.add(i)            # (and it is no option another is compared with)
                     continue
                 outcome = _outcome(after, side)
             except Exception:
@@ -18389,6 +18446,9 @@ def _strictly_better(state, side, actions):
         random.setstate(py_rng)
         np.random.set_state(np_rng)
     better = [-1] * len(actions)
+    if len(banned) < len(actions):       # (were every option banned, the ban yields)
+        for i in banned:
+            better[i] = BANNED
     for group in seen.values():
         if len(group) < 2:
             continue
@@ -18398,7 +18458,7 @@ def _strictly_better(state, side, actions):
                 top = [j for j in above if not any(k != j and _at_least_as_good(side, qk, dict(group)[j])
                                                    for k, qk in group)]
                 better[i] = (top or above)[0]
-    return better if any(b >= 0 for b in better) else None
+    return better if any(b != -1 for b in better) else None
 
 
 def _move_to_better(play, better):
@@ -18406,7 +18466,7 @@ def _move_to_better(play, better):
     nothing is better than."""
     if better is None:
         return play
-    walked = set()
+    walked = set()                       # (a BANNED pick is not moved here: its caller picks again among the rest)
     while 0 <= int(play) < len(better) and int(better[int(play)]) >= 0 and int(play) not in walked:
         walked.add(int(play))
         play = int(better[int(play)])
@@ -18417,12 +18477,34 @@ def select_root_action(children_stats, temperature, cfg=None):
     """The root pick of both searches: _select_root_action's pick, moved on to THE SAME BUT BETTER option when
     children_stats carries 'sb' (_strictly_better of the root's options) and the pick is strictly worse than one."""
     play, pi, diag = _select_root_action(children_stats, temperature, cfg)
-    moved = _move_to_better(play, children_stats.get('sb'))
+    better = children_stats.get('sb')
+    moved = _move_to_better(play, better)
+    if better is not None and 0 <= moved < len(better) and better[moved] == BANNED:
+        # THE SIEGE BAN: the same pick rule over the options that are left
+        moved = _move_to_better(_select_allowed(children_stats, temperature, cfg, better), better)
+        diag = dict(diag, siege_ban=(int(play), moved))
     if moved != play:
         diag = dict(diag, strictly_better=(int(play), moved))
         pi = np.zeros(len(pi))
         pi[moved] = 1.0
     return moved, pi, diag
+
+
+def _select_allowed(children_stats, temperature, cfg, better):
+    """The root pick among the options that are not BANNED: _select_root_action on the remaining children's
+    statistics (should that fail: the most visited of them)."""
+    keep = [i for i, b in enumerate(better) if b != BANNED]
+    k = len(better)
+    rest = {}
+    for name, v in children_stats.items():
+        if name == 'sb':
+            continue
+        per_child = v is not None and not isinstance(v, (str, bytes, dict)) and hasattr(v, '__len__') and len(v) == k
+        rest[name] = [v[i] for i in keep] if per_child else v
+    try:
+        return keep[int(_select_root_action(rest, temperature, cfg)[0])]
+    except Exception:
+        return max(keep, key=lambda i: float(children_stats['n'][i]))
 
 
 def _select_root_action(children_stats, temperature, cfg=None):

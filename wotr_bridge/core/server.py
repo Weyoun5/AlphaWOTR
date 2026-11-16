@@ -41,7 +41,7 @@ import random
 import time
 from collections import Counter, namedtuple
 
-from . import answer, boardanswer, client_protocol, compare, emission, layout, link, live_parser, panel
+from . import ai_units, answer, boardanswer, client_protocol, compare, emission, layout, link, live_parser, panel
 from . import reconcile, settings, strength, turn_search, voice, words
 from . import emitter as em
 from . import randomness as rnd
@@ -800,6 +800,8 @@ class Server(object):
         # a board answer may carry the person's own pieces as parameters: it is not a menu row
         act = self.rand.journal_pick(
             menu if picked is None or any(a is picked for a in menu) else [picked] + menu, chooser)[0]
+        if not human:               # (a step that only COUNTS units: which of them go - the seat's rule)
+            act = ai_units.pick(ai, state, side, act)
         if not human and self.boards.settling():
             return []       # (the AI's step is chosen now and committed when his answer stands)
         silent = skip is not None and skip(act)

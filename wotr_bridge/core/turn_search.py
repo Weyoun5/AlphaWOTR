@@ -193,7 +193,12 @@ def _same_but_better(ai, state, side, menu, hit, own):
     -> the move to play: `hit`, or the option that is the same but better."""
     rows = list(menu) if len(menu) <= SAME_BUT_BETTER_ROWS else [hit, own]
     at = next(i for i, a in enumerate(rows) if a is hit)
-    moved = rows[ai._move_to_better(at, ai._strictly_better(state, side, rows))]
+    verdicts = ai._strictly_better(state, side, rows)
+    if verdicts is not None and verdicts[at] == ai.BANNED:
+        _say('its move %s walks away from a siege the Shadow may not lift (the siege ban): keeps %s' % (
+            hit.action_type, own.action_type))
+        return own
+    moved = rows[ai._move_to_better(at, verdicts)]
     if moved is not hit:
         _say('its move %s is the same as %s but worse: plays that' % (hit.action_type, moved.action_type))
     return moved
