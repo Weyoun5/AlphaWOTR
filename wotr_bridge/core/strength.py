@@ -45,7 +45,9 @@ def default(gpu):
 def plan(position, menu, sims):
     """-> (simulations of the ordinary search, the turn search's setting or None) for the decision
     among `menu`.  position: the slider's (anything out of range is the nearest end); sims: the
-    simulations of a full decision (the server's --sims)."""
+    simulations of a full decision (the panel's simulations knob, else the server's --sims; 0: none)."""
+    if not sims:        # no search at all: the net's own choice, and no candidates for a turn search
+        return 0, None
     setting = LEVELS[min(max(int(position), 1), len(LEVELS)) - 1]
     if small(menu):
         return min(sims, SMALL_SIMS), setting and SMALL_SETTING

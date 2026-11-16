@@ -84,6 +84,14 @@ class OwnModelSearch:
             raise ValueError('Unknown live search backend: '+self.backend)
 
 
+    def raw(self, state, side, menu):
+        """The net's own first choice among `menu`, with no search: one net call (the panel's simulations knob
+        at its lowest stop)."""
+        import ai
+        if side is not self.side:
+            raise ValueError('Own-model live search belongs to its configured seat')
+        return ai._greedy_prior_action(state, side, self.net, list(menu))
+
     def choose(self, state, side, *, num_simulations=300):
         import ai,own_search,rng_streams
         if side is not self.side:
@@ -209,6 +217,12 @@ class SeatSearches:
                          for side, search in sorted(self.searches.items(),
                                                     key=lambda item: item[0].name))
 
+
+    def raw(self, state, side, menu):
+        search = self.searches.get(side)
+        if search is None:
+            raise ValueError('AI vs AI search has no seat %r' % (side,))
+        return search.raw(state, side, menu)
 
     def choose(self, state, side, *, num_simulations=300):
         search = self.searches.get(side)

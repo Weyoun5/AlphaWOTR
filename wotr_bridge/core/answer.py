@@ -10,7 +10,7 @@ the position (a callable) and the test hook for a decision shown.
 import contextlib
 from collections import namedtuple
 
-from . import boardmodel, layout, panel, reconcile, words
+from . import boardmodel, layout, panel, reconcile, typed, words
 
 # the person's open decision: its id, the kind of the step machine, his side, the state it is
 # asked in (a phase flag set), the legal actions
@@ -29,6 +29,9 @@ class Answer(object):
     def __init__(self, decision, identity, source, token=None, action=None, fix=None, at=None):
         self.decision, self.identity, self.source, self.token = decision, identity, source, token
         self.action, self.fix, self.judged, self.at = action, fix, False, at
+
+
+OPENS = 'opens'     # in the place of a battle: the battle that the attack of this decision opens - (OPENS, its id)
 
 
 def _battle(state):
@@ -112,8 +115,18 @@ class Answers(object):
         if click is not None and click.decision != dec_id:
             self.voice.result(click, 'superseded', words.stale())
             click = self.click = None
-        # (a word kept for another battle than the one that is open answers nothing)
-        self.early = {q: e for q, e in self.early.items() if e[1] == _battle(state)}
+        # (a word kept for another battle than the one that is open answers nothing; a word typed with
+        # the attack itself is kept for the battle that attack opens, and for no other decision)
+        now, kept = _battle(state) if self.early else None, {}
+        for q, (word, b) in self.early.items():
+            if b is not None and b[0] == OPENS:
+                if now is not None:
+                    kept[q] = (word, now)       # the battle his attack opened
+                elif b[1] == dec_id:
+                    kept[q] = (word, b)         # his attack is not carried out yet
+            elif b == now:
+                kept[q] = (word, b)
+        self.early = kept
         asked = next((q for q in self.early if words.early_fits(q, kind)), None)
         if click is None and asked is not None:
             self.hear(self.early.pop(asked)[0], self.open)     # a word given before this question
@@ -331,7 +344,11 @@ class Answers(object):
             family = layout.FP_DICE if layout.side_tag(o.side) == 'fp' else layout.SH_DICE
             staged = {b.face.get(p) for p in family if b.zone.get(p) in reconcile.DISPLAY or (
                 p in mine and b.zone.get(p) in layout.boxes(p))} if hasattr(b, 'zone') else ()
+            # (an attack typed with a word for its battle: the attack is heard now, the word waits)
+            text, with_it, asks = typed.bundled(text, words.EARLY, o.menu, words.region_key)
             verdict, act = words.heard(text, o.state, o.side, o.menu, staged, o.kind)
+            if with_it and verdict == 'pick' and words.by_word(act) and o is self.open:
+                self.early[asks] = (with_it, (OPENS, o.id))
             if verdict == 'pick' and words.by_word(act) and words.closes(text) and o is self.open:
                 self.closing = (o.id, panel.identity(act))   # ruling 8: the board is asked first
             elif verdict == 'none' and words.ends(text, o.kind) and o is self.open:

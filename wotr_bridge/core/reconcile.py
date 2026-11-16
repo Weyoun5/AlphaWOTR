@@ -138,10 +138,14 @@ def bind_dice(state, board, last=()):
             (Side.FREE_PEOPLES, em._FP_DIE_IDS, FP_DICE, FP_DEAD, FP_REINF),
             (Side.SHADOW, em._SH_DIE_IDS, SA_DICE, SA_DEAD, SA_REINF)):
         where = {}
+
+        def at(z, pool=pool, dead=dead):
+            return ('pool' if z == pool else 'hunt' if z == HUNT_BOX
+                    else 'used' if z == dead else 'staged' if z in DISPLAY else 'out')
         for pid in family:
-            z = (last.get(pid) if isinstance(last, dict) else None) or board.zone.get(pid)
-            where[pid] = ('pool' if z == pool else 'hunt' if z == HUNT_BOX
-                          else 'used' if z == dead else 'staged' if z in DISPLAY else 'out')
+            # (a piece he brought in from outside - the spare a minion earns - stands where it LIES)
+            came = at(last.get(pid)) if isinstance(last, dict) and last.get(pid) else 'out'
+            where[pid] = came if came != 'out' else at(board.zone.get(pid))
         free = sorted(family, key=lambda p: p in last)
         engine = []
         for i, d in enumerate(state.dice.get(side, [])):
@@ -465,6 +469,16 @@ def _dice_rows(state, board, dice, rows):
             else:
                 continue
             rows.append(Row(text, tag, Counter({want: 1}), {pid: board.zone[pid]}, [], {}, face))
+
+
+def dice_moves(state, board):
+    """The piece moves that make the action dice on the table the game's at a roll, touching nothing but
+    dice: a roll takes EVERY die that lies in a pool, so each die of the game is put in its place and a die
+    piece that stands for none goes back to its reserve.  Each piece counts where it lies (no move of a
+    person is waited for at a roll)."""
+    rows = []
+    _dice_rows(state, board, bind_dice(state, board), rows)
+    return moves([r for r in rows if r.flip or r.face or _unbalanced(r)])[0]
 
 
 def table_cards(state):

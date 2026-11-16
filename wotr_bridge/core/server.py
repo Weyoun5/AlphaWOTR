@@ -732,7 +732,8 @@ class Server(object):
         if self.search is None:
             return self.rng.choice(menu)        # test harness without nets
         position = self.rand.prefers['strength'] or strength.default(turn_search.gpu())
-        sims, setting = strength.plan(position, menu, self.sims)
+        stated = self.rand.prefers['sims']          # (the panel's simulations knob; -1: not moved)
+        sims, setting = strength.plan(position, menu, self.sims if stated < 0 else stated)
         self.voice.how = words.ai_thinking(side, sims)
         if self.voice.write_status is not None:
             self.voice.write_status(_enrich=False, state='thinking', waiting_on=self.voice.how)
@@ -743,7 +744,7 @@ class Server(object):
         if self.on_search is not None:
             self.on_search(state, handed, side, seed)
         with ai.search_turn_owner(owner):
-            act, _policy = self.search.choose(handed, side, num_simulations=sims)
+            act = self.search.choose(handed, side, num_simulations=sims)[0] if sims else self.search.raw(handed, side, menu)
         if act is None:
             raise RuntimeError('the search returned no action for %s %s' % (side.name, kind))
         key = action_policy_key(act)
@@ -987,6 +988,9 @@ class Server(object):
             # the client's pool is made the engine's pool right before the draw
             out += reconcile.render(reconcile.pool_moves(call.pool, call.used, self.link.board),
                                     self.link.nick)
+        if call.kind == 'action_roll' and self.link.board is not None:
+            # a roll takes every die that lies in a pool: the dice on the table are made the game's first
+            out += reconcile.render(reconcile.dice_moves(self.pos.state, self.link.board), self.link.nick)
         out += [d.text if d.kind == 'call' else self.voice.chat(self.ai_sides[-1], d.text) for d in calls]
         if his and not again:
             out.append(self.voice.chat(self.ai_sides[0], words.roll_request(self.human, need, ctx)

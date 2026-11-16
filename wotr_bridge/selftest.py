@@ -82,8 +82,11 @@ def main(argv=None):
             rec[backend] = shown(act)
             rec[backend + '_seconds'] = round(time.perf_counter() - t0, 1)
         rec['same'] = rec['native'] == rec['python']
+        # the simulations knob at its lowest: the net's own choice, no search
+        raw = searches['native'][side].raw(pickle.loads(r['handed']), side, menu)
+        rec['raw'], rec['raw_in_menu'] = raw and shown(raw), raw is not None and in_menu(raw, menu) is not None
         rec['in_menu'] = picks['native'] is not None
-        ok = rec['same'] and rec['in_menu']
+        ok = rec['same'] and rec['in_menu'] and rec['raw_in_menu']
         if not a.no_turn_search and picks['native'] is not None:
             asked = turn_search._S['asked']
             t0 = time.perf_counter()

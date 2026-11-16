@@ -302,6 +302,14 @@ def state_key(post):
     armies as unordered rosters under their region.  Raises when the state cannot be read so."""
     from enum import Enum
     active = set()
+    # the dice whose face no rule reads any more: a spent die, and the die of the two-step action under way
+    # (a die in the Hunt Box keeps its face: it lies there AS that face)
+    done = {id(d) for dice in post.dice.values() for d in dice if d.used}
+    for step in ('pending_army_move', 'pending_muster'):
+        i, dice = getattr(post, step + '_die', None), post.dice.get(getattr(post, step + '_side', None), ())
+        if isinstance(i, int) and 0 <= i < len(dice):
+            done.add(id(dice[i]))
+    done -= {id(d) for d in post.hunt_box}
 
     def canon(x):
         if isinstance(x, Enum):
@@ -322,6 +330,8 @@ def state_key(post):
                 return getattr(x, '__qualname__', type(x).__name__)
             fields = dict(getattr(x, '__dict__', None) or {})
             fields.update((n, getattr(x, n)) for n in getattr(type(x), '__slots__', ()) if hasattr(x, n))
+            if id(x) in done:                               # the face such a die shows is no part of the position
+                fields['current'] = None
             if type(x).__name__ == 'Army':                  # a roster has no order
                 for name in ('units', 'leaders'):
                     fields[name] = sorted((canon(f) for f in fields.get(name) or ()), key=repr)

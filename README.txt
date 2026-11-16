@@ -19,9 +19,10 @@ PLAY
   Play on the board as against a person, or click your choice in the AI
   panel on the right.  In chat, "help" lists the words the AI
   understands; "back" puts the board back, "undo" takes back your last
-  decision, "pass" passes.
-  AI strength: the slider at the top of the AI panel, 1 (fastest) to
-  4 (strongest).
+  decision, "pass" passes.  Attacks are typed, short forms work:
+  "osg from si nc" (nc = no combat card).
+  At the top of the AI panel: AI strength, 1 (fastest) to 4 (strongest),
+  and the simulations of its search, from none to 1000.
   Without questions:  Play_vs_AI.bat SA COR   (the AI's side, SA or FP,
   then its net: WIN or MIL for FP, WIN or COR for SA).
   Play_vs_AI.bat AUTO   watches AI vs AI.

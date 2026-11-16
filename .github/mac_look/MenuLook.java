@@ -31,7 +31,8 @@ import javax.swing.UIManager;
  * to FOLDER/look.json:
  *   the AI menu's entries, and that they are entries only (on a Mac the menus are drawn by macOS in the bar at the
  *     top of the screen, which shows nothing else);
- *   the strength knob (the component named "ai.strength") of the AI panel: showing, where, the words over it;
+ *   the strength knob (the component named "ai.strength") of the AI panel: showing, where, the words over it -
+ *     and the simulations knob under it ("ai.sims"): showing, its words;
  *   the knob pressed and let go on another position, by mouse events put into the client's own event queue: the
  *     file play_settings.json beside the client must then state that position.
  * It keeps two pictures of the screen (screen_robot.png by Java, screen_capture.png by macOS) and ends the client:
@@ -41,6 +42,7 @@ import javax.swing.UIManager;
  */
 public class MenuLook {
     static final String KNOB = "ai.strength";
+    static final String SIMS_KNOB = "ai.sims";
     static final int WAIT_S = 240;
     static File dir;
     static final StringBuilder json = new StringBuilder("{\n");
@@ -194,6 +196,12 @@ public class MenuLook {
                         put("entries", entries.append("]").toString());
                         put("menu_entries_only", String.valueOf(only));
                         put("legacy_entry", String.valueOf(legacy));
+                        Component sims = null;
+                        Window[] all = Window.getWindows();
+                        for (int i = 0; i < all.length && sims == null; i++)
+                            if (all[i].isShowing()) sims = named(all[i], SIMS_KNOB);
+                        put("sims_knob_showing", String.valueOf(sims != null && sims.isShowing()));
+                        if (sims != null) put("sims_knob_words", q(String.valueOf(call(sims.getParent(), "searchWords"))));
                         Component knob = knob();
                         put("knob_found", String.valueOf(knob != null));
                         put("knob_showing", String.valueOf(knob != null && knob.isShowing()));

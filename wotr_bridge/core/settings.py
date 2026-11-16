@@ -13,6 +13,8 @@ with a value of the default's own type, gives DEFAULT.
     'turn'      Automatically roll action dice and draw cards for me
     'strength'  the slider's position, 1.. (what each position means: strength.py); the file states
                 it only once he has moved the slider - 0 = not moved: the PC's default (strength.default)
+    'sims'      the simulations knob: the simulations of the ordinary search, 0 = no search (the net's own
+                choice); the file states it only once he has moved the knob - -1 = not moved: the server's --sims
 
 WHEN a changed box counts is the asker's rule, not this file's: each thing a box governs asks once,
 when it begins (randomness.ClientRandomness.directives_for: a request of the game; server.Server.
@@ -22,7 +24,7 @@ import json
 import os
 
 NAME = 'play_settings.json'
-DEFAULT = {'effects': True, 'dice': False, 'turn': True, 'strength': 0}
+DEFAULT = {'effects': True, 'dice': False, 'turn': True, 'strength': 0, 'sims': -1}
 
 
 class Settings(object):

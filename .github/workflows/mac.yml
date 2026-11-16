@@ -55,6 +55,7 @@ jobs:
           grep -q '"menu_entries_only": true' "$LOOK/look.json"
           grep -q '"legacy_entry": false' "$LOOK/look.json"
           grep -q '"knob_showing": true' "$LOOK/look.json"
+          grep -q '"sims_knob_showing": true' "$LOOK/look.json"
           grep -q '"knob_writes_file": true' "$LOOK/look.json"
       - name: Keep the download and what was logged
         if: always()

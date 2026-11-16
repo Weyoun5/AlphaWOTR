@@ -8,6 +8,7 @@ import functools
 import re
 import types
 import unicodedata
+from . import typed
 
 _SCRUB = re.compile(r'[{}\[\]<>]')
 _NAME_BAD = re.compile(r"[^a-z0-9 ,'!\-:]")
@@ -477,7 +478,7 @@ UNSEEN = frozenset((
     'combat_no_retreat', 'victor_stay', 'followup_done', 'shine', 'shine_none',
     'rearguard_none', 'combat_effect_choice', 'casualty_preserve_units',
     'casualty_preserve_elites', 'hunt_gollum_no_reveal', 'end_turn'))
-_EARLY = {'nc': 'card', 'press': 'round', 'stop': 'round', 'continue': 'round'}
+EARLY = {'nc': 'card', 'press': 'round', 'stop': 'round', 'continue': 'round'}
 _ROUND_KINDS = ('combat:attacker_continue', 'combat:combat_round_result',
                 'combat:attacker_siege_decision')
 
@@ -525,7 +526,7 @@ def early_kind(text, battle, side):
     """The question of the open `battle` that a word of `side` may be given for in advance
     ('card', 'round'), or None.  A word waits only for the question it was typed for: none
     with no battle open, and no "nc" / "cc" once his card of this round is in."""
-    early = 'card' if text.startswith('cc ') else _EARLY.get(text)
+    early = 'card' if text.startswith('cc ') else EARLY.get(text)
     if early is None or not isinstance(battle, dict):
         return None
     role = 'atk' if battle.get('attacker_side') is side else 'def'
@@ -555,7 +556,7 @@ def word_for(state, side, action):
     """The shortest thing to type for an option a word may commit."""
     kind, p = action.action_type, action.params or {}
     if kind == 'army_attack':
-        return '%s from %s' % (chat_key(place(p.get('to'))), chat_key(place(p.get('from'))))
+        return '%s from %s' % (region_key(p.get('to')), region_key(p.get('from')))
     if kind == 'combat_card_play':
         return 'cc %s' % chat_key(card_title(p.get('card_id')))
     return next((w for w in ('nc', 'pass', 'field', 'siege', 'press', 'stop', 'stand', 'done')
@@ -575,6 +576,10 @@ def _face(state, side, action):
         return None
 
 
+def region_key(key):        # a region as it is typed in chat
+    return chat_key(place(key))
+
+
 def heard(text, state, side, menu, staged, kind):
     """A chat line of the person against the menu of his open decision (of
     `kind`) -> (verdict, action): 'pick' it names exactly one option; 'several' / 'none'
@@ -592,15 +597,9 @@ def heard(text, state, side, menu, staged, kind):
     if EYES.match(t):
         hits = [a for a in menu if a.action_type == 'eye_allocate'
                 and int((a.params or {}).get('count') or 0) == int(t[:-1])]
-    if not hits:
-        rest = t[7:] if t.startswith('attack ') else t
-        to, _, frm = rest.partition(' from ')
-        attacks = [a for a in menu if a.action_type == 'army_attack']
-        hits = [a for a in attacks if chat_key(place(a.params.get('to'))) == to
-                and (not frm or chat_key(place(a.params.get('from'))) == frm)]
-        word = word or (bool(frm) and any(
-            chat_key(place(a.params.get('to'))) == to or chat_key(place(a.params.get('from'))) == frm
-            for a in attacks))
+    if not hits and t not in ALIASES:       # (a fixed word is never read as a region's short form)
+        hits, half = typed.attacks(t, menu, region_key)
+        word = word or half
     if not hits:
         name = t[3:] if t.startswith('cc ') else t
         hits = [a for a in menu if a.action_type == 'combat_card_play' and name in _card_names(a)]
@@ -635,7 +634,8 @@ _OLD = {
     'help': 'You can type "back" (I put the board back), "undo" (take back your last decision), "finish" '
             '(I do what I left to your own hand), "pass", "fp ok", "done", "nc" or "cc" and a card name for a combat card, "field", '
             '"stand", "press", "continue", "stop", "0e" for no Eyes, an attack such as "dale from '
-            'erebor", and the name of a gate when I ask; everything else is a move on the board '
+            'erebor" (short forms and a combat card with it work too: "osg from si nc"), '
+            'and the name of a gate when I ask; everything else is a move on the board '
             'or a click in the panel.',
     'skip': 'There is no skip any more: answer with a move on the board or a click in the panel, '
             'or type "back" and I put the board back as the game has it.',
@@ -981,7 +981,7 @@ def no_cards(text):
 
 
 def ai_thinking(side, sims):
-    return 'The %s is choosing its move (%d simulations).' % (side_name(side), sims)
+    return 'The %s is choosing its move (%s).' % (side_name(side), '%d simulations' % sims if sims else 'no search')
 
 
 def ai_did(side, label):
