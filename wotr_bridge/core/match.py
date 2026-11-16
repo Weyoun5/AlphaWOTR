@@ -96,7 +96,7 @@ No engine apply happens here; everything about the game comes in through the
 Menu the caller builds:
 
   Menu(options, plan, sig=None, key=None, name=None, expand=None,
-       conseq=None, outcome=None, side=None, net=None, faults=None)
+       conseq=None, outcome=None, side=None, net=None, faults=None, position=None)
     faults     [(option, what failed, the error)]: the Menu's callbacks append
                here when one of them FAILED for an option (a fault, not a
                hold); the board cannot answer that option, and the caller
@@ -133,6 +133,11 @@ Menu the caller builds:
     outcome(o) -> hashable engine-state key after o (after the whole chain
                that led to o's menu), or None.  Chains with the same outcome
                are one choice (the same removals in another order).
+    position(o) -> a cheap hashable key of the position after o, as the engine's own
+               search tells positions apart, or None.  A position reached again by
+               other choices, with the same board still to explain, is not searched
+               again (two figures the game cannot tell apart, each gone where the
+               other might have).
 """
 import collections
 
@@ -171,10 +176,11 @@ _Step = collections.namedtuple('_Step', 'o menu p how level')
 
 class Menu(object):
     __slots__ = ('options', 'plan', 'sig', 'key', 'name', 'expand', 'conseq', 'outcome', 'side', 'net',
-                 'faults')
+                 'faults', 'position')
 
     def __init__(self, options, plan, sig=None, key=None, name=None, expand=None, conseq=None,
-                 outcome=None, side=None, net=None, faults=None):
+                 outcome=None, side=None, net=None, faults=None, position=None):
+        self.position = position
         self.faults = faults if faults is not None else []      # see the module text
         self.side = side            # 'fp' / 'sh': whose decision it is (None: not told)
         self.net = net              # net(o) -> the changes of o AND of what the engine does alone
@@ -435,6 +441,16 @@ def _can_stage(table, faces):
     return all(n <= moved[f] + pool[f] for f, n in shown.items())
 
 
+class _Seen(set):
+    """What one search has been through: the sets of choices it followed (the same choices in another order are
+    not followed again), and what each POSITION it searched gave (`gave`: reached again by other choices, with
+    the same board still to explain, its chains are those chains)."""
+
+    def __init__(self):
+        set.__init__(self)
+        self.gave = {}
+
+
 def _less(d, own, coarse):
     """A board difference without a step's own move (own: read by its coarse rules, as d is here).  What the
     step took from a CHOICE of zones, or brought to one, that the board does not show there (another step made
@@ -535,8 +551,17 @@ def _search(base, d_now, menu, depth, stats, carry, seen, prefix, raw=None, lag=
             stats['depth_cut'] += 1
             continue
         rest, raw2 = [_less(d, bm.project(p.d, p.coarse), p.coarse) if d is not None else None for d in (d_now, raw)]
-        f2, w2, a2, _lv = _search(base.apply(p.plan), rest, sub, depth - 1, stats, p.soft, seen, pk, raw2, lag,
-                                  faces)
+        # the same POSITION with the same board still to explain, reached by other choices (two figures the game
+        # cannot tell apart, each gone where the other might have): searched already - its chains are these chains
+        same = menu.position(o) if menu.position is not None else None
+        if same is not None:
+            same = (same, depth) + tuple(frozenset(d.items()) if d else None for d in (rest, raw2, p.soft))
+        if same in seen.gave:
+            stats['same_position'] += 1
+        else:
+            seen.gave[same if same is not None else pk] = _search(
+                base.apply(p.plan), rest, sub, depth - 1, stats, p.soft, seen, pk, raw2, lag, faces)[:3]
+        f2, w2, a2 = seen.gave[same if same is not None else pk]
         full.extend([step] + chain for chain in f2)
         waits.extend(([step] + chain, dist) for chain, dist in w2)
         ahead.extend([step] + chain for chain in a2)
@@ -631,7 +656,7 @@ def _before_its_die(lv, depth, lag, faces):
             continue
         tried |= {stage, s.die if s is not None else None}      # (one search for each die: its die is the question)
         full, _waits, ahead, _lv = _search(lv.base, bm.add_delta(lv.d_now, dict(stage)), menu, depth, lv.stats,
-                                           None, set(), (), None, lag, faces)
+                                           None, _Seen(), (), None, lag, faces)
         if full or ahead:
             return [((full or ahead)[0], 1)]
     return []
@@ -776,7 +801,7 @@ def only(menu, options):
     """The Menu of a decision narrowed to some of its options, read without the quick filter:
     the board against exactly these answers (an answer he named by a click or a word)."""
     return Menu(options, menu.plan, None, menu.key, menu.name, menu.expand, menu.conseq, menu.outcome,
-                menu.side, menu.net, menu.faults)
+                menu.side, menu.net, menu.faults, menu.position)
 
 
 def named(base, now, menu, o, opened=None):
@@ -857,7 +882,7 @@ def judge(base, now, menu, depth=MAX_DEPTH, check_extend=True, opened=None, tidi
         lag, raw = bm.delta(now, seen), bm.delta(base, now)     # ... or as it lies
     shut = bm.turned(now, opened, base) if opened is not None else frozenset()
     faces = (base, bm.moved_faces(base, seen)[0])   # (a die still in transit is not the human's)
-    full, waits, ahead, lv = _search(base, d_now, menu, depth, stats, None, set(), (), raw, lag, faces)
+    full, waits, ahead, lv = _search(base, d_now, menu, depth, stats, None, _Seen(), (), raw, lag, faces)
     waits = waits if full or waits or ahead else _before_its_die(lv, depth, lag, faces)
     if full:
         groups = collections.OrderedDict()

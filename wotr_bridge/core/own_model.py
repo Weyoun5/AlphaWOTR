@@ -245,9 +245,36 @@ class SeatSearches:
                      lambda self, value: self._restore('index', value))
 
 
+_TAG = []        # the net tag of this process's seats (load_own_net keeps it)
+_OTHER = {}      # the nets of sides no search of this process plays
+
+
+def seat_net(search, side):
+    """The policy net of `side`: its seat's search's own; for a side this process does not play, the net of the
+    same tag, loaded on first use (the certain line plays the opponent's own action with it; the seat table of the
+    engine is left as it was).  None when there is none."""
+    import ai
+    one = search.searches.get(side) if hasattr(search, 'searches') else search
+    if one is not None and getattr(one, 'side', None) is side:
+        return one.net
+    if side not in _OTHER:
+        seat = 'fp' if side is ai.Side.FREE_PEOPLES else 'sh'
+        had, before = seat in ai.PLAYER_PROFILES, ai.PLAYER_PROFILES.get(seat)
+        try:
+            _OTHER[side] = load_own_net(_TAG[0], side) if _TAG else None
+        except Exception:
+            _OTHER[side] = None
+        if had:
+            ai.PLAYER_PROFILES[seat] = before
+        else:
+            ai.PLAYER_PROFILES.pop(seat, None)
+    return _OTHER[side]
+
+
 def load_own_net(tag, side):
     """Open only the configured seat's file; never overwrite stored seat metadata."""
     import ai
+    _TAG[:] = [tag]
     threads=os.environ.get('WOTR_LIVE_INFERENCE_THREADS')
     if threads is not None:
         ai.torch.set_num_threads(int(threads))

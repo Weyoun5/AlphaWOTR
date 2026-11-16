@@ -259,7 +259,9 @@ class ClientLink(object):
         places states it (from, to); any other took it from where the commands before it had
         put it, else from where it lay on the last board - the one place a command names is
         not taken for it (the client's own lines name the place they PUT a piece too).  A piece
-        no command names (the client's Undo) moved with a command of his when one stands there."""
+        no command names (the client's Undo) moved with a command of his when one stands there -
+        and one that lies elsewhere with NO command of anyone since that board is read like a
+        piece he moved, whoever's hand it was: the board is what he sees."""
         seen, self.seen, now = self.seen, self.board, self.board.zone
         cmds = self.receipts.take(len(self.feed.lines) if want is None else want)
         if seen is None or self.human is None:
@@ -267,19 +269,20 @@ class ClientLink(object):
         # {piece: its last command was mine} (None: every command was); where he took it; where it lies
         by, was, at, when = {None: True}, dict(seen.zone), dict(seen.zone), {}      # now; when he last named it
         named = Counter()           # how many commands of his name it (two that leave it where it lay: away and back)
+        cmds = [c for c in cmds if live_parser.parse(self.feed.lines[c[0]]).get('op') not in TALK]
+        by[None] = bool(cmds)
         for i, k, pids, ts in cmds:
-            if live_parser.parse(self.feed.lines[i]).get('op') not in TALK:
-                nick, tags, numbers = _shape(raw[k])
-                # (a command under an AI seat's nick is never his: a line of mine, or the result of a
-                # call of mine that the client wrote after the call's receipt - a draw, a discard)
-                mine = self.mine(i) or nick in AI_NICK.values()
-                zones = [t for t in tags if t.startswith('Game.') or t in (reconcile.FP_HAND, reconcile.SA_HAND)]
-                for p in pids if pids is not None else [n for n in numbers if n in seen.zone or n in now]:
-                    if not mine and by.get(p, True):
-                        was[p] = zones[0] if len(zones) == 2 else at.get(p)
-                    by[p], at[p], when[p] = mine, zones[1] if len(zones) == 2 else now.get(p), (ts, i)
-                    named[p] += not mine
-                by[None] = by[None] and mine
+            nick, tags, numbers = _shape(raw[k])
+            # (a command under an AI seat's nick is never his: a line of mine, or the result of a
+            # call of mine that the client wrote after the call's receipt - a draw, a discard)
+            mine = self.mine(i) or nick in AI_NICK.values()
+            zones = [t for t in tags if t.startswith('Game.') or t in (reconcile.FP_HAND, reconcile.SA_HAND)]
+            for p in pids if pids is not None else [n for n in numbers if n in seen.zone or n in now]:
+                if not mine and by.get(p, True):
+                    was[p] = zones[0] if len(zones) == 2 else at.get(p)
+                by[p], at[p], when[p] = mine, zones[1] if len(zones) == 2 else now.get(p), (ts, i)
+                named[p] += not mine
+            by[None] = by[None] and mine
         moved = {p: was.get(p) for p in set(was) | set(now) if not by.get(p, by[None]) and (
             was.get(p) != now.get(p) or (by.get(p) is False and (named[p] > 1 or any(
                 old.get(p) != new.get(p) for old, new in zip(seen[1:], self.board[1:])))))}

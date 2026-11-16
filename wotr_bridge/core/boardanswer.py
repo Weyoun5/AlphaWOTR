@@ -311,8 +311,16 @@ class BoardAnswers(object):
         sentence that tells him is said with what happens (its number, or True).  -> those
         pieces.  Every ending is logged.  Where the piece does not lie where the game has it,
         the next pass of the comparison carries it - and says the sentence of a reason of
-        words.PUT_BACK (explain)."""
+        words.PUT_BACK (explain).  EACH PIECE UNDER ITS OWN TRUE REASON: of what lay BESIDE his
+        answer, one the game now has neither where it lies nor where he took it from was moved ON
+        by that answer itself (the clicked move takes every Regular of the region, the one he had
+        dragged away among them): NEEDED, not "the rest I put back"."""
         h = self.his
+        if reason == words.BESIDE and any(p in h.pieces for p in pieces):
+            fate, view = {}, self.link.view
+            reconcile.difference(self.position().state, self.link.board, view.card_pid_map, True,
+                                 view.die_id_map or None, {p: own.frm for p, own in h.pieces.items()}, fate)
+            self.end(words.NEEDED, [p for p in pieces if fate.get(p, True) is None])
         gone = {p: h.pieces.pop(p) for p in sorted(h.pieces if pieces is None else pieces) if p in h.pieces}
         if isinstance(pieces, dict):
             gone.update((p, Own(frm, self.voice.stats['steps'], self.voice.req, False))
@@ -622,13 +630,15 @@ class BoardAnswers(object):
             means = {p: x for p, x in means.items() if p not in g.elsewhere}
             odd = [p for p, x in means.items() if x is False]
             rival = [p for p in means if not odd and not bm.stages_only(self.moved(g, [p]), True)]
-            # (the words are of HIS pieces only: THE pieces of his that fit no move, as they lie - or, with none such,
-            # ALL that alone begin a move of their own: more moves than are owed, none called illegal (a die or card
-            # only laid out names none); and never a card of his hand by name in chat: by what lies moved)
-            if odd or len(rival) > 1 or not words.is_plain(text) or any(words.chat_card_name(
+            # (the words are of HIS pieces only: THE pieces of his that fit no move, as they lie - or, with none such
+            # and each ALONE the beginning of a move - two moves of their own, or no move the board names -, ALL of
+            # them: more moves than are owed, none called illegal, the die or card laid out named with the rest;
+            # and never a card of his hand by name in chat: by what lies moved)
+            more = len(means) > 1 and all(x is True for x in means.values()) and (len(rival) > 1 or not v.nearest)
+            if odd or more or not words.is_plain(text) or any(words.chat_card_name(
                     words.card_title(c)) in words.chat_card_name(text) for c in o.state.hands[o.side].hand):
                 text = words.board_choices(()) if v.kind == 'undecided' else words.board_unclear(
-                    None, faulty, bm.moved_words(self.moved(g, odd or rival[1:] and rival)), len(rival) > 1)
+                    None, faulty, bm.moved_words(self.moved(g, odd)), more)
             self.voice.say_about(text, pieces=_about(zone, self.has(g)))
         return None
 

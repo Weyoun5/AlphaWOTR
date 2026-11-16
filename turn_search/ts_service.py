@@ -210,8 +210,14 @@ def main():
                     ref_row = next((i for i, (d, k, p) in decoded if policy_key(ai.Action(die_idx=d, action_type=k, params=p)) == want), None)
                 if ref_row is None:
                     return dict(ok=False, why="the server's own move (%s) is not in the fast engine's menu" % rkind)
+            fav_row = None
+            if req.get("favoured") is not None:       # the bridge's certain line: a candidate with the bar at its floor
+                fdie, fkind, fparams = req["favoured"]
+                fkinds = base.encode()[4]
+                fav_row = next((i for i in range(int(base.rows)) if base.vocab[int(fkinds[i])] == fkind
+                                and base.row(ai, i)[0] == fdie and base.row(ai, i)[2] == fparams), None)
             before = dict(search.stats)
-            pick, rep = search.choose(base, (seed, 7), ref_move=ref_row)
+            pick, rep = search.choose(base, (seed, 7), ref_move=ref_row, favoured=() if fav_row is None else (fav_row,))
             die, kind, params = base.row(ai, int(pick))
             tdie, tkind, tparams = base.row(ai, int(rep["ref"]))
             return dict(ok=True, die=die, kind=kind, params=params, switched=bool(pick != rep["ref"]),
@@ -219,7 +225,8 @@ def main():
                         plan=rep.get("plan"), plans=rep.get("n_pairs"), rows=int(base.rows), setting=setting, net=key,
                         playouts=search.stats["playouts"] - before["playouts"], plies=search.stats["plies"] - before["plies"],
                         seconds=time.perf_counter() - t0, device=TS.DEVICE, workers=workers,
-                        cut=rep.get("cut") or {}, out_of_time=bool(rep.get("out_of_time")))
+                        cut=rep.get("cut") or {}, out_of_time=bool(rep.get("out_of_time")),
+                        stage3=rep.get("stage3"), favoured=fav_row is not None)
         finally:
             base.close()
 

@@ -60,6 +60,11 @@ class Config:
         self.margin = 2.0           # switch away from the net's move only if that last, unselected gain exceeds margin * its se
         self.min_gain = 0.03        # ... and this much win probability
         self.lines = False          # keep each plan's readable line (slow: for reports)
+        self.bar_prior = False      # THE BAR FOLLOWS THE NET'S OWN OPINION OF THE CHALLENGER (need()): min_gain and margin
+                                    # are what a challenger needs that the net thinks nothing of; one the net rates
+                                    # like the move to beat needs only ...
+        self.gain_floor = 0.0025    # ... this much win probability and
+        self.margin_floor = 1.0     # ... this many standard errors
         self.seconds = 0.0          # the time one decision may take (0 = as long as it takes).  A PC too slow for the
                                     # streams above gets as many as fit: the screen's rest may use half of what is left
                                     # after its first stream, then r2 and r3 are cut by one factor; under MIN_R2 / MIN_R3
@@ -68,6 +73,26 @@ class Config:
 
 
 MIN_R2, MIN_R3 = 4, 8               # fewer streams than these say nothing: the decision is given up instead
+
+
+def need(cfg, p_move, p_ref):
+    """(gain, standard errors) a challenger must show at stage 3 to replace the move to beat.
+    Without cfg.bar_prior: (min_gain, margin) for everyone.  With it the two shrink with how well the NET ITSELF rates
+    the challenger against the move to beat: lam = ln(p_ref / p_move) / ln(p_ref / p_min), cut to 0..1 - 0 for a
+    challenger of the same prior or more, 1 for one at the candidates' floor p_min - and
+        gain needed   = gain_floor   + (min_gain - gain_floor)   * lam
+        margin needed = margin_floor + (margin   - margin_floor) * lam      (in standard errors of the stage-3 gain)
+    min_gain guards against the judge's own bias and margin against the dice; the net's prior is evidence of its
+    own, independent of both, that the challenger is a reasonable move."""
+    if not cfg.bar_prior:
+        return cfg.min_gain, cfg.margin
+    if p_move >= p_ref:
+        lam = 0.0
+    elif p_ref <= cfg.p_min or p_move <= cfg.p_min:
+        lam = 1.0
+    else:
+        lam = min(1.0, max(0.0, math.log(p_ref / p_move) / math.log(p_ref / cfg.p_min)))
+    return (cfg.gain_floor + (cfg.min_gain - cfg.gain_floor) * lam, cfg.margin_floor + (cfg.margin - cfg.margin_floor) * lam)
 
 
 def warm(w, values, names, judges=None):
@@ -241,9 +266,12 @@ class TurnSearch:
         params = params if isinstance(params, dict) else {}
         return name, str(params.get("minion") or params.get("character") or params.get("card_id") or params.get("nation") or "")
 
-    def choose(self, base, seed_key, forced_moves=(), ref_move=None):
+    def choose(self, base, seed_key, forced_moves=(), ref_move=None, favoured=()):
         """base: a game standing at an open decision.  -> (row index to play, report dict).
-        ref_move: the row to beat (the move the caller would play otherwise); None = the net's own top move."""
+        ref_move: the row to beat (the move the caller would play otherwise); None = the net's own top move.
+        favoured: rows that are candidates whatever their prior and need only the bar's floor (the bridge's
+        certain line: a move whose line needs no roll where the move to beat needs one)."""
+        favoured = tuple(int(m) for m in favoured)
         w, cfg = self.w, self.cfg
         began, cut = time.perf_counter(), {}     # cut: the streams this decision got instead of the configured ones
         side, turn0 = str(base.side), int(base.turn)
@@ -257,7 +285,7 @@ class TurnSearch:
         moves = [i for n, i in enumerate(order[:cfg.k_moves])
                  if n < 2 or len(order) <= SMALL_MENU or lp[i] >= math.log(cfg.p_min)]
         ref_row = top if ref_move is None else int(ref_move)
-        for m in tuple(forced_moves) + (ref_row,):
+        for m in tuple(forced_moves) + favoured + (ref_row,):
             if int(m) not in moves:
                 moves.append(int(m))
         for name in cfg.advisers.get(side, ()):
@@ -318,28 +346,40 @@ class TurnSearch:
         v2 = {pair: np.zeros(r2) for pair in keep}
         for spec, o in zip(specs, self._exec(base, seed_key, side, turn0, specs)):
             v2[(spec[0], spec[1])][spec[2] - 1000] = o[0]
+        p_ref = float(math.exp(lp[ref_row]))
+
+        def bar(move):                           # what this move must show (a favoured move: the floor)
+            if int(move) in favoured:
+                return cfg.gain_floor, cfg.margin_floor
+            return need(cfg, float(math.exp(lp[move])), p_ref)
         table = []
-        cand, cand_gain = None, 0.0
+        cand, cand_gain, cand_over = None, 0.0, None
         for pair in keep:
             d = (v2[pair] - v2[ref]) / 2.0                          # win-probability scale, paired by stream
             gain, se = float(d.mean()), float(d.std(ddof=1) / math.sqrt(len(d))) if len(d) > 1 else 0.0
             table.append(dict(move=pair[0], plan=pair[1], prior=float(math.exp(lp[pair[0]])), s1=s1[pair] / 2 + 0.5,
                               s2=float(v2[pair].mean()) / 2 + 0.5, gain=gain, se=se, steps=len(plan_of[pair]),
                               line=line_of.get(pair), net=adviser_of(cfg, side, pair[1])))
-            if pair != ref and gain > cand_gain:
-                cand, cand_gain = pair, gain
+            g_need, m_need = bar(pair[0])
+            table[-1].update(need_gain=g_need, need_margin=m_need)
+            # the best-looking challenger: the largest gain OVER its own bar (one bar for all: the largest gain)
+            over = gain - g_need
+            if pair != ref and gain > 0.0 and (cand_over is None or over > cand_over):
+                cand, cand_gain, cand_over = pair, gain, over
         # stage 3: the best-looking challenger was CHOSEN on stage 2's dice, so its gain there flatters it.  Play it and
         # the net's move once more on dice nothing was chosen on; only that gain decides.
         best, best_gain, best_se, s3 = ref, 0.0, 0.0, None
-        if cand is not None and cand_gain >= cfg.min_gain:
+        g_need, m_need = bar(cand[0]) if cand is not None else (cfg.min_gain, cfg.margin)
+        if cand is not None and cand_gain >= g_need:
             specs = [(pair[0], pair[1], 2000 + k, follow(pair))
                      for k in range(r3) for pair in (cand, ref)]
             out = self._exec(base, seed_key, side, turn0, specs)
             v3 = np.array([o[0] for o in out]).reshape(r3, 2)
             d = (v3[:, 0] - v3[:, 1]) / 2.0
             gain, se = float(d.mean()), float(d.std(ddof=1) / math.sqrt(len(d)))
-            s3 = dict(move=cand[0], plan=cand[1], gain=gain, se=se, stage2_gain=cand_gain)
-            if gain >= cfg.min_gain and gain > cfg.margin * se:
+            s3 = dict(move=cand[0], plan=cand[1], gain=gain, se=se, stage2_gain=cand_gain, need_gain=g_need, need_margin=m_need,
+                      prior=float(math.exp(lp[cand[0]])), ref_prior=p_ref)
+            if gain >= g_need and gain > m_need * se:
                 best, best_gain, best_se = cand, gain, se
         return best[0], dict(side=side, turn=turn0, top=top, ref=ref_row, pick=best[0], plan=best[1], gain=best_gain, se=best_se,
                              follow=follow(best), stage3=s3,

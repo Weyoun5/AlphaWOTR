@@ -757,7 +757,10 @@ class Server(object):
         # TURN SEARCH (core/turn_search.py): the rest of the turn and the next one are played out for the candidates;
         # a move confirmed as better replaces the pick.  Off, refused or failed: the pick stands.  How hard both
         # searches work at this decision is strength.plan's word (the menu's slider; small decisions cheaply).
-        return turn_search.improve(ai, handed, side, owner, seed, menu, hit, setting)
+        # THE CERTAIN LINE (core/certain_line.py): a move whose line reaches for certain the position the pick reaches
+        # only if the opponent chooses so is played; against a roll it joins the turn search's candidates
+        outright, favoured = turn_search.certain(ai, turn_search.Seats(self._menu, self.search), handed, side, owner, menu, hit)
+        return outright or turn_search.improve(ai, handed, side, owner, seed, menu, hit, setting, favoured=favoured)
 
     def _decide(self, side, kind, flag=None, phase=None, after=None, sanctioned=None,
                 skip=None, route=None, stands=False):

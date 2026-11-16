@@ -33,6 +33,9 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import certain_line
+from .own_model import seat_net
+
 FLAG = Path(__file__).resolve().parents[1] / 'turn_search.json'
 GAME = FLAG.parents[1]          # the game's folder: a path of the file that is not absolute is a place in the game
 GPU_FAILED, CANNOT_RUN = 4, 5   # the service's exit codes (the kit's ts_device.py)
@@ -204,7 +207,52 @@ def _same_but_better(ai, state, side, menu, hit, own):
     return moved
 
 
-def improve(ai, state, side, owner, seed, menu, own, setting):
+def _last_word(ans):
+    """The last comparison's figures for the log line: the challenger's gain on fresh dice against what it needed."""
+    last = ans.get('stage3')
+    if not last:
+        return ''
+    return '; best challenger %+.1f +- %.1f points, needed %.1f points and %.1f standard errors%s' % (
+        100 * last['gain'], 100 * last['se'], 100 * last['need_gain'], last['need_margin'],
+        ' (certain line: the bar at its floor)' if ans.get('favoured') else '')
+
+
+class Seats(object):
+    """What certain_line asks about the two seats: the options a side is offered (the server's own menu function)
+    and its policy net (own_model.seat_net: the searching seat's own, the other side's loaded on first use)."""
+
+    def __init__(self, menu, search):
+        self.menu, self.search = menu, search
+
+    def net(self, side):
+        return seat_net(self.search, side)
+
+
+def certain(ai, seats, state, side, owner, menu, own):
+    """THE CERTAIN LINE (certain_line.py), asked once the AI's pick `own` is made - at every level, with or without
+    the turn search.  seats: .menu(state, side), .net(side).
+    -> (the move to play outright or None, the move that joins improve()'s candidates with the bar at its floor or
+    None).  A move played outright is a decided move like any other: THE SAME BUT BETTER and the siege ban weigh it."""
+    if len(menu) < 2 or not state.dice_rolled:
+        return None, None
+    got = certain_line.find(ai, seats, state, side, owner, menu, own)
+    if got is None:
+        return None, None
+    how, hit = got
+    if how != 'outright':
+        return None, hit
+    hit = _same_but_better(ai, state, side, menu, hit, own)
+    if hit is own:
+        return None, None
+    _S['switched'] += 1
+    _say('PLAYS %s %s instead of %s: CERTAIN LINE - it reaches for certain the position the other reaches only if the '
+         'opponent chooses so (%d lines found, %.1f s)' % (
+             hit.action_type, json.dumps(hit.params, default=str, sort_keys=True)[:110], own.action_type,
+             certain_line.LAST.get('lines') or 0, certain_line.LAST.get('seconds') or 0))
+    return hit, None
+
+
+def improve(ai, state, side, owner, seed, menu, own, setting, favoured=None):
     """own: the move the server's ordinary search picked (an entry of menu).  -> the move to play: own, or the entry of
     menu the turn search confirmed as better.  state: what the search may see (hidden cards already dealt at random).
     setting: how hard the service searches at this decision - a name of the kit's search_settings.json (strength.py
@@ -221,6 +269,7 @@ def improve(ai, state, side, owner, seed, menu, own, setting):
         conn.send({'op': 'choose', 'state': pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL), 'side': seat,
                    'seed': int(seed) & 0x7FFFFFFF, 'rows': len(menu), 'ref': (own.die_idx, own.action_type, own.params),
                    'setting': setting, 'net': _S['nets'].get(seat, 'win'),
+                   'favoured': None if favoured is None else (favoured.die_idx, favoured.action_type, favoured.params),
                    'owner': None if owner is None else ('fp' if owner is ai.Side.FREE_PEOPLES else 'sh')})
         if not conn.poll(float(cfg.get('decision_seconds', 60))):
             # the answer may still arrive later and would be read as the next decision's: start over with a new service
@@ -246,7 +295,7 @@ def improve(ai, state, side, owner, seed, menu, own, setting):
     _S['asked'] += 1
     _S['seconds'] += time.perf_counter() - started
     how = '%s: %.1f s, %d playouts%s' % (setting, time.perf_counter() - started, ans.get('playouts') or 0,
-                                         '; fewer than the setting\'s, to fit the time' if ans.get('cut') else '')
+                                         '; fewer than the setting\'s, to fit the time' if ans.get('cut') else '') + _last_word(ans)
     if ans.get('out_of_time'):
         _S['slow'][setting] = _S['slow'].get(setting, 0) + 1
         _say('keeps %s - out of time before anything was decided (%s)' % (own.action_type, how))

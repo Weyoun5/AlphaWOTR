@@ -18289,15 +18289,19 @@ print('[SELECT] resolved: pi_mode=%s temp_earned=%s head_act=%s'
 #       Free Peoples pieces gone for good      state.fp_casualties, by nation and kind          FP: fewer, Shadow: more
 #       corruption                                                                              FP: less,  Shadow: more
 #       the Fellowship's progress              the track and the Mordor track, each             FP: more,  Shadow: less
+#       Elven Rings                            own more, the enemy's fewer (a ring the Free Peoples use passes to the
+#                                              Shadow); this turn's ring use still open: own yes, the enemy's no
 #   A better KIND of unit in the same place is no such quantity (a judgement); where a piece stands, the Hunt Box, the
-#   political track, rings and tokens, every open decision are part of "everything else": equal, or no verdict.
+#   political track, Dwarven Rings and tokens, every open decision are part of "everything else": equal, or no
+#   verdict.
 # Each option is applied once (_apply_action_detect_rng: the step the search itself makes; an option that consumes a
 # random number is left out, and the random streams are put back as they were).  That costs about 2 ms an option in
 # Python, so the rule lives where a move is DECIDED - the options handed in are the search's root children, at most
 # 40 - and not inside the tree (measured: RESULTS.md, "Dominance").  Inside the tree, and for both sides, the part
 # that needs no option applied is ai_policies.least_destroyed (units lost to the stacking limit).
-_SB_BLANK = (1, 2, 7, 8, 11, 14, 15, 23)     # _state_sig's key: armies, dice, progress, corruption, mordor_step,
-#                                              the two hand sizes, fp_casualties (checked against the state below)
+_SB_BLANK = (1, 2, 7, 8, 11, 14, 15, 23, 34, 35, 36, 37)
+#   _state_sig's key: armies, dice, progress, corruption, mordor_step, the two hand sizes, fp_casualties, the two
+#   Elven Ring counts and the two "ring used this turn" marks (checked against the state below)
 
 
 def _outcome(state, side):
@@ -18310,7 +18314,10 @@ def _outcome(state, side):
     hands = state.hands
     if not (key[7] == f.progress and key[8] == f.corruption and key[11] == f.mordor_step
             and key[14] == len(hands[Side.FREE_PEOPLES].hand) and key[15] == len(hands[Side.SHADOW].hand)
-            and isinstance(key[1], tuple) and isinstance(key[2], tuple) and isinstance(key[23], tuple)):
+            and isinstance(key[1], tuple) and isinstance(key[2], tuple) and isinstance(key[23], tuple)
+            and isinstance(key[34], int) and isinstance(key[36], bool)
+            and key[34:38] == (int(state.fp_elven_rings), int(state.sh_elven_rings),
+                               bool(state.fp_ring_used_this_turn), bool(state.sh_ring_used_this_turn))):
         raise RuntimeError('_state_sig key layout changed: _SB_BLANK must follow it')
     public = key[-1]
     rest = (tuple(None if i in _SB_BLANK else part for i, part in enumerate(key[:-1])),
@@ -18341,7 +18348,12 @@ def _outcome(state, side):
         enemy_vp=int(state.vp.shadow if fp else state.vp.free_peoples),
         gone=Counter({(getattr(n, 'name', str(n)), k): int(v) for n, kinds in (state.fp_casualties or {}).items()
                       for k, v in (kinds or {}).items() if v}),
-        corruption=int(f.corruption), progress=(int(f.progress), int(f.mordor_step)))
+        corruption=int(f.corruption), progress=(int(f.progress), int(f.mordor_step)),
+        # (each entry: more is better for `side`)
+        rings=(int(state.fp_elven_rings if fp else state.sh_elven_rings),
+               -int(state.sh_elven_rings if fp else state.fp_elven_rings),
+               int(not (state.fp_ring_used_this_turn if fp else state.sh_ring_used_this_turn)),
+               int(bool(state.sh_ring_used_this_turn if fp else state.fp_ring_used_this_turn))))
 
 
 def _at_least_as_good(side, a, b):
@@ -18359,7 +18371,8 @@ def _at_least_as_good(side, a, b):
           and a['own_vp'] >= b['own_vp'] and a['enemy_vp'] <= b['enemy_vp']
           and (within(a['gone'], b['gone']) if fp else within(b['gone'], a['gone']))
           and (a['corruption'] <= b['corruption'] if fp else a['corruption'] >= b['corruption'])
-          and all((x >= y) if fp else (x <= y) for x, y in zip(a['progress'], b['progress'])))
+          and all((x >= y) if fp else (x <= y) for x, y in zip(a['progress'], b['progress']))
+          and all(x >= y for x, y in zip(a['rings'], b['rings'])))
     return ok and a != b
 
 

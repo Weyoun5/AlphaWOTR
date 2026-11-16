@@ -385,10 +385,11 @@ class _Decision(object):
             if isinstance(pc, dict) else []
         self._v = self._runs = self._rest = None
         self._next = {}                                     # the Menu of the decision that follows each option
+        self._outs = {}                                     # the position each option leaves (outcome: asked once)
 
     def menu(self):
         return match.Menu(self.options, self.plan, self.sig, self.key, self.name, self.expand,
-                          self.conseq, self.outcome, self.tag, self.net, self.faults)
+                          self.conseq, self.outcome, self.tag, self.net, self.faults, self.position)
 
     def net(self, o):
         """The option as the renderer performs it and all the engine does alone after it, as ONE
@@ -536,11 +537,23 @@ class _Decision(object):
         return self._next[id(o)]
 
     def outcome(self, o):
+        if id(o) not in self._outs:
+            post = self.run(o).post
+            try:
+                self._outs[id(o)] = state_key(post) if post is not None else None
+            except Exception as e:
+                self._outs[id(o)] = self._failed(o, 'the outcome', e)
+        return self._outs[id(o)]
+
+    def position(self, o):
+        """The position o leaves, by the key the engine's own search knows a position by (cheap; what
+        it does not hold - WHICH card left a hand - the board shows), or None."""
+        import ai
         post = self.run(o).post
         try:
-            return state_key(post) if post is not None else None
+            return ai._state_sig(post, parts=True) if post is not None else None
         except Exception as e:
-            return self._failed(o, 'the outcome', e)
+            return self._failed(o, 'the position', e)
 
     def _die(self, o):
         letter = die_letter(self.state, self.side, o)
