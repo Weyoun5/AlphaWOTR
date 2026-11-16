@@ -60,11 +60,9 @@ and answers with a Verdict:
                             opened and was read as it lies: his answer only
                             when he says so (a closing word) - never applied
                             by time (ready() is False)
-               .unfinished  the answer closes its die / card window, the board
-                            has not (the die still lies in Current Action), AND
-                            a roll or a draw of the client, or a decision of his
-                            own, follows the step: once applied the board could
-                            not take it back (see ready)
+               .unfinished  the answer ends his action, and his die still lies
+                            in Current Action: putting it away is his (see
+                            ready)
                .conseq      per step: True when the board also shows (part
                             of) that step's consequences.
                .closing     the last step has no move of its own and was read
@@ -139,7 +137,6 @@ Menu the caller builds:
 import collections
 
 from . import boardmodel as bm
-from . import layout
 
 COMMIT, WAIT, NOTHING, UNDECIDED, MISMATCH = 'commit', 'wait', 'nothing', 'undecided', 'mismatch'
 EXTEND, CHANGE, SAME = 'extend', 'change', 'same'       # again(): kinds of a second commit
@@ -304,7 +301,6 @@ class _Level(object):
         not yet on the board)."""
         if self._cands is None:
             regions, dice = bm.observed(self.d_now)
-            hidden = bm.boxed(self.d_now)
             zones, out, less = bm.touched(self.d_now) + (regions,)
             if self.carry or self.lag:
                 # what the steps before may have left on the board (their consequences, what
@@ -320,10 +316,8 @@ class _Level(object):
                     continue
                 # (outside its pool a die has no face: 'die:fp:?' stands for any die of the side)
                 die_seen = s.die is None or s.die in dice or s.die[:7] + '?' in dice
-                # (a shared stronghold box that changed stands for ONE stronghold region the
-                # board does not name: the filter never rejects an option the board shows)
                 unseen = s.regions - regions
-                if die_seen and len(unseen) <= hidden and unseen <= layout.SHADOW_STRONGHOLDS:
+                if die_seen and not unseen:
                     first.append(o)
                 elif len(unseen) == 1 < len(s.regions):
                     (gapped if die_seen else undiced).append(o)
@@ -717,21 +711,18 @@ def _commit(chain, root, stats, check_extend, ahead=False, shut=frozenset(), tid
         # strict part of every bigger answer of that die and card, and the quiet time closes it
         ext = False
     # the answer's own plan closes its die / card window (the optional kill) and the board still
-    # holds a die or card in the play area - put there with this answer, or lying there since
-    # the decision opened (the die of a two-step action): the move is not finished on the board.
-    # That waits only where the board could not take the answer back once it is applied (ruling (Y)
-    # on the quiet time: an answer he has not closed AND that cannot be taken back by hand): a roll
-    # or a draw of the client follows the step - or a decision of his own follows it at once, which
-    # would read a change of this answer as ITS answer.  Where the other seat's step comes next, the
-    # board still takes it back while that step has not shown (BoardAnswers.again)
+    # holds HIS DIE in the play area - put there with this answer, or lying there since the
+    # decision opened (the die of a two-step action): the action is not finished on the board.
+    # Putting that die away is HIS (owner: "it also killed my die for me without my consent"):
+    # whatever step follows, the answer waits for it (ready).  A card alone holds nothing back
+    # (his combat card in its slot while he defends: no die of his is out, the battle is not
+    # his action - the casualties that end it are taken as they are made)
     last = chain[-1]
     closing = [ch for ch in last.p.plan if ch.opt and ch.pid is not None and ch.zone is not None
-               and bm.zone_id(ch.zone) in bm.USED_DICE and bm.kind_of(ch.pid).startswith(('die:', 'card'))]
+               and bm.zone_id(ch.zone) in bm.USED_DICE and bm.kind_of(ch.pid).startswith('die:')]
     waits = (not bm.kills(root.d_now) and bool(closing) and not (root.raw and bm.kills(root.raw))
-             and (any(v > 0 and z in bm.PLAY_AREA and k.startswith(('die:', 'card'))
-                      for (z, k), v in root.d_now.items())
-                  or any((root.base.p.get(ch.pid) or ('',))[0] in bm.PLAY_AREA for ch in closing))
-             and last.menu.expand is not None and last.menu.expand(last.o) is not None)
+             and (any(v > 0 and z in bm.PLAY_AREA and k.startswith('die:') for (z, k), v in root.d_now.items())
+                  or any((root.base.p.get(ch.pid) or ('',))[0] in bm.PLAY_AREA for ch in closing)))
     done, rest = [], root.d_now         # each step's pick out of its OWN share of the board
     for s in chain:
         done.append(bm.performed(rest, s.p.plan))
@@ -832,7 +823,7 @@ def reads(base, now, menu, pid, opened=None, acts=False):
                 collections.Counter())
     for o in menu.options:
         s = menu.sig(o) if menu.sig else None
-        if s is not None and s.regions is not None and bm.is_map_region(zone) and zone not in bm.SHARED_BOXES \
+        if s is not None and s.regions is not None and bm.is_map_region(zone) \
                 and bm.region_of(zone) not in s.regions:
             continue                    # (its own moves touch other map regions, exactly: Sig)
         p = lv.plan(o)
@@ -982,21 +973,16 @@ def ready(verdict, polls_equal, seconds_quiet, k=K_POLLS, q=Q_SECONDS):
     gave this same board; seconds_quiet = time since the last client line.
     THE QUIET TIME (q seconds) is for an answer that can still GROW or whose
     growth is not settled (a strict part of another target: `extendable` is
-    not False) - or that he has not closed (its die or card still lies in the
-    play area) AND that the board could not take back once it is applied:
-    a roll or a draw of the client follows it (a card drawn by hand, a
-    Fellowship move), or a decision of his own follows it at once and would
-    read his change of it as ITS answer (an attack, an action while the
-    other seat has no die left) - Verdict.unfinished; his kill of the die
-    makes it final at once.  Everything else k polls - also the last move of
-    a die that still lies laid out, a card's option with the card on the
-    table, when the other seat's step comes next: nothing can be added, and
-    the board takes it back while that step has not shown.  Never an
-    `untouched` answer: time does not make a board his that he has not
+    not False).  Everything else k polls - a card's option with the card on
+    the table, a step that does not end its action.  NEVER by time: an answer
+    he has not closed (it ends his action, and his die still lies in the
+    play area - Verdict.unfinished): putting the die away is his, and
+    makes the answer final at once (as a closing word or a click does); and
+    an `untouched` answer: time does not make a board his that he has not
     touched."""
-    if verdict.kind != COMMIT or verdict.untouched or polls_equal < k:
+    if verdict.kind != COMMIT or verdict.untouched or verdict.unfinished or polls_equal < k:
         return False
-    return (verdict.extendable is False and not verdict.unfinished) or seconds_quiet >= q
+    return verdict.extendable is False or seconds_quiet >= q
 
 
 def again(base, now, menu, committed, depth=MAX_DEPTH, opened=None, tidied_last=False):

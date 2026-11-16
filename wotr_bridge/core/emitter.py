@@ -1241,9 +1241,6 @@ def _holding_zone_code(replayer, pid, default=None):
 
 def _piece_zone_code(replayer, pid, default=None):
     """Client zone code where the replayer believes a piece sits."""
-    slot = (getattr(replayer, 'shadow_stronghold_regions', None) or {}).get(str(pid))
-    if slot and _norm_zone(replayer.piece_region.get(str(pid))) == slot[0] + ' stronghold':
-        return slot[1]
     zone = replayer.piece_region.get(str(pid)) \
         or layout.initial().get(str(pid))
     if not zone:
@@ -1335,19 +1332,14 @@ def garrison_side_of(state, region):
     return canon_side(g) if g is not None else None
 
 
-def arrival_zone(region, side, garrison, bound=None):
+def arrival_zone(region, side, garrison):
     """THE zone code of a piece of `side` that stands in, or arrives at, `region`.  garrison:
     the side that holds the region's stronghold under siege (None: no siege).  Its pieces are
-    inside the stronghold's box - the region's own; for a Shadow stronghold the shared box
-    `bound` ({piece: (region, box)}) ties to it, else the first free one (a third besieged
-    Shadow stronghold has none: its garrison stands in the field).  Every other piece: the field."""
+    inside the stronghold's box - the region's own, whichever side built the stronghold.  Every
+    other piece: the field."""
     key = _norm_zone(str(region))
     if garrison is not None and canon_side(side) == canon_side(garrison):
-        if key not in layout.SHADOW_STRONGHOLDS:
-            return zone_code_for(key + ' stronghold')
-        boxes = layout.shared_boxes(key, bound)
-        if boxes:
-            return boxes[0]
+        return zone_code_for(key + ' stronghold')
     return zone_code_for(key)
 
 
@@ -1364,13 +1356,12 @@ def relief_garrison(state, region, side):
 
 
 def garrison_arrival_zone(replayer, region, side, after=None):
-    """arrival_zone as a planner asks it: the siege is the ENGINE's (the view's state), the
-    shared boxes are tied as the view has them.  after: the engine state AFTER the arrival,
-    when the caller has it: a force that lands for a relief battle is no part of the garrison."""
+    """arrival_zone as a planner asks it: the siege is the ENGINE's (the view's state).  after:
+    the engine state AFTER the arrival, when the caller has it: a force that lands for a relief
+    battle is no part of the garrison."""
     key = _norm_zone(str(region))
     landing = after is not None and relief_garrison(after, key, side) is not None
-    return arrival_zone(key, side, None if landing else garrison_side_of(replayer.state, key),
-                        getattr(replayer, 'shadow_stronghold_regions', None))
+    return arrival_zone(key, side, None if landing else garrison_side_of(replayer.state, key))
 
 
 def plan_companion_move(replayer, nick, side_name, params):
@@ -1829,7 +1820,7 @@ def _supply_before(replayer, side, nation):
 
 
 def _reduce_elite(replayer, nick, side, elite, nation, source):
-    """One Elite reduced where it stands (also a seat in a shared stronghold box): it leaves the
+    """One Elite reduced where it stands (also inside a stronghold's box): it leaves the
     board and a Regular of its nation takes its seat, from the box `source` names."""
     seat = _piece_zone_code(replayer, elite[0])
     ops = [('swap_place', {'nick': nick, 'pieces': elite, 'to': seat})]
@@ -2343,8 +2334,7 @@ def plan(action_type, params, replayer, nick, side_name, die_idx=None):
                               % (side, region))
         # R17-SIEGE-LIFT-SWEEP D6 (the copy-watch line): before the
         # withdrawal the engine has the whole side in the FIELD.  A piece the
-        # client already shows inside this stronghold (its own box, or a
-        # shared Shadow slot bound to it) is NOT moved again - a field -> box
+        # client already shows inside this stronghold's box is NOT moved again - a field -> box
         # line for it is what the client refused (from-zone mismatch) - and
         # that is a loud zone_model_mismatch, never a silent skip.
         box_key = region + ' stronghold'
@@ -2365,8 +2355,7 @@ def plan(action_type, params, replayer, nick, side_name, die_idx=None):
             ops.extend(_by_real_zone(
                 replayer, ('move', {'nick': nick, 'pieces': rest,
                                     'frm': zone_code_for(region),
-                                    'to': arrival_zone(region, side_name, side_name, getattr(
-                                        replayer, 'shadow_stronghold_regions', None))}),
+                                    'to': arrival_zone(region, side_name, side_name)}),
                 'retreat_into_siege at %s' % region))
         return ops
     if action_type == 'siege_trim':

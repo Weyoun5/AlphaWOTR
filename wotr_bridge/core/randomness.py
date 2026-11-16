@@ -705,9 +705,10 @@ class ClientRandomness(object):
         did NOT use, by name.  A result answers the step it came for and never a later one:
         left in the bank it is taken by the next step of its kind, which then shows no roll
         or draw of its own (and a tile whose face has left the pool since stops every
-        retry).  Only what the PERSON made before he was asked stays - he may roll for a
-        request he sees coming, steps ahead, while the client makes nothing for the AI
-        except on a call; when his early roll is void is the server's rule (drop_early)."""
+        retry).  Only what the PERSON made before he was asked stays - he may roll, or draw
+        his card, for a request he sees coming, steps ahead (the card of an action whose die
+        an Elven Ring turns first), while the client makes nothing for the AI except on a
+        call; when his early result is void is the server's rule (drop_early)."""
         lost, early = Counter(), 0
         for kind, words, bank, used, passed, makers in self._lanes():
             stay = []
@@ -739,15 +740,19 @@ class ClientRandomness(object):
         return gone
 
     def drop_early(self, side):
-        """The server's rule ends the wait of `side`'s early roll (the AI acts, a battle or a
-        Hunt opens): its dice leave the bank; returns how many (for the caller's sentence).
+        """The server's rule ends the wait of `side`'s early results (the AI acts, a battle or a
+        Hunt opens): its dice leave the bank - returns how many (for the caller's sentence) -
+        and so does a card it drew early, which is dropped as unused (take_dropped).
         Between attempts only: the cursors of a running attempt index the bank."""
         tag, n = _side_name(side), 0
         if self._feed_pos != _cursors():
             return 0
-        for _kind, _words, bank, _used, _passed, makers in self._lanes():
+        for kind, _words, bank, _used, _passed, makers in self._lanes():
             keep = [e for e, maker in zip(bank, makers) if maker != tag]
-            n += len(bank) - len(keep)
+            if kind == 'card':      # (a piece of the client's board: it goes back as every unused result)
+                self._dropped += [str(e[1]) if e[1] is not None else None for e, m in zip(bank, makers) if m == tag]
+            else:
+                n += len(bank) - len(keep)
             bank[:] = keep
         return n
 
@@ -880,11 +885,13 @@ class ClientRandomness(object):
         return bank, range(p[name] if key is None else p[name].get(key, 0)), (), [None] * len(bank)
 
     def _lanes(self):
-        """Every bank as _lane gives it, with its kind and its plain name in front."""
+        """Every bank as _lane gives it, with its kind and its plain name in front - and, for the
+        end of a step, WHOSE each entry is: a card is its deck's side's (nobody else draws it)."""
         for kind, (name, _request, words) in _KINDS.items():
             for key in (list(self._feed[name]) if kind == 'card' else [None]):
-                yield (kind, words if key is None else '%s %s %s' % (key + (words,))) \
-                    + self._lane(kind, key)
+                bank, used, passed, makers = self._lane(kind, key)
+                yield (kind, words if key is None else '%s %s %s' % (key + (words,)), bank, used, passed,
+                       makers if key is None else [key[0]] * len(bank))
 
     def owed(self):
         """What the open request still lacks: {deck of a draw, or None: how many}."""

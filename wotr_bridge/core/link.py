@@ -154,7 +154,6 @@ class ClientLink(object):
         self.view = ClientView(state)
         self.view.die_id_map = {}
         self.board = None           # reconcile.Board of this poll, or None
-        self.bound = {}             # shared Shadow stronghold boxes of this poll
         self.attested = False       # the client's feed stated which hand it keeps from the AI
         self.receipts = Receipts(client_dir, self.feed.path, voice)     # what the client did with my replies
         self.owed = []              # lines owed to the client ahead of everything else of the next reply
@@ -372,9 +371,8 @@ class ClientLink(object):
                     return False
             self.feed_off = 0 if self.feed_off is None and want == len(self.feed.lines) else self.feed_off
         state = self.state()
-        self.view.piece_region, self.bound = layout.bind_shared_boxes(state, board.zone)
+        self.view.piece_region = layout.zone_names(board.zone)
         self.board = board
-        self.view.shadow_stronghold_regions = dict(self.bound)
         self.view.piece_mark = dict(board.mark)     # a two-sided piece is turned to a SIDE
         self.bind(state)                # (until the loop knows what the person moved on this board)
         return True

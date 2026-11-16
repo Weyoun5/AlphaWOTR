@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """menu - the match.Menu of an open decision of the person (bridge2/m3/INTERFACE.md).
 
-    opening = tables(state, board, cid_pid, bound)          once, when the decision opens
+    opening = tables(state, board, cid_pid)                 once, when the decision opens
     m       = build(state, side, kind, options, opening, ctx)
     v       = match.judge(opening.base, table(board), m, opened=opening.opened)   per changed board
     steps   = realise(state, v.chain, v)                    at the commit: [(action, fix)]
@@ -128,7 +128,7 @@ def board_key(board):
             frozenset(board.mark.items()))
 
 
-def _wanted(state, board, cid_pid=None, bound=None, settled=None, keep=None, dice=None, his=()):
+def _wanted(state, board, cid_pid=None, settled=None, keep=None, dice=None, his=()):
     """What reconcile would still move on `board` for `state` -> (rows [(pid, zone, face,
     side)], its ops, the rows nothing can show).  `settled`: as if no decision were open.
     What an open or owed decision is about (keep(state, board); the owed rows of PICKS when
@@ -136,7 +136,7 @@ def _wanted(state, board, cid_pid=None, bound=None, settled=None, keep=None, dic
     pick is never on the board a decision is read from.  dice: the binding of the die pieces,
     when the board is the client's own (reconcile.bind_dice; else bound here).  his: {piece:
     where he took it from} - of several of a kind THAT piece goes, and back there."""
-    ops, unshown = rc.moves(rc.difference(state, board, cid_pid, settled or rc.settled(state), bound, dice,
+    ops, unshown = rc.moves(rc.difference(state, board, cid_pid, settled or rc.settled(state), dice,
                                           keep=(keep or owned)(state, board)), his)
     rows = []
     for op in ops:
@@ -175,7 +175,7 @@ def _change(row, optional=False, src=None):
     return bm.Change(row[0], row[1], row[2], row[3], None, src, 1, optional)
 
 
-def tables(state, board, cid_pid=None, bound=None, keep=None, his=(), dice=None, turned=()):
+def tables(state, board, cid_pid=None, keep=None, his=(), dice=None, turned=()):
     """OPENED (the client board as it is) and BASE (the board as the engine state has it).
     keep(state, board): the pieces of a decision of his that is open or owed (see _wanted).
     his: the pieces he moved before this decision was asked and that are its to read
@@ -185,12 +185,12 @@ def tables(state, board, cid_pid=None, bound=None, keep=None, his=(), dice=None,
     piece of the same kind in the same place stands for one of them.
     dice: the loop's binding of the die pieces of this board (one binding for all who read it)."""
     his = dict(his)
-    rows, ops, unshown = _wanted(state, board, cid_pid, bound, None, keep, dice, his)
+    rows, ops, unshown = _wanted(state, board, cid_pid, None, keep, dice, his)
     # a card the engine holds in a hand that already lies in a Current Card slot was put there
     # early (the next card of a chain, ahead of a roll).  While a decision is open the comparison
     # leaves the play area alone; BASE has such a card where the comparison will want it - in
     # the hand - so that playing it stays the move of the option that plays it
-    later = _wanted(state, board, cid_pid, bound, True, keep, dice, his)[0]
+    later = _wanted(state, board, cid_pid, True, keep, dice, his)[0]
     rows += [r for r in later if r[1] in HAND.values() and board.zone[r[0]] in PLAY.values()]
     # ... and a die or card HE put away before this decision was asked (out of the play area, or
     # out of his pool or hand by way of it: not one he only moved from box to box) lies in BASE in
@@ -277,8 +277,7 @@ def _view(live, state, board):
     """A copy of the live view that shows `board` under `state` (what Server._read_board sets)."""
     v = copy.copy(live)
     v._state_fn = lambda: state
-    v.piece_region, bound = layout.bind_shared_boxes(state, board.zone)
-    v.shadow_stronghold_regions = dict(bound)
+    v.piece_region = layout.zone_names(board.zone)
     v.die_id_map = rc.bind_dice(state, board)
     v.piece_mark = dict(board.mark)
     v.fellowship_location = v.piece_region.get(bm.FELLOWSHIP)
@@ -290,7 +289,7 @@ def _render(view, nick, side, kind, act, pre, post):
     seat fact of the reveal flip: he is one seat, so the Free Peoples seat is the AI's exactly
     when he plays the Shadow (the AI's placement then turns the figure)."""
     v = copy.copy(view)
-    for k in ('piece_region', 'shadow_stronghold_regions', 'die_id_map', 'piece_mark'):
+    for k in ('piece_region', 'die_id_map', 'piece_mark'):
         setattr(v, k, dict(getattr(view, k)))
     if kind == 'declare' and act.action_type == 'pass':
         return emission.Emission()
@@ -384,10 +383,6 @@ class _Decision(object):
         self.battle = sorted(set(str(pc[k]) for k in ('defender_region', 'attacker_region', 'region',
                                                       'trim_region') if pc.get(k))) \
             if isinstance(pc, dict) else []
-        # the pair of shared Shadow stronghold boxes is one place while it holds one garrison
-        held = self.battle + list(getattr(state, 'besieged_strongholds', None) or ())
-        self.either = tuple(layout.SHARED_BOXES.values()) if layout.one_garrison(
-            bm.region_token(r) for r in held) else ()
         self._v = self._runs = self._rest = None
         self._next = {}                                     # the Menu of the decision that follows each option
 
@@ -499,8 +494,6 @@ class _Decision(object):
                        self.base0.place(row[0])[0] if row[0] in self.base0.p else None,
                        bm.zone_id(row[1]) if row[1] is not None else None)
             hit = next((t for t in (k.take(self, o, mv) for k in picks if k.take) if t), None)
-            if row[1] in self.either and mv.was is not None:    # into either box of the pair
-                hit = (hit[0] if hit else kind, hit[1] if hit else mv.was, self.either)
             if hit:
                 groups[hit] += 1
             else:

@@ -16,8 +16,9 @@ INSTALL
 PLAY
   The launcher asks your side and which AI you play against.
   In the client: New Game, then menu AI > "Play vs AI..." > Start Game.
-  Play on the board as against a person, or click your choice in the AI
-  panel on the right.  In chat, "help" lists the words the AI
+  Play on the board as against a person (your action ends when you put
+  your die away), or click your choice in the AI panel on the right.
+  In chat, "help" lists the words the AI
   understands; "back" puts the board back, "undo" takes back your last
   decision, "pass" passes.  Attacks are typed: "osg from si nc"
   (nc = no combat card).  Abbreviations: da dg ereb fords gh gorg hd

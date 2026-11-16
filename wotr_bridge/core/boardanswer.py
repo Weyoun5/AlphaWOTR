@@ -342,7 +342,7 @@ class BoardAnswers(object):
         result does not fit): what he moved and the game has elsewhere is NEEDED - it goes back."""
         pos, board = self.position(), self.link.board
         ops = reconcile.moves(reconcile.difference(
-            pos.state, board, self.link.view.card_pid_map, True, self.link.bound,
+            pos.state, board, self.link.view.card_pid_map, True,
             self.link.view.die_id_map))[0] if board is not None and self.his.pieces else ()
         self.end(words.NEEDED, [op[2] for op in ops if op[2] in self.his.pieces])
 
@@ -539,7 +539,7 @@ class BoardAnswers(object):
             g = self.gest = Gesture(o.id, o.state, o.side, spec, self.position(), self.now(), options=o.menu)
             owed = functools.partial(mn.owned, phase=g.pos.phase, person=self.human)
             g.elsewhere = aside = self.aside(g, self.his.pieces, self._staging(g.pos))
-            g.opening = mn.tables(o.state, self.link.board, self.link.view.card_pid_map, self.link.bound, owed,
+            g.opening = mn.tables(o.state, self.link.board, self.link.view.card_pid_map, owed,
                                   {p: own.frm for p, own in self.his.pieces.items() if p not in aside},
                                   self.link.view.die_id_map or None, [p for p, own in self.his.pieces.items() if own.turned])
             if ahead:       # (all that separates this board from the game he did himself: read as moved, not as lagging)

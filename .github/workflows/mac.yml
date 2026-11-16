@@ -32,10 +32,11 @@ jobs:
       # The real client, started as a person starts it (AI vs AI, so that nobody has to click): its window must come
       # up, its AI menu must hold entries only (macOS draws the menus and shows nothing else), and the AI panel's
       # strength knob must show and, dragged, be written to play_settings.json.  The look is
-      # .github/mac_look/MenuLook.java's (a java agent); what it saw and its pictures are kept below.
+      # .github/mac_look/MenuLook.java's (a java agent); what it saw and its pictures are kept below.  Then the game
+      # plays on for LOOK_PACE_S seconds without search and pace.csv records how the client answers as its log grows.
       - name: The game client and its AI menu
         working-directory: ${{ runner.temp }}/fresh/AlphaWOTR
-        timeout-minutes: 12
+        timeout-minutes: 25
         run: |
           LOOK="$RUNNER_TEMP/look"
           JDK="${JAVA_HOME:-$(/usr/libexec/java_home)}"
@@ -45,12 +46,13 @@ jobs:
           "$JDK/bin/jar" cfm "$LOOK/MenuLook.jar" "$LOOK/manifest.txt" -C "$LOOK/classes" .
           set +e
           env -i HOME="$HOME" TMPDIR="$TMPDIR" JAVA_HOME="$JDK" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-            JAVA_TOOL_OPTIONS="-javaagent:$LOOK/MenuLook.jar=$LOOK" \
+            JAVA_TOOL_OPTIONS="-javaagent:$LOOK/MenuLook.jar=$LOOK" LOOK_PACE_S=780 \
             ./python/bin/python3 -B wotr_bridge/play.py AUTO > "$LOOK/session.log" 2>&1
           echo "the session ended with $?"
           set -e
           tail -n 40 "$LOOK/session.log"
           cat "$LOOK/look.json"
+          cat "$LOOK/pace.csv" || true
           grep -q '"ai_menu": true' "$LOOK/look.json"
           grep -q '"menu_entries_only": true' "$LOOK/look.json"
           grep -q '"legacy_entry": false' "$LOOK/look.json"
@@ -68,6 +70,7 @@ jobs:
             ${{ runner.temp }}/made/AlphaWOTR-mac.zip.sha256
             ${{ runner.temp }}/made/selftest_mac.json
             ${{ runner.temp }}/look/look.json
+            ${{ runner.temp }}/look/pace.csv
             ${{ runner.temp }}/look/session.log
             ${{ runner.temp }}/look/*.png
             ${{ runner.temp }}/fresh/AlphaWOTR/turn_search/turn_search_service.log

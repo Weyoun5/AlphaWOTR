@@ -55,7 +55,7 @@ class ClientView(object):
         """A copy for a probe: dicts of its own (a renderer may write them) and, when `state`
         is given, that state in the place of the game's."""
         view = copy.copy(self)
-        for name in ('piece_region', 'shadow_stronghold_regions', 'die_id_map', 'piece_mark'):
+        for name in ('piece_region', 'die_id_map', 'piece_mark'):
             if hasattr(view, name):
                 setattr(view, name, dict(getattr(view, name)))
         if state is not None:

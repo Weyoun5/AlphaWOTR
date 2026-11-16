@@ -339,6 +339,9 @@ def is_map_region(zid):
     return not _GENERIC.match(zid)
 
 
+SEATS = frozenset(('fellowship box', 'guide box'))      # where a Companion of the Fellowship sits
+
+
 def region_of(zid):
     """The map region of a zone id: the stronghold box belongs to its region."""
     return zid[:-11] if zid.endswith(' stronghold') else zid
@@ -687,8 +690,10 @@ def inside(part, whole, coarse=frozenset()):
 
 def lent(part, whole, coarse=frozenset()):
     """`part` shows on the map in `whole` and is all there but for pieces leaving or entering ONE
-    map region: another step of the same answer brought as many back there, or took them on
-    (two armies moved one behind the other).  Everything off the map - its die - must be there,
+    place a figure stands - a map region, or a seat of the Fellowship (SEATS): another step of
+    the same answer brought as many back there, or took them on (two armies moved one behind the
+    other; the hobbit made Guide and sent out of the Fellowship in one go, who never showed in the
+    Guide box).  Everything else off the map - its die - must be there,
     but the other end of a trip into or out of that region which the other step made back WHOLE
     (the Regular a reduce brought, removed as the next hit: neither end shows)."""
     p, w = project(part, coarse), project(whole, coarse)
@@ -696,7 +701,7 @@ def lent(part, whole, coarse=frozenset()):
     for k, v in p.items():
         if k[0] in PLAY_AREA or (v > 0 and k[0] in DICE_POOLS):
             continue
-        on_map = all(is_map_region(z) for z in k[0].split('|'))    # (a choice of zones: every one of them)
+        on_map = all(is_map_region(z) or z in SEATS for z in k[0].split('|'))   # (a choice of zones: every one of them)
         if (0 < v <= w.get(k, 0)) or (w.get(k, 0) <= v < 0):
             shown = shown or on_map
             continue
@@ -904,21 +909,9 @@ def observed(d):
     for (z, k) in d:
         if k.startswith('die:'):
             dice.add(k)
-        if is_map_region(z) and z not in SHARED_BOXES:
+        if is_map_region(z):
             regions.add(region_of(z))
     return frozenset(regions), frozenset(dice)
-
-
-# A piece in a stronghold's box stands in that stronghold's region.  A Free Peoples stronghold
-# has a box of its own ('<region> stronghold': region_of); the Shadow strongholds share ONE pair
-# of boxes, and which stronghold a shared box holds is the engine's knowledge, not the board's.
-SHARED_BOXES = frozenset(zone_id(code) for code in layout.SHARED_BOXES.values())
-
-
-def boxed(d):
-    """How many shared stronghold boxes a delta touches: each stands for one region of
-    layout.SHADOW_STRONGHOLDS that the board does not name (for the prefilter)."""
-    return len({z for (z, _k) in d if z in SHARED_BOXES})
 
 
 # ---------------------------------------------------------------- plain words

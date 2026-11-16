@@ -36,6 +36,9 @@ class Comparison(object):
         self.fresh = False          # started from a saved position: the board is built whole first
         self.turn_ends = []         # [{'turn', 'rows', 'stray'}] verified at each turn end
         self.verdict = (0, 0, 'equal', [])      # (poll, id of the state compared, verdict, rows)
+        self.spent = set()          # the combat cards of rounds that have been fought: put away by the next pass
+        #                             that looks at the whole board (played)
+        self.round = set()          # the combat cards a battle still holds for its round
         self.left = None            # what a card of his own leaves to HIM (the loop opens it; _left, waits): [the number
         #                             of the sentence that told him - 0: not told yet -, what is left now, in words]
 
@@ -60,6 +63,11 @@ class Comparison(object):
             return rows
         self.left[1] = what
         return [r for r in rows if not any(r is x for x in mine)]
+
+    def played(self, base, act, post):
+        """The loop took a step of the game: what it did with the combat cards of a battle (reconcile.round_cards)."""
+        self.round, spent = reconcile.round_cards(base, act, post, self.round)
+        self.spent |= spent
 
     def waits(self):
         """Asked by the loop after a pass that looked at the whole board, before it takes the next step of
@@ -118,14 +126,15 @@ class Comparison(object):
         # placed too, whatever decision the position has open (until equal once).  What is the
         # person's stays where it lies (owned) - after "back" nothing he moved is his any more,
         # and with no decision of his open nothing a decision owns either
-        known = (state, board, self.link.view.card_pid_map, settled or self.fresh, self.link.bound,
-                 self.link.view.die_id_map or None)
-        rows = reconcile.difference(*known, own.pieces if asked is None or own.whole else (), fate)
+        known = (state, board, self.link.view.card_pid_map, settled or self.fresh, self.link.view.die_id_map or None)
+        spent = self.spent = {c for c in self.spent if not known[3] and board.zone.get(
+            str(known[2].get(c))) in reconcile.DISPLAY}         # (while one still lies in the play area)
+        rows = reconcile.difference(*known, own.pieces if asked is None or own.whole else (), fate, spent)
         if not held and asked is None and self.human is not None:
             self.settle(fate, settled)
         back = self.owned().back
         if any(fate.get(p, 0) is not None and p in own.pieces for p in back):   # (kept a moment ago, his no longer)
-            rows = reconcile.difference(*known, self.owned().pieces)
+            rows = reconcile.difference(*known, self.owned().pieces, None, spent)
         self.left = None if asked is not None else self.left    # ("back": the whole board as the game has it)
         rows = rows if held else self._left(rows)
         ops, unshown = reconcile.moves(rows, back)
@@ -133,7 +142,7 @@ class Comparison(object):
         # this pass does not look at (asked as if the game were settled); only what is his AGAIN goes where HE had put it
         gone = {p: frm for p, frm in back.items() if p not in own.pieces and not reconcile.looks(p, known[3])}
         ops += [op for op in reconcile.moves(reconcile.difference(
-            state, board, known[2], True, known[4], known[5], self.owned().pieces), gone)[0] if op[2] in gone] if gone else []
+            state, board, known[2], True, known[4], self.owned().pieces), gone)[0] if op[2] in gone] if gone else []
         ops += [('move', layout.side_of(p), p, board.zone[p], frm) for p, frm in sorted(back.items())
                 if frm and p in own.pieces and board.zone.get(p) not in (None, frm) and not any(op[2] == p for op in ops)]
         if held:        # (rows nothing else of which is this pass's)

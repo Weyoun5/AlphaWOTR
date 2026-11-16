@@ -38,14 +38,9 @@ BOXES = {
 # the families a player himself places, moves and removes on the map - his figures; all else on the
 # table is a marker, a die, a card or a tile
 FIGURES = frozenset(('fp unit', 'fp leader', 'companion', 'sa unit', 'minion'))
-# THE BOXES OF THE STRONGHOLDS: a Free Peoples stronghold has a box of its own; the Shadow
-# strongholds share one pair, and a pair that holds ONE garrison is one place.  Which stronghold
-# a shared box holds is the engine's knowledge, so this row is applied where the state is known:
-# by the plans (menu: a piece that goes into the pair may go into either box) and by the
-# comparison (reconcile: either box is right) - not by the board model
-SHARED_BOXES = {'shadow stronghold': 'Game.1996', 'shadow stronghold 2': 'Game.2028'}
-SHADOW_STRONGHOLDS = frozenset(('orthanc', 'moria', 'dol guldur', 'mount gundabad', 'morannon',
-                                'minas morgul', 'barad dur', 'umbar'))
+# THE BOXES OF THE STRONGHOLDS: each of the sixteen strongholds has a box of its own, named
+# '<region> stronghold' (the client's double click on a stronghold moves its units there): the
+# garrison of a siege stands in it, whichever side holds the walls (emitter.arrival_zone)
 # THE SLOTS: zones (by the client's own name, lower case) that are one place for every piece -
 # a card or a ring is one of a kind, the slot it lies in does not change which one it is.
 # (pattern, the one zone, its words)
@@ -140,21 +135,6 @@ def kill_box(pid, types=None):
     return boxes(pid, types)[0]
 
 
-def one_garrison(regions):
-    """Do the shared boxes hold at most one garrison?  regions: the strongholds under siege and
-    the regions of an open battle, by name."""
-    return len(SHADOW_STRONGHOLDS.intersection(regions)) <= 1
-
-
-def shared_boxes(region, bound=None):
-    """The shared boxes that may hold the garrison of a Shadow stronghold (the first: where a
-    plan shows it): the one that `bound` ({piece: (region, box)} of the pieces lying in the
-    shared boxes) ties to it, then every shared box tied to no stronghold."""
-    used = {code: reg for reg, code in (bound or {}).values()}
-    codes = tuple(SHARED_BOXES.values())
-    return tuple(c for c in codes if used.get(c) == region) + tuple(c for c in codes if c not in used)
-
-
 def unit_type(pid, dynamic_types=None, side_hint=None):
     """(nation, kind) of a client piece, the kind in lower case: 'regular', 'elite', 'leader',
     'nazgul', or 'companion' / 'minion' with the figure's name for the nation.  dynamic_types:
@@ -171,49 +151,10 @@ def unit_type(pid, dynamic_types=None, side_hint=None):
     return nation, (str(getattr(kind, 'value', kind)).lower() if kind is not None else None)
 
 
-def bind_shared_boxes(state, zone, dynamic_types=None):
-    """A board's {piece: zone code} -> ({piece: the name of its zone}, {piece: (region, shared
-    box code)}).  A piece in a shared Shadow stronghold box is named '<region> stronghold': the
-    box belongs to the besieged Shadow stronghold whose engine garrison its unit pieces match
-    best; with no besieged Shadow stronghold the pieces keep the box's own name."""
+def zone_names(zone):
+    """A board's {piece: zone code} -> {piece: the client's own name of its zone}."""
     import log_replay as lr
-    from board import sanitize
-    names = {pid: (LOCATION_CODES.get(code) or lr.decode_location(code) or code) for pid, code in zone.items()}
-    slots = {}
-    for pid, code in zone.items():
-        if code in SHARED_BOXES.values():
-            slots.setdefault(code, []).append(pid)
-    if not slots or state is None:
-        return names, {}
-    sieged = sorted(sanitize(str(b)) for b in (getattr(state, 'besieged_strongholds', None) or ())
-                    if sanitize(str(b)) in SHADOW_STRONGHOLDS)
-    armies = {sanitize(str(k)): a for k, a in state.armies.items()}
-    low = lambda x: str(getattr(x, 'value', x)).lower()
-
-    def score(region, pids):
-        have = {}
-        for u in getattr(armies.get(region), 'units', ()) or ():
-            key = (low(u.nation), low(u.kind))
-            have[key] = have.get(key, 0) + 1
-        hit = 0
-        for pid in pids:
-            nation, kind = unit_type(pid, dynamic_types)
-            if have.get((low(nation), kind), 0) > 0:
-                have[(low(nation), kind)] -= 1
-                hit += 1
-        return hit
-
-    bound, taken = {}, set()
-    for code in sorted(slots, key=lambda c: -len(slots[c])):
-        free = [r for r in sieged if r not in taken]
-        if not free:
-            continue
-        region = max(free, key=lambda r: score(r, slots[code]))
-        taken.add(region)
-        for pid in slots[code]:
-            names[pid] = region + ' stronghold'
-            bound[pid] = (region, code)
-    return names, bound
+    return {pid: (LOCATION_CODES.get(code) or lr.decode_location(code) or code) for pid, code in zone.items()}
 
 
 def political_marker_active(pid, marks):

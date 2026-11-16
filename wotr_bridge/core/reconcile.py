@@ -54,7 +54,7 @@ def settled(state):
 
 def looks(pid, settled):
     """Does a pass of difference() look at this piece?  At an action die, an event card and a
-    Hunt tile only when the game is settled."""
+    Hunt tile only when the game is settled (but the combat cards of a fought round: round_cards)."""
     return settled or not str(layout.family(pid)).endswith((' die', ' card', 'tile'))
 
 
@@ -210,7 +210,7 @@ def _off_board(tag, have, dead):
     return pool[::-1] if tag == 'fp' and sum(z == FP_DEAD for z in have.values()) >= dead else pool
 
 
-def _army_rows(state, board, bound, rows):
+def _army_rows(state, board, rows):
     """Units, Leaders, Nazgul, Minions, separated Companions: region by
     region, inside the stronghold box for the garrison of a siege."""
     from combat import garrison_side_for
@@ -234,8 +234,8 @@ def _army_rows(state, board, bound, rows):
             if stays is not None and em.canon_side(side) == em.canon_side(garrison):
                 stays[category(figure, unit)] -= 1
                 if stays[category(figure, unit)] < 0:
-                    return em.arrival_zone(region, side, None, bound)
-            return em.arrival_zone(region, side, garrison, bound)
+                    return em.arrival_zone(region, side, None)
+            return em.arrival_zone(region, side, garrison)
         for u in army.units:
             side = _side(u.nation)
             cls = ('unit', _nv(u.nation), _nv(u.kind), side)
@@ -256,18 +256,11 @@ def _army_rows(state, board, bound, rows):
     flux = {}
     fought = {_key(battle[k]) for k in ('defender_region', 'attacker_region', 'region', 'trim_region')
               if isinstance(battle, dict) and battle.get(k)}
-    shadow = (sieged | fought) & layout.SHADOW_STRONGHOLDS
     for region in sorted(fought - sieged):
         try:                            # (a battle region without a stronghold has no box)
-            boxes = layout.shared_boxes(region, bound) if region in shadow else (
-                em.arrival_zone(region, 'fp', 'fp', bound),)
-            flux.update((box, _code(region)) for box in boxes)
+            flux[em.arrival_zone(region, 'fp', 'fp')] = _code(region)
         except LookupError:
             pass
-    for region in sorted(shadow & sieged if layout.one_garrison(sieged | fought) else ()):
-        # the two shared boxes are one place while they hold ONE garrison (layout.SHARED_BOXES)
-        boxes = layout.shared_boxes(region, bound)
-        flux.update((box, boxes[0]) for box in boxes[1:])
     have = {}
     for pid, code in board.zone.items():
         if pid in lr.COMPANIONS or pid in lr.MINION_PIECES:
@@ -487,15 +480,37 @@ def table_cards(state):
     return [str(c.card_id) for c in list(getattr(table, 'fp_cards', ())) + list(getattr(table, 'sh_cards', ()))]
 
 
-def _card_rows(state, board, cid_pid, rows):
+def round_cards(base, act, post, held=()):
+    """The combat cards of a battle's round across the step `act` -> (those the battle still holds, those
+    that are SPENT).  held: the cards committed by the steps before; the battle of `base` names its two, and
+    `act` may commit one.  A card is spent when the battle of `post` names it nowhere any more - not as a
+    commitment, not in a round that pauses for an effect, not for what follows the casualties - or is over:
+    the round was fought, and the card is the game's discard although the battle, and with it the action,
+    goes on (difference: spent)."""
+    was, now = [getattr(s, 'pending_combat', None) or {} for s in (base, post)]
+    cards = set(held) | {c for c in (was.get('atk_combat_card'), was.get('def_combat_card')) if isinstance(c, str)}
+    if act.action_type == 'combat_card_play' and (act.params or {}).get('card_id'):
+        cards.add(str(act.params['card_id']))
+
+    def names(x, cid):
+        return x == cid or (isinstance(x, dict) and any(names(v, cid) for v in x.values())) or (
+            isinstance(x, (list, tuple, set, frozenset)) and any(names(v, cid) for v in x))
+    # (the record of the round that was observed is its history, no use of the card)
+    live = {k: v for k, v in now.items() if k != '_observed_round_completed'}
+    still = {c for c in cards if names(live, c)}
+    return still, cards - still
+
+
+def _card_rows(state, board, cid_pid, rows, only=None):
     """Event cards: one whose identity is known lies in its hand, on the table, in its deck or
-    discarded; the cards nobody has seen lie in their decks."""
+    discarded; the cards nobody has seen lie in their decks.  only: these cards alone, where they
+    still lie in the play area (the combat cards of a fought round, while the game is not settled)."""
     from game_state import Side
     table = set(table_cards(state))
     used = {board.zone[p] for p in cid_pid.values() if board.zone.get(p) in TABLE}
     for cid, pid in sorted(cid_pid.items()):
         z = board.zone.get(pid)
-        if z is None:
+        if z is None or (only is not None and (cid not in only or z not in DISPLAY)):
             continue
         side = Side.FREE_PEOPLES if str(cid).startswith('FREE_PEOPLES') else Side.SHADOW
         tag = 'fp' if side is Side.FREE_PEOPLES else 'sa'
@@ -517,6 +532,8 @@ def _card_rows(state, board, cid_pid, rows):
         if z != want:
             rows.append(Row('card of the %s' % ('Free Peoples' if tag == 'fp' else 'Shadow'),
                             tag, Counter({want: 1}), {pid: z}, [], {}, {}))
+    if only is not None:
+        return
     # the cards nobody has seen: a card piece whose identity is not known belongs in its deck,
     # and the deck holds as many of them as the game has undealt cards there.  One that lies
     # elsewhere goes back (unseen); one too many is a card the game holds outside the deck
@@ -548,39 +565,40 @@ def _tile_rows(state, board, rows):
                         have.get(cls, {}), [TILE_REMOVED], {}, {}))
 
 
-def difference(state, board, cid_pid=None, settled=True, bound=None, dice=None, keep=(), fate=None):
+def difference(state, board, cid_pid=None, settled=True, dice=None, keep=(), fate=None, spent=()):
     """Every row where the board is not the engine ([] = equal).  A plain
     function of (engine state, board); the rest is optional knowledge:
     cid_pid  {card id: piece} of the cards whose identity is known
     settled  False while a decision is open (display slots are left alone)
-    bound    layout.bind_shared_boxes' pid -> (region, shared box)
     dice     bind_dice's result, when the caller already has it
     keep     the pieces that are a person's (boardanswer.BoardAnswers.owned; menu.owned): each
              is wanted where it lies (_kept) - {piece: the place he took it from, or None}, or
              the pieces alone; no other piece is moved in the stead of one (dice: bind_dice)
     fate     a dict: this pass ASKS whether what is a person's may stay where it lies, and is
              told what _kept found for each of his pieces it looks at (see there) - and True
-             for one it looks at that no row holds (a card in its place): the game has it there."""
+             for one it looks at that no row holds (a card in its place): the game has it there.
+    spent    the combat cards of a round that has been fought (round_cards): put away at once, also
+             while the game is not settled"""
     dice = bind_dice(state, board, keep) if dice is None else dice
-    rows = [_kept(r, keep, fate, settled) for r in _rows(state, board, cid_pid, settled, bound, dice)]
+    rows = [_kept(r, keep, fate, settled) for r in _rows(state, board, cid_pid, settled, dice, spent)]
     if fate is not None and isinstance(keep, dict):
         fate.update((p, True) for p, frm in keep.items() if frm is not None and p not in fate and looks(p, settled))
     return [r for r in rows if r.flip or r.face or _unbalanced(r)]
 
 
-def _rows(state, board, cid_pid=None, settled=True, bound=None, dice=None):
+def _rows(state, board, cid_pid=None, settled=True, dice=None, spent=()):
     """Every row of the comparison - where each class of pieces lies and where the engine
     has it -, balanced or not (see difference)."""
-    if bound is None:
-        bound = layout.bind_shared_boxes(state, board.zone)[1]
     rows = []
-    _army_rows(state, board, bound or {}, rows)
+    _army_rows(state, board, rows)
     _marker_rows(state, board, rows)
     dice = bind_dice(state, board) if dice is None else dice
     if settled:
         _card_rows(state, board, cid_pid or {}, rows)
         _dice_rows(state, board, dice, rows)
         _tile_rows(state, board, rows)
+    elif spent:
+        _card_rows(state, board, cid_pid or {}, rows, spent)
     for attr in ('pending_army_move', 'pending_muster'):
         # the die of a two-step action under way lies in the play area: one that was killed
         # before the action ended (a take-back of the step that closed it) comes back

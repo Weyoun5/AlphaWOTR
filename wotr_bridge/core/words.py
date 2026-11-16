@@ -368,7 +368,7 @@ def units_words(params):
 # kind of an open decision -> (title, what is asked, how to answer it on the board, what to type)
 DECISIONS = {
     'action': ('Your action', 'use one of your action dice',
-               'spend the die and move your pieces',
+               'move your pieces and put the die away',
                'an attack ("dale from erebor") or "pass"'),
     'declare': ('The Fellowship phase', 'declare where the Fellowship is, or go on',
                 'move the Fellowship figure to its region', '"fp ok" to go on without declaring'),
@@ -379,7 +379,7 @@ DECISIONS = {
     'guide_change': ('The Guide', 'choose the Guide of the Fellowship',
                      'put the Companion into the Guide box', '"fp ok" to keep the one who sits there'),
     'hunt': ('The Hunt', 'the Hunt found the Fellowship, choose how to take the damage',
-             'move the Corruption marker or remove the Companion', ''),
+             'move the Corruption marker or remove the Companion', '"random" for a random Companion'),
     'hunt:hunt_gollum': ('The Hunt', 'Gollum is the Guide: he may reveal the Fellowship to '
                          'take one damage less', '', ''),
     'hunt:hobbit_place': ('The Hunt', 'a hobbit leaves the Fellowship, choose where he goes',
@@ -411,8 +411,8 @@ DECISIONS = {
     'combat:defender_siege_choice': ('Field or siege', 'fight in the field or withdraw into the stronghold',
                                      'move your units into the stronghold box',
                                      '"field" to fight in the field'),
-    'combat:defender_retreat': ('Retreat', 'retreat to a free region or stand',
-                                'move the army to the region', '"field" to stand'),
+    'combat:defender_retreat': ('Retreat', 'retreat to a free region, into your stronghold, or stand',
+                                'move the army there', '"field" to stand'),
     'combat:attacker_card_retreat': ('Retreat', 'your combat card lets you retreat: retreat or stand',
                                      'move the army to the region', '"field" to stand'),
     'combat:victor_advance': ('Advance', 'advance into the conquered region or stay',
@@ -459,16 +459,18 @@ ALIASES = {
     'fp ok': ('pass',),
     'done': ('followup_done',),
     'field': ('combat_no_retreat',),
+    'fight': ('combat_no_retreat',),
     'siege': ('retreat_into_siege',),
     'continue': ('combat_continue', 'siege_press', 'siege_assault'),
     'press': ('siege_press', 'siege_assault', 'combat_continue'),
     'stop': ('combat_cease', 'siege_no_press'),
     'stand': ('victor_stay', 'combat_no_retreat'),
+    'random': ('hunt_sacrifice_random',),
 }
 # a word that belongs to ONE part of the turn is a word only in its decisions: "fp ok" closes the
 # Fellowship phase - it goes on without declaring, it keeps the Guide who sits in the Guide box
 # (ends) - and typed anywhere else it answers nothing (it never passes an action)
-ONLY_IN = {'fp ok': ('declare', 'guide_change')}
+ONLY_IN = {'fp ok': ('declare', 'guide_change'), 'random': ('hunt',)}
 # The answers that leave NO trace on the board: only these may be committed by a chat
 # word (owner ruling: the chat is only for what cannot be seen from the pieces).  Every
 # other option is answered on the board (M3) or by a click; the panel is free for all.
@@ -477,7 +479,7 @@ UNSEEN = frozenset((
     'combat_continue', 'combat_cease', 'siege_press', 'siege_no_press', 'siege_assault',
     'combat_no_retreat', 'victor_stay', 'followup_done', 'shine', 'shine_none',
     'rearguard_none', 'combat_effect_choice', 'casualty_preserve_units',
-    'casualty_preserve_elites', 'hunt_gollum_no_reveal', 'end_turn'))
+    'casualty_preserve_elites', 'hunt_gollum_no_reveal', 'end_turn', 'hunt_sacrifice_random'))
 EARLY = {'nc': 'card', 'press': 'round', 'stop': 'round', 'continue': 'round'}
 _ROUND_KINDS = ('combat:attacker_continue', 'combat:combat_round_result',
                 'combat:attacker_siege_decision')
@@ -633,7 +635,7 @@ _GONE = ('That is no longer a word here: type "back" and I put the board back as
 _OLD = {
     'help': 'You can type "back" (I put the board back), "undo" (take back your last decision), "finish" '
             '(I do what I left to your own hand), "pass", "fp ok", "done", "nc" or "cc" and a card name for a combat card, "field", '
-            '"stand", "press", "continue", "stop", "0e" for no Eyes, an attack such as "dale from '
+            '"stand", "press", "continue", "stop", "random", "0e" for no Eyes, an attack such as "dale from '
             'erebor" (the usual abbreviations and a combat card with it work too: "osg from si nc"), '
             'and the name of a gate when I ask; everything else is a move on the board '
             'or a click in the panel.',
@@ -642,7 +644,6 @@ _OLD = {
     'reset': _GONE, 'rewind': _GONE, 'manual': _GONE, 'manual edit': _GONE,
     'yes': 'Nothing here is answered with yes or no: answer on the board or in the panel, and '
            'type "help" for the words I know.',
-    'random': 'To let a random Companion take the Hunt damage, click that option in the panel.',
     'unpause': 'The chat cannot pause or resume the game: if you paused it in the old AI window, '
                'press RESUME there.',
 }
@@ -785,10 +786,6 @@ def board_choices(names):
     return 'The board does not say which move you mean%s; %sclick it in the panel.' % (
         ': ' + ', or '.join(names[:6]) + (' and %d more' % more if more > 0 else '') if names else '',
         'type %s, or ' % ' or '.join('"%s"' % t for t in own[:6]) if typed else '')
-
-
-def only_choice(label):
-    return 'You had only one choice, so I made it for you: %s.' % label.rstrip('.')
 
 
 def also_moved():

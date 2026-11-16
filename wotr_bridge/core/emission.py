@@ -397,27 +397,13 @@ def _retrack_ops(view, ops):
         pids = [str(p) for p in pids if str(p) not in _DIE_PIDS]
         if not pids:
             continue
-        # CR-D3-break-03: a later emitted movement of a piece voids any
-        # unconfirmed replacement seat recorded for it below.
-        _pending = getattr(view, 'shadow_slot_pending', None) or {}
         if op in _RETRACK_DEAD:
             for p in pids:
-                _pending.pop(p, None)
                 view.piece_region[p] = _lr.decode_location(layout.kill_box(p, view.piece_types))
         elif op in _RETRACK_TO and f.get('to'):
             name = _lr.decode_location(str(f['to'])) or str(f['to'])
-            # a shared Shadow stronghold box names no region: a piece put into
-            # one (an arrival, the Regular of a reduced Elite) stands in the
-            # stronghold whose pieces the view already has in that box
-            tied = next((seat for seat in (getattr(view, 'shadow_stronghold_regions', None) or {}).values()
-                         if seat[1] == f['to']), None)
             for p in pids:
-                _pending.pop(p, None)
-                if tied:
-                    view.shadow_stronghold_regions[p] = tied
-                    view.piece_region[p] = tied[0] + ' stronghold'
-                else:
-                    view.piece_region[p] = str(name)
+                view.piece_region[p] = str(name)
 
 
 def _ops_to_emission(view, nick, action_type, ops):

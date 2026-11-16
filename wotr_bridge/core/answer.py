@@ -151,9 +151,12 @@ class Answers(object):
         """ONE legal answer is not asked (P-096) - unless the board has a say in it: he picks
         the pieces it is made with (some of several of a class: which Leader, which dice -
         that pick stays his, ruling 3), or pieces he moved lie there that this decision reads
-        (WHOLE BOARD OR NOTHING: they are that answer, or he is told - _board)."""
+        (WHOLE BOARD OR NOTHING: they are that answer, or he is told - _board); and unless it is
+        the only one because of the cards he holds, which nobody across the table sees (owner:
+        "it's not supposed to know my hand"): his combat card, while he has a card in hand."""
         menu = o.menu
-        if len(menu) == 1 and not self.boards.chain:
+        hidden = words.early_fits('card', o.kind) and bool(o.state.hands[o.side].hand)
+        if len(menu) == 1 and not self.boards.chain and not hidden:
             plan, base, moved = None, None, False
             if self.link.board is not None:
                 with contextlib.suppress(Exception):

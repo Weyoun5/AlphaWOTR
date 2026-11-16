@@ -32,6 +32,7 @@ class Voice(object):
         self.notes, self.replies, self.log_tail, self.said = [], [], [], []
         self.ai_last = None
         self.how = words.starting()
+        self.unsaid = None          # the status that the client does not repeat in chat (waits)
         self.write_status = None    # FileBridge.write_status, set by build()
         self.over_said = False
         self.error_file = 'core-error.txt'
@@ -193,13 +194,20 @@ class Voice(object):
             lines.append(self.chat(loser, 'gg'))
         return lines + end
 
+    def waits(self, kind, side, state):
+        """A decision of the person is waited for: the status says so.  For an action of his dice the client
+        shows it in the panel and does not say it in chat (owner: "can you remove this message entirely, it's
+        redundant")."""
+        self.how = words.waiting_for_you(kind, side, state)
+        self.unsaid = self.how if kind == 'action' else None
+
     def status(self, sims):
         """Extra fields of ai_bridge_status.json (transport.status_extra)."""
         pos = self.position()
         st = pos.state
         return {'mode': 'ai_vs_ai' if self.human is None else 'sided',
                 'turn': int(st.turn), 'phase': pos.phase,
-                'acting': getattr(pos.active, 'name', None), 'sims': sims,
+                'acting': getattr(pos.active, 'name', None), 'sims': sims, 'status_in_chat': self.how != self.unsaid,
                 'note': '', 'game_over': ({k: str(v) for k, v in pos.over.items()}
                                           if pos.over else None),
                 'core': dict(self.stats)}

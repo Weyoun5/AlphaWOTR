@@ -20,6 +20,7 @@ import javax.swing.JMenu;
 import javax.swing.JMenuBar;
 import javax.swing.JMenuItem;
 import javax.swing.JSeparator;
+import javax.swing.JTextPane;
 import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
 
@@ -37,6 +38,10 @@ import javax.swing.UIManager;
  *     file play_settings.json beside the client must then state that position.
  * It keeps two pictures of the screen (screen_robot.png by Java, screen_capture.png by macOS) and ends the client:
  * 0 = looked, 3 = no AI menu came, 4 = the look itself failed.
+ * With LOOK_PACE_S set, the game first plays on for that many seconds with the search off (play_settings.json:
+ * sims 0 - the log grows fast) and FOLDER/pace.csv gets one row every 15 seconds: the paragraphs of the game's log
+ * pane, how long the client's event queue takes to answer (median / worst of 30 askings, in ms - what a person
+ * feels as lag), and the memory the client uses.  Nothing is judged: the rows are the finding.
  * It knows two things of the client: the menu's title and the knob's name; the knob's stops are read from its own
  * fields (min, max, value, pad()).
  */
@@ -158,6 +163,50 @@ public class MenuLook {
         }
     }
 
+    static JTextPane biggest(Component c, JTextPane best) {
+        if (c instanceof JTextPane && (best == null
+                || ((JTextPane) c).getDocument().getLength() > best.getDocument().getLength())) best = (JTextPane) c;
+        if (c instanceof Container) {
+            Component[] kids = ((Container) c).getComponents();
+            for (int i = 0; i < kids.length; i++) best = biggest(kids[i], best);
+        }
+        return best;
+    }
+
+    static void pace(int seconds) throws Exception {
+        Files.write(new File("play_settings.json").toPath(),
+                "{\"effects\": true, \"dice\": false, \"turn\": true, \"strength\": 1, \"sims\": 0}".getBytes(StandardCharsets.UTF_8));
+        StringBuilder rows = new StringBuilder("seconds,log_paragraphs,log_characters,queue_median_ms,queue_worst_ms,heap_used_mb\n");
+        final Runnable nothing = new Runnable() { public void run() { } };
+        long start = System.currentTimeMillis();
+        while (System.currentTimeMillis() - start < seconds * 1000L) {
+            long[] took = new long[30];
+            for (int i = 0; i < took.length; i++) {
+                Thread.sleep(500);
+                long t = System.nanoTime();
+                SwingUtilities.invokeAndWait(nothing);
+                took[i] = (System.nanoTime() - t) / 1000000L;
+            }
+            java.util.Arrays.sort(took);
+            final int[] log = new int[2];
+            SwingUtilities.invokeAndWait(new Runnable() {
+                public void run() {
+                    JTextPane pane = null;
+                    Window[] all = Window.getWindows();
+                    for (int i = 0; i < all.length; i++) if (all[i].isShowing()) pane = biggest(all[i], pane);
+                    if (pane == null) return;
+                    log[0] = pane.getDocument().getDefaultRootElement().getElementCount();
+                    log[1] = pane.getDocument().getLength();
+                }
+            });
+            Runtime rt = Runtime.getRuntime();
+            rows.append((System.currentTimeMillis() - start) / 1000).append(',').append(log[0]).append(',').append(log[1])
+                    .append(',').append(took[took.length / 2]).append(',').append(took[took.length - 1])
+                    .append(',').append((rt.totalMemory() - rt.freeMemory()) / 1048576L).append('\n');
+            Files.write(new File(dir, "pace.csv").toPath(), rows.toString().getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
     static void look() {
         try {
             Thread.sleep(15000);                                     // the client's own start first
@@ -242,6 +291,15 @@ public class MenuLook {
                 });
             }
             pictures("screen");
+            String paceFor = System.getenv("LOOK_PACE_S");
+            if (paceFor != null && paceFor.trim().length() > 0) {
+                try {
+                    pace(Integer.parseInt(paceFor.trim()));
+                } catch (Throwable t) {
+                    put("pace_error", q(String.valueOf(t)));
+                }
+                pictures("late");
+            }
             finish(0);
         } catch (Throwable t) {
             put("error", q(String.valueOf(t)));

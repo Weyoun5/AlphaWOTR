@@ -319,9 +319,7 @@ class Server(object):
         self.boards.took(moved, self.answers.open, rolling, moved if rolling and click.source != 'board' else late)
         # what the funnel handed back, and what no step used and has left the bank: said once -
         # and the piece of such a result is nobody's: the comparison carries it back with this reply
-        unused, self.inbox.unused = self.inbox.unused + self.rand.take_dropped(), []
-        if unused and self.human is not None:
-            self.boards.end(boardanswer.UNUSED, *self.link.ignored(unused))
+        self._hand_back()
         # (a die staged and the word typed in one poll: both seen.  THE ORDER of a word that ANSWERS - it gave his
         # answer, or closed his decision - and his moves: what the client's lines hold after it, that decision never read)
         for body, unseen, at in self.link.heard():
@@ -422,7 +420,7 @@ class Server(object):
             # (those the board has where the game as it is now would have them settled, and the game restored
             # would not - but what the restored game's own pass moves, or what is his: his die of a two-step action)
             ops = lambda state, settled: {op[2]: op[4] for op in reconcile.moves(reconcile.difference(
-                state, self.link.board, self.link.view.card_pid_map, settled, self.link.bound))[0] if op[0] == 'move'}
+                state, self.link.board, self.link.view.card_pid_map, settled))[0] if op[0] == 'move'}
             was, now, own = ops(before.state, True), ops(self.pos.state, True), ops(before.state, False)
             self.boards.end(boardanswer.TAKEN_BACK, {
                 p: z for p, z in was.items() if p not in now and p not in own and p not in self.owned().pieces
@@ -432,6 +430,7 @@ class Server(object):
         self.rand.abort_step('taken back')
         self.answers.close(True)
         self.compare.recon = self.compare.left = None       # (... and what a card of the undone steps left to him)
+        self.compare.spent, self.compare.round = set(), set()
         self.asked = self.shown = None
         self.used_random = False
         if self.link.board is not None:     # (the dice binding follows the engine state)
@@ -758,6 +757,13 @@ class Server(object):
         # searches work at this decision is strength.plan's word (the menu's slider; small decisions cheaply).
         return turn_search.improve(ai, handed, side, owner, seed, menu, hit, setting)
 
+    def _hand_back(self):
+        """What the funnel handed back, and what no step used and has left the bank: said once - and the
+        piece of such a result is nobody's: the comparison carries it back with this reply."""
+        unused, self.inbox.unused = self.inbox.unused + self.rand.take_dropped(), []
+        if unused and self.human is not None:
+            self.boards.end(boardanswer.UNUSED, *self.link.ignored(unused))
+
     def _decide(self, side, kind, flag=None, phase=None, after=None, sanctioned=None,
                 skip=None, route=None, stands=False):
         """One decision of either seat: choose (once per step), apply on a
@@ -772,6 +778,7 @@ class Server(object):
         if not self.probing and not human and not self.rand.step_open \
                 and base.pending_combat is None and base.pending_hunt is None:
             self.link.drop_early()          # the AI acts: they answer nothing of its step
+            self._hand_back()
         if flag is not None:
             state = ai.clone_state(base)
             setattr(state, flag, True)
@@ -788,7 +795,7 @@ class Server(object):
             return []       # (the one answer left is given when his answer before it stands)
         picked = self.answers.pick(kind, state, side, menu, spec) if human else None
         if human and picked is None:
-            self.voice.how = words.waiting_for_you(kind, side, base)
+            self.voice.waits(kind, side, base)
             return []
 
         def chooser(actions):
@@ -828,7 +835,7 @@ class Server(object):
             self.rand.abort_step('an answer made on the board failed')
             self.boards.failed(self.voice.save_error(e, self.position))
             self.answers.drop()
-            self.voice.how = words.waiting_for_you(kind, side, base)
+            self.voice.waits(kind, side, base)
             return []
         lines = []
         if not silent and not self.shown:
@@ -844,16 +851,15 @@ class Server(object):
         self._commit(post, '%s %s %s' % (layout.side_tag(side), kind, act.action_type),
                      who='forced' if given in ('only', 'stands') else 'human' if human else 'ai',
                      side=side, act=act, source=given, **change)
+        self.compare.played(base, act, post)
         if not self.rand.prefers[card_box(side if human else None, kind, act)]:
             self.compare.left = self.compare.left or [0, '']    # (what his card brings about for his figures is his to show)
-        if given == 'only':     # the one legal answer: named in one sentence (what the board
-            #                     already shows - 'stands' - is never announced)
-            self.voice.say(words.only_choice(label))
         opened = any(getattr(base, k, None) is None and getattr(post, k, None) is not None
                      for k in ('pending_combat', 'pending_hunt'))
         self.voice.told(side, label, click)
         if opened:
             self.link.drop_early()          # they answer no combat or Hunt roll
+            self._hand_back()
             self.link.battle(not human and lines != [])     # (shown by this reply, or by the comparison)
         return [] if held else (lines or None)
 

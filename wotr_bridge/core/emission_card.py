@@ -215,8 +215,6 @@ class _Scratch(object):
                                  or ())
         self.fellowship_location = getattr(view, 'fellowship_location',
                                            None)
-        self.shadow_stronghold_regions = dict(
-            getattr(view, 'shadow_stronghold_regions', {}) or {})
 
 
 def _retrack_scratch(scratch, ops):
