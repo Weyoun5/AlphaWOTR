@@ -1394,8 +1394,8 @@
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/nets/values/sh_value.pt"
   },
   "search_settings.json": {
-   "sha256": "b6b38cc8b06ebde7c6c9fb5bd6b6ae8bf40a348c019bc6771ccc2c9db9fb2e53",
-   "bytes": 775,
+   "sha256": "f3f36017719d81eae72d04b927636c250805ae62ead51476828a2db044442508",
+   "bytes": 817,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/search_settings.json"
   },
   "tree/claude_bugscan_2026-10-21/d6sp/fpsp/fp_collect.py": {
@@ -2549,8 +2549,8 @@
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/tscommon.py"
   },
   "turnsearch.py": {
-   "sha256": "ea15dfab4bdf3357dafce55061f1f72f8dfe3d7339147f53163dc3ac42ed92f6",
-   "bytes": 22595,
+   "sha256": "4936222e967b1f449c8cb94b1481f2a4dfb04d238b241c1f91a3ad8394026d75",
+   "bytes": 26171,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/turnsearch.py"
   }
  },
@@ -2576,6 +2576,13 @@
    "changed": [
     "search_settings.json",
     "ts_service.py",
+    "turnsearch.py"
+   ]
+  },
+  {
+   "what": "LIKE FOR LIKE 1116",
+   "changed": [
+    "search_settings.json",
     "turnsearch.py"
    ]
   }

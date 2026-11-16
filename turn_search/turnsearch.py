@@ -65,6 +65,10 @@ class Config:
                                     # like the move to beat needs only ...
         self.gain_floor = 0.0025    # ... this much win probability and
         self.margin_floor = 1.0     # ... this many standard errors
+        self.fair = False           # LIKE FOR LIKE: plan j of a move = the mover's NEXT DIE ACTION opens with its
+                                    # (j + 1)-th ranked row, then its own play (next_action()); the move to beat is
+                                    # judged by its best plan as well; a challenger that spends an Elven Ring the
+                                    # move to beat keeps must clear the whole bar
         self.seconds = 0.0          # the time one decision may take (0 = as long as it takes).  A PC too slow for the
                                     # streams above gets as many as fit: the screen's rest may use half of what is left
                                     # after its first stream, then r2 and r3 are cut by one factor; under MIN_R2 / MIN_R3
@@ -139,7 +143,23 @@ def key_ints(seed_key):
 
 
 class Playout:
-    __slots__ = ("world", "move", "plan", "k", "own", "follow", "record", "value", "view", "enc", "dt", "line")
+    __slots__ = ("world", "move", "plan", "k", "own", "follow", "record", "value", "view", "enc", "dt", "line", "die", "ring")
+
+
+def next_action(w, p, sel):
+    """Like for like: does the mover's own choice `sel` open a NEW die action?  The parts of one die, a card's
+    follow-ups, an answer inside the opponent's action and - an Elven Ring use is not an action - the action a ring
+    funds all belong to the action before.  Keeps the playout's marks (the die in use, a ring just used)."""
+    die, kind, _params = p.world.row(w.ai, sel)
+    if kind == "elven_ring":
+        p.ring = True
+        return False
+    if die is None or die < 0:
+        return False
+    if p.ring or die == p.die:
+        p.ring, p.die = False, die
+        return False
+    return True
 
 
 def run_batch(w, values, cfg, base, seed_key, side, turn0, specs):
@@ -150,6 +170,11 @@ def run_batch(w, values, cfg, base, seed_key, side, turn0, specs):
     info = base.world_info()
     extra = info[5] - info[2]
     jobs = []
+    first = {}                                   # like for like: each first move's die, and is it an Elven Ring use
+    if cfg.fair:
+        for move in {spec[0] for spec in specs}:
+            die_, kind_, _params = base.row(w.ai, int(move))
+            first[move] = (die_, kind_ == "elven_ring")
     for move, plan, k, follow in specs:
         p = Playout()
         p.world = base.world_clone(TS.stream(*seed_key, k), extra)
@@ -162,6 +187,7 @@ def run_batch(w, values, cfg, base, seed_key, side, turn0, specs):
                 q.world.close()
             raise
         p.move, p.plan, p.k, p.own, p.follow, p.record, p.value, p.view, p.line = move, plan, k, 0, follow, [], None, None, []
+        p.die, p.ring = first.get(move, (None, False))
         jobs.append(p)
     active = list(jobs)
     plies = 0
@@ -210,7 +236,21 @@ def run_batch(w, values, cfg, base, seed_key, side, turn0, specs):
             for s, p, pr in answers:
                 lp = np.asarray(pr.log_probabilities, np.float64)
                 sel = int(np.argmax(lp))
-                if s == side and p.dt == 0 and 0 < p.plan < cfg.plans:
+                if cfg.fair and s == side and p.dt == 0 and 0 < p.plan < cfg.plans:
+                    if not p.own and next_action(w, p, sel):       # like for like: the plan IS the next action's rank
+                        cand, regions = p.enc[1], p.enc[2]
+                        if p.follow is None:                       # the first realisation: take it and record it
+                            ranked = np.argsort(-lp)
+                            if p.plan < len(ranked):
+                                sel = int(ranked[p.plan])
+                                p.record.append(row_key(cand, regions, sel))
+                        elif p.follow:                             # the recorded move, if it is legal here
+                            for i in range(len(cand)):
+                                if row_key(cand, regions, i) == p.follow[0]:
+                                    sel = i
+                                    break
+                        p.own = 1
+                elif s == side and p.dt == 0 and 0 < p.plan < cfg.plans:
                     cand, regions = p.enc[1], p.enc[2]
                     if p.follow is not None:                       # a recorded plan: its next move if it is legal here
                         if p.own < len(p.follow):
@@ -313,7 +353,8 @@ class TurnSearch:
         line_of = {pair: o[2] for pair, o in zip(pairs, out)}
         seen, live = set(), []
         for pair in pairs:                       # a sampled plan that came out as another's sequence adds nothing
-            key = (pair[0], "greedy" if pair[1] == 0 else plan_of[pair] if pair[1] < cfg.plans else pair[1])
+            key = (pair[0], "greedy" if pair[1] == 0 or (cfg.fair and pair[1] < cfg.plans and not plan_of[pair])
+                   else plan_of[pair] if pair[1] < cfg.plans else pair[1])
             if key not in seen:
                 seen.add(key)
                 live.append(pair)
@@ -333,7 +374,11 @@ class TurnSearch:
         s1 = {pair: float(np.mean(val[pair])) for pair in live}
         ref = (ref_row, 0)
         ranked = sorted(live, key=lambda pair: -s1[pair])
-        keep = [ref] + [pair for pair in ranked if pair != ref][:cfg.keep - 1]
+        # like for like: every plan of the move to beat goes on to stage 2, as a challenger's plans may
+        ref_family = [pair for pair in live if pair[0] == ref_row] if cfg.fair else [ref]
+        if ref not in ref_family:
+            ref_family.insert(0, ref)
+        keep = ref_family + [pair for pair in ranked if pair not in ref_family][:max(cfg.keep - len(ref_family), 1)]
         if cfg.seconds and (len(keep) * r2 + 2 * r3) * pace() > left():
             fits = max(left(), 0.0) / ((len(keep) * r2 + 2 * r3) * pace())
             r2, r3 = cut["r2"], cut["r3"] = int(r2 * fits), int(r3 * fits)
@@ -346,9 +391,17 @@ class TurnSearch:
         v2 = {pair: np.zeros(r2) for pair in keep}
         for spec, o in zip(specs, self._exec(base, seed_key, side, turn0, specs)):
             v2[(spec[0], spec[1])][spec[2] - 1000] = o[0]
+        # like for like: the move to beat is represented by ITS best plan on these streams (chosen exactly as the
+        # challenger's plan is: by the stage-2 mean), and both go to stage 3's fresh streams
+        spends = set()                           # (the first moves that are Elven Ring uses)
+        if cfg.fair:
+            ref = max(ref_family, key=lambda pair: (float(v2[pair].mean()), -pair[1]))
+            spends = {m for m in moves if self.kind(base, m)[0] == "elven_ring"}
         p_ref = float(math.exp(lp[ref_row]))
 
         def bar(move):                           # what this move must show (a favoured move: the floor)
+            if int(move) in spends and ref_row not in spends:
+                return cfg.min_gain, cfg.margin  # a ring spent is a cost: the whole bar, whatever its prior
             if int(move) in favoured:
                 return cfg.gain_floor, cfg.margin_floor
             return need(cfg, float(math.exp(lp[move])), p_ref)
@@ -364,7 +417,8 @@ class TurnSearch:
             table[-1].update(need_gain=g_need, need_margin=m_need)
             # the best-looking challenger: the largest gain OVER its own bar (one bar for all: the largest gain)
             over = gain - g_need
-            if pair != ref and gain > 0.0 and (cand_over is None or over > cand_over):
+            # (a plan of the move to beat is no challenger)
+            if (pair[0] != ref_row if cfg.fair else pair != ref) and gain > 0.0 and (cand_over is None or over > cand_over):
                 cand, cand_gain, cand_over = pair, gain, over
         # stage 3: the best-looking challenger was CHOSEN on stage 2's dice, so its gain there flatters it.  Play it and
         # the net's move once more on dice nothing was chosen on; only that gain decides.
@@ -378,7 +432,7 @@ class TurnSearch:
             d = (v3[:, 0] - v3[:, 1]) / 2.0
             gain, se = float(d.mean()), float(d.std(ddof=1) / math.sqrt(len(d)))
             s3 = dict(move=cand[0], plan=cand[1], gain=gain, se=se, stage2_gain=cand_gain, need_gain=g_need, need_margin=m_need,
-                      prior=float(math.exp(lp[cand[0]])), ref_prior=p_ref)
+                      prior=float(math.exp(lp[cand[0]])), ref_prior=p_ref, ref_plan=ref[1])
             if gain >= g_need and gain > m_need * se:
                 best, best_gain, best_se = cand, gain, se
         return best[0], dict(side=side, turn=turn0, top=top, ref=ref_row, pick=best[0], plan=best[1], gain=best_gain, se=best_se,

@@ -6,9 +6,9 @@
   "sh": {"win": {"policy": "sh_win", "judge": "sh_value.pt"}, "cor": {"policy": "sh_cor", "judge": "own"}}
  },
  "settings": {
-  "wide": {"advisers": false, "config": {"bar_prior": true, "horizon": 2, "k_moves": 8, "plans": 4, "kinds": 12, "keep": 24, "r2": 24}},
-  "wide_advisers": {"advisers": true, "config": {"bar_prior": true, "horizon": 2, "k_moves": 8, "plans": 4, "kinds": 12, "keep": 24, "r2": 24}},
-  "wide_advisers_double": {"advisers": true, "config": {"bar_prior": true, "horizon": 2, "k_moves": 8, "plans": 4, "kinds": 12, "keep": 24, "r1": 8, "r2": 48, "r3": 64}}
+  "wide": {"advisers": false, "config": {"bar_prior": true, "fair": true, "horizon": 2, "k_moves": 8, "plans": 4, "kinds": 12, "keep": 24, "r2": 24}},
+  "wide_advisers": {"advisers": true, "config": {"bar_prior": true, "fair": true, "horizon": 2, "k_moves": 8, "plans": 4, "kinds": 12, "keep": 24, "r2": 24}},
+  "wide_advisers_double": {"advisers": true, "config": {"bar_prior": true, "fair": true, "horizon": 2, "k_moves": 8, "plans": 4, "kinds": 12, "keep": 24, "r1": 8, "r2": 48, "r3": 64}}
  },
  "default": "wide_advisers_double"
 }
