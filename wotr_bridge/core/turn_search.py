@@ -36,6 +36,7 @@ from pathlib import Path
 FLAG = Path(__file__).resolve().parents[1] / 'turn_search.json'
 GAME = FLAG.parents[1]          # the game's folder: a path of the file that is not absolute is a place in the game
 GPU_FAILED, CANNOT_RUN = 4, 5   # the service's exit codes (the kit's ts_device.py)
+SAME_BUT_BETTER_ROWS = 400      # improve(): the longest menu a switch is weighed against in full
 TOLD = 'ai_turn_search.json'    # in the client's folder: what the PC gives, in the service's own words (its --tell)
 _S = {'proc': None, 'conn': None, 'cfg': None, 'fails': 0, 'off': False, 'cannot_run': False, 'log': None, 'told': None,
       'asked': 0, 'switched': 0, 'seconds': 0.0, 'nets': {}, 'unknown': set(), 'device': None, 'slow': {}}
@@ -185,6 +186,19 @@ def _same(a, b):
     return a.action_type == b.action_type and a.die_idx == b.die_idx and a.params == b.params
 
 
+def _same_but_better(ai, state, side, menu, hit, own):
+    """THE SAME BUT BETTER (ai._strictly_better): the move the turn search switches to is a decided move like any
+    other.  It is weighed against the whole menu up to SAME_BUT_BETTER_ROWS options (2 ms an option), in a longer
+    menu against the ordinary search's own pick (which that search has cleared against its root options).
+    -> the move to play: `hit`, or the option that is the same but better."""
+    rows = list(menu) if len(menu) <= SAME_BUT_BETTER_ROWS else [hit, own]
+    at = next(i for i, a in enumerate(rows) if a is hit)
+    moved = rows[ai._move_to_better(at, ai._strictly_better(state, side, rows))]
+    if moved is not hit:
+        _say('its move %s is the same as %s but worse: plays that' % (hit.action_type, moved.action_type))
+    return moved
+
+
 def improve(ai, state, side, owner, seed, menu, own, setting):
     """own: the move the server's ordinary search picked (an entry of menu).  -> the move to play: own, or the entry of
     menu the turn search confirmed as better.  state: what the search may see (hidden cards already dealt at random).
@@ -250,6 +264,9 @@ def improve(ai, state, side, owner, seed, menu, own, setting):
             hit = None
     if hit is None:
         _fail('its move (%s) is not in the menu' % act.action_type)
+        return own
+    hit = _same_but_better(ai, state, side, menu, hit, own)
+    if hit is own:
         return own
     _S['switched'] += 1
     _say('PLAYS %s %s instead of %s %s: +%.1f +- %.1f points two turns on (%s)' % (

@@ -157,6 +157,17 @@ def zone_names(zone):
     return {pid: (LOCATION_CODES.get(code) or lr.decode_location(code) or code) for pid, code in zone.items()}
 
 
+def cargo_words(cargo, name):
+    """A card's army ((class, nation, kind, n), ...) in words: '1 Sauron Elite and 5 Sauron Regulars' (None:
+    nothing chosen).  name(nation) -> the nation as it is written."""
+    parts = []
+    for cls, nation, kind, n in (tuple(r)[:4] for r in cargo or () if len(r) >= 4 and r[3]):
+        what = 'Nazgul' if cls == 'nazgul' else '%s %s' % (
+            name(str(nation).lower()), str(kind).capitalize() if cls == 'unit' else 'Leader')
+        parts.append('%d %s%s' % (n, what, 's' if n > 1 and cls != 'nazgul' else ''))
+    return ' and '.join(parts) or None
+
+
 def political_marker_active(pid, marks):
     """Does a political marker show its active side?  None when the dump does not state a
     side for it (the four nations that start at war have no passive side)."""

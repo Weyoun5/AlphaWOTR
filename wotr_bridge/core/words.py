@@ -8,7 +8,7 @@ import functools
 import re
 import types
 import unicodedata
-from . import typed
+from . import layout, typed
 
 _SCRUB = re.compile(r'[{}\[\]<>]')
 _NAME_BAD = re.compile(r"[^a-z0-9 ,'!\-:]")
@@ -193,8 +193,11 @@ def _value(value):
         frm = value.pop('from_region', None) or value.pop('from', None)
         to = value.pop('to_region', None) or value.pop('to', None)
         head = ''
+        if 'cargo' in value:                    # (a card's army by kind: its count stage's counter is no number of Nazgul)
+            value.pop('count', None)
+        cargo = layout.cargo_words(value.pop('cargo', None), place)
         if frm and to:
-            who = _names(value.pop('companions', None)) or (
+            who = _names(value.pop('companions', None)) or cargo or (
                 '%s Nazgul' % value.pop('count') if 'count' in value else
                 'the Witch-king' if value.pop('include_wk', None) else 'the pieces')
             head = 'move %s from %s to %s' % (who, place(frm), place(to))

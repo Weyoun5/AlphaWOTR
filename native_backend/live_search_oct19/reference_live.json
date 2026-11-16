@@ -4,8 +4,8 @@
     "action_choice_tail.py": "be81747b6503ff150cbac4ad05aa219c51f31455c65ac050b569d9e4ec81487f",
     "action_encoding_backend.py": "ac3b30e9a4fceedaab8b46d710b3604541b46d9bb82cbb70bafd5ad9f4fb3596",
     "action_schema.py": "73926065f64bb219778b5cd70430e939ca0831254ffe5a527b958a5624bd6f3b",
-    "ai.py": "2590e8f1aafe443b2e96139ee628da660b7494004c28dd2f3434c5355f249976",
-    "ai_policies.py": "870379317d6ea56475c0aa54643e5b1dd0d5d244d6f254561d80051a75dbec68",
+    "ai.py": "46053ab80c631b0535648b3906a054f998fcfdfaf9b1c9752df7c03b5d3ebe27",
+    "ai_policies.py": "2d40e26f9707ef67f9948b6e3e6ca9cf8a6c61675cd87864f4c13c40aa1b26c9",
     "army_card_cargo.py": "b1cb282f63c27bde0b1786ae20c086ca63142369fbe627998f82fc6468fdba19",
     "army_cargo_state.py": "41a70d398e8546ec1d342f11dde1dc9d8c89c7d29b70de2bf6b664154964019e",
     "army_move_participants.py": "a0952f677faa0a4cca3bca0fdd166d73e12e2a47aa5ea8878a5eaad49bb5a0d6",
@@ -149,7 +149,7 @@
     "experiments/forced_hunt/native_forcing.py": "5948fcee65142796d8c29930c3834fa19fbe8314b5c150180e29dac5b6218941",
     "experiments/native_search_core/inference/controller_binding.py": "0b3ec35b6903e71cfccd412a8698c274dcf219e661182df5e16267cd4a141373",
     "experiments/native_search_core/inference/numeric_bridge.py": "5774176288a44e623459e4f69c5c36a57c6386747444d87a21e9316cf62bb3dc",
-    "experiments/native_search_core/own_value_controller_sep13/orchestration/orchestrator.py": "c34d7fb13fc0d854d7d2d838ac7f190f712369a29b382ede519ea40c3648fc34",
+    "experiments/native_search_core/own_value_controller_sep13/orchestration/orchestrator.py": "69e4296856fbf5b79cadab3bd4beb6106ab79b681e47d0ad274fcec6ced99084",
     "experiments/native_search_core/own_value_controller_sep13/own_binding.py": "ad8136d1d77676ef5882bb4ffb964eccf4718802d118fd322a1a372f4a2df14c",
     "experiments/native_search_core/own_value_numeric_sep13/root_numeric.py": "acd011c3bc797082e2364f01765154077471727a0beecdd11b887ff9d64a3fb1",
     "experiments/search_adapter_contract/menu_view.py": "fd02dcb95182edfc1daf4897a0010118a03069eb2070de98fe9ebb5f5d317342",
@@ -165,8 +165,8 @@
     "action_choice_tail.py": "be81747b6503ff150cbac4ad05aa219c51f31455c65ac050b569d9e4ec81487f",
     "action_encoding_backend.py": "ac3b30e9a4fceedaab8b46d710b3604541b46d9bb82cbb70bafd5ad9f4fb3596",
     "action_schema.py": "73926065f64bb219778b5cd70430e939ca0831254ffe5a527b958a5624bd6f3b",
-    "ai.py": "2590e8f1aafe443b2e96139ee628da660b7494004c28dd2f3434c5355f249976",
-    "ai_policies.py": "870379317d6ea56475c0aa54643e5b1dd0d5d244d6f254561d80051a75dbec68",
+    "ai.py": "46053ab80c631b0535648b3906a054f998fcfdfaf9b1c9752df7c03b5d3ebe27",
+    "ai_policies.py": "2d40e26f9707ef67f9948b6e3e6ca9cf8a6c61675cd87864f4c13c40aa1b26c9",
     "army_card_cargo.py": "b1cb282f63c27bde0b1786ae20c086ca63142369fbe627998f82fc6468fdba19",
     "army_cargo_state.py": "41a70d398e8546ec1d342f11dde1dc9d8c89c7d29b70de2bf6b664154964019e",
     "army_move_participants.py": "a0952f677faa0a4cca3bca0fdd166d73e12e2a47aa5ea8878a5eaad49bb5a0d6",
@@ -491,5 +491,38 @@
       }
     ],
     "why": "the engine-only head imports the search glue from wotr_bridge\\core (the old wotr_bridge\\live package is removed); import path only, no engine change"
-  }
+  },
+  "base_reference_search3_1115": "76b916248a76b3632b48b1b3d78906960c94729ace9d21643d9a92497de5bede",
+  "search3_1115": [
+    {
+      "table": "source_sha256",
+      "name": "ai.py",
+      "before": "2590e8f1aafe443b2e96139ee628da660b7494004c28dd2f3434c5355f249976",
+      "after": "46053ab80c631b0535648b3906a054f998fcfdfaf9b1c9752df7c03b5d3ebe27"
+    },
+    {
+      "table": "source_sha256",
+      "name": "ai_policies.py",
+      "before": "870379317d6ea56475c0aa54643e5b1dd0d5d244d6f254561d80051a75dbec68",
+      "after": "2d40e26f9707ef67f9948b6e3e6ca9cf8a6c61675cd87864f4c13c40aa1b26c9"
+    },
+    {
+      "table": "runtime_source_sha256",
+      "name": "ai.py",
+      "before": "2590e8f1aafe443b2e96139ee628da660b7494004c28dd2f3434c5355f249976",
+      "after": "46053ab80c631b0535648b3906a054f998fcfdfaf9b1c9752df7c03b5d3ebe27"
+    },
+    {
+      "table": "runtime_source_sha256",
+      "name": "ai_policies.py",
+      "before": "870379317d6ea56475c0aa54643e5b1dd0d5d244d6f254561d80051a75dbec68",
+      "after": "2d40e26f9707ef67f9948b6e3e6ca9cf8a6c61675cd87864f4c13c40aa1b26c9"
+    },
+    {
+      "table": "native_boundary_sha256",
+      "name": "experiments/native_search_core/own_value_controller_sep13/orchestration/orchestrator.py",
+      "before": "c34d7fb13fc0d854d7d2d838ac7f190f712369a29b382ede519ea40c3648fc34",
+      "after": "69e4296856fbf5b79cadab3bd4beb6106ab79b681e47d0ad274fcec6ced99084"
+    }
+  ]
 }

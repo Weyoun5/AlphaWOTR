@@ -282,6 +282,68 @@ def project_recruitment_target(legal_actions, human_index, projection):
     }
 
 
+LEAST_DESTROYED = 'least_units_lost_to_stacking'
+STACK_LIMIT = 10        # (game_logic.MAX_ARMY_UNITS: the limit of an army that moves in from outside)
+
+
+def _own_units_at(state, side, region):
+    from board import sanitize
+    from combat import side_of_nation
+    want = sanitize(str(region))
+    for key, army in state.armies.items():      # (the first entry of that region, as the native mu_army)
+        if sanitize(key) == want:
+            return sum(1 for unit in army.units if side_of_nation(unit.nation) == side)
+    return 0
+
+
+def least_destroyed(state, side, actions, keep, tags):
+    """THE AI NEVER CHOOSES TO LOSE UNITS TO THE STACKING LIMIT.  Options that differ only in HOW MANY units arrive
+    in one region are one family; an option that would put more of the side's units there than the limit holds
+    loses the excess for nothing its family's smaller options do not also give ("you could just move fewer
+    units"), so within a family only the options with the least excess stay.  Families:
+      * army_move rows equal in everything but n_regular / n_elite;
+      * the rows of ONE cargo count stage of a card that moves an army (choices carry _cargo_key and count).
+    The one case the owner allows: figures that cannot move without a unit (the Nazgul and Leaders of an army_move
+    that takes them) into an army that is already full - there the least excess is one unit, and that option
+    stays.  An army_move family that takes no such figure and cannot arrive without excess is dropped whole
+    (while any other row of the menu remains).  This is the AI's menu only: what is legal for a person on the
+    board is the engine's and is not touched.  Native twin: ai_policy_projection.inc."""
+    families = {}
+    for i, action in enumerate(actions):
+        if not keep[i]:
+            continue
+        p = action.params or {}
+        if action.action_type == 'army_move' and 'to' in p and ('n_regular' in p or 'n_elite' in p):
+            rest = _freeze({k: v for k, v in p.items() if k not in ('n_regular', 'n_elite')})
+            moved = int(p.get('n_regular') or 0) + int(p.get('n_elite') or 0)
+            carries = bool(p.get('take_leaders')) or bool(p.get('n_nazgul')) or bool(p.get('leader_set'))
+            key, to = ('army_move', action.die_idx, rest), p['to']
+        elif action.action_type == 'card_option':
+            c = p.get('choices') or {}
+            cargo_key = c.get('_cargo_key')
+            if not cargo_key or cargo_key[0] != 'unit' or type(c.get('count')) is not int:
+                continue
+            moved = sum(int(row[3]) for row in c.get('cargo') or () if row[0] == 'unit')
+            to = (c.get('_cargo_continue') or {}).get('to_region') or c.get('to_region')
+            if not to:
+                continue
+            key, carries = ('cargo', p.get('card_id'), c.get('_cargo_index'), _freeze(c.get('_cargo_continue'))), True
+        else:
+            continue
+        excess = max(0, _own_units_at(state, side, to) + moved - STACK_LIMIT)
+        families.setdefault(key, []).append((i, excess, carries))
+    drop = []
+    for members in families.values():
+        least = min(excess for _i, excess, _c in members)
+        for i, excess, carries in members:
+            if excess > least or (excess > 0 and not carries):
+                drop.append(i)
+    if len(drop) < sum(1 for flag in keep if flag):      # (never an empty menu)
+        for i in drop:
+            keep[i] = False
+            tags[i] = LEAST_DESTROYED
+
+
 def project_ai_actions(state, side, legal_actions):
     """Return the AI subset of a complete legal menu, with forced provenance.
 
@@ -361,6 +423,7 @@ def project_ai_actions(state, side, legal_actions):
                     and 'palantir_deck' in (action.params.get('choices') or {}):
                 tags[i] = BONUS_DRAW
 
+    least_destroyed(state, side, actions, keep, tags)
     selected = tuple(a for i, a in enumerate(actions) if keep[i])
     reasons = tuple(sorted(set(tags.values())))
     forced = None

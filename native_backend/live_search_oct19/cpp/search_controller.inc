@@ -355,6 +355,7 @@ struct Node {
     bool has_kernel_sets=false;std::vector<std::pair<std::string,World>> kernel_sets;bool has_kernel_key=false;std::string kernel_key;
     uint64_t forced_visits=0;double conf_sum=0.0,phi_sum=0.0;
     std::string forced_policy_reason;
+    bool unsettled=false;   // ai._search_unsettled: the side that stepped in still owes the step's follow-up; not valued, played on
     std::unique_ptr<Snapshot> state;
     std::unique_ptr<Catalog> catalog;
     std::shared_ptr<const Snapshot> action_row;     // cached (die, type, params) tuple graph
@@ -1562,6 +1563,12 @@ struct Controller {
         double value=pv.value;
         if(node->side!=root_side)value=mcts_eval_state(*node->state,root_side,leaf_corr(node));
         make_children(node,*menu,pv.priors,max_children);
+        // ai._search_unsettled (VALUE ONLY SETTLED POSITIONS): the engine's own pending cascade, kinds card_option / card_followup,
+        // owed by this node's side, reached by a step of that same side; never the root.
+        if(node->parent!=nullptr&&!node->children.empty()&&node->parent->side==node->side){
+            const auto pend=native_pending_actor(*node->state,-1);
+            node->unsettled=(pend.kind=="card_option"||pend.kind=="card_followup")&&pend.side==node->side;
+        }
         ev("EXPAND",{node_id_for_trace(node),static_cast<int64_t>(menu->size()),0});
         return value;
     }
@@ -1872,7 +1879,7 @@ struct Controller {
                 path.push_back(branch);node=branch;
                 if(!node->is_terminal&&node->children.empty()&&node->visit_count==0){
                     leaf_value=settle_new_node(node,node->parent->side);leaf_term=node->is_terminal;
-                    if(!node->forced_policy_reason.empty()&&!leaf_term)continue;
+                    if((!node->forced_policy_reason.empty()||node->unsettled)&&!leaf_term)continue;
                     break;
                 }
                 continue;
@@ -1906,13 +1913,13 @@ struct Controller {
                     if(hunted.first==1){
                         Node* branch=node->outcomes[0];path.push_back(branch);
                         leaf_value=settle_new_node(branch,node->side);leaf_term=branch->is_terminal;
-                        if(!branch->forced_policy_reason.empty()&&!leaf_term){node=branch;continue;}
+                        if((!branch->forced_policy_reason.empty()||branch->unsettled)&&!leaf_term){node=branch;continue;}
                         break;
                     }
                     if(hunted.first==2){
                         node->state=std::move(hunted.second);
                         leaf_value=settle_new_node(node,node->parent->side);leaf_term=node->is_terminal;
-                        if(!node->forced_policy_reason.empty()&&!leaf_term)continue;
+                        if((!node->forced_policy_reason.empty()||node->unsettled)&&!leaf_term)continue;
                         break;
                     }
                 }
@@ -1926,7 +1933,7 @@ struct Controller {
                     if(is_kernel_parent(kind)&&kernel_expand_combat(node,*new_state)){   // 9.5 hook (refuses today)
                         Node* branch=node->outcomes[0];path.push_back(branch);
                         leaf_value=settle_new_node(branch,node->side);leaf_term=branch->is_terminal;
-                        if(!branch->forced_policy_reason.empty()&&!leaf_term){node=branch;continue;}
+                        if((!branch->forced_policy_reason.empty()||branch->unsettled)&&!leaf_term){node=branch;continue;}
                         break;
                     }
                     // first draw of the bank: count 1, end_turn included (A4-02, see select_outcome)
@@ -1935,12 +1942,12 @@ struct Controller {
                     kernel_register_world(node);
                     path.push_back(branch);
                     leaf_value=settle_new_node(branch,node->side);leaf_term=branch->is_terminal;
-                    if(!branch->forced_policy_reason.empty()&&!leaf_term){node=branch;continue;}
+                    if((!branch->forced_policy_reason.empty()||branch->unsettled)&&!leaf_term){node=branch;continue;}
                     break;
                 }
                 node->state=std::move(new_state);
                 leaf_value=settle_new_node(node,node->parent->side);leaf_term=node->is_terminal;
-                if(!node->forced_policy_reason.empty()&&!leaf_term)continue;
+                if((!node->forced_policy_reason.empty()||node->unsettled)&&!leaf_term)continue;
                 break;
             }
             if(pending_box){auto it=pending_box->by_node.find(node);if(it!=pending_box->by_node.end()){pending_box->last=it->second;leaf_value=std::numeric_limits<double>::quiet_NaN();break;}}
@@ -1994,6 +2001,10 @@ struct Controller {
         budget=static_cast<uint64_t>(sims_budget(cfg.num_simulations,static_cast<int64_t>(root->children.size())));
         // R2-RS-FREE-FORCE / ai.py _force_cap: the root floor never takes more than a quarter of the budget.
         force_cap=force_idx.empty()?0:std::min<uint64_t>(static_cast<uint64_t>(cfg.free_force),budget/(4*static_cast<uint64_t>(force_idx.size())));
+        // ai.mcts_search SMALL MENUS ARE SEARCHED FULL WIDTH (_SMALL_MENU = 8): every child in the floor, the cap an equal share
+        // (rounded up) of the budget; select_root_action (Python, both backends) then plays the best mean value.
+        {const uint64_t K=static_cast<uint64_t>(root->children.size());
+         if(K>=2&&K<=8&&root->forced_policy_reason.empty()){force_idx.clear();for(size_t i=0;i<K;++i)force_idx.push_back(i);force_cap=std::max<uint64_t>(1,(budget+K-1)/K);}}
         const int64_t num_simulations=static_cast<int64_t>(budget);
         if(cfg.leaf_batch>1){
             int64_t done=0;

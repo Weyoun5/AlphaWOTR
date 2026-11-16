@@ -28,6 +28,9 @@ D = TS.D
 TIMES = dict(engine=0.0, encode=0.0, nets=0.0, batch=0.0)
 
 
+SMALL_MENU = 8          # as the live search's ai._SMALL_MENU
+
+
 class Config:
     def __init__(self, **kw):
         self.k_moves = 6            # candidate first moves
@@ -250,7 +253,9 @@ class TurnSearch:
         top = order[0]
         if len(order) == 1:
             return top, dict(side=side, turn=turn0, top=top, ref=top, pick=top, pairs=[], reason="one legal move")
-        moves = [i for n, i in enumerate(order[:cfg.k_moves]) if n < 2 or lp[i] >= math.log(cfg.p_min)]
+        # (a menu of at most SMALL_MENU rows is searched whole: no prior keeps a row out)
+        moves = [i for n, i in enumerate(order[:cfg.k_moves])
+                 if n < 2 or len(order) <= SMALL_MENU or lp[i] >= math.log(cfg.p_min)]
         ref_row = top if ref_move is None else int(ref_move)
         for m in tuple(forced_moves) + (ref_row,):
             if int(m) not in moves:

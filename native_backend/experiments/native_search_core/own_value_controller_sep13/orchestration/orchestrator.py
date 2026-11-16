@@ -646,7 +646,7 @@ def materialize_root_actions(ai, menu_query, menu, count):
     return tuple(actions), descriptors
 
 
-def build_visit_info(ai, root, root_actions, action_encs, region_indices, temperature):
+def build_visit_info(ai, root, root_actions, action_encs, region_indices, temperature, better=None):
     """visit_info exactly as ai.mcts_search 17705-17760 + final selection 17790-17884.
 
     `root` is a controller_binding.RootView (or any object with the same arrays).
@@ -715,7 +715,7 @@ def build_visit_info(ai, root, root_actions, action_encs, region_indices, temper
          'tf': term_frac, 'pv': visit_info['proven'],
          'pvv': visit_info['proven_value'],
          'fn': visit_info['forced'], 'cf': visit_info['conf'],
-         'ph': visit_info['phi']},
+         'ph': visit_info['phi'], 'qv': q_var, 'sb': better},
         temperature, cfg=selector_cfg)
     visit_info.update(selector_contract.make_evidence(
         selector_cfg, temperature, pi_sel, eligible=sel_diag['elig'],
@@ -1370,7 +1370,10 @@ def _build(ai):
                     plan_provider.native_finish(root, root_actions, ctl.root_plan_result() if planned else None)
                 # temperature > 0: select_root_action samples with np.random.choice on the search
                 # NumPy stream (the decorator swapped it in); same function, same inputs as the source.
-                idx, visit_info = build_visit_info(ai, root, root_actions, action_encs, region_indices, temperature)
+                # THE SAME BUT BETTER (ai._strictly_better): the verdicts of the root's options, as ai.mcts_search
+                # hands them to the same pick function (None for a root that is not the engine's own state object)
+                better = ai._strictly_better(state, side, list(root_actions))
+                idx, visit_info = build_visit_info(ai, root, root_actions, action_encs, region_indices, temperature, better)
                 # 4. RNG/counters hand-back, _stash_tree (9.6), then the debug export. The source tracer
                 #    reads its tree after mcts_search returned, i.e. after _stash_tree cut the chosen
                 #    child's parent link (17849); the native detach cuts exactly that link and the

@@ -90,7 +90,8 @@ class OwnModelSearch:
         import ai
         if side is not self.side:
             raise ValueError('Own-model live search belongs to its configured seat')
-        return ai._greedy_prior_action(state, side, self.net, list(menu))
+        # (a real decision, not the search's in-tree twin: an option that is the same but worse is never played)
+        return ai._greedy_prior_action(state, side, self.net, list(menu), decision=True)
 
     def choose(self, state, side, *, num_simulations=300):
         import ai,own_search,rng_streams

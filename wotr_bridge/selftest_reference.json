@@ -1,7 +1,7 @@
 {
  "platform": "win32",
  "sims": 60,
- "library": "f663df4f01a6cf75334029c1b534ceae3f732b7926c114c04f0a47ef35058829",
+ "library": "bcb1b7815574400b63a7f83d0e720ad70e46cb772021bbdfd2469a8fb41fb8b3",
  "results": [
   {
    "n": 0,
@@ -14,14 +14,20 @@
     "elven_ring",
     "{\"new_face\": \"Character\", \"old_face\": \"Muster\", \"side\": \"fp\", \"target_die_idx\": 2}"
    ],
-   "native_seconds": 0.4,
+   "native_seconds": 0.6,
    "python": [
     -1,
     "elven_ring",
     "{\"new_face\": \"Character\", \"old_face\": \"Muster\", \"side\": \"fp\", \"target_die_idx\": 2}"
    ],
-   "python_seconds": 1.5,
+   "python_seconds": 2.3,
    "same": true,
+   "raw": [
+    -1,
+    "elven_ring",
+    "{\"new_face\": \"Character\", \"old_face\": \"Muster\", \"side\": \"fp\", \"target_die_idx\": 2}"
+   ],
+   "raw_in_menu": true,
    "in_menu": true,
    "turn_search": {
     "answered": true,
@@ -31,7 +37,7 @@
      "elven_ring",
      "{\"new_face\": \"Character\", \"old_face\": \"Muster\", \"side\": \"fp\", \"target_die_idx\": 2}"
     ],
-    "seconds": 8.5,
+    "seconds": 21.1,
     "cannot_run": false
    },
    "ok": true
@@ -47,14 +53,20 @@
     "army_move",
     "{\"from\": \"Carrock\", \"n_elite\": 0, \"n_regular\": 1, \"side\": \"fp\", \"take_leaders\": true, \"to\": \"old forest road\"}"
    ],
-   "native_seconds": 0.7,
+   "native_seconds": 1.5,
    "python": [
     0,
     "army_move",
     "{\"from\": \"Carrock\", \"n_elite\": 0, \"n_regular\": 1, \"side\": \"fp\", \"take_leaders\": true, \"to\": \"old forest road\"}"
    ],
-   "python_seconds": 5.7,
+   "python_seconds": 9.5,
    "same": true,
+   "raw": [
+    0,
+    "army_move",
+    "{\"from\": \"Carrock\", \"n_elite\": 0, \"n_regular\": 1, \"side\": \"fp\", \"take_leaders\": true, \"to\": \"old forest road\"}"
+   ],
+   "raw_in_menu": true,
    "in_menu": true,
    "turn_search": {
     "answered": true,
@@ -64,7 +76,7 @@
      "army_move",
      "{\"from\": \"Carrock\", \"n_elite\": 0, \"n_regular\": 1, \"side\": \"fp\", \"take_leaders\": true, \"to\": \"old forest road\"}"
     ],
-    "seconds": 5.0,
+    "seconds": 10.4,
     "cannot_run": false
    },
    "ok": true
@@ -80,14 +92,20 @@
     "army_move",
     "{\"from\": \"Fords of Isen\", \"n_elite\": 0, \"n_regular\": 1, \"side\": \"fp\", \"take_leaders\": true, \"to\": \"helm s deep\"}"
    ],
-   "native_seconds": 0.5,
+   "native_seconds": 0.7,
    "python": [
     4,
     "army_move",
     "{\"from\": \"Fords of Isen\", \"n_elite\": 0, \"n_regular\": 1, \"side\": \"fp\", \"take_leaders\": true, \"to\": \"helm s deep\"}"
    ],
-   "python_seconds": 2.2,
+   "python_seconds": 2.7,
    "same": true,
+   "raw": [
+    4,
+    "army_move",
+    "{\"from\": \"Fords of Isen\", \"n_elite\": 0, \"n_regular\": 1, \"side\": \"fp\", \"take_leaders\": true, \"to\": \"helm s deep\"}"
+   ],
+   "raw_in_menu": true,
    "in_menu": true,
    "turn_search": {
     "answered": true,
@@ -97,7 +115,7 @@
      "army_move",
      "{\"from\": \"Fords of Isen\", \"n_elite\": 0, \"n_regular\": 1, \"side\": \"fp\", \"take_leaders\": true, \"to\": \"helm s deep\"}"
     ],
-    "seconds": 2.3,
+    "seconds": 3.7,
     "cannot_run": false
    },
    "ok": true
@@ -119,8 +137,14 @@
     "muster_minion",
     "{\"minion\": \"Saruman\", \"region\": \"orthanc\"}"
    ],
-   "python_seconds": 4.8,
+   "python_seconds": 3.0,
    "same": true,
+   "raw": [
+    3,
+    "muster_minion",
+    "{\"minion\": \"Saruman\", \"region\": \"orthanc\"}"
+   ],
+   "raw_in_menu": true,
    "in_menu": true,
    "turn_search": {
     "answered": true,
@@ -130,7 +154,7 @@
      "muster_minion",
      "{\"minion\": \"Saruman\", \"region\": \"orthanc\"}"
     ],
-    "seconds": 3.1,
+    "seconds": 12.9,
     "cannot_run": false
    },
    "ok": true
@@ -146,7 +170,7 @@
     "card_option",
     "{\"card_id\": \"SHADOW_Character_Nazg\\u00fbl_Strike!\", \"card_name\": \"__nazgul_moves__\", \"choices\": {\"_naz_done\": true, \"_naz_post\": \"strike\"}, \"idx\": 96, \"side\": \"sh\"}"
    ],
-   "native_seconds": 0.2,
+   "native_seconds": 0.3,
    "python": [
     -1,
     "card_option",
@@ -154,6 +178,12 @@
    ],
    "python_seconds": 0.6,
    "same": true,
+   "raw": [
+    -1,
+    "card_option",
+    "{\"card_id\": \"SHADOW_Character_Nazg\\u00fbl_Strike!\", \"card_name\": \"__nazgul_moves__\", \"choices\": {\"_naz_done\": true, \"_naz_post\": \"strike\"}, \"idx\": 96, \"side\": \"sh\"}"
+   ],
+   "raw_in_menu": true,
    "in_menu": true,
    "turn_search": {
     "answered": true,
@@ -163,7 +193,7 @@
      "card_option",
      "{\"card_id\": \"SHADOW_Character_Nazg\\u00fbl_Strike!\", \"card_name\": \"__nazgul_moves__\", \"choices\": {\"_naz_done\": true, \"_naz_post\": \"strike\"}, \"idx\": 96, \"side\": \"sh\"}"
     ],
-    "seconds": 3.8,
+    "seconds": 7.2,
     "cannot_run": false
    },
    "ok": true
@@ -179,14 +209,20 @@
     "casualty_allocate",
     "{\"casualties\": 1, \"nation\": \"Nation.SOUTHRON_EASTERLINGS\", \"operation\": \"remove_regular\"}"
    ],
-   "native_seconds": 0.4,
+   "native_seconds": 0.3,
    "python": [
     -1,
     "casualty_allocate",
     "{\"casualties\": 1, \"nation\": \"Nation.SOUTHRON_EASTERLINGS\", \"operation\": \"remove_regular\"}"
    ],
-   "python_seconds": 2.0,
+   "python_seconds": 1.5,
    "same": true,
+   "raw": [
+    -1,
+    "casualty_allocate",
+    "{\"casualties\": 1, \"nation\": \"Nation.SOUTHRON_EASTERLINGS\", \"operation\": \"remove_regular\"}"
+   ],
+   "raw_in_menu": true,
    "in_menu": true,
    "turn_search": {
     "answered": true,
@@ -196,7 +232,7 @@
      "casualty_allocate",
      "{\"casualties\": 1, \"nation\": \"Nation.SOUTHRON_EASTERLINGS\", \"operation\": \"remove_regular\"}"
     ],
-    "seconds": 2.6,
+    "seconds": 9.1,
     "cannot_run": false
    },
    "ok": true

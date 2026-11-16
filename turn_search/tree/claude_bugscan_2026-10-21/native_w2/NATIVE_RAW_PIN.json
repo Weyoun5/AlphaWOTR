@@ -7,7 +7,7 @@
   "action_encoding_backend.py": "ac3b30e9a4fceedaab8b46d710b3604541b46d9bb82cbb70bafd5ad9f4fb3596",
   "action_schema.py": "73926065f64bb219778b5cd70430e939ca0831254ffe5a527b958a5624bd6f3b",
   "ai.py": "e31c4651f2693ce4fa6ca64a715a6c5123ce3f872f95abc6a06ac931a7f429de",
-  "ai_policies.py": "870379317d6ea56475c0aa54643e5b1dd0d5d244d6f254561d80051a75dbec68",
+  "ai_policies.py": "2d40e26f9707ef67f9948b6e3e6ca9cf8a6c61675cd87864f4c13c40aa1b26c9",
   "arena_scale.py": "d80d97688f821b5afa171d6dfba051e3a28a8f2c5907e89402422115ea93c782",
   "army_card_cargo.py": "b1cb282f63c27bde0b1786ae20c086ca63142369fbe627998f82fc6468fdba19",
   "army_cargo_state.py": "41a70d398e8546ec1d342f11dde1dc9d8c89c7d29b70de2bf6b664154964019e",
@@ -243,5 +243,8 @@
  "compiler_variant": "pgo_optimize",
  "live_box_source_origin": "native_backend/live_search_oct19 (D7 DLL 181807db), see box/SOURCE_ORIGIN.json",
  "passed_parity": true,
- "parity_report": "claude_bugscan_2026-10-21/linux_port/LINUX_PORT_REPORT_native.md section 8 (round-18 rebuild 2026-10-28: native_w2/parity/py_r18 vs nat_r18 24/24 compare rc 0, frame 3/3, leak 2/2, ents 8/8, spot checks 7/7, search_full 0 native refusals)"
+ "parity_report": "claude_bugscan_2026-10-21/linux_port/LINUX_PORT_REPORT_native.md section 8 (round-18 rebuild 2026-10-28: native_w2/parity/py_r18 vs nat_r18 24/24 compare rc 0, frame 3/3, leak 2/2, ents 8/8, spot checks 7/7, search_full 0 native refusals)",
+ "search3_1115": [
+  "ai_policies.py"
+ ]
 }

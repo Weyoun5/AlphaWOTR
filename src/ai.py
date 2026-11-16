@@ -13123,6 +13123,7 @@ class MCTSNode:
                  'w3', 'ov_seen', 'ov_win', 'forced_visits',
                  'conf_sum', 'phi_sum', 'kernel_sets', 'kernel_key',
                  'forced_policy_reason', 'round_sampling', '_opponent_edge_catalog',
+                 'unsettled',
                  'turn_owner', '__weakref__')
 
     def __init__(self, state, side, parent=None, action=None, prior=0.0):
@@ -13134,6 +13135,7 @@ class MCTSNode:
         self.children = []           # List of MCTSNode
         self._opponent_edge_catalog = None
         self.forced_policy_reason = None
+        self.unsettled = False       # (_search_unsettled)
         self.round_sampling = False
         self.visit_count = 0
         self.value_sum = 0.0         # Sum of values from this side's perspective
@@ -14677,7 +14679,29 @@ def _expand_node(node: MCTSNode, fp_net: 'WOTRValueNet', sh_net: 'WOTRValueNet',
             p = priors[i] / total_prior if total_prior > 0 else 1.0 / len(selected_list)
             child = MCTSNode(state=None, side=node.side, parent=node, action=actions[i], prior=p)
             node.children.append(child)
+    node.unsettled = _search_unsettled(node)
     return value
+
+
+# VALUE ONLY SETTLED POSITIONS.  A node is UNSETTLED when the side that made the step into it still owes the
+# continuation of that step: the engine's one cascade of pending decisions (_pending_decision_kind_side) names a
+# decision of kind 'card_option' or 'card_followup' (a card's choices and stages, and the engine's own follow-ups
+# that use the same pending: which units go back when a stack is over its limit, further figures of the same die)
+# for the node's own side, and the node's parent acted for that same side.  The net's value of such a position
+# counts pieces that the open follow-up is about to take or move.  So the simulation that first reaches the node
+# does not back that value up: it goes on down the node's own children by the ordinary selection (all of them are
+# new, so the first one of the highest prior), until a node that is settled, a chance node, or a terminal one - and
+# backs THAT value up.  The root is never unsettled (its decision is the one being made).  Native twin:
+# search_controller.inc Node::unsettled.
+_SEARCH_FOLLOW_UP_KINDS = ('card_option', 'card_followup')
+
+
+def _search_unsettled(node):
+    parent = node.parent
+    if parent is None or node.state is None or not node.children or parent.side != node.side:
+        return False
+    kind, side = _pending_decision_kind_side(node.state, None)
+    return kind in _SEARCH_FOLLOW_UP_KINDS and side == node.side
 
 
 def _prune_candidates_original(actions, priors, max_children=40, free_guarantee=None):
@@ -14868,6 +14892,11 @@ _SIMS_FLOOR = max(1, int(os.environ.get('WOTR_SIMS_FLOOR', '120') or 120))
 _LEAF_BATCH = max(1, int(os.environ.get('WOTR_LEAF_BATCH', '1') or 1))
 _PENDING_EVAL_BOX = [None]      # active _PendingEvals collector or None
 _DEFERRED = float('nan')        # leaf-value sentinel: evaluation pending
+
+
+_SMALL_MENU = 8      # a root of at most this many choices is searched full width and decided by mean value
+_SMALL_MIN_GAIN = 0.06   # ... when the best mean leads the net's own move by this much (values are in [-1, 1]:
+_SMALL_MARGIN = 2.0      # 0.03 of win probability) and by more than this many standard errors (turnsearch.Config)
 
 
 def _sims_budget(num_simulations, k):
@@ -15257,8 +15286,11 @@ def _search_decision_context(state, sort_dice=False):
     )
 
 
-def _state_sig(state, sort_dice=False):
+def _state_sig(state, sort_dice=False, parts=False):
     """Strong cheap fingerprint of everything search-relevant.
+
+    parts: return the key itself (the tuple this fingerprint is the hash of) - _strictly_better compares two
+    positions field by field with it.
 
     sort_dice: canonicalize each side's dice by face — die ORDER never
     matters to game logic, but roll order splits identical multisets
@@ -15306,7 +15338,7 @@ def _state_sig(state, sort_dice=False):
         followup_sig = (round_signature(dict(
             followup, exclude=tuple(sorted(followup.get('exclude') or ()))))
             if followup is not None else None)
-        return hash((
+        key = (
             state.turn, armies, dice,
             _hunt_timing_context(state), _route_event_context(state), _breaking_remaining(state),
             sanitize(game_logic.fellowship_region(state)),
@@ -15365,7 +15397,8 @@ def _state_sig(state, sort_dice=False):
                 'source_card_id') if (getattr(state, 'pending_card_option', None)
                                      or {}).get('gandalf_draw') else None),
             _search_decision_context(state, sort_dice),
-            _search_public_context(state)))
+            _search_public_context(state))
+        return key if parts else hash(key)
     except Exception:
         return None
 
@@ -15655,7 +15688,7 @@ def _kernel_serve_world(chance: 'MCTSNode') -> 'Optional[MCTSNode]':
 
 
 def _greedy_prior_action(state: GameState, side: Side, net,
-                         actions) -> 'Optional[Action]':
+                         actions, decision=False) -> 'Optional[Action]':
     """Argmax-prior pick for the transition's phase decisions (declare /
     eyes / hand-limit) — the in-tree twin of the episode loop's
     noise-free phase MCTS, collapsed to one net call.
@@ -15675,6 +15708,12 @@ def _greedy_prior_action(state: GameState, side: Side, net,
         return _OWN_VALUE_CONTEXT.turn_action(state, side, actions)
     try:
         priors, _v = _get_priors_and_value(state, side, net, actions)
+        if decision:
+            # a REAL decision made by the net alone (not the in-tree twin): THE SAME BUT BETTER applies, over the
+            # options a search would consider (at most 40, the highest priors)
+            order = sorted(range(len(actions)), key=lambda i: (-float(priors[i]), i))[:MCTS_MAX_CHILDREN or 40]
+            better = _strictly_better(state, side, [actions[i] for i in order])
+            return actions[order[_move_to_better(0, better)]]
         return actions[int(np.argmax(priors))]
     except Exception:
         from reward_contract import uses_predecision
@@ -18232,7 +18271,161 @@ print('[SELECT] resolved: pi_mode=%s temp_earned=%s head_act=%s'
          os.environ.get('WOTR_VALUE_HEAD_ACT', 'scaled2')), flush=True)
 
 
+# THE SAME BUT BETTER (owner, 2026-11-16).  Among the options of one decision whose outcome involves no roll and no
+# draw, B is STRICTLY WORSE than A when the position after B is the position after A in everything else and A is at
+# least as good on every one of the quantities below and better on at least one.  B is then never the AI's move: the
+# pick moves on to A (the search's verdict on B holds for A all the more).
+#   "the position ... in everything else": the engine's own identity of a position, _state_sig (what tree reuse and
+#       the merging of chance outcomes already treat as the same position), with the quantities taken out of the key.
+#   the quantities, each with the direction nobody disputes, for the side that chooses:
+#       own units and figures on the board     per region, by nation and kind / by identity     a superset
+#       the enemy's units and figures          the same                                         a subset
+#       own action dice still to use           by face (dice in the Hunt Box are no quantity)    a superset
+#       own dice in all                        how many                                         more
+#       the enemy's dice                       both                                             a subset / fewer
+#       own cards in hand                      by card (the enemy's hand must be equal)         a superset
+#       victory points                         own more, the enemy's fewer
+#       Free Peoples pieces gone for good      state.fp_casualties, by nation and kind          FP: fewer, Shadow: more
+#       corruption                                                                              FP: less,  Shadow: more
+#       the Fellowship's progress              the track and the Mordor track, each             FP: more,  Shadow: less
+#   A better KIND of unit in the same place is no such quantity (a judgement); where a piece stands, the Hunt Box, the
+#   political track, rings and tokens, every open decision are part of "everything else": equal, or no verdict.
+# Each option is applied once (_apply_action_detect_rng: the step the search itself makes; an option that consumes a
+# random number is left out, and the random streams are put back as they were).  That costs about 2 ms an option in
+# Python, so the rule lives where a move is DECIDED - the options handed in are the search's root children, at most
+# 40 - and not inside the tree (measured: RESULTS.md, "Dominance").  Inside the tree, and for both sides, the part
+# that needs no option applied is ai_policies.least_destroyed (units lost to the stacking limit).
+_SB_BLANK = (1, 2, 7, 8, 11, 14, 15, 23)     # _state_sig's key: armies, dice, progress, corruption, mordor_step,
+#                                              the two hand sizes, fp_casualties (checked against the state below)
+
+
+def _outcome(state, side):
+    """-> (the rest of the position, its quantities) or None when the engine cannot key the position."""
+    from collections import Counter
+    key = _state_sig(state, parts=True)      # (the tree-reuse form: with every open decision's content)
+    if key is None:
+        return None
+    f, other = state.fellowship, (Side.SHADOW if side == Side.FREE_PEOPLES else Side.FREE_PEOPLES)
+    hands = state.hands
+    if not (key[7] == f.progress and key[8] == f.corruption and key[11] == f.mordor_step
+            and key[14] == len(hands[Side.FREE_PEOPLES].hand) and key[15] == len(hands[Side.SHADOW].hand)
+            and isinstance(key[1], tuple) and isinstance(key[2], tuple) and isinstance(key[23], tuple)):
+        raise RuntimeError('_state_sig key layout changed: _SB_BLANK must follow it')
+    public = key[-1]
+    rest = (tuple(None if i in _SB_BLANK else part for i, part in enumerate(key[:-1])),
+            public[:5] + public[6:],                    # (public[5]: the hands' character / face-down counts)
+            tuple(sorted(str(c) for c in hands[other].hand)),
+            tuple(len(hands[s].discarded_face_down) for s in (Side.FREE_PEOPLES, Side.SHADOW)))
+    board = {side: {}, other: {}}
+    for region, army in state.armies.items():
+        where = sanitize(str(region))
+        for u in army.units:
+            board[_side_of_nation(u.nation)].setdefault(where, Counter())[(u.nation.name, u.kind.name)] += 1
+        for l in army.leaders:
+            nation = getattr(l, 'nation', None)
+            owner = _side_of_nation(nation) if nation is not None else (
+                Side.FREE_PEOPLES if isinstance(l, Companion) else Side.SHADOW)
+            board[owner].setdefault(where, Counter())[_sig_leader_id(l)] += 1
+    in_hunt = {id(d) for d in state.hunt_box}
+
+    def to_use(s):
+        return Counter(d.current.name for d in state.dice.get(s, ()) if not d.used and d.current is not None
+                       and id(d) not in in_hunt)
+    fp = side == Side.FREE_PEOPLES
+    return rest, dict(
+        own=board[side], enemy=board[other], own_dice=to_use(side), enemy_dice=to_use(other),
+        own_dice_all=len(state.dice.get(side, ())), enemy_dice_all=len(state.dice.get(other, ())),
+        own_hand=Counter(str(c) for c in hands[side].hand),
+        own_vp=int(state.vp.free_peoples if fp else state.vp.shadow),
+        enemy_vp=int(state.vp.shadow if fp else state.vp.free_peoples),
+        gone=Counter({(getattr(n, 'name', str(n)), k): int(v) for n, kinds in (state.fp_casualties or {}).items()
+                      for k, v in (kinds or {}).items() if v}),
+        corruption=int(f.corruption), progress=(int(f.progress), int(f.mordor_step)))
+
+
+def _at_least_as_good(side, a, b):
+    """Is the outcome `a` at least as good as `b` on every quantity, and better on one (same rest assumed)?"""
+    def within(x, y):                    # multiset x is part of multiset y
+        return all(y.get(k, 0) >= v for k, v in x.items())
+
+    def board_within(x, y):
+        return all(within(c, y.get(r, {})) for r, c in x.items())
+    fp = side == Side.FREE_PEOPLES
+    ok = (board_within(b['own'], a['own']) and board_within(a['enemy'], b['enemy'])
+          and within(b['own_dice'], a['own_dice']) and within(a['enemy_dice'], b['enemy_dice'])
+          and a['own_dice_all'] >= b['own_dice_all'] and a['enemy_dice_all'] <= b['enemy_dice_all']
+          and within(b['own_hand'], a['own_hand'])
+          and a['own_vp'] >= b['own_vp'] and a['enemy_vp'] <= b['enemy_vp']
+          and (within(a['gone'], b['gone']) if fp else within(b['gone'], a['gone']))
+          and (a['corruption'] <= b['corruption'] if fp else a['corruption'] >= b['corruption'])
+          and all((x >= y) if fp else (x <= y) for x, y in zip(a['progress'], b['progress'])))
+    return ok and a != b
+
+
+def _strictly_better(state, side, actions):
+    """For each option the index of an option of `actions` that is THE SAME BUT BETTER (see above), else -1.
+    None when nothing can be compared (fewer than two options, or the state is not the engine's own object)."""
+    if len(actions) < 2 or not isinstance(state, GameState) or _outcome(state, side) is None:
+        return None                      # (_outcome on the root: also the one loud check of the key's layout)
+    py_rng, np_rng = random.getstate(), np.random.get_state()
+    seen = {}
+    try:
+        for i, action in enumerate(actions):
+            try:
+                after, rolled = _apply_action_detect_rng(state, action)
+                now = np.random.get_state()
+                if rolled or now[2] != np_rng[2] or not np.array_equal(now[1], np_rng[1]):
+                    random.setstate(py_rng)
+                    np.random.set_state(np_rng)
+                    continue
+                outcome = _outcome(after, side)
+            except Exception:
+                random.setstate(py_rng)
+                np.random.set_state(np_rng)
+                continue                 # (an option that cannot be applied here is no part of any verdict)
+            if outcome is not None:
+                seen.setdefault(outcome[0], []).append((i, outcome[1]))
+    finally:
+        random.setstate(py_rng)
+        np.random.set_state(np_rng)
+    better = [-1] * len(actions)
+    for group in seen.values():
+        if len(group) < 2:
+            continue
+        for i, qb in group:
+            above = [j for j, qa in group if j != i and _at_least_as_good(side, qa, qb)]
+            if above:                    # (of several, one that nothing is better than in turn: the relation has no cycle)
+                top = [j for j in above if not any(k != j and _at_least_as_good(side, qk, dict(group)[j])
+                                                   for k, qk in group)]
+                better[i] = (top or above)[0]
+    return better if any(b >= 0 for b in better) else None
+
+
+def _move_to_better(play, better):
+    """The pick `play` moved on along `better` (an index list of _strictly_better, or None) to an option that
+    nothing is better than."""
+    if better is None:
+        return play
+    walked = set()
+    while 0 <= int(play) < len(better) and int(better[int(play)]) >= 0 and int(play) not in walked:
+        walked.add(int(play))
+        play = int(better[int(play)])
+    return int(play)
+
+
 def select_root_action(children_stats, temperature, cfg=None):
+    """The root pick of both searches: _select_root_action's pick, moved on to THE SAME BUT BETTER option when
+    children_stats carries 'sb' (_strictly_better of the root's options) and the pick is strictly worse than one."""
+    play, pi, diag = _select_root_action(children_stats, temperature, cfg)
+    moved = _move_to_better(play, children_stats.get('sb'))
+    if moved != play:
+        diag = dict(diag, strictly_better=(int(play), moved))
+        pi = np.zeros(len(pi))
+        pi[moved] = 1.0
+    return moved, pi, diag
+
+
+def _select_root_action(children_stats, temperature, cfg=None):
     """Pick the root action from per-arm search stats
     ({'p' clean priors, 'q' parent-perspective child Q, 'n' raw visit
     counts, optional 'tf' resolved-terminal fraction}) and return
@@ -18313,6 +18506,31 @@ def select_root_action(children_stats, temperature, cfg=None):
         alive = pv_arr != -1
     else:
         alive = np.ones(len(n), dtype=bool)
+
+    # SMALL MENU, SEARCHED FULL WIDTH (mcts_search: every visit of every arm was served by the root floor, so
+    # 'fn' equals 'n').  Every arm has the same number of simulations, so visits say nothing; the MEAN VALUE
+    # decides - by the turn search's own test of a clear lead (turnsearch.Config margin / min_gain): the net's own
+    # move (the highest prior; of equals the first) is played unless the arm of the best mean value leads it by at
+    # least _SMALL_MIN_GAIN AND by more than _SMALL_MARGIN standard errors of that lead ('qv': the variance of
+    # the values backed up through each arm).  A lead inside the noise of the values does not overrule the net.
+    _fn_fw = children_stats.get('fn')
+    if _fn_fw is not None and 2 <= len(n) <= _SMALL_MENU and tot > 0:
+        _fn_fw = np.asarray(_fn_fw, dtype=np.float64)
+        if np.all(_fn_fw >= n) and np.any(alive & (n > 0)):
+            _seen = alive & (n > 0)
+            _arms = [i for i in range(len(n)) if _seen[i]]
+            play = max(_arms, key=lambda i: (float(p[i]), -i))
+            best = max(_arms, key=lambda i: (float(q[i]), float(p[i]), -i))
+            _qv = children_stats.get('qv')
+            _qv = np.zeros(len(n)) if _qv is None else np.asarray(_qv, dtype=np.float64)
+            gain = float(q[best] - q[play])
+            se = float(np.sqrt(_qv[best] / n[best] + _qv[play] / n[play]))
+            if best != play and gain >= _SMALL_MIN_GAIN and gain > _SMALL_MARGIN * se:
+                play = best
+            pi = np.zeros(len(n))
+            pi[play] = 1.0
+            return play, pi, {'q_hat': q_hat, 'sigma': 0.0, 'elig': _seen,
+                              'regret': float(q[best] - q[play])}
 
     max_n = float(n.max()) if len(n) else 0.0
     elig = (n >= float(cfg.min_visits)) & alive
@@ -19295,6 +19513,14 @@ def mcts_search(state: GameState, side: Side,
     _force_cap = (min(_FREE_FORCE,
                       int(num_simulations) // (4 * len(_force_idx)))
                   if _force_idx else 0)
+    # SMALL MENUS ARE SEARCHED FULL WIDTH: a root of 2.._SMALL_MENU children gives every child the same number of
+    # simulations (the floor above serves the least visited child first, so with every child in it and the cap at
+    # an equal share the whole budget goes round the children), and select_root_action then decides by the mean
+    # values: the net's own move, unless another child leads it clearly (_SMALL_MIN_GAIN, _SMALL_MARGIN).
+    # Native twin: search_controller.inc (force_idx).
+    if 2 <= len(root.children) <= _SMALL_MENU and not root.forced_policy_reason:
+        _force_idx = list(range(len(root.children)))
+        _force_cap = max(1, -(-int(num_simulations) // len(_force_idx)))
 
     def _simulate_from(node, path):
         """One simulation starting at `node` (already appended to
@@ -19344,7 +19570,7 @@ def mcts_search(state: GameState, side: Side,
                     leaf_value = _settle_new_node(
                         node, node.parent.side, fp_net, sh_net, side)
                     leaf_term = node.is_terminal
-                    if node.forced_policy_reason and not leaf_term:
+                    if (node.forced_policy_reason or node.unsettled) and not leaf_term:
                         continue
                     break
                 continue
@@ -19402,7 +19628,7 @@ def mcts_search(state: GameState, side: Side,
                         leaf_value = _settle_new_node(
                             branch, node.side, fp_net, sh_net, side)
                         leaf_term = branch.is_terminal
-                        if branch.forced_policy_reason and not leaf_term:
+                        if (branch.forced_policy_reason or branch.unsettled) and not leaf_term:
                             node = branch
                             continue
                         break
@@ -19412,7 +19638,7 @@ def mcts_search(state: GameState, side: Side,
                             node, node.parent.side, fp_net, sh_net,
                             side)
                         leaf_term = node.is_terminal
-                        if node.forced_policy_reason and not leaf_term:
+                        if (node.forced_policy_reason or node.unsettled) and not leaf_term:
                             continue
                         break
                 # Lazy materialization + RNG detection
@@ -19447,7 +19673,7 @@ def mcts_search(state: GameState, side: Side,
                         leaf_value = _settle_new_node(
                             branch, node.side, fp_net, sh_net, side)
                         leaf_term = branch.is_terminal
-                        if branch.forced_policy_reason and not leaf_term:
+                        if (branch.forced_policy_reason or branch.unsettled) and not leaf_term:
                             node = branch
                             continue
                         break
@@ -19463,7 +19689,7 @@ def mcts_search(state: GameState, side: Side,
                     leaf_value = _settle_new_node(
                         branch, node.side, fp_net, sh_net, side)
                     leaf_term = branch.is_terminal
-                    if branch.forced_policy_reason and not leaf_term:
+                    if (branch.forced_policy_reason or branch.unsettled) and not leaf_term:
                         node = branch
                         continue
                     break
@@ -19471,7 +19697,7 @@ def mcts_search(state: GameState, side: Side,
                 leaf_value = _settle_new_node(
                     node, node.parent.side, fp_net, sh_net, side)
                 leaf_term = node.is_terminal
-                if node.forced_policy_reason and not leaf_term:
+                if (node.forced_policy_reason or node.unsettled) and not leaf_term:
                     continue
                 break
             if (_PENDING_EVAL_BOX[0] is not None
@@ -19644,7 +19870,8 @@ def mcts_search(state: GameState, side: Side,
          'tf': term_frac, 'pv': visit_info['proven'],
          'pvv': visit_info['proven_value'],
          'fn': visit_info['forced'], 'cf': visit_info['conf'],
-         'ph': visit_info['phi']},
+         'ph': visit_info['phi'], 'qv': q_var,
+         'sb': _strictly_better(root.state, root.side, [c.action for c in root.children])},
         temperature, cfg=selector_cfg)
     visit_info.update(make_evidence(
         selector_cfg, temperature, pi_sel, eligible=sel_diag['elig'],

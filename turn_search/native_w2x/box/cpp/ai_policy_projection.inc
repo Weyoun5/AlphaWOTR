@@ -283,6 +283,53 @@ NativePolicyProjection ap_project(const Snapshot& state,const Snapshot& descript
         }else if(truth(state,ap_get(state,card_pending,"palantir_draw"))){
             for(size_t i=0;i<rows.size();++i)if(rows[i].kind=="card_option" && ap_get(descriptors,ap_get(descriptors,rows[i].params,"choices"),"palantir_deck")!=missing)tags[i]=ap_draw;
         }
+        // ai_policies.least_destroyed (THE AI NEVER CHOOSES TO LOSE UNITS TO THE STACKING LIMIT): rows that differ only in how many
+        // units arrive in one region are a family; only the rows of the least excess over the limit stay.  Families: army_move rows
+        // equal in everything but n_regular / n_elite; the rows of one cargo count stage (choices carry _cargo_key and count).
+        // An army_move family that takes no Leader / Nazgul and cannot arrive without excess is dropped whole.  Never an empty menu.
+        {
+            struct Member{size_t row;int64_t excess;bool carries;};
+            struct Fam{int type;int64_t die;ap_Frozen rest;std::vector<Member> members;};
+            std::vector<Fam> fams;
+            auto own_at=[&](const std::string& region){const auto army=mu_army(state,sanitize_name(region));int64_t n=0;
+                if(army!=missing&&!ctx_none(state,army))for(auto u:child_edges(state,obs_attr(state,army,"units")))n+=ctx_unit_side(state,u)==side;return n;};
+            auto number=[&](uint64_t node){return node==missing||!truth(descriptors,node)?int64_t(0):typed(descriptors,node,WOTR_INT,"native policy unit count must be integer").integer;};
+            for(size_t i=0;i<rows.size();++i){
+                if(!keep[i])continue;const auto& row=rows[i];const auto p=row.params;
+                int type=-1;int64_t moved=0;bool carries=false;ap_Frozen rest;std::string to;
+                if(row.kind=="army_move"){
+                    const auto to_node=ap_get(descriptors,p,"to"),nr=ap_get(descriptors,p,"n_regular"),ne=ap_get(descriptors,p,"n_elite");
+                    if(to_node==missing||(nr==missing&&ne==missing))continue;
+                    type=0;rest=ap_freeze(descriptors,p);
+                    rest.children.erase(std::remove_if(rest.children.begin(),rest.children.end(),[](const ap_Frozen& item){return item.children[0].value=="n_regular"||item.children[0].value=="n_elite";}),rest.children.end());
+                    moved=number(nr)+number(ne);
+                    carries=truth(descriptors,ap_get(descriptors,p,"take_leaders"))||truth(descriptors,ap_get(descriptors,p,"n_nazgul"))||truth(descriptors,ap_get(descriptors,p,"leader_set"));
+                    to=std::string(text(descriptors,to_node));
+                }else if(row.kind=="card_option"){
+                    const auto c=ap_get(descriptors,p,"choices");if(c==missing)continue;
+                    const auto ck=ap_get(descriptors,c,"_cargo_key"),count=ap_get(descriptors,c,"count");
+                    if(ck==missing||!truth(descriptors,ck)||count==missing||descriptors.nodes[count].tag!=WOTR_INT)continue;
+                    const auto ckv=child_edges(descriptors,ck);if(ckv.empty()||!text_is(descriptors,ckv[0],"unit"))continue;
+                    const auto cargo=ap_get(descriptors,c,"cargo");
+                    if(cargo!=missing&&truth(descriptors,cargo))for(auto r:child_edges(descriptors,cargo)){const auto v=child_edges(descriptors,r);if(v.size()>=4&&text_is(descriptors,v[0],"unit"))moved+=typed(descriptors,v[3],WOTR_INT,"native policy cargo count must be integer").integer;}
+                    const auto cont=ap_get(descriptors,c,"_cargo_continue");
+                    auto to_node=cont==missing?missing:ap_get(descriptors,cont,"to_region");
+                    if(to_node==missing||!truth(descriptors,to_node))to_node=ap_get(descriptors,c,"to_region");
+                    if(to_node==missing||!truth(descriptors,to_node))continue;
+                    type=1;rest.tag=WOTR_TUPLE;rest.children={ap_freeze(descriptors,ap_get(descriptors,p,"card_id")),ap_freeze(descriptors,ap_get(descriptors,c,"_cargo_index")),ap_freeze(descriptors,cont)};
+                    carries=true;to=std::string(text(descriptors,to_node));
+                }else continue;
+                const int64_t excess=std::max<int64_t>(0,own_at(to)+moved-10);
+                auto fam=std::find_if(fams.begin(),fams.end(),[&](const Fam& f){return f.type==type&&(type==1||f.die==row.die)&&ap_equal(f.rest,rest);});
+                if(fam==fams.end()){fams.push_back({type,row.die,std::move(rest),{}});fam=fams.end()-1;}
+                fam->members.push_back({i,excess,carries});
+            }
+            std::vector<size_t> drop;
+            for(const auto& f:fams){int64_t least=f.members.front().excess;for(const auto& m:f.members)least=std::min(least,m.excess);
+                for(const auto& m:f.members)if(m.excess>least||(m.excess>0&&!m.carries))drop.push_back(m.row);}
+            size_t kept=0;for(bool flag:keep)kept+=flag;
+            if(drop.size()<kept)for(size_t i:drop){keep[i]=false;tags[i]="least_units_lost_to_stacking";}
+        }
         std::set<std::string_view> unique;size_t selected=0,last=0;
         for(size_t i=0;i<rows.size();++i){if(!tags[i].empty())unique.insert(tags[i]);if(keep[i]){++selected;last=i;}}
         result.reasons.assign(unique.begin(),unique.end());

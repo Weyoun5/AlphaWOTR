@@ -8,10 +8,12 @@ The names and their measured worth (the cluster's test of the settings: gain per
 points of win probability, the narrow setting before them +0.34): wide +0.63, wide_advisers +0.67,
 wide_advisers_double +0.92.
 
-A SMALL decision - at most SMALL_CHOICES choices, or a choice among SMALL_KINDS only (a discard,
-the eyes, declaring the Fellowship, a retreat, the casualties) - is searched cheaply whatever the
-slider says: at most SMALL_SIMS simulations, and the turn search (where the slider has it on at
-all) with SMALL_SETTING.
+A SMALL decision - a choice among SMALL_KINDS only (a discard, the eyes, declaring the Fellowship,
+a retreat, the casualties) - is searched cheaply whatever the slider says: at most SMALL_SIMS
+simulations, and the turn search (where the slider has it on at all) with SMALL_SETTING.  How MANY
+choices a decision has does not make it small: a menu of few choices is searched full width by
+the engine (ai._SMALL_MENU: the same simulations for every choice; the net's own move plays unless
+another choice's mean value leads it clearly).
 
 A slider nobody has moved (settings 'strength' 0) stands at THIS PC's default: default(gpu) -
 DEFAULT_GPU when the turn search runs its nets on the GPU (turn_search.gpu), DEFAULT_CPU when it
@@ -24,7 +26,6 @@ two defaults.
 """
 LEVELS = (None, 'wide', 'wide_advisers', 'wide_advisers_double')
 DEFAULT_GPU, DEFAULT_CPU = 3, 1
-SMALL_CHOICES = 2
 SMALL_SIMS = 100
 SMALL_SETTING = 'wide'
 SMALL_KINDS = frozenset((
@@ -34,7 +35,7 @@ SMALL_KINDS = frozenset((
 
 
 def small(menu):
-    return len(menu) <= SMALL_CHOICES or all(a.action_type in SMALL_KINDS for a in menu)
+    return all(a.action_type in SMALL_KINDS for a in menu)
 
 
 def default(gpu):
