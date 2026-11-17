@@ -3410,5 +3410,22 @@ def main(argv=None):
             dlog.close()
 
 
+def fixed_hash_seed(script):
+    """Their launcher runs the engine with PYTHONHASHSEED=0 (wotr_bridge/launch_head.py's HEAD_ENV): the iteration
+    order of Python's sets of strings, which reaches the engine's menus, depends on it.  Setting it from inside the
+    process does nothing, and `python -I` (or -E) ignores it in the environment, so the process re-executes itself
+    once with it: -s -P instead of -I (no user site, no script folder on the path), the other PYTHON* variables
+    dropped.  POSIX only (on Windows exec would not keep the protocol's pipes: set PYTHONHASHSEED=0 there)."""
+    if sys.flags.hash_randomization == 0 or os.name != 'posix' or os.environ.get('WOTR_HASHSEED_REEXEC'):
+        return
+    env = dict((k, v) for k, v in os.environ.items() if not k.startswith('PYTHON'))
+    env['PYTHONHASHSEED'] = '0'
+    env['WOTR_HASHSEED_REEXEC'] = '1'
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execve(sys.executable, [sys.executable, '-s', '-P', os.path.abspath(script)] + sys.argv[1:], env)
+
+
 if __name__ == '__main__':
+    fixed_hash_seed(__file__)
     main()
