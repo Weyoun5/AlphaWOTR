@@ -5,6 +5,8 @@
 #include "wotr_random.h"
 
 #include <algorithm>
+#include <cctype>
+#include <tuple>
 
 using pyobj::Obj;
 using awjson::Value;
@@ -35,6 +37,12 @@ void Tables::load(const Value& j) {
     for (const auto& x : at(j, "decks").arr) decks.push_back(x.s);
     for (const auto& x : at(j, "special_tiles").arr) special_tiles.insert(x.s);
     for (const auto& kv : card_in) card_out[kv.second] = kv.first;
+    for (const auto& kv : nation_in) nation_out[kv.second] = kv.first;
+    for (const auto& kv : at(j, "stronghold").obj) stronghold[kv.first] = kv.second.truthy();
+    for (const auto& kv : at(j, "fp_region").obj) fp_region[kv.first] = kv.second.truthy();
+    for (const auto& kv : at(j, "adjacent").obj) for (const auto& x : kv.second.arr) adjacent[kv.first].insert(x.s);
+    strmap("card_title", card_title); strmap("combat_effect_kind", combat_effect_kind);
+    hidden_cc = at(j, "hidden_cc").s;
 }
 
 Adapter::Adapter(pyobj::Model& model, const Tables& tables, Obj* prototypes) : m(model), t(tables), protos(prototypes) {}
@@ -414,10 +422,283 @@ void Adapter::build_cards(Obj* st, const Value& view, Memo& memo) {
     m.set_attr(st, "persistent_cards", pcs);
 }
 
-// SETUPS (the adapter's lines 1879-2272), ported kind by kind
-Adapter::Setup Adapter::setup(const std::string& kind, Obj* st, const Value& dec, const Value& view, const Memo& memo) {
-    (void)dec; (void)view;
+// ---------------------------------------------------------------- SETUPS (the adapter's lines 1879-2272)
+namespace {
+// opts(dec, kind, **fields): the options of `kind` whose fields equal the given ones (a field given as None: absent
+// or null)
+std::vector<const Value*> opts(const Value& dec, const std::string& kind, std::vector<std::pair<std::string, const Value*>> fields = {}) {
+    std::vector<const Value*> out;
+    for (const Value& o : or_empty(dec, "options").arr) {
+        if (!kind.empty() && at(o, "kind").s != kind) continue;
+        bool ok = true;
+        for (const auto& [k, v] : fields) {
+            const Value& x = at(o, k);
+            if (v == nullptr) { if (x.kind != Value::Null) { ok = false; break; } continue; }
+            if (x.kind != v->kind || x.s != v->s || x.i != v->i || x.b != v->b) { ok = false; break; }
+        }
+        if (ok) out.push_back(&o);
+    }
+    return out;
+}
+std::string lower(std::string x) { for (char& c : x) c = char(std::tolower(static_cast<unsigned char>(c))); return x; }
+// plain(s): lower-case letters and digits (the titles compared here are ASCII)
+std::string plain(const std::string& x) { std::string o; for (unsigned char c : x) if (std::isalnum(c) && c < 128) o += char(std::tolower(c)); return o; }
+}  // namespace
+
+// army_at(st, key): the army whose key sanitises as `key` does
+Obj* Adapter::army_at(Obj* st, const std::string& key) {
+    Obj* armies = pyobj::Model::attr(st, "armies");
+    const std::string san = awad_sanitize(key);
+    for (size_t j = 0; j + 1 < armies->k.size(); j += 2) if (awad_sanitize(armies->k[j]->s) == san) return armies->k[j + 1];
+    return nullptr;
+}
+
+// game_logic._leader_side: Companions FP, Nazgul and Minions SH, plain leaders by nation (None: FP)
+int Adapter::leader_side(Obj* ld) {
+    const std::string& type = pyobj::Model::type(ld);
+    if (type == "game_state.Companion") return 0;
+    if (type == "game_state.Nazgul" || type == "game_logic.Minion") return 1;
+    Obj** nat = pyobj::Model::attr_slot(ld, "nation");
+    if (!nat || (*nat)->tag != WOTR_ENUM) return 0;
+    return FP_NATIONS.count((*nat)->k[1]->s) ? 0 : 1;
+}
+
+// _sail_in: Corsairs of Umbar's landing (the adapter's lines 1921-1981)
+Obj* Adapter::sail_in(Obj* st, const Value& b, const std::string& frm, const std::string& reg, int atk) {
+    using M = pyobj::Model;
+    Obj* src = army_at(st, frm);
+    if (!src) return nullptr;
+    auto nation_of = [](Obj* x) { return M::attr(x, "nation")->k[1]->s; };
+    auto unit_side = [&](Obj* u) { return FP_NATIONS.count(nation_of(u)) ? 0 : 1; };
+    auto saruman = [](Obj* ld) {
+        if (M::type(ld) != "game_logic.Minion") return false;
+        Obj** n = M::attr_slot(ld, "name");
+        return n && (*n)->tag == WOTR_STRING && lower((*n)->s).find("saruman") != std::string::npos;
+    };
+    Obj* relief = nullptr;
+    bool besieged = false;
+    for (Obj* x : M::attr(st, "besieged_strongholds")->k) if (x->s == reg) besieged = true;
+    // combat.garrison_side_for
+    auto garrison_side = [&](const std::string& region) {
+        Obj* ec = M::attr(st, "enemy_controlled");
+        const std::string san = awad_sanitize(region);
+        for (int side : {1, 0}) {
+            Obj* set = M::dict_get(ec, side_enum(side));
+            if (set) for (Obj* x : set->k) if (x->s == san) return side;
+        }
+        auto f = t.fp_region.find(san);
+        return (f != t.fp_region.end() && f->second) ? 0 : 1;
+    };
+    if (besieged && garrison_side(reg) == atk && army_at(st, reg)) {
+        // army_card_cargo.freeze(inventory(st, reg)): the Shadow figures there, by category, sorted
+        Obj* garrison = army_at(st, reg);
+        std::map<std::tuple<std::string, std::string, std::string>, int64_t> inv;
+        for (Obj* u : M::attr(garrison, "units")->k)
+            if (unit_side(u) == 1) ++inv[{"unit", nation_of(u), M::attr(u, "kind")->k[1]->s}];
+        for (Obj* l : M::attr(garrison, "leaders")->k) {
+            if (leader_side(l) != 1 || saruman(l)) continue;
+            if (M::type(l) == "game_state.Nazgul") { ++inv[{"nazgul", "SAURON", ""}]; continue; }
+            Obj** n = M::attr_slot(l, "name");
+            if (n && M::truthy(*n)) ++inv[{"named", (*n)->s, ""}];
+            else ++inv[{"leader", nation_of(l), ""}];
+        }
+        relief = m.tuple();
+        for (const auto& [key, count] : inv)
+            if (count) relief->k.push_back(m.tuple({m.str(std::get<0>(key)), m.str(std::get<1>(key)), m.str(std::get<2>(key)), m.integer(count)}));
+    }
+    std::map<std::pair<std::string, std::string>, int64_t> want;
+    const bool listed = at(b, "attackers").truthy();
+    for (const Value& p : or_empty(b, "attackers").arr) want[{at(p, "nation").s, at(p, "unit").s}] += at(p, "n").kind == Value::Null ? 0 : at(p, "n").as_int();
+    auto take = [&](const std::pair<std::string, std::string>& k) {
+        if (!listed) return true;
+        auto it = want.find(k);
+        if (it != want.end() && it->second > 0) { --it->second; return true; }
+        return false;
+    };
+    Obj* dst = get_or_create_army(st, reg);
+    Obj* keep_units = m.list();
+    for (Obj* u : M::attr(src, "units")->k) {
+        const std::string unit = M::attr(u, "kind")->k[1]->s == "REGULAR" ? "regular" : "elite";
+        if (unit_side(u) == atk && take({t.nation_out.at(nation_of(u)), unit})) M::attr(dst, "units")->k.push_back(u);
+        else keep_units->k.push_back(u);
+    }
+    Obj* keep_leaders = m.list();
+    for (Obj* ld : M::attr(src, "leaders")->k) {
+        const std::string& tn = M::type(ld);
+        bool go;
+        if (leader_side(ld) != atk || saruman(ld)) go = false;
+        else if (tn == "game_state.Nazgul") go = take({"SAURON", "nazgul"});
+        else if (tn == "game_state.Leader") go = take({t.nation_out.at(nation_of(ld)), "leader"});
+        else go = true;
+        (go ? M::attr(dst, "leaders") : keep_leaders)->k.push_back(ld);
+    }
+    m.set_attr(src, "units", keep_units);
+    m.set_attr(src, "leaders", keep_leaders);
+    if (keep_units->k.empty() && keep_leaders->k.empty()) {
+        Obj* armies = M::attr(st, "armies");
+        Obj* kept = m.dict();
+        for (size_t j = 0; j + 1 < armies->k.size(); j += 2)
+            if (armies->k[j + 1] != src) { kept->k.push_back(armies->k[j]); kept->k.push_back(armies->k[j + 1]); }
+        m.set_attr(st, "armies", kept);
+    }
+    return relief;
+}
+
+// _battle: the engine's pending_combat for the referee's battle (the adapter's lines 1983-2046)
+Obj* Adapter::battle(Obj* st, const Value& view, const Memo& memo, const std::string& phase, int64_t rounds_fought) {
+    using M = pyobj::Model;
+    const Value& b = at(view, "battle");
+    if (!b.truthy()) return nullptr;
+    const int atk = side_in(at(b, "attacker").s);
+    auto fi = t.region_in.find(at(b, "from").s), ri = t.region_in.find(at(b, "region").s);
+    if (at(b, "from").kind != Value::Str || at(b, "region").kind != Value::Str || fi == t.region_in.end() || ri == t.region_in.end()) return nullptr;
+    std::string frm = fi->second;
+    const std::string reg = ri->second;
+    const std::string kind = at(b, "battle").kind == Value::Str ? at(b, "battle").s : "";
+    auto sh = t.stronghold.find(reg);
+    const bool stronghold = sh != t.stronghold.end() && sh->second;
+    auto adj = t.adjacent.find(frm);
+    const bool sailed = frm != reg && !(adj != t.adjacent.end() && adj->second.count(reg));
+    Obj* relief = nullptr;
+    bool pre_siege = false;
+    if (sailed) {
+        relief = sail_in(st, b, frm, reg, atk);
+        for (Obj* x : M::attr(st, "besieged_strongholds")->k) if (x->s == reg) pre_siege = true;
+        frm = reg;
+    }
+    Obj* pc = m.dict();
+    auto put = [&](const char* k, Obj* v) { m.dict_set(pc, m.str(k), v); };
+    put("attacker_region", m.str(frm)); put("defender_region", m.str(reg));
+    put("attacker_side", side_enum(atk)); put("defender_side", side_enum(1 - atk));
+    put("is_siege", m.boolean(kind == "siege")); put("stronghold_region", m.boolean(stronghold));
+    put("phase", m.str(phase)); put("deciding_side", side_enum(memo.side));
+    put("rounds_fought", m.integer(rounds_fought)); put("shine_asked", m.boolean(true));
+    put("atk_casualty_policy", m.str("preserve_elites")); put("def_casualty_policy", m.str("preserve_elites"));
+    if (at(b, "white_rider").truthy()) put("gtw_shine", m.boolean(true));
+    if (sailed) {
+        put("attacker_no_retreat", m.boolean(!pre_siege || relief != nullptr));
+        if (relief) { put("is_siege", m.boolean(false)); put("corsairs_relief_garrison", relief); }
+    }
+    if (frm != reg && at(b, "attackers").truthy()) {
+        std::map<std::pair<std::string, std::string>, int64_t> want;
+        for (const Value& p : at(b, "attackers").arr) want[{at(p, "nation").s, at(p, "unit").s}] += at(p, "n").kind == Value::Null ? 0 : at(p, "n").as_int();
+        if (Obj* army = army_at(st, frm)) {
+            Obj* keep = m.list(); Obj* rg = m.list();
+            bool own_kept = false;
+            for (Obj* u : M::attr(army, "units")->k) {
+                const std::string nat = M::attr(u, "nation")->k[1]->s;
+                const int side = FP_NATIONS.count(nat) ? 0 : 1;
+                if (side != atk) { keep->k.push_back(u); continue; }
+                const std::string unit = M::attr(u, "kind")->k[1]->s == "REGULAR" ? "regular" : "elite";
+                auto it = want.find({t.nation_out.at(nat), unit});
+                if (it != want.end() && it->second > 0) { --it->second; keep->k.push_back(u); own_kept = true; }
+                else rg->k.push_back(u);
+            }
+            if (!rg->k.empty() && own_kept) { m.set_attr(army, "units", keep); put("rearguard_units", rg); }
+        }
+    }
+    m.set_attr(st, "pending_combat", pc);
+    return pc;
+}
+
+Adapter::Setup Adapter::setup_card_choice(Obj* st, const Value& dec, const Value& view, const Memo& memo) {
+    using M = pyobj::Model;
     Setup r;
+    r.ported = true;                                           // a None set-up is a port result too
+    const Value& ctx = or_empty(dec, "context");
+    const int me = memo.side;
+    const Value& b = at(view, "battle");
+    std::vector<const Value*> regions;
+    for (const Value* o : opts(dec, "card_choice")) if (at(*o, "region").truthy()) regions.push_back(o);
+    auto question = [&]() { const Value& q = at(ctx, "question"); return q.kind == Value::Str ? q.s : (q.kind == Value::Null ? "None" : ""); };
+    if (b.truthy() && !regions.empty() && lower(question()).find("retreat") != std::string::npos) {
+        const bool attacker = side_in(at(b, "attacker").s) == me;
+        const int64_t rnd = b.get("round") ? at(b, "round").as_int() : 1;
+        Obj* pc = battle(st, view, memo, attacker ? "attacker_card_retreat" : "defender_retreat", rnd - 1);
+        if (pc) {
+            m.dict_set(pc, m.str("_card_retreat_offered"), m.boolean(true));
+            m.dict_set(pc, m.str("_card_retreat_mandatory"), m.boolean(true));
+            r.label = "action"; return r;
+        }
+    }
+    const auto counts = opts(dec, "card_choice");
+    const std::string card = at(ctx, "card").kind == Value::Str ? t.card(at(ctx, "card").s) : "";
+    bool all_counts = !counts.empty();
+    for (const Value* o : counts) if (at(*o, "count").kind == Value::Null) all_counts = false;
+    if (b.truthy() && all_counts && !card.empty()) {
+        auto ki = t.combat_effect_kind.find(card);
+        const std::string kind = ki == t.combat_effect_kind.end() ? "" : ki->second;
+        const bool attacker = side_in(at(b, "attacker").s) == me;
+        if (!kind.empty()) {
+            const int64_t rnd = b.get("round") ? at(b, "round").as_int() : 1;
+            Obj* pc = battle(st, view, memo, "combat_effect_choice", rnd - 1);
+            if (pc) {
+                const std::string role = attacker ? "atk" : "def";
+                Obj* ec = m.dict();
+                Obj* cl = m.list();
+                int64_t mx = 0; bool first = true;
+                for (const Value* o : counts) { const int64_t c = at(*o, "count").as_int(); cl->k.push_back(m.integer(c)); if (first || c > mx) mx = c; first = false; }
+                m.dict_set(ec, m.str("stage"), m.str(kind == "onslaught" ? "post" : "pre"));
+                m.dict_set(ec, m.str("owner"), m.str(role));
+                m.dict_set(ec, m.str("effect"), m.str(kind));
+                m.dict_set(ec, m.str("card_id"), m.str(card));
+                m.dict_set(ec, m.str("counts"), cl);
+                m.dict_set(ec, m.str("max_count"), m.integer(mx));
+                m.dict_set(pc, m.str("effect_choice"), ec);
+                m.dict_set(pc, m.str(role + "_combat_card"), m.str(card));
+                r.label = "action"; return r;
+            }
+        }
+    }
+    const auto draws = opts(dec, "draw");
+    if (!draws.empty() && me == 1) {   // the Palantir of Orthanc's bonus draw (ai._open_palantir_deck_choice)
+        Obj* opt = m.dict();
+        auto put = [&](const char* k, Obj* v) { m.dict_set(opt, m.str(k), v); };
+        put("card_id", m.str("__palantir_draw__")); put("card_name", m.str("Palantir draw"));
+        put("side", m.str("sh")); put("decider", m.str("sh")); put("direct", m.boolean(true)); put("palantir_draw", m.boolean(true));
+        Obj* options = m.list();
+        for (const Value* o : draws) {
+            Obj* d = m.dict();
+            const Value& deck = at(*o, "deck");
+            m.dict_set(d, m.str("palantir_deck"), deck.kind == Value::Str ? m.str(deck.s) : m.none());
+            options->k.push_back(d);
+        }
+        put("options", options);
+        m.set_attr(st, "pending_card_option", opt);
+        r.label = "action"; return r;
+    }
+    Value skip_true; skip_true.kind = Value::Bool; skip_true.b = true;
+    if (me == 0 && ctx.get("damage") && !opts(dec, "card_choice", {{"skip", &skip_true}}).empty()) {
+        for (const Value* o : counts) {   // Axe and Bow / Horn of Gondor against the Hunt damage
+            const Value& tc = at(*o, "target_card");
+            const std::string cid = tc.kind == Value::Str ? t.card(tc.s) : "";
+            if (cid.empty()) continue;
+            const std::string title = t.card_title.at(cid);
+            if (plain(title) == plain("Axe and Bow") || plain(title) == plain("Horn of Gondor")) {
+                m.set_attr(st, "_pending_hunt_damage", m.integer(at(ctx, "damage").as_int()));
+                Obj* opt = m.dict();
+                auto put = [&](const char* k, Obj* v) { m.dict_set(opt, m.str(k), v); };
+                put("card_id", m.str(cid)); put("card_name", m.str(title)); put("side", m.str("fp")); put("decider", m.str("fp"));
+                put("direct", m.boolean(true)); put("hunt_reduction", m.boolean(true));
+                Obj* use = m.dict(); m.dict_set(use, m.str("use_hunt_reduction"), m.integer(1)); m.dict_set(use, m.str("card_id"), m.str(cid));
+                Obj* no = m.dict(); m.dict_set(no, m.str("use_hunt_reduction"), m.integer(0));
+                put("options", m.list({use, no}));
+                m.set_attr(st, "pending_card_option", opt);
+                r.label = "action"; return r;
+            }
+        }
+    }
+    r.label = ""; return r;                                    // None: no engine decision
+}
+
+Adapter::Setup Adapter::setup(const std::string& kind, Obj* st, const Value& dec, const Value& view, const Memo& memo) {
+    using M = pyobj::Model;
+    Setup r;
+    const Value& b = or_empty(view, "battle");
+    const Value& ctx = or_empty(dec, "context");
+    const int me = memo.side;
+    const int64_t rnd = b.get("round") ? at(b, "round").as_int() : 1;
+    auto done = [&](Obj* pc, const char* label = "action") { r.ported = true; r.label = pc ? label : ""; return r; };
     if (kind == "ACTION") {                       // setup_action
         m.set_attr(st, "pending_combat", m.none());
         m.set_attr(st, "dice_rolled", m.boolean(true));
@@ -426,9 +707,97 @@ Adapter::Setup Adapter::setup(const std::string& kind, Obj* st, const Value& dec
         r.ported = true; r.label = "eye"; r.flag = "_eye_allocation_phase";
     } else if (kind == "DISCARD_EXCESS_CARD") {   // setup_discard
         Obj* d = m.dict();
-        m.dict_set(d, m.str("side"), side_enum(memo.side));
+        m.dict_set(d, m.str("side"), side_enum(me));
         m.set_attr(st, "pending_discard", d);
         r.ported = true; r.label = "discard";
+    } else if (kind == "COMBAT_CARD") {           // setup_combat_card
+        const bool attacker = side_in(at(b, "attacker").s) == me;
+        Obj* pc = battle(st, view, memo, attacker ? "attacker_combat_card" : "defender_combat_card", rnd - 1);
+        if (pc && !attacker) {
+            const Value& back = at(b, "attacker_card_back");
+            const Value& shown = at(b, "attacker_card");
+            if (shown.truthy()) {
+                const std::string cid = t.card(shown.s);
+                m.dict_set(pc, m.str("atk_combat_card"), cid.empty() ? m.none() : m.str(cid));
+            } else if (back.truthy()) {
+                m.dict_set(pc, m.str("atk_combat_card"), m.str(t.hidden_cc));
+                Obj* h = m.dict(); m.dict_set(h, m.str("deck"), m.str(back.s));
+                m.dict_set(pc, m.str("atk_hidden_cc"), h);
+            } else m.dict_set(pc, m.str("atk_combat_card"), m.none());
+        }
+        return done(pc);
+    } else if (kind == "CASUALTY") {              // setup_casualty
+        const bool attacker = side_in(at(b, "attacker").s) == me;
+        Obj* pc = battle(st, view, memo, "casualty_allocation", rnd);
+        if (pc) {
+            const int64_t hits = ctx.get("hits") ? at(ctx, "hits").as_int() : 1;
+            m.dict_set(pc, m.str("alloc_stage"), m.str(attacker ? "attacker" : "defender"));
+            m.dict_set(pc, m.str("atk_hits"), m.integer(attacker ? hits : 0));
+            m.dict_set(pc, m.str("def_hits"), m.integer(attacker ? 0 : hits));
+        }
+        return done(pc);
+    } else if (kind == "CEASE_ATTACK") {
+        return done(battle(st, view, memo, at(b, "battle").kind == Value::Str && at(b, "battle").s == "siege" ? "combat_round_result" : "attacker_continue", rnd));
+    } else if (kind == "EXTEND_SIEGE") {
+        return done(battle(st, view, memo, "combat_round_result", rnd));
+    } else if (kind == "RETREAT") {
+        return done(battle(st, view, memo, "defender_retreat", rnd));
+    } else if (kind == "FIELD_OR_SIEGE") {
+        return done(rnd <= 1 ? battle(st, view, memo, "defender_siege_choice", 0) : battle(st, view, memo, "defender_retreat", rnd - 1));
+    } else if (kind == "ADVANCE") {
+        Obj* pc = battle(st, view, memo, "victor_advance", rnd);
+        if (pc) m.dict_set(pc, m.str("is_siege"), m.boolean(false));
+        return done(pc);
+    } else if (kind == "WHITE_RIDER") {
+        Obj* pc = battle(st, view, memo, "fp_shine", rnd - 1);
+        if (pc) {   // pc.pop('shine_asked', None)
+            for (size_t j = 0; j + 1 < pc->k.size(); j += 2)
+                if (pc->k[j]->s == "shine_asked") { pc->k.erase(pc->k.begin() + long(j), pc->k.begin() + long(j) + 2); break; }
+        }
+        return done(pc);
+    } else if (kind == "HUNT_CASUALTY") {
+        Obj* h = m.dict();
+        m.dict_set(h, m.str("damage"), m.integer(ctx.get("damage") ? at(ctx, "damage").as_int() : 1));
+        m.dict_set(h, m.str("phase"), m.str("hunt_sacrifice"));
+        m.dict_set(h, m.str("casualty_taken"), m.boolean(false));
+        m.set_attr(st, "pending_hunt", h);
+        m.set_attr(st, "_pending_hunt_damage", m.integer(0));
+        r.ported = true; r.label = "action";
+    } else if (kind == "GUIDE_ABILITY") {
+        Obj* g = M::attr(M::attr(st, "fellowship"), "guide");
+        Obj** nm = M::attr_slot(g, "name");
+        Obj** ability = M::attr_slot(g, "guide_ability");
+        std::string phase;
+        if (nm && (*nm)->tag == WOTR_STRING && (*nm)->s == "Gollum") phase = "hunt_gollum";
+        else if (ability && (*ability)->tag == WOTR_STRING && (*ability)->s == "sacrifice_reduce_hunt") phase = "hunt_sacrifice";
+        r.ported = true;
+        if (phase.empty()) return r;
+        Obj* h = m.dict();
+        m.dict_set(h, m.str("damage"), m.integer(ctx.get("damage") ? at(ctx, "damage").as_int() : 1));
+        m.dict_set(h, m.str("phase"), m.str(phase));
+        m.dict_set(h, m.str("casualty_taken"), m.boolean(false));
+        m.set_attr(st, "pending_hunt", h);
+        m.set_attr(st, "_pending_hunt_damage", m.integer(0));
+        r.label = "action";
+    } else if (kind == "REVEAL_FELLOWSHIP") {
+        m.set_attr(M::attr(st, "fellowship"), "hidden", m.boolean(false));
+        m.set_attr(st, "_reveal_place_due", m.boolean(true));
+        m.set_attr(st, "_pending_hunt_damage", m.integer(0));
+        m.set_attr(st, "_sh_tile_drawn_regions", m.set());
+        r.ported = true; r.label = "action";
+    } else if (kind == "CHOOSE_GUIDE") {
+        Obj* cands = m.list();
+        for (const Value* o : opts(dec, "guide")) {
+            auto ci = at(*o, "character").kind == Value::Str ? t.char_in.find(at(*o, "character").s) : t.char_in.end();
+            if (ci != t.char_in.end() && !ci->second.empty()) cands->k.push_back(m.str(ci->second));
+        }
+        r.ported = true;
+        if (cands->k.empty()) return r;
+        Obj* d = m.dict(); m.dict_set(d, m.str("candidates"), cands);
+        m.set_attr(st, "pending_guide_change", d);
+        r.label = "action";
+    } else if (kind == "CARD_CHOICE") {
+        return setup_card_choice(st, dec, view, memo);
     }
     return r;
 }

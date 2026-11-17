@@ -41,7 +41,7 @@ def main():
     ap.add_argument('--alpha', required=True)
     ap.add_argument('--out', required=True)
     ap.add_argument('--every', type=int, default=5)
-    ap.add_argument('transcripts', nargs='+')
+    ap.add_argument('transcripts', nargs='*')
     a = ap.parse_args()
     alpha, out = os.path.abspath(a.alpha), os.path.abspath(a.out)
     transcripts = [os.path.abspath(t) for t in a.transcripts]
@@ -57,6 +57,15 @@ def main():
     import snapshot
     import board as board_mod
 
+    import cards as cards_mod0
+    import combat as combat_mod
+
+    def cards_mod_title(cid):
+        return cards_mod0.get_card(cid).card_name
+
+    def combat_kind(cid):
+        return combat_mod.combat_effect_kind(getattr(cards_mod0.get_card(cid), 'combat_name', '') or '') or None
+
     # 1. the tables
     FP, SH = gs.Side.FREE_PEOPLES, gs.Side.SHADOW
     fp_vp, sh_vp = gl._vp_settlement_tables()
@@ -69,7 +78,15 @@ def main():
                        for k in wpb.BOARD._regions},
         vp_fp_settlements=[list(x) for x in fp_vp], vp_sh_settlements=[list(x) for x in sh_vp],
         board_keys={k: getattr(r, 'key', k) for k, r in wpb.BOARD._regions.items()},
-        special_tiles=sorted(names.special_tile))
+        special_tiles=sorted(names.special_tile),
+        # for the decision set-ups (SETUPS): the board's strongholds and adjacency, each card's printed title and
+        # combat effect kind (combat.combat_effect_kind of its combat name), ai._HIDDEN_CC
+        stronghold={k: bool(m.get('is_stronghold')) for k, m in board_mod.regions.items()},
+        adjacent={k: sorted(wpb.BOARD.adjacent(k)) for k in wpb.BOARD._regions},
+        card_title={cid: cards_mod_title(cid) for cid in names.card_out},
+        combat_effect_kind={cid: combat_kind(cid) for cid in names.card_out},
+        hidden_cc=ai._HIDDEN_CC,
+        fp_region={k: bool(gl.is_fp_region(k)) for k in wpb.BOARD._regions})
     with open(os.path.join(out, 'adapter.json'), 'w', encoding='utf-8') as f:
         json.dump(tables, f, sort_keys=True, ensure_ascii=False)
 

@@ -20,6 +20,11 @@ struct Tables {
     std::vector<std::string> minion_keys, decks;
     std::set<std::string> special_tiles;
     std::map<std::string, std::string> card_out;                        // engine card id -> protocol key
+    std::map<std::string, std::string> nation_out;                      // Nation member -> protocol nation
+    std::map<std::string, bool> stronghold, fp_region;                  // board.regions is_stronghold, gl.is_fp_region
+    std::map<std::string, std::set<std::string>> adjacent;              // BOARD.adjacent
+    std::map<std::string, std::string> card_title, combat_effect_kind;  // card id -> title, combat.combat_effect_kind
+    std::string hidden_cc;                                              // ai._HIDDEN_CC
     void load(const awjson::Value& j);
     std::string card(const std::string& key) const { auto it = card_in.find(key); return it == card_in.end() ? "" : it->second; }
 };
@@ -55,6 +60,11 @@ private:
     pyobj::Obj* tile(const std::string& key);
     void build_cards(pyobj::Obj* st, const awjson::Value& view, Memo& memo);
     std::vector<std::string> shuffled(Memo& memo, std::vector<std::string> items);
+    pyobj::Obj* army_at(pyobj::Obj* st, const std::string& key);
+    int leader_side(pyobj::Obj* leader);
+    pyobj::Obj* sail_in(pyobj::Obj* st, const awjson::Value& b, const std::string& frm, const std::string& reg, int atk);
+    pyobj::Obj* battle(pyobj::Obj* st, const awjson::Value& view, const Memo& memo, const std::string& phase, int64_t rounds_fought);
+    Setup setup_card_choice(pyobj::Obj* st, const awjson::Value& dec, const awjson::Value& view, const Memo& memo);
 };
 
 }  // namespace awad
