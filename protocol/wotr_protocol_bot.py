@@ -2017,30 +2017,54 @@ def _battle(bot, st, view, phase, rounds_fought):
         if relief is not None:
             pc['is_siege'] = False
             pc['corsairs_relief_garrison'] = relief
-    # A rearguard: the units of the attacker's region not in the attack
+    # A rearguard: the figures of the attacker's region not in the attack.
+    # v0.2.0's engine fixes a battle's participants once, as
+    # pending_combat['attacker_rearguard'] (army_participants
+    # freeze_attack: the region, the side and the rear's counts); every
+    # round reads them back (partition_battle_army).  The rear stays in
+    # its region: removing it from the army (as the adapter did for
+    # v0.1.6) left a peaceful Leader without its Army units, and the
+    # engine's own formation then pulled the only attacking unit back as
+    # his guard ("Cannot form attacking army").  The rear is the
+    # referee's: the attacker's units and plain Leaders not listed.
     if frm != reg and b.get('attackers'):
+        from army_participants import FORMATION_VERSION
         want = {}
         for p in b['attackers']:
             k = (p.get('nation'), p.get('unit'))
             want[k] = want.get(k, 0) + int(p.get('n', 0))
         army = army_at(st, frm)
         if army is not None:
-            keep_units, rg_units = [], []
+            rear_units, rear_leaders = [], []
             for u in army.units:
                 if ai._side_of_nation(u.nation) is not atk:
-                    keep_units.append(u)
                     continue
                 unit = 'regular' if u.kind is gs.UnitKind.REGULAR else 'elite'
                 k = (names.nation_out[u.nation], unit)
                 if want.get(k, 0) > 0:
                     want[k] -= 1
-                    keep_units.append(u)
                 else:
-                    rg_units.append(u)
-            if rg_units and any(ai._side_of_nation(u.nation) is atk
-                                for u in keep_units):
-                army.units = keep_units
-                pc['rearguard_units'] = rg_units
+                    rear_units.append(u)
+            for ld in army.leaders:
+                if type(ld).__name__ != 'Leader' or gl._leader_side(ld) is not atk:
+                    continue
+                k = (names.nation_out[ld.nation], 'leader')
+                if want.get(k, 0) > 0:
+                    want[k] -= 1
+                else:
+                    rear_leaders.append(ld)
+            units = {}
+            for u in rear_units:
+                k = (u.nation.name, u.kind.name)
+                units[k] = units.get(k, 0) + 1
+            leaders = {}
+            for ld in rear_leaders:
+                leaders[ld.nation.name] = leaders.get(ld.nation.name, 0) + 1
+            pc['attacker_rearguard'] = (
+                board.sanitize(str(frm)), atk.name,
+                (FORMATION_VERSION,
+                 tuple((n, k, c) for (n, k), c in sorted(units.items())),
+                 tuple(sorted(leaders.items()))))
     st.pending_combat = pc
     return pc
 
