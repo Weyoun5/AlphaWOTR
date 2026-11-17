@@ -337,7 +337,7 @@ int main(int argc, char** argv) {
                                                     rows[ri].substr(0, 160).c_str(), (long long)got_o, int(mt.has_plan), int(mt.chain), (long long)want.o, int(want.plan), int(want.chain));
                                 }
                                 ++match_cases; match_cases_same += all_same;
-                                if (decide && all_same) {   // LeagueSearcher.choose and _search_and_map's tail on the module
+                                if (decide && all_same && (!std::getenv("AW_CASE") || std::to_string(c) == std::getenv("AW_CASE"))) {   // LeagueSearcher.choose and _search_and_map's tail on the module
                                     std::vector<awad::Adapter::Matched> mts;
                                     for (size_t ri = 0; ri < rowsn.size(); ++ri) {
                                         const auto parts = ga.kids(rowsn[ri]);

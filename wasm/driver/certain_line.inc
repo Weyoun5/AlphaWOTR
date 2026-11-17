@@ -13,6 +13,7 @@ extern "C" {
 typedef int (*aw_priors_fn)(void* user, const void* state, int32_t side, const void* menu, float* out, size_t n);
 }
 namespace awcl {
+static const bool DEBUG = std::getenv("AW_CL_DEBUG") != nullptr;
 
 constexpr int OWN_ACTIONS = 2, STEPS = 40;
 constexpr uint64_t APPLIES = 2000, MENUS = 400;
@@ -79,9 +80,9 @@ End end(const Snapshot& s, int side, int owner) {
     const auto mark = obs_attr(s, s.root, "_battle_resolved_attacker", false);
     std::string rest;
     if (!ctx_none(s, mark)) {
-        Snapshot plain(s);
-        rr_set_attr(plain, plain.root, "_battle_resolved_attacker", rr_scalar(plain, WOTR_NONE));
-        if (!awsb::outcome(plain, side, rest, e.q)) return e;
+        auto plain = action_clone(s);                            // ai.clone_state, then the mark cleared
+        rr_set_attr(*plain, plain->root, "_battle_resolved_attacker", rr_scalar(*plain, WOTR_NONE));
+        if (!awsb::outcome(*plain, side, rest, e.q)) return e;
     } else if (!awsb::outcome(s, side, rest, e.q)) return e;
     e.key = rest + "#" + std::to_string(decider(s, owner).first);
     e.ok = true;
@@ -157,6 +158,12 @@ struct Search {
     awsb::Board own(const Snapshot& s) { std::string rest; awsb::Quantities q; if (!awsb::outcome(s, side, rest, q)) throw std::runtime_error("unkeyed"); return q.own; }
     bool reached(const Snapshot& s, int owner) {
         const End got = end(s, side, owner);
+        if (DEBUG) std::fprintf(stderr, "[cl] reached? key %s, q %s, at_least %d\n", got.key == ref.key.key ? "same" : "DIFFERENT",
+                                got.q == ref.key.q ? "same" : "different", got.ok ? int(awsb::at_least_as_good(side, got.q, ref.key.q)) : -1);
+        if (DEBUG && got.key != ref.key.key) {
+            size_t i = 0; while (i < got.key.size() && i < ref.key.key.size() && got.key[i] == ref.key.key[i]) ++i;
+            std::fprintf(stderr, "[cl]   at %zu: got ...%s\n[cl]   ref ...%s\n", i, got.key.substr(i > 80 ? i - 80 : 0, 260).c_str(), ref.key.key.substr(i > 80 ? i - 80 : 0, 260).c_str());
+        }
         if (!got.ok || got.key != ref.key.key) return false;
         return got.q == ref.key.q ? !strict : awsb::at_least_as_good(side, got.q, ref.key.q);
     }
@@ -188,7 +195,7 @@ struct Search {
         std::map<std::string, int64_t> want;
         auto e = end_own.find(dst); if (e != end_own.end()) for (const auto& [k, v] : e->second) want[k] += v;
         auto w = now.find(dst); if (w != now.end()) for (const auto& [k, v] : w->second) want[k] -= v;
-        auto clone = std::make_shared<Snapshot>(s);
+        std::shared_ptr<Snapshot> clone(action_clone(s));     // ai.clone_state (its defaults and aliases)
         const auto list = obs_attr(*clone, army, "units");
         std::vector<uint64_t> first, rest;
         for (auto u : units) {
@@ -235,7 +242,9 @@ struct Search {
             if (!pass) {
                 bool all_differ = !regs.empty();
                 for (const auto& r : regs) all_differ &= differ.count(r) != 0;
-                if (!(all_differ && fits(menu, i, regs, now))) continue;
+                const bool f = all_differ && fits(menu, i, regs, now);
+                if (DEBUG) std::fprintf(stderr, "[cl] step %zu %s differ=%d fits=%d\n", i, row_text(menu, i).c_str(), int(all_differ), int(f));
+                if (!f) continue;
             }
             if (out_()) break;
             ++applies;
@@ -246,6 +255,7 @@ struct Search {
                 const awsb::Board board = own(*after.first);
                 bool sets = false;
                 for (const auto& r : regs) sets |= at_region(board, r) == at_region(end_own, r);
+                if (DEBUG) std::fprintf(stderr, "[cl]   applied, sets=%d\n", int(sets));
                 if (!sets) continue;
             }
             out.push_back({i, after.first});
