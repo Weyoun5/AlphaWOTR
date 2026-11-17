@@ -10,9 +10,9 @@
 #                                             and the threaded controller beside the single-thread one)
 #   each target also builds the test programs: nn_parity (network against torch), replay (recorded searches);
 #   for wasm they are Node programs (build/nn_parity[64].js, build/replay[64].js) reading the host's files.
-#   --simd: wasm SIMD (-msimd128) for every unit: the network's explicit SIMD path (nn/awnet.cpp, the scalar build's
-#           bits) and the compiler's vectorisation elsewhere (no reassociation: the replay test shows the same search)
-#           (wasm targets; output names get -simd)
+#   --simd: the network with wasm SIMD (-msimd128 for nn/awnet.cpp: its explicit SIMD path, the scalar build's bits)
+#           (wasm targets; output names get -simd). The engine stays scalar: compiled with -msimd128 it replayed the
+#           same searches but was no faster (2026-11-17: 72.7 s against 70.1 s for the 18 selftest searches)
 #
 # Their sources are copied into build/src-<target> and the patches in patches/ are applied to the copy (sed scripts,
 # documented at their top; '# file:' names the file, '# targets:' the targets they apply to), so a new release of
@@ -27,6 +27,7 @@ BOX="$ROOT/native_backend/live_search_oct19"
 OUT="$HERE/build"
 MODE="${1:-wasm32}"
 SIMD=0; [ "${2:-}" = "--simd" ] && SIMD=1
+NNFLAGS=""
 NUMERIC="-ffp-contract=off -fno-fast-math -fno-builtin-pow -fno-builtin-log"
 
 case "$MODE" in
@@ -37,7 +38,7 @@ case "$MODE" in
 esac
 if [ $SIMD = 1 ]; then
   [ "$MODE" = native ] && { echo "--simd is for the wasm targets" >&2; exit 2; }
-  ARCH="$ARCH -msimd128"; SUFFIX="$SUFFIX-simd"
+  NNFLAGS="-msimd128"; SUFFIX="$SUFFIX-simd"
 fi
 SRC="$OUT/src-$MODE"
 rm -rf "$SRC" && mkdir -p "$SRC" && cp -R "$BOX/cpp" "$BOX/include" "$SRC/"
@@ -67,7 +68,7 @@ for u in "$SRC/cpp/position.cpp" "$HERE/driver/box_unity.cpp" "$SRC/cpp/random_s
          "$HERE/driver/replay.cpp" "$HERE/nn/nn_parity.cpp"; do
   $CXX -c "$u" -o "$OBJ/$(basename "${u%.cpp}").o" & pids+=($!)
 done
-$CXX -c "$HERE/nn/awnet.cpp" -o "$OBJ/awnet.o" & pids+=($!)
+$CXX $NNFLAGS -c "$HERE/nn/awnet.cpp" -o "$OBJ/awnet.o" & pids+=($!)
 for p in "${pids[@]}"; do wait "$p"; done
 BOXOBJ="$OBJ/position.o $OBJ/box_unity.o $OBJ/random_stream.o $OBJ/wasm_api.o $OBJ/awnet.o"
 
