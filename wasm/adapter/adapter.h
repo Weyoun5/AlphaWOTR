@@ -73,6 +73,9 @@ public:
     };
     Matched map_action(const std::string& kind, pyobj::Obj* st, const awjson::Value& dec, const Row& row, const Memo& memo);
     std::string slug(const std::string& key) const;
+    // figures(st, key, side): {(nation, unit): n} and the Character keys of `side` in a region
+    struct Figures { std::map<std::pair<std::string, std::string>, int64_t> units; std::set<std::string> chars; };
+    Figures figures(pyobj::Obj* st, const std::string& key, int side);
 
 private:
     pyobj::Model& m;
@@ -94,8 +97,6 @@ private:
     pyobj::Obj* sail_in(pyobj::Obj* st, const awjson::Value& b, const std::string& frm, const std::string& reg, int atk);
     pyobj::Obj* battle(pyobj::Obj* st, const awjson::Value& view, const Memo& memo, const std::string& phase, int64_t rounds_fought);
     static std::string pstr_of(const awjson::Value& v, const char* k);
-    struct Figures { std::map<std::pair<std::string, std::string>, int64_t> units; std::set<std::string> chars; };
-    Figures figures(pyobj::Obj* st, const std::string& key, int side);
     // army_move_plan: (ok, everything, from slug, to slug); ok false = None
     struct MovePlan { bool ok = false, everything = false; std::map<std::pair<std::string, std::string>, int64_t> moved; std::set<std::string> chars; };
     // army_move_plan(bot, st, a, advance) as the plan object (none when the action fails or moves nothing)

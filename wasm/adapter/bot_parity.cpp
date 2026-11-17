@@ -10,6 +10,7 @@
 // decisions in step are compared.
 #include "bot.h"
 #include "graph_text.h"
+#include "wotr_random.h"
 
 #include <chrono>
 #include <cstdio>
@@ -52,6 +53,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<awad::Adapter> adapter;
     std::unique_ptr<awbot::Bot> bot;
     bool in_step = true, resync = false;
+    size_t applies_off_n = 0, total_drew = 0;
     size_t total = 0, stepped = 0, same = 0, unported = 0, games = 0, search_args_off = 0;
     std::map<std::string, std::pair<size_t, size_t>> by_how;      // Python's how -> (in step, same)
     std::map<std::string, size_t> unported_why, cpp_how_diff;
@@ -90,6 +92,23 @@ int main(int argc, char** argv) {
             bot->set_memo_rng(words, index, hg, hg ? (r.arr[1].kind == awjson::Value::Real ? r.arr[1].d : double(r.arr[1].as_int())) : 0.0);
             resync = false;
         }
+        // Python's global Random before each engine action on the work copy, in order
+        std::deque<const awjson::Value*> applies;
+        if (const auto* ap = item.get("applies")) for (const auto& x : ap->arr) applies.push_back(&x);
+        size_t applies_drew = 0;
+        bool applies_off = false;
+        bot->next_apply_rng = [&]() -> void* {
+            if (applies.empty()) { applies_off = true; return nullptr; }
+            const awjson::Value& x = *applies.front(); applies.pop_front();
+            applies_drew += x.get("drew") && x.get("drew")->truthy();
+            const auto& r = *x.get("rng");
+            std::vector<uint32_t> words;
+            for (size_t i = 0; i + 1 < r.arr[0].arr.size(); ++i) words.push_back(uint32_t(r.arr[0].arr[i].as_int()));
+            const bool hg = !r.arr[1].is_null();
+            const double g = hg ? (r.arr[1].kind == awjson::Value::Real ? r.arr[1].d : double(r.arr[1].as_int())) : 0.0;
+            uint64_t bits = 0; std::memcpy(&bits, &g, 8);
+            return wotr_random_create(words.data(), words.size(), uint32_t(r.arr[0].arr.back().as_int()), hg ? 1 : 0, bits);
+        };
         bool args_off = false;
         bot->next_search = [&](int64_t) { if (args.empty()) { args_off = true; return awbot::SearchArgs{0, 0, 1, 8}; } auto a = args.front(); args.pop_front(); return a; };
         const auto t0 = std::chrono::steady_clock::now();
@@ -108,6 +127,8 @@ int main(int argc, char** argv) {
             const bool ok = tr_.o && *tr_.o == want;
             same += ok; auto& bh = by_how[how]; ++bh.first; bh.second += ok;
             if (args_off || !args.empty()) ++search_args_off;
+            if (applies_off || !applies.empty()) ++applies_off_n;
+            total_drew += applies_drew;
             if (tr_.how != how) ++cpp_how_diff[how + " -> " + tr_.how];
             if (!ok && (verbose || shown < 20)) {
                 ++shown;
@@ -119,7 +140,7 @@ int main(int argc, char** argv) {
             if (!ok) in_step = false;
         }
         if (!in_step && !py_plan && !py_work) {   // the Python bot has neither a plan nor a chain: in step again
-            bot->drop_plan(); bot->set_work(false); in_step = true; resync = true;
+            bot->drop_plan(); bot->drop_work(); in_step = true; resync = true;
         }
     }
     std::printf("%s: %zu games, %zu decisions; %zu in step, %zu of them the Python's answer; %zu not ported (",
@@ -129,6 +150,7 @@ int main(int argc, char** argv) {
     for (const auto& [k, v] : by_how) std::printf(" %s %zu/%zu", k.c_str(), v.second, v.first);
     std::printf("; how differs:");
     for (const auto& [k, v] : cpp_how_diff) std::printf(" [%s] %zu", k.c_str(), v);
+    std::printf("; engine actions on the copy off %zu (Python's drew from its Random %zu times)", applies_off_n, total_drew);
     std::printf("; search arguments off %zu; %.1f ms a decision\n", search_args_off, total ? secs / total * 1e3 : 0.0);
     return same == stepped ? 0 : 1;
 }

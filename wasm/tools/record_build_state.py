@@ -241,6 +241,17 @@ def main():
             cases[-1].append(True)
         return o, how, info
     wpb.AlphaWotrBot._decide = _decide
+    apply0 = wpb.AlphaWotrBot._apply_copy
+
+    def apply_copy(self, st, a, flag=None):
+        # the global Random before the engine's action on the work copy (its dice and draws come from it)
+        before = random.getstate()
+        w = apply0(self, st, a, flag)
+        after = random.getstate()
+        last.setdefault('applies', []).append({'drew': before != after, 'ok': w is not None,
+                                               'rng': [list(before[1]), before[2]]})
+        return w
+    wpb.AlphaWotrBot._apply_copy = apply_copy
     wpb.build_state = build_state
     from core import own_model
     choose0 = own_model.OwnModelSearch.choose
@@ -306,7 +317,7 @@ def main():
                 if rec.get('dir') != 'out':
                     continue
                 m = json.loads(rec['line'])
-                last['searches'], last['how'] = [], None
+                last['searches'], last['how'], last['applies'] = [], None, []
                 rs = bot.memo.rng.getstate() if (bot.memo is not None and m.get('type') == 'decide') else None
                 try:
                     reply = bot.handle(m)
@@ -318,6 +329,7 @@ def main():
                         item.update(o=(reply or {}).get('o'), how=((reply or {}).get('info') or {}).get('how'), searches=last['searches'],
                                     plan=None if bot.plan is None else type(bot.plan).__name__,
                                     work=bot.work is not None,
+                                    applies=last['applies'],
                                     rng=None if rs is None else [list(rs[1]), rs[2]])   # the memo's Random before it
                     log.write(json.dumps(item, separators=(',', ':')) + '\n')
         print('%s: %d cases' % (os.path.basename(path), len(cases) - before), file=sys.stderr, flush=True)

@@ -72,14 +72,14 @@ fi
 pids=()
 for u in "$SRC/cpp/position.cpp" "$HERE/driver/box_unity.cpp" "$SRC/cpp/random_stream.cpp" "$HERE/driver/wasm_api.cpp" \
          "$HERE/driver/replay.cpp" "$HERE/nn/nn_parity.cpp" "$HERE/adapter/build_state.cpp" "$HERE/adapter/matching.cpp" "$HERE/adapter/bs_parity.cpp" "$HERE/driver/decision.cpp" \
-         "$HERE/adapter/plans.cpp" "$HERE/adapter/bot.cpp" "$HERE/adapter/bot_parity.cpp"; do
+         "$HERE/adapter/plans.cpp" "$HERE/adapter/bot.cpp" "$HERE/adapter/bot_parity.cpp" "$HERE/adapter/bot_api.cpp"; do
   # at most 6 compilers at once (this machine's jobs take at most 8 threads)
   if [ ${#pids[@]} -ge 6 ]; then wait "${pids[0]}"; pids=("${pids[@]:1}"); fi
   $CXX -c "$u" -o "$OBJ/$(basename "${u%.cpp}").o" & pids+=($!)
 done
 $CXX $NNFLAGS -c "$HERE/nn/awnet.cpp" -o "$OBJ/awnet.o" & pids+=($!)
 for p in "${pids[@]}"; do wait "$p"; done
-BOXOBJ="$OBJ/position.o $OBJ/box_unity.o $OBJ/random_stream.o $OBJ/wasm_api.o $OBJ/awnet.o $OBJ/build_state.o $OBJ/matching.o $OBJ/decision.o $OBJ/plans.o $OBJ/bot.o"
+BOXOBJ="$OBJ/position.o $OBJ/box_unity.o $OBJ/random_stream.o $OBJ/wasm_api.o $OBJ/awnet.o $OBJ/build_state.o $OBJ/matching.o $OBJ/decision.o $OBJ/plans.o $OBJ/bot.o $OBJ/bot_api.o"
 
 if [ "$MODE" = native ]; then
   mkdir -p "$OUT/native"
@@ -94,12 +94,14 @@ EXPORTS='["_malloc","_free","_wotr_abi_version","_wotr_snapshot_abi_version","_w
 "_wotr_snapshot_destroy","_wotr_snapshot_last_error","_wotr_snapshot_prepare_observation_tables",
 "_wotr_snapshot_prepare_action_tables_v53","_wotr_snapshot_full_actions","_wotr_snapshot_encode_state_v53",
 "_wotr_snapshot_encode_actions_v53","_awasm_graph_create","_awasm_snapshot_root_count","_awnet_load","_awnet_free",
-"_awnet_last_error","_awnet_forward","_awnet_obs_dim","_awnet_act_dim","_awasm_combat_reply"]'
+"_awnet_last_error","_awnet_forward","_awnet_obs_dim","_awnet_act_dim","_awasm_combat_reply",
+"_aw_create","_aw_message","_aw_destroy","_aw_last_error"]'
 EXPORTS=$(echo "$EXPORTS" | tr -d '\n')
 $LINK -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,worker,web \
   -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=64MB -sSTACK_SIZE=4MB \
   -sEXPORTED_FUNCTIONS="$EXPORTS" \
-  -sEXPORTED_RUNTIME_METHODS='["HEAPU8","HEAPF32","HEAP32","HEAP64","UTF8ToString"]' \
+  -sFORCE_FILESYSTEM=1 \
+  -sEXPORTED_RUNTIME_METHODS='["HEAPU8","HEAPF32","HEAP32","HEAP64","UTF8ToString","stringToUTF8","lengthBytesUTF8","FS"]' \
   $BOXOBJ -o "$OUT/alphawotr$SUFFIX.mjs"
 # the test programs as Node programs (they read the fixtures from the host file system)
 NODEPROG="-sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=8MB -sNODERAWFS=1 -sENVIRONMENT=node"

@@ -9,9 +9,12 @@
 #include "wotr_random.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cctype>
 #include <set>
 
+extern "C" void* awasm_apply_descriptor_random(const void* state, const void* tables, const void* menu, const void* random, int32_t side, int64_t index, void** random_out, void** events);
 using pyobj::Obj;
 using awjson::Value;
 
@@ -318,7 +321,77 @@ Adapter::Matched Adapter::map_action(const std::string& kind, Obj* st, const Val
         }
         return r;
     }
-    r.unported = !(kind == "ACTION");
+    // the mappers only an engine chain reaches (m_army_move, m_recruit, m_move_companions, m_move_minions)
+    auto sl = [&](const Value& v) { return slugv(v); };
+    auto fv = [](const char* k, const Value& v) { return v.is_null() ? fnone(k) : f(k, v); };
+    const Value& ch = or_empty(p, "choices");
+    if (kind == "ARMY_MOVE") {
+        if (ty == "pass" || ty == "followup_done") return mm(opts(dec, "end"));
+        if (ty == "card_option") {
+            if (at(ch, "_done").truthy() || !ch.truthy()) return mm(opts(dec, "end"), false, true);
+            const Value fr = sl(at(ch, "from_region").truthy() ? at(ch, "from_region") : at(ch, "from"));
+            const Value to = sl(at(ch, "to_region").truthy() ? at(ch, "to_region") : at(ch, "to"));
+            if (fr.is_null() || to.is_null()) return r;
+            const auto cand = opts(dec, "army_move", {f("from", fr), f("to", to)});
+            std::vector<const Value*> all;
+            for (auto* o : cand) if (at(*o, "all").truthy()) all.push_back(o);
+            return mm(all.empty() ? cand : all, false, true);
+        }
+        if (ty != "army_move") return r;
+        const auto cand = opts(dec, "army_move", {fv("from", sl(at(p, "from"))), fv("to", sl(at(p, "to")))});
+        if (cand.empty()) return r;
+        Matched x = mm(cand, true, true);
+        const Memo mc = memo;
+        x.make_plan = [this, st, a, mc]() { auto pl = army_move_plan_obj(st, a, mc, false); if (pl) static_cast<ArmyMovePlan*>(pl.get())->started = true; return pl; };
+        std::vector<int64_t> os; std::vector<bool> alls;
+        for (auto* o : cand) { os.push_back(has_o(o) ? at(*o, "o").as_int() : -1); alls.push_back(at(*o, "all").truthy()); }
+        x.resolve = [os, alls](Plan* pl) -> std::optional<int64_t> {
+            if (!pl) return std::nullopt;
+            const bool every = static_cast<ArmyMovePlan*>(pl)->everything;
+            for (size_t i = 0; i < os.size(); ++i) if (alls[i] == every) return os[i];
+            return os[0];
+        };
+        return x;
+    }
+    if (kind == "RECRUIT") {
+        if (ty == "pass") return mm(opts(dec, "end"));
+        if (ty != "muster_recruit" && ty != "muster_elite") return r;
+        auto pl = plan_maker(st, a, memo)();
+        auto* rp = static_cast<RecruitPlan*>(pl.get());
+        return mm(opts(dec, "recruit", {fv("region", rp->region), fv("nation", rp->nation), fv("unit", rp->unit)}), false, true);
+    }
+    if (kind == "MOVE_COMPANIONS") {
+        if (ty != "card_option") return r;
+        if (at(ch, "_comp_done").truthy()) return mm(opts(dec, "end"));
+        if (at(ch, "from_region").truthy() && at(ch, "companions").truthy()) {
+            std::vector<std::string> keys;
+            for (const Value& n : at(ch, "companions").arr) if (n.kind == Value::Str) { const std::string k = char_out(n.s); if (!k.empty()) keys.push_back(k); }
+            auto pl = std::make_shared<CompanionMovePlan>(keys, sl(at(ch, "from_region")), sl(at(ch, "to_region")));
+            const auto o = pl->answer(dec);
+            if (!o) return r;
+            r.ok = true; r.o = *o; r.has_plan = true; r.chain = true;
+            r.make_plan = [pl]() { return std::shared_ptr<Plan>(pl); };
+            return r;
+        }
+        return r;
+    }
+    if (kind == "MOVE_MINIONS") {
+        std::shared_ptr<Plan> pl;
+        if (ty == "card_option") {
+            if (at(ch, "_naz_done").truthy()) return mm(opts(dec, "end"));
+            const Value fr = sl(at(ch, "from_region")), to = sl(at(ch, "to_region"));
+            if (fr.is_null() || to.is_null()) return r;
+            pl = std::make_shared<MinionPlan>(t, std::vector<std::tuple<std::string, Value, Value>>{{at(ch, "include_wk").truthy() ? "witch-king" : "nazgul", fr, to}});
+        } else if (ty == "nazgul_move" || ty == "mouth_move") pl = plan_maker(st, a, memo)();
+        else return r;
+        const auto o = pl->answer(dec);
+        if (!o) return r;
+        r.ok = true; r.o = *o; r.has_plan = true; r.chain = true;
+        r.make_plan = [pl]() { return pl; };
+        return r;
+    }
+    static const std::set<std::string> NO_MAPPER = {"ARMY_SELECTION", "JOIN_GROUP", "CHOOSE_ATTACK", "SEPARATE_COMPANIONS", "REMOVE_EXCESS_UNIT"};
+    r.unported = !(kind == "ACTION") && !NO_MAPPER.count(kind);
     return r;
 }
 
@@ -367,12 +440,15 @@ Adapter::MovePlan Adapter::army_move_plan(Obj* st, const Row& a, const Memo& mem
     const uint32_t limb = 1;
     void* rng = wotr_random_create_seeded(&limb, 1);
     void* rng_out = nullptr; void* events = nullptr;
-    void* after = (a.menu && obs_tables && rng) ? wotr_snapshot_apply_descriptor_random(sn, obs_tables, a.menu, rng, memo.side, a.index, &rng_out, &events) : nullptr;
+    void* after = (a.menu && obs_tables && rng) ? awasm_apply_descriptor_random(sn, obs_tables, a.menu, rng, memo.side, a.index, &rng_out, &events) : nullptr;
+    if (!after && std::getenv("AW_BOT_DEBUG")) std::fprintf(stderr, "[plan] army_move_plan: apply failed: %s\n", wotr_snapshot_last_error());
     if (rng_out) wotr_random_destroy(rng_out);
     if (events) wotr_snapshot_destroy(events);
     if (rng) wotr_random_destroy(rng);
     wotr_snapshot_destroy(sn);
-    if (!after) return plan;                                  // ai._execute_action raised: no plan
+    if (!after) {                                             // ai._execute_action raised: no plan
+        return plan;
+    }
     pyobj::Graph ag;
     const size_t nv = wotr_snapshot_node_count(after), ne = wotr_snapshot_edge_count(after), nb = wotr_snapshot_byte_count(after);
     ag.values.resize(nv); ag.edges.resize(ne); ag.bytes.resize(nb); ag.root = wotr_snapshot_root(after);
