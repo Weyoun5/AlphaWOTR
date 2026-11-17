@@ -938,8 +938,8 @@
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/saruman_muster.inc"
   },
   "native_w2x/box/cpp/search_controller.inc": {
-   "sha256": "128820961b4bdff6e2cb664b505e17a7fc8660f961423dd6fcec743250f0c44f",
-   "bytes": 175887,
+   "sha256": "d11e7af9c9c8c9537099e8893b517dc752b5669daf37fe0ec4fce06b5578f660",
+   "bytes": 175889,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/search_controller.inc"
   },
   "native_w2x/box/cpp/search_controller_exports.inc": {
