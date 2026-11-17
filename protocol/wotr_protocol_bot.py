@@ -1745,6 +1745,20 @@ class AlphaWotrBot(object):
                     if act_key(a2) == k:
                         a, mt = a2, mt2
                         break
+            if mt is None and action is not None and act_key(action) not in banned:
+                # an action not in the menu as such: the seat's unit rule
+                # (ai_units.pick) named the units an Army move takes or the
+                # nation a pressed siege pays with; matched by itself, so its
+                # plan carries those units (before: the first matched option)
+                try:
+                    mt = self.map_action(st, dec, action)
+                except Exception as e:
+                    mt = None
+                    if self.verbose:
+                        log('  map error %s: %s' % (act_json(action), e))
+                if mt is not None:
+                    a = action
+                    info['units'] = 'the seat\'s unit rule'
             if mt is None:
                 info['note'] = 'search returned %s' % (
                     act_json(action) if action is not None else None)
