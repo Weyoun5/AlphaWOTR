@@ -132,7 +132,7 @@ struct Parser {
         if (p == start) throw std::runtime_error("JSON: bad value");
         const std::string num(start, p);
         if (real) { v.kind = Value::Real; v.d = std::strtod(num.c_str(), nullptr); }
-        else { v.kind = Value::Int; v.i = std::stoll(num); }
+        else { v.kind = Value::Int; try { v.i = std::stoll(num); } catch (const std::out_of_range&) { v.i = int64_t(std::stoull(num)); } }   // (a u64 seed: its bits)
         return v;
     }
 };

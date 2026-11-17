@@ -4,6 +4,8 @@
 // engine's chain goes on (Match.chain). Not ported yet: m_advance and the move / attack answers of m_card_choice
 // (their plans apply the action on a copy of the state first): they return `unported`.
 #include "adapter.h"
+#include "opts.h"
+#include "plans.h"
 #include "wotr_random.h"
 
 #include <algorithm>
@@ -15,40 +17,7 @@ using awjson::Value;
 
 namespace awad {
 namespace {
-const Value NULLV;
-const Value& at(const Value& v, const std::string& k) { const Value* x = v.get(k); return x ? *x : NULLV; }
-const Value& or_empty(const Value& v, const std::string& k) { const Value& x = at(v, k); return x.truthy() ? x : NULLV; }
-Value S(const std::string& s) { Value v; v.kind = Value::Str; v.s = s; return v; }
-Value I(int64_t i) { Value v; v.kind = Value::Int; v.i = i; return v; }
-Value B(bool b) { Value v; v.kind = Value::Bool; v.b = b; return v; }
-// a field value as Python compares o.get(k) != v: None for a missing slug
-struct F { std::string k; bool none; Value v; };
-F f(const std::string& k, const Value& v) { return {k, false, v}; }
-F fnone(const std::string& k) { return {k, true, Value()}; }
-F fstr(const std::string& k, const std::string& s, bool present) { return present ? f(k, S(s)) : fnone(k); }
-bool equal(const Value& a, const Value& b) {
-    if ((a.kind == Value::Int || a.kind == Value::Bool) && (b.kind == Value::Int || b.kind == Value::Bool))
-        return (a.kind == Value::Int ? a.i : a.b) == (b.kind == Value::Int ? b.i : b.b);
-    if (a.kind != b.kind) return false;
-    if (a.kind == Value::Str) return a.s == b.s;
-    if (a.kind == Value::Null) return true;
-    if (a.kind == Value::Real) return a.d == b.d;
-    return false;
-}
-std::vector<const Value*> opts(const Value& dec, const std::string& kind, const std::vector<F>& fields = {}) {
-    std::vector<const Value*> out;
-    for (const Value& o : or_empty(dec, "options").arr) {
-        if (!kind.empty() && at(o, "kind").s != kind) continue;
-        bool ok = true;
-        for (const auto& fl : fields) {
-            const Value& x = at(o, fl.k);
-            if (fl.none ? x.kind != Value::Null : !equal(x, fl.v)) { ok = false; break; }
-        }
-        if (ok) out.push_back(&o);
-    }
-    return out;
-}
-bool has_o(const Value* o) { return o && at(*o, "o").kind != Value::Null; }
+using namespace awad::opt;
 std::string plain(const std::string& x) { std::string o; for (unsigned char c : x) if (std::isalnum(c) && c < 128) o += char(std::tolower(c)); return o; }
 std::string lower(std::string x) { for (char& c : x) c = char(std::tolower(static_cast<unsigned char>(c))); return x; }
 const std::map<std::string, std::vector<std::string>> DIE_ACTIONS = {
@@ -150,12 +119,39 @@ Adapter::Matched Adapter::map_action(const std::string& kind, Obj* st, const Val
             if (c.empty()) c = die_options(std::vector<std::string>(order.begin() + 1, order.end()));
             return c;
         };
-        if (ty == "army_move") { const auto c = ordered(); if (c.empty()) return r; return mm(c, true, true); }   // the plan: a function
-        if (ty == "army_attack") { const auto c = ordered(); if (c.empty()) return r; return mm(c, true, false); }
-        if (ty == "muster_recruit" || ty == "muster_elite" || ty == "companion_move" || ty == "nazgul_move" || ty == "mouth_move") {
-            const auto c = die_options(acts); if (c.empty()) return r; return mm(c, true, true);
+        if (ty == "army_move") {   // the plan: a function (army_move_plan, made for the action picked)
+            const auto c = ordered(); if (c.empty()) return r;
+            Matched x = mm(c, true, true);
+            const Memo mc = memo;
+            x.make_plan = [this, st, a, mc]() { return army_move_plan_obj(st, a, mc, false); };
+            return x;
         }
-        if (ty == "companion_separate") { const auto c = die_options(acts); if (c.empty()) return r; return mm(c, true, false); }
+        if (ty == "army_attack") {
+            const auto c = ordered(); if (c.empty()) return r;
+            Matched x = mm(c, true, false);
+            const Value fr = slugv(at(p, "from")), to = slugv(at(p, "to"));
+            x.make_plan = [fr, to]() { return std::make_shared<AttackPlan>(fr, to); };
+            return x;
+        }
+        if (ty == "muster_recruit" || ty == "muster_elite" || ty == "companion_move" || ty == "nazgul_move" || ty == "mouth_move") {
+            const auto c = die_options(acts); if (c.empty()) return r;
+            Matched x = mm(c, true, true);
+            x.make_plan = plan_maker(st, a, memo);
+            return x;
+        }
+        if (ty == "companion_separate") {
+            const auto c = die_options(acts); if (c.empty()) return r;
+            Matched x = mm(c, true, false);
+            std::vector<std::string> who;
+            const Value& cs = at(p, "companions");
+            if (cs.truthy()) { for (const Value& n : cs.arr) if (n.kind == Value::Str) who.push_back(n.s); }
+            else if (at(p, "companion").kind == Value::Str) who.push_back(at(p, "companion").s);
+            std::vector<std::string> keys;
+            for (const auto& n : who) { const std::string k = char_out(n); if (!k.empty()) keys.push_back(k); }
+            const Value to = slugv(at(p, "to_region"));
+            x.make_plan = [keys, to]() { return std::make_shared<SeparatePlan>(keys, to); };
+            return x;
+        }
         return r;
     }
     if (kind == "FELLOWSHIP_PHASE") {
@@ -191,7 +187,10 @@ Adapter::Matched Adapter::map_action(const std::string& kind, Obj* st, const Val
         else if (!red.empty()) pick = red[0];
         else if (!rem_e.empty()) pick = rem_e[0];
         if (!has_o(pick)) return r;
-        r.ok = true; r.o = at(*pick, "o").as_int(); r.has_plan = true; return r;
+        r.ok = true; r.o = at(*pick, "o").as_int(); r.has_plan = true;
+        const Value dc = dec;
+        r.make_plan = [dc, k]() { auto pl = std::make_shared<CasualtyPlan>(casualty_key(dc), k); casualty_pick(dc, k > 0, pl.get()); return std::shared_ptr<Plan>(pl); };
+        return r;
     }
     if (kind == "CEASE_ATTACK") {
         if (ty == "combat_continue" || ty == "siege_press") return mm(opts(dec, "continue"));
@@ -210,7 +209,13 @@ Adapter::Matched Adapter::map_action(const std::string& kind, Obj* st, const Val
     }
     if (kind == "FIELD_OR_SIEGE") {
         if (ty == "retreat_into_siege") return mm(opts(dec, "siege"));
-        if (ty == "combat_no_retreat" || ty == "combat_retreat") return mm(opts(dec, "field"), true);
+        if (ty == "combat_no_retreat" || ty == "combat_retreat") {
+            Matched x = mm(opts(dec, "field"), true);
+            std::optional<Value> to;
+            if (ty == "combat_retreat") to = slugv(at(p, "to_region"));
+            x.make_plan = [to]() { return std::make_shared<RetreatPlan>(to); };
+            return x;
+        }
         return r;
     }
     if (kind == "WHITE_RIDER") {
@@ -227,7 +232,12 @@ Adapter::Matched Adapter::map_action(const std::string& kind, Obj* st, const Val
     if (kind == "GUIDE_ABILITY") {
         if (ty == "hunt_gollum_reveal" || ty == "hunt_guide_separate") return mm(opts(dec, "use"));
         if (ty == "hunt_gollum_no_reveal") return mm(opts(dec, "skip"));
-        if (ty == "hunt_take_corruption" || ty == "hunt_sacrifice_guide" || ty == "hunt_sacrifice_random") return mm(opts(dec, "skip"), true);
+        if (ty == "hunt_take_corruption" || ty == "hunt_sacrifice_guide" || ty == "hunt_sacrifice_random") {
+            Matched x = mm(opts(dec, "skip"), true);
+            const std::string okind = ty == "hunt_take_corruption" ? "corruption" : ty == "hunt_sacrifice_guide" ? "guide" : "random";
+            x.make_plan = [okind]() { return std::make_shared<AnswerPlan>("HUNT_CASUALTY", okind); };
+            return x;
+        }
         return r;
     }
     if (kind == "REVEAL_FELLOWSHIP") {
@@ -241,15 +251,13 @@ Adapter::Matched Adapter::map_action(const std::string& kind, Obj* st, const Val
     if (kind == "ADVANCE") {
         if (ty == "victor_stay") return mm(opts(dec, "stay"));
         if (ty != "victor_advance") return r;
-        const MovePlan plan = army_move_plan(st, a, memo);    // m_advance: ArmyMovePlan(advance=True).answer(dec)
-        if (!plan.ok) return r;
-        const auto cand = opts(dec, "advance");
-        if (cand.empty()) return r;
-        std::vector<const Value*> pick;
-        for (auto* o : cand) if (at(*o, "all").truthy() == plan.everything) pick.push_back(o);
-        const Value* o = pick.empty() ? cand[0] : pick[0];
-        if (!has_o(o)) return r;
-        r.ok = true; r.o = at(*o, "o").as_int(); r.has_plan = true; return r;
+        auto plan = army_move_plan_obj(st, a, memo, true);    // m_advance: ArmyMovePlan(advance=True).answer(dec)
+        if (!plan) return r;
+        const auto o = plan->answer(dec);
+        if (!o) return r;
+        r.ok = true; r.o = *o; r.has_plan = true;
+        r.make_plan = [plan]() { return plan; };
+        return r;
     }
     if (kind == "CARD_CHOICE") {                              // m_card_choice
         if (ty == "card_option") {
@@ -296,9 +304,15 @@ Adapter::Matched Adapter::map_action(const std::string& kind, Obj* st, const Val
             const std::string word = ty == "army_move" ? "move" : "attack";
             for (auto* o : opts(dec, "card_choice")) if (lower(at(*o, "answer").kind == Value::Str ? at(*o, "answer").s : "") == word) {
                 if (ty == "army_move") {   // Match(o, army_move_plan(...), chain=True): a plan unless the move fails
-                    r.ok = true; r.o = at(*o, "o").as_int(); r.has_plan = army_move_plan(st, a, memo).ok; r.chain = true; return r;
+                    auto plan = army_move_plan_obj(st, a, memo, false);
+                    r.ok = true; r.o = at(*o, "o").as_int(); r.has_plan = bool(plan); r.chain = true;
+                    if (plan) r.make_plan = [plan]() { return plan; };
+                    return r;
                 }
-                r.ok = true; r.o = at(*o, "o").as_int(); r.has_plan = true; r.chain = true; return r;
+                r.ok = true; r.o = at(*o, "o").as_int(); r.has_plan = true; r.chain = true;
+                const Value frv = fr.empty() ? Value() : S(fr), tov = to.empty() ? Value() : S(to);
+                r.make_plan = [frv, tov]() { return std::make_shared<AttackPlan>(frv, tov); };
+                return r;
             }
             return r;
         }
@@ -375,7 +389,73 @@ Adapter::MovePlan Adapter::army_move_plan(Obj* st, const Row& a, const Memo& mem
     movable.erase("saruman");
     plan.ok = true;
     plan.everything = moved == before.units && chars == movable;
+    plan.moved = moved; plan.chars = chars;
     return plan;
+}
+
+// recruit_plan, companion_plan, minion_plan (the action's plan, made at once in Python: here when asked)
+std::function<std::shared_ptr<Plan>()> Adapter::plan_maker(Obj* st, const Row& a, const Memo& memo) {
+    using M = pyobj::Model;
+    const Value& p = a.params;
+    const std::string ty = a.type;
+    if (ty == "muster_recruit" || ty == "muster_elite") {
+        const std::string nm = pstr_of(p, "nation");
+        auto it = t.nation_out.find(nm);
+        const Value nat = it == t.nation_out.end() ? Value() : S(it->second);
+        std::string unit;
+        if (ty == "muster_elite") unit = "elite";
+        else {
+            const Value* tp = p.get("type");
+            unit = !tp ? "regular" : tp->kind == Value::Null ? "None" : tp->kind == Value::Str ? pstr_of(p, "type") : std::to_string(tp->as_int());
+            if (unit == "leader" && nat.kind == Value::Str && nat.s == "SAURON") unit = "nazgul";
+        }
+        const Value region = slugv(at(p, "region")), u = S(unit);
+        return [region, nat, u]() { return std::make_shared<RecruitPlan>(region, nat, u); };
+    }
+    const Value& frm = at(p, "from").truthy() ? at(p, "from") : at(p, "from_region");
+    const Value& to = at(p, "to").truthy() ? at(p, "to") : at(p, "to_region");
+    const std::string fkey = frm.kind == Value::Str ? pstr_of(p, at(p, "from").truthy() ? "from" : "from_region") : "";
+    Obj* army = fkey.empty() ? nullptr : army_at(st, fkey);
+    if (ty == "companion_move") {
+        std::vector<std::string> who;
+        if (at(p, "companions").truthy()) { for (const Value& n : at(p, "companions").arr) if (n.kind == Value::Str) who.push_back(n.s); }
+        else if (army) for (Obj* ld : M::attr(army, "leaders")->k) if (M::type(ld) == "game_state.Companion") who.push_back(M::attr(ld, "name")->s);
+        std::vector<std::string> keys;
+        for (const auto& n : who) { const std::string k = char_out(n); if (!k.empty()) keys.push_back(k); }
+        const Value f = slugv(frm), tt = slugv(to);
+        return [keys, f, tt]() { return std::make_shared<CompanionMovePlan>(keys, f, tt); };
+    }
+    // nazgul_move / mouth_move
+    const Value f = slugv(frm), tt = slugv(to);
+    std::vector<std::tuple<std::string, Value, Value>> flights;
+    if (ty == "mouth_move") flights.push_back({"mouth-of-sauron", f, tt});
+    else {
+        int64_t n = 0;
+        if (army) for (Obj* ld : M::attr(army, "leaders")->k) n += M::type(ld) == "game_state.Nazgul";
+        if (p.get("count") && !at(p, "count").is_null()) n = std::min(n, at(p, "count").as_int());
+        if (at(p, "include_wk").truthy()) flights.push_back({"witch-king", f, tt});
+        for (int64_t i = 0; i < n; ++i) flights.push_back({"nazgul", f, tt});
+    }
+    const Tables* tp = &t;
+    return [tp, flights]() { return std::make_shared<MinionPlan>(*tp, flights); };
+}
+
+std::shared_ptr<Plan> Adapter::army_move_plan_obj(Obj* st, const Row& a, const Memo& memo, bool advance) {
+    const MovePlan mp = army_move_plan(st, a, memo);
+    if (!mp.ok) return nullptr;
+    return std::make_shared<ArmyMovePlan>(t, slugv(at(a.params, "from")), slugv(at(a.params, "to")), mp.moved, mp.chars, mp.everything, advance);
+}
+
+Value Adapter::slugv(const Value& key) const {
+    if (key.kind == Value::Null) return Value();
+    const std::string k = key.kind == Value::Str ? (key.s.rfind("\x01" "enum:", 0) == 0 ? key.s.substr(6) : key.s) : std::to_string(key.as_int());
+    const std::string sl = slug(k);
+    return sl.empty() ? Value() : S(sl);
+}
+
+std::string Adapter::char_out(const std::string& name) const {
+    for (const auto& kv : t.char_in) if (kv.second == name) return kv.first;
+    return "";
 }
 
 std::string Adapter::pstr_of(const Value& v, const char* k) {

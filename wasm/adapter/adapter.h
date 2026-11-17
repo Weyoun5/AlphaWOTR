@@ -1,6 +1,9 @@
 // The protocol adapter (protocol/wotr_protocol_bot.py) in C++: phase 3, the state from the referee's view.
 #pragma once
+#include <functional>
 #include <map>
+#include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -10,6 +13,7 @@
 std::string awad_sanitize(const std::string& name);   // board.sanitize (the box's sanitize_name; driver/box_unity.cpp)
 
 namespace awad {
+struct Plan;
 
 // The adapter's name tables (Names), from wasm/tools/record_build_state.py's adapter.json
 struct Tables {
@@ -53,7 +57,20 @@ public:
     struct Row { int64_t die = -1; std::string type; awjson::Value params; const void* menu = nullptr; int64_t index = -1; };
     const void* obs_tables = nullptr;   // the box's prepared observation tables (for the plans that apply an action)
     // map_action's Match: ok (an option matched; o_none: its 'o' is None), has_plan, chain; unported: not yet
-    struct Matched { bool ok = false, o_none = false, has_plan = false, chain = false, unported = false; int64_t o = -1; };
+    // make_plan: the plan (Match.plan(), made once, may be none); resolve: Match.option()'s final option given it
+    struct Matched {
+        bool ok = false, o_none = false, has_plan = false, chain = false, unported = false; int64_t o = -1;
+        std::function<std::shared_ptr<Plan>()> make_plan;
+        std::function<std::optional<int64_t>(Plan*)> resolve;
+        std::shared_ptr<Plan> plan() { if (!made && make_plan) { cached = make_plan(); } made = true; return cached; }
+        std::optional<int64_t> option() {   // (None when the option's 'o' is None)
+            if (resolve) { auto o2 = resolve(plan().get()); if (o2) return o2; }
+            if (o_none) return std::nullopt;
+            return o;
+        }
+    private:
+        std::shared_ptr<Plan> cached; bool made = false;
+    };
     Matched map_action(const std::string& kind, pyobj::Obj* st, const awjson::Value& dec, const Row& row, const Memo& memo);
     std::string slug(const std::string& key) const;
 
@@ -80,7 +97,12 @@ private:
     struct Figures { std::map<std::pair<std::string, std::string>, int64_t> units; std::set<std::string> chars; };
     Figures figures(pyobj::Obj* st, const std::string& key, int side);
     // army_move_plan: (ok, everything, from slug, to slug); ok false = None
-    struct MovePlan { bool ok = false, everything = false; };
+    struct MovePlan { bool ok = false, everything = false; std::map<std::pair<std::string, std::string>, int64_t> moved; std::set<std::string> chars; };
+    // army_move_plan(bot, st, a, advance) as the plan object (none when the action fails or moves nothing)
+    std::shared_ptr<Plan> army_move_plan_obj(pyobj::Obj* st, const Row& a, const Memo& memo, bool advance);
+    awjson::Value slugv(const awjson::Value& key) const;     // bot.slug(key): None for None or an unknown region
+    std::string char_out(const std::string& name) const;     // CHAR_OUT.get(name) ('' none)
+    std::function<std::shared_ptr<Plan>()> plan_maker(pyobj::Obj* st, const Row& a, const Memo& memo);
     MovePlan army_move_plan(pyobj::Obj* st, const Row& a, const Memo& memo);
     void choice_tokens(const awjson::Value& v, std::set<std::pair<std::string, std::string>>& out);
     int64_t score_options(const awjson::Value& dec, const std::set<std::pair<std::string, std::string>>& toks, bool empty);

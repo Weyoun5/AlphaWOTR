@@ -307,6 +307,7 @@ def main():
                     continue
                 m = json.loads(rec['line'])
                 last['searches'], last['how'] = [], None
+                rs = bot.memo.rng.getstate() if (bot.memo is not None and m.get('type') == 'decide') else None
                 try:
                     reply = bot.handle(m)
                 except SystemExit:
@@ -316,7 +317,8 @@ def main():
                     if m.get('type') == 'decide':
                         item.update(o=(reply or {}).get('o'), how=((reply or {}).get('info') or {}).get('how'), searches=last['searches'],
                                     plan=None if bot.plan is None else type(bot.plan).__name__,
-                                    work=bot.work is not None)
+                                    work=bot.work is not None,
+                                    rng=None if rs is None else [list(rs[1]), rs[2]])   # the memo's Random before it
                     log.write(json.dumps(item, separators=(',', ':')) + '\n')
         print('%s: %d cases' % (os.path.basename(path), len(cases) - before), file=sys.stderr, flush=True)
     if log is not None:
