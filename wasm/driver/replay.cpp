@@ -1,6 +1,7 @@
 // Replays native searches recorded by wasm/tools/record_searches.py in this build of the box.
 //
-//   replay FIXTURES_DIR [--threaded] [--live] [--kernel] [--limit N] [FILE.aws ...]
+//   replay FIXTURES_DIR [--threaded] [--live] [--kernel] [--setup] [--limit N] [FILE.aws ...]
+//   replay FIXTURES_DIR --verdicts FILE.awv     only THE SAME BUT BETTER (strictly_better.inc) against Python's verdicts
 //
 // recorded (default): the controller gets the recorded root state, tables, configuration and search RNG; every
 //   request it makes must equal the recorded one bit for bit (operation, side, purpose, leaf ids, offsets,
@@ -12,10 +13,13 @@
 //   differs in the last bits may change the tree), with the visit share of the recorded pick.
 // --kernel: the combat distributions (COMBAT_DIST) from the module's combat kernel (driver/combat_reply.inc) instead of
 //   the recorded Python replies; in recorded mode the search must still be identical. Always on with --live.
+// --setup: the module sets the search up itself (setup.h: configuration, own-value seed, search stream from the
+//   recorded seat seed, search index and search seed of a --seeded recording); each must equal the recorded one.
 // --threaded: the box's own threaded controller (native only); default: the single-thread provider (wasm patch 0003).
 #include "aw_controller_abi.h"
 #include "awnet.h"
 #include "select.h"
+#include "setup.h"
 
 #include <algorithm>
 #include <chrono>
@@ -31,6 +35,8 @@
 
 extern "C" void* awasm_graph_create(const uint8_t* p);
 extern "C" void* awasm_combat_reply(const void* tables, const void* payload);
+extern "C" int64_t awasm_snapshot_root_count(const void* handle);
+extern "C" int awasm_strictly_better(const void* state, const void* tables, const void* menu, int32_t side, int64_t* out, size_t k);
 
 namespace {
 
@@ -84,6 +90,7 @@ struct Search {
     const uint8_t* menu; size_t menu_size;
     std::vector<int64_t> better; bool has_better;
     uint32_t pick; double seconds;
+    bool has_setup = false; uint64_t seat_seed = 0; uint32_t index = 0; uint64_t search_seed = 0; int32_t owner = 0;
 };
 
 Search parse(Reader& r, size_t obs_dim, size_t act_dim) {
@@ -122,6 +129,10 @@ Search parse(Reader& r, size_t obs_dim, size_t act_dim) {
     s.menu = r.graph(&s.menu_size);
     s.better = r.vec<int64_t>(v.k); s.has_better = r.get<uint32_t>() != 0;
     s.pick = r.get<uint32_t>(); s.seconds = r.get<double>();
+    if (r.e - r.p >= 24) {
+        s.seat_seed = r.get<uint64_t>(); s.index = r.get<uint32_t>(); s.search_seed = r.get<uint64_t>(); s.owner = r.get<int32_t>();
+        s.has_setup = true;
+    }
     return s;
 }
 
@@ -271,13 +282,14 @@ std::vector<uint8_t> export_graph(const void* h) {
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: replay FIXTURES_DIR [--threaded] [--live] [--limit N] [FILE.aws ...]\n"); return 2; }
     const std::string dir = argv[1];
-    bool threaded = false, live = false, kernel = false; size_t limit = 0;
+    bool threaded = false, live = false, kernel = false, own_setup = false; size_t limit = 0;
     std::vector<std::string> files;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--threaded") threaded = true;
         else if (a == "--live") live = true;
         else if (a == "--kernel") kernel = true;
+        else if (a == "--setup") own_setup = true;
         else if (a == "--limit" && i + 1 < argc) limit = std::stoul(argv[++i]);
         else files.push_back(a);
     }
@@ -292,6 +304,9 @@ int main(int argc, char** argv) {
         std::sort(files.begin(), files.end());
     }
     if (limit && files.size() > limit) files.resize(limit);
+    std::string verdicts_file;
+    for (int i = 2; i + 1 < argc; ++i) if (std::string(argv[i]) == "--verdicts") verdicts_file = argv[i + 1];
+    if (!verdicts_file.empty()) files.clear();
     // tables
     auto tables = slurp(dir + "/tables.awg");
     Reader tr{tables.data() + 8, tables.data() + tables.size()};
@@ -308,6 +323,38 @@ int main(int argc, char** argv) {
         else if (name == "hunt") hunt_t = h;
     }
     if (!obs_t || !act_t || !menu_t || !hunt_t) { std::fprintf(stderr, "tables.awg lacks a table (run record_searches.py)\n"); return 2; }
+    if (!verdicts_file.empty()) {
+        auto data = slurp(verdicts_file);
+        uint32_t count; std::memcpy(&count, data.data() + 4, 4);
+        Reader r{data.data() + 8, data.data() + data.size()};
+        size_t same_n = 0, with = 0, banned = 0, total_rows = 0; double secs = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t side = r.get<uint32_t>(), position = r.get<uint32_t>();
+            const uint8_t* root_g = r.graph(); const uint8_t* menu_g = r.graph();
+            void* root = awasm_graph_create(root_g); void* menu = awasm_graph_create(menu_g);
+            const int64_t k = int64_t(awasm_snapshot_root_count(menu));
+            std::vector<int64_t> want = r.vec<int64_t>(size_t(k)); const bool has = r.get<uint32_t>() != 0;
+            std::vector<int64_t> got(size_t(k), -1);
+            const auto t0 = std::chrono::steady_clock::now();
+            const int sb = awasm_strictly_better(root, obs_t, menu, int32_t(side), got.data(), size_t(k));
+            secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            const bool same = sb >= 0 && (sb == 1) == has && (!has || got == want);
+            same_n += same; with += has; total_rows += size_t(k);
+            for (auto x : want) banned += x == awselect::BANNED;
+            if (!same || has) {
+                std::string a, b;
+                for (auto x : want) a += std::to_string(x) + " ";
+                for (auto x : got) b += std::to_string(x) + " ";
+                std::printf("[%s] position %u (%s, %lld options): python %s[%s] module %s[%s]%s\n", same ? "PASS" : "FAIL", position,
+                            side ? "SH" : "FP", (long long)k, has ? "" : "None ", a.c_str(), sb == 1 ? "" : "None ", b.c_str(),
+                            sb < 0 ? (std::string(" error: ") + wotr_snapshot_last_error()).c_str() : "");
+            }
+            wotr_snapshot_destroy(root); wotr_snapshot_destroy(menu);
+        }
+        std::printf("%s: %zu of %u verdict lists equal Python's (%zu with verdicts, %zu banned options; %zu options; %.2f s)\n",
+                    same_n == count ? "PASS" : "FAIL", same_n, count, with, banned, total_rows, secs);
+        return same_n == count ? 0 : 1;
+    }
     awnet::Net nets[2], vnets[2];
     if (live) {
         const char* tag[2] = {"fp", "sh"};
@@ -318,7 +365,7 @@ int main(int argc, char** argv) {
         }
     }
     const size_t OBS = 4745, ACT = 199;
-    int bad = 0; size_t same_pick = 0; double t_total = 0, t_py = 0, t_nn = 0;
+    int bad = 0; size_t same_pick = 0, sb_total = 0, sb_same_n = 0, sb_with = 0; double t_total = 0, t_py = 0, t_nn = 0;
     for (const auto& path : files) {
         auto data = slurp(path);
         Reader r{data.data() + 8, data.data() + data.size()};
@@ -327,6 +374,24 @@ int main(int argc, char** argv) {
         WotrOwnValueConfig own{}; std::memcpy(&own, s.own.data(), std::min(sizeof(own), s.own.size()));
         void* root = awasm_graph_create(s.root);
         void* rng = wotr_random_create(s.rng.words.data(), 624, s.rng.index, s.rng.has_gauss, s.rng.bits);
+        std::string setup_note;
+        if (own_setup) {
+            if (!s.has_setup || !s.search_seed) { std::printf("[FAIL] %s: not a --seeded recording\n", path.c_str()); ++bad; continue; }
+            const WotrSearchConfig mine = awsetup::search_config(int(s.side), int64_t(s.sims), s.owner);
+            const WotrOwnValueConfig mown = awsetup::own_config(s.seat_seed, s.index);
+            uint32_t limbs[2] = {uint32_t(s.search_seed), uint32_t(s.search_seed >> 32)};
+            void* mrng = wotr_random_create_seeded(limbs, 2);
+            std::vector<uint32_t> w(624); uint32_t idx; int32_t hg; uint64_t bits;
+            wotr_random_export(mrng, w.data(), 624, &idx, &hg, &bits);
+            const bool cfg_same = s.config.size() == sizeof(mine) && std::memcmp(s.config.data(), &mine, sizeof(mine)) == 0;
+            const bool own_same = s.own.size() == sizeof(mown) && std::memcmp(s.own.data(), &mown, sizeof(mown)) == 0;
+            const bool rng_same0 = w == s.rng.words && idx == s.rng.index && hg == s.rng.has_gauss && bits == s.rng.bits;
+            setup_note = std::string(", set-up: config ") + (cfg_same ? "equal" : "DIFFERENT") + ", own seed " + (own_same ? "equal" : "DIFFERENT") +
+                         ", search stream " + (rng_same0 ? "equal" : "DIFFERENT");
+            cfg = mine; own = mown;
+            wotr_random_destroy(rng); rng = mrng;
+            if (!(cfg_same && own_same && rng_same0)) { std::printf("[FAIL] %s%s\n", path.c_str(), setup_note.c_str()); ++bad; wotr_random_destroy(rng); wotr_snapshot_destroy(root); continue; }
+        }
         Context c; c.s = &s; c.live = live; c.kernel = kernel; c.obs_dim = OBS; c.act_dim = ACT; c.obs_tables = obs_t;
         c.net = &nets[s.side]; c.vnet = &vnets[s.side]; c.eps = cfg.opponent_policy_epsilon;
         const auto t0 = std::chrono::steady_clock::now();
@@ -348,6 +413,7 @@ int main(int argc, char** argv) {
         bool ok = c.mismatch.empty() && status == awabi::STATUS_COMPLETE;
         std::string detail;
         uint32_t pick = 0xffffffff; double share = 0;
+        bool sb_ok = true; std::string sb_note;
         if (ok) {
             WotrSearchRoot rv{}; rv.struct_size = sizeof(rv);
             wotr_search_controller_root(ctl, &rv);
@@ -369,7 +435,18 @@ int main(int argc, char** argv) {
             }
             st.root_side = rv.root_side;
             st.conf_on = cfg.conf_leaf || cfg.conf_track;
-            if (s.has_better) st.better = s.better;
+            // THE SAME BUT BETTER in the module (strictly_better.inc) against Python's recorded verdicts
+            void* rmenu = wotr_search_controller_root_menu(ctl);
+            std::vector<int64_t> verdicts(k, -1);
+            const int sb = rmenu ? awasm_strictly_better(root, obs_t, rmenu, int32_t(s.side), verdicts.data(), k) : -1;
+            if (rmenu) wotr_snapshot_destroy(rmenu);
+            const bool sb_same = sb >= 0 && (sb == 1) == s.has_better && (!s.has_better || verdicts == s.better);
+            ++sb_total; sb_same_n += sb_same; sb_with += s.has_better;
+            if (!sb_same) {
+                sb_ok = false;
+                sb_note = sb < 0 ? std::string(", STRICTLY_BETTER ERROR: ") + wotr_snapshot_last_error() : ", SAME-BUT-BETTER VERDICTS DIFFER";
+            } else if (s.has_better) sb_note = ", same-but-better verdicts equal";
+            if (sb == 1) st.better = verdicts;
             pick = awselect::pick(st);
             uint64_t total = 0; for (size_t i = 0; i < k; ++i) total += rv.visits[i];
             if (s.pick < k && total) share = double(rv.visits[s.pick]) / double(total);
@@ -383,13 +460,13 @@ int main(int argc, char** argv) {
                 const auto mg = export_graph(m);
                 wotr_snapshot_destroy(m);
                 const bool menu_same = mg.size() == s.menu_size && std::memcmp(mg.data(), s.menu, s.menu_size) == 0;
-                ok = view_same && rng_same && menu_same && pick == s.pick && c.next == s.events.size();
+                ok = view_same && rng_same && menu_same && pick == s.pick && c.next == s.events.size() && sb_ok;
                 detail = std::string("root view ") + (view_same ? "identical" : "DIFFERENT") + ", rng " + (rng_same ? "identical" : "DIFFERENT") +
                          ", root menu " + (menu_same ? "identical" : "DIFFERENT") + ", " + std::to_string(c.next) + "/" + std::to_string(s.events.size()) + " requests";
                 if (kernel && c.dist_requests)
                     detail += ", combat kernel " + std::to_string(c.dist_requests) + " replies (" + std::to_string(c.dist_same_graph) + " equal to Python's in value)";
             } else {
-                ok = pick == s.pick;
+                ok = pick == s.pick && sb_ok;
                 char buf[160];
                 std::snprintf(buf, sizeof buf, "%llu requests (%llu combat), %llu leaves, %llu rows, network %.2f s", (unsigned long long)c.requests,
                               (unsigned long long)c.dist_requests, (unsigned long long)c.leaves, (unsigned long long)c.rows, c.nn_seconds);
@@ -398,6 +475,7 @@ int main(int argc, char** argv) {
         } else {
             detail = c.mismatch.empty() ? std::string("status ") + std::to_string(status) : c.mismatch;
         }
+        detail += sb_note + setup_note;
         same_pick += pick == s.pick;
         bad += !ok;
         std::printf("[%s] position %u seed %u (%s, %u sims): pick %u (recorded %u, its visit share %.2f), %s; %.2f s (Python native %.2f s)\n",
@@ -407,6 +485,7 @@ int main(int argc, char** argv) {
         wotr_random_destroy(rng);
         wotr_snapshot_destroy(root);
     }
+    std::printf("same but better: %zu of %zu verdict lists equal Python's (%zu searches with verdicts)\n", sb_same_n, sb_total, sb_with);
     std::printf("%s: %zu searches, %zu same pick; %.1f s (network %.1f s) against Python native %.1f s\n",
                 bad ? "FAIL" : "PASS", files.size(), same_pick, t_total, t_nn, t_py);
     return bad ? 1 : 0;

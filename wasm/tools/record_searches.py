@@ -12,6 +12,9 @@ Writes into --out:
   tables.awg     extended with the menu-category and Hunt chance tables ('menu', 'hunt'), next to 'observation'
                  and 'actions_v53' (export_fixtures.py writes those two; this script rewrites the file with all four)
   SET/NNNN.aws   one search a file (format below; count 1); SET is --set (default searches)
+  or, with --verdicts FILE, only the same-but-better test records:
+  awv: b'AWV1', u32 count, per search: u32 side, u32 position, graph: root state, graph: root menu,
+       i64 better[K], u32 has_better
 
 aws: b'AWS1', u32 count, then per search:
   u32 position, u32 seed index, u32 side (0 FP, 1 SH), u32 simulations
@@ -31,11 +34,15 @@ aws: b'AWS1', u32 count, then per search:
   graph: the root menu (descriptor rows)
   i64 better[K] (ai._strictly_better's verdicts; all -1 when it returned None), u32 has_better
   u32 pick (build_visit_info's index), f64 seconds (the whole native search, Python included)
+  u64 seat seed, u32 search index (OwnModelSearch: the own-value seed is derive_seed(seat seed,
+      'bridge-own-reply:INDEX')), u64 search seed (random.seed before the search, 0 = not seeded: --seeded),
+  i32 turn owner (0 none, 1 FP, 2 SH)
 """
 import argparse
 import ctypes as C
 import os
 import pickle
+import random
 import struct
 import sys
 import time
@@ -62,11 +69,16 @@ def main():
     ap.add_argument('--positions', nargs='*', default=[])
     ap.add_argument('--limit', type=int, default=0, help='positions per file (0 = all)')
     ap.add_argument('--set', default='searches', help='the folder under --out for the .aws files')
+    ap.add_argument('--seeded', action='store_true', help='seed the search stream (random.seed) before each search '
+                    'and record the seeds, so the module can set the search up from the state alone')
+    ap.add_argument('--verdicts', default='', help='write only the same-but-better test records (awv) to this file, '
+                    'no .aws (the root state, the root menu, the verdicts; a few hundred kB a search)')
     a = ap.parse_args()
     sys.path.insert(0, HERE)
     import export_fixtures as ef
     alpha = os.path.abspath(a.alpha)
     out = os.path.abspath(a.out)
+    verdicts_path = os.path.abspath(a.verdicts) if a.verdicts else ''
     files = [os.path.abspath(p) for p in a.positions] or [os.path.join(alpha, 'wotr_bridge', 'selftest_positions.pkl')]
     os.makedirs(out, exist_ok=True)
     sys.path[:0] = [os.path.join(alpha, 'src'), os.path.join(alpha, 'wotr_bridge')]
@@ -196,9 +208,19 @@ def main():
                 continue
             for si in range(len(seeds)):
                 rec.clear()
+                search = searches[(side, si)]
+                own_index = search.index
+                search_seed = (7000000 + 1000 * (1000 * fi + n) + si) if a.seeded else 0
+                if a.seeded:
+                    random.seed(search_seed)
                 t0 = time.perf_counter()
-                with ai.search_turn_owner(owner):
-                    act, _ = searches[(side, si)].choose(pickle.loads(r['handed']), side, num_simulations=sims)
+                try:
+                    with ai.search_turn_owner(owner):
+                        act, _ = searches[(side, si)].choose(pickle.loads(r['handed']), side, num_simulations=sims)
+                except Exception as error:      # (their search refuses a few positions: 'Unsupported ...')
+                    print('position %d.%d seed %d: the native search refused: %s: %s' % (
+                        fi, n, si, type(error).__name__, str(error)[:120]), flush=True)
+                    continue
                 seconds = time.perf_counter() - t0
                 if 'pick' not in rec:
                     print('position %d.%d seed %d: no native search ran (forced or refused)' % (fi, n, si))
@@ -210,11 +232,24 @@ def main():
                 b += struct.pack('<I', len(rec['events'])) + b''.join(rec['events'])
                 b += rec['root_view'] + rec['rng_after'] + rec['menu'] + rec['better']
                 b += struct.pack('<Id', rec['pick'], seconds)
-                records.append(b)
+                owner_code = 0 if owner is None else (1 if owner is ai.Side.FREE_PEOPLES else 2)
+                b += struct.pack('<QIQi', seeds[si], own_index, search_seed, owner_code)
+                if a.verdicts:
+                    v = struct.pack('<II', si_side, 1000 * fi + n) + rec['root'] + rec['menu'] + rec['better']
+                    records.append(v)
+                else:
+                    records.append(b)
                 kinds = [e[0] for e in rec['events']]
                 print('position %d.%d (%s, turn %s) seed %d: %d sims, %d requests (%d combat), pick %d %s, %.2f s'
                       % (fi, n, r['side'], r.get('turn'), si, sims, len(kinds), kinds.count(2), rec['pick'],
                          act.action_type, seconds), flush=True)
+    if a.verdicts:
+        with open(verdicts_path, 'wb') as f:
+            f.write(b'AWV1' + struct.pack('<I', len(records)))
+            for v in records:
+                f.write(v)
+        print('wrote %d verdict records to %s' % (len(records), a.verdicts))
+        return
     folder = os.path.join(out, a.set)
     os.makedirs(folder, exist_ok=True)
     for name in os.listdir(folder):

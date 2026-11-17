@@ -8,7 +8,8 @@
 #                                             certifies; browser support is narrower
 #   native  build/native/                     the same patched sources with this Mac's clang (parity reference,
 #                                             and the threaded controller beside the single-thread one)
-#   each target also builds the test programs: nn_parity (network against torch), replay (recorded searches);
+#   each target also builds the test programs: nn_parity (network against torch), replay (recorded searches),
+#   bs_parity (the adapter's build_state against Python's);
 #   for wasm they are Node programs (build/nn_parity[64].js, build/replay[64].js) reading the host's files.
 #   --simd: the network with wasm SIMD (-msimd128 for nn/awnet.cpp: its explicit SIMD path, the scalar build's bits)
 #           (wasm targets; output names get -simd). The engine stays scalar: compiled with -msimd128 it replayed the
@@ -52,7 +53,7 @@ for p in "$HERE"/patches/*.sed; do
   [ "$before" != "$(shasum "$SRC/$f" | cut -d' ' -f1)" ] || { echo "patch $(basename "$p") changed nothing in $f" >&2; exit 1; }
 done
 
-INC="-I$SRC/include -I$SRC/cpp -I$HERE/nn -I$HERE/driver"
+INC="-I$SRC/include -I$SRC/cpp -I$HERE/nn -I$HERE/driver -I$HERE/adapter"
 OBJ="$OUT/obj-$MODE$SUFFIX"
 mkdir -p "$OBJ"
 if [ "$MODE" = native ]; then
@@ -65,18 +66,19 @@ else
 fi
 pids=()
 for u in "$SRC/cpp/position.cpp" "$HERE/driver/box_unity.cpp" "$SRC/cpp/random_stream.cpp" "$HERE/driver/wasm_api.cpp" \
-         "$HERE/driver/replay.cpp" "$HERE/nn/nn_parity.cpp"; do
+         "$HERE/driver/replay.cpp" "$HERE/nn/nn_parity.cpp" "$HERE/adapter/build_state.cpp" "$HERE/adapter/bs_parity.cpp"; do
   $CXX -c "$u" -o "$OBJ/$(basename "${u%.cpp}").o" & pids+=($!)
 done
 $CXX $NNFLAGS -c "$HERE/nn/awnet.cpp" -o "$OBJ/awnet.o" & pids+=($!)
 for p in "${pids[@]}"; do wait "$p"; done
-BOXOBJ="$OBJ/position.o $OBJ/box_unity.o $OBJ/random_stream.o $OBJ/wasm_api.o $OBJ/awnet.o"
+BOXOBJ="$OBJ/position.o $OBJ/box_unity.o $OBJ/random_stream.o $OBJ/wasm_api.o $OBJ/awnet.o $OBJ/build_state.o"
 
 if [ "$MODE" = native ]; then
   mkdir -p "$OUT/native"
   $LINK -o "$OUT/native/nn_parity" "$OBJ/awnet.o" "$OBJ/nn_parity.o"
   $LINK -o "$OUT/native/replay" $BOXOBJ "$OBJ/replay.o"
-  ls -la "$OUT/native/nn_parity" "$OUT/native/replay"
+  $LINK -o "$OUT/native/bs_parity" $BOXOBJ "$OBJ/bs_parity.o"
+  ls -la "$OUT/native/nn_parity" "$OUT/native/replay" "$OUT/native/bs_parity"
   exit 0
 fi
 EXPORTS='["_malloc","_free","_wotr_abi_version","_wotr_snapshot_abi_version","_wotr_search_controller_abi_version",
@@ -94,4 +96,5 @@ $LINK -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,worker,web \
 NODEPROG="-sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=8MB -sNODERAWFS=1 -sENVIRONMENT=node"
 $LINK $NODEPROG "$OBJ/awnet.o" "$OBJ/nn_parity.o" -o "$OUT/nn_parity$SUFFIX.js"
 $LINK $NODEPROG $BOXOBJ "$OBJ/replay.o" -o "$OUT/replay$SUFFIX.js"
+$LINK $NODEPROG $BOXOBJ "$OBJ/bs_parity.o" -o "$OUT/bs_parity$SUFFIX.js"
 ls -la "$OUT/alphawotr$SUFFIX.wasm" "$OUT/nn_parity$SUFFIX.wasm" "$OUT/replay$SUFFIX.wasm"
