@@ -276,6 +276,13 @@ private:
                           std::unordered_map<std::string, uint64_t>& strings) {
         if (o->tag == WOTR_STRING) { auto it = strings.find(o->s); if (it != strings.end()) return it->second; }
         const bool compound = o->tag >= WOTR_LIST && o->tag != WOTR_BIGINT;
+        // CPython's empty tuple is one object: every () of a state is one node
+        static const Obj empty_tuple_key{};
+        if (o->tag == WOTR_TUPLE && o->k.empty()) {
+            auto it = memo.find(&empty_tuple_key);
+            if (it != memo.end()) return it->second;
+            memo[&empty_tuple_key] = g.values.size();
+        }
         if (compound) { auto it = memo.find(o); if (it != memo.end()) return it->second; }
         const uint64_t index = g.values.size();
         g.values.push_back(WotrValue{});

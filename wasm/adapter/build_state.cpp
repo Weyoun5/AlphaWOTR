@@ -579,22 +579,35 @@ Obj* Adapter::battle(Obj* st, const Value& view, const Memo& memo, const std::st
         put("attacker_no_retreat", m.boolean(!pre_siege || relief != nullptr));
         if (relief) { put("is_siege", m.boolean(false)); put("corsairs_relief_garrison", relief); }
     }
+    // the rearguard as v0.2.0 records it (the adapter's 2cc5f6d): pc['attacker_rearguard'] = (region, side,
+    // ('forced_rearguard_v1', rear units by (nation, kind), rear plain Leaders by nation)); the rear stays put
     if (frm != reg && at(b, "attackers").truthy()) {
         std::map<std::pair<std::string, std::string>, int64_t> want;
         for (const Value& p : at(b, "attackers").arr) want[{at(p, "nation").s, at(p, "unit").s}] += at(p, "n").kind == Value::Null ? 0 : at(p, "n").as_int();
         if (Obj* army = army_at(st, frm)) {
-            Obj* keep = m.list(); Obj* rg = m.list();
-            bool own_kept = false;
+            std::map<std::pair<std::string, std::string>, int64_t> units;
+            std::map<std::string, int64_t> leaders;
             for (Obj* u : M::attr(army, "units")->k) {
                 const std::string nat = M::attr(u, "nation")->k[1]->s;
-                const int side = FP_NATIONS.count(nat) ? 0 : 1;
-                if (side != atk) { keep->k.push_back(u); continue; }
-                const std::string unit = M::attr(u, "kind")->k[1]->s == "REGULAR" ? "regular" : "elite";
-                auto it = want.find({t.nation_out.at(nat), unit});
-                if (it != want.end() && it->second > 0) { --it->second; keep->k.push_back(u); own_kept = true; }
-                else rg->k.push_back(u);
+                if ((FP_NATIONS.count(nat) ? 0 : 1) != atk) continue;
+                const std::string kind = M::attr(u, "kind")->k[1]->s;
+                auto it = want.find({t.nation_out.at(nat), kind == "REGULAR" ? "regular" : "elite"});
+                if (it != want.end() && it->second > 0) --it->second;
+                else ++units[{nat, kind}];
             }
-            if (!rg->k.empty() && own_kept) { m.set_attr(army, "units", keep); put("rearguard_units", rg); }
+            for (Obj* ld : M::attr(army, "leaders")->k) {
+                if (M::type(ld) != "game_state.Leader" || leader_side(ld) != atk) continue;
+                const std::string nat = M::attr(ld, "nation")->k[1]->s;
+                auto it = want.find({t.nation_out.at(nat), "leader"});
+                if (it != want.end() && it->second > 0) --it->second;
+                else ++leaders[nat];
+            }
+            Obj* us = m.tuple();
+            for (const auto& [k, c] : units) us->k.push_back(m.tuple({m.str(k.first), m.str(k.second), m.integer(c)}));
+            Obj* ls = m.tuple();
+            for (const auto& [k, c] : leaders) ls->k.push_back(m.tuple({m.str(k), m.integer(c)}));
+            put("attacker_rearguard", m.tuple({m.str(awad_sanitize(frm)), m.str(atk ? "SHADOW" : "FREE_PEOPLES"),
+                                                m.tuple({m.str("forced_rearguard_v1"), us, ls})}));
         }
     }
     m.set_attr(st, "pending_combat", pc);
@@ -689,6 +702,46 @@ Adapter::Setup Adapter::setup_card_choice(Obj* st, const Value& dec, const Value
         }
     }
     r.label = ""; return r;                                    // None: no engine decision
+}
+
+// game_logic.fellowship_region: the Fellowship's region key, sanitised
+std::string Adapter::fellowship_region(Obj* st) {
+    using M = pyobj::Model;
+    Obj* r = M::attr(M::attr(st, "fellowship"), "region");
+    if (r->tag == WOTR_STRING) return awad_sanitize(r->s);
+    for (const char* a : {"key", "name", "orig_name"}) {
+        Obj** v = M::attr_slot(r, a);
+        if (v && (*v)->tag == WOTR_STRING) return awad_sanitize((*v)->s);
+    }
+    throw std::runtime_error("fellowship region without a key");
+}
+
+// ai.auto_mordor_gateway: the gateway the Fellowship's progress reaches (hidden, not in Mordor), else ""
+std::string Adapter::auto_mordor_gateway(Obj* st) {
+    using M = pyobj::Model;
+    Obj* f = M::attr(st, "fellowship");
+    const int64_t progress = M::attr(f, "progress")->i;
+    if (M::truthy(M::attr(f, "mordor_entered")) || !M::truthy(M::attr(f, "hidden")) || progress <= 0) return "";
+    const std::string cur = fellowship_region(st);
+    for (const std::string gw : {"morannon", "minas morgul"}) {
+        if (!t.stronghold.count(gw)) continue;                      // board.regions
+        std::set<std::string> seen = {cur};
+        std::vector<std::pair<std::string, int64_t>> q = {{cur, 0}};
+        int64_t dist = -1;
+        for (size_t h = 0; h < q.size(); ++h) {
+            const auto [r, d] = q[h];
+            if (r == gw) { dist = d; break; }
+            if (d >= progress) continue;
+            auto adj = t.adjacent.find(r);
+            if (adj == t.adjacent.end()) continue;
+            for (const auto& x : adj->second) {
+                const std::string a = awad_sanitize(x);
+                if (seen.insert(a).second) q.push_back({a, d + 1});
+            }
+        }
+        if (dist >= 0 && dist <= progress) return gw;
+    }
+    return "";
 }
 
 Adapter::Setup Adapter::setup(const std::string& kind, Obj* st, const Value& dec, const Value& view, const Memo& memo) {
@@ -798,6 +851,32 @@ Adapter::Setup Adapter::setup(const std::string& kind, Obj* st, const Value& dec
         r.label = "action";
     } else if (kind == "CARD_CHOICE") {
         return setup_card_choice(st, dec, view, memo);
+    } else if (kind == "FELLOWSHIP_PHASE") {      // setup_fellowship
+        r.ported = true;
+        auto match = [&](const std::vector<const Value*>& o) {
+            r.has_match = true;
+            if (o.empty() || at(*o[0], "o").kind == Value::Null) r.match_none = true; else r.match = at(*o[0], "o").as_int();
+            return r;
+        };
+        Obj* fs = M::attr(st, "fellowship");
+        const auto enter = opts(dec, "enter_mordor");
+        const std::string here = fellowship_region(st);
+        if (!enter.empty() && (here == "morannon" || here == "minas morgul")) return match(enter);
+        // ai._auto_enter_mordor on a copy: it declares into the gateway its progress reaches
+        const std::string gw = auto_mordor_gateway(st);
+        if (!gw.empty()) {
+            std::string slug;
+            for (const auto& kv : t.region_in) if (kv.second == awad_sanitize(gw)) slug = kv.first;
+            Value sv; sv.kind = Value::Str; sv.s = slug;
+            const auto o = opts(dec, "declare", {{"region", &sv}});
+            if (!o.empty() && at(*o[0], "o").kind != Value::Null) return match(o);
+        }
+        const auto declares = opts(dec, "declare");
+        if (declares.empty() || !M::truthy(M::attr(fs, "hidden"))) return match(opts(dec, "done"));
+        // ai._get_declare_actions(st, allow_in_place=True) is empty only for a revealed Fellowship, one in Mordor, or a
+        // negative progress (otherwise its own region is reachable)
+        if (M::truthy(M::attr(fs, "mordor_entered")) || M::attr(fs, "progress")->i < 0) return match(opts(dec, "done"));
+        r.label = "declare"; r.flag = "_declare_phase";
     }
     return r;
 }

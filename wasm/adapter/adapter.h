@@ -44,7 +44,8 @@ public:
     pyobj::Obj* build_state(const awjson::Value& view, Memo& memo);
     // SETUPS[kind](bot, st, dec, view): the question set up on the state; false when the kind is not ported yet.
     // label / flag: the search label and the phase flag ('' none) the Python returns
-    struct Setup { bool ported = false; std::string label, flag; };
+    // match: the set-up answered by a rule (Match(o)): the option's 'o' (or none when has_match and o is None)
+    struct Setup { bool ported = false; std::string label, flag; bool has_match = false; bool match_none = false; int64_t match = 0; };
     Setup setup(const std::string& kind, pyobj::Obj* st, const awjson::Value& dec, const awjson::Value& view, const Memo& memo);
 
 private:
@@ -61,6 +62,8 @@ private:
     void build_cards(pyobj::Obj* st, const awjson::Value& view, Memo& memo);
     std::vector<std::string> shuffled(Memo& memo, std::vector<std::string> items);
     pyobj::Obj* army_at(pyobj::Obj* st, const std::string& key);
+    std::string fellowship_region(pyobj::Obj* st);
+    std::string auto_mordor_gateway(pyobj::Obj* st);
     int leader_side(pyobj::Obj* leader);
     pyobj::Obj* sail_in(pyobj::Obj* st, const awjson::Value& b, const std::string& frm, const std::string& reg, int atk);
     pyobj::Obj* battle(pyobj::Obj* st, const awjson::Value& view, const Memo& memo, const std::string& phase, int64_t rounds_fought);

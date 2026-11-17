@@ -89,7 +89,57 @@ std::string diff(const G& a, uint64_t x, const G& b, uint64_t y, const std::stri
     }
 }
 
+// a graph value as record_build_state.py's canon() writes a Python value
+std::string pcanon(const G& a, uint64_t n) {
+    const auto& v = a.g.values[n];
+    switch (v.tag) {
+    case WOTR_NONE: return "N";
+    case WOTR_BOOL: return v.integer ? "T" : "F";
+    case WOTR_INT: return "i" + std::to_string(v.integer);
+    case WOTR_FLOAT: { char b[40]; std::snprintf(b, sizeof b, "f%.17g", v.real); return b; }
+    case WOTR_STRING: return "s" + std::to_string(v.count) + ":" + a.text(n);
+    case WOTR_ENUM: return "e" + a.text(a.kids(n)[1]);
+    case WOTR_LIST: case WOTR_TUPLE: { std::string o = "["; bool first = true; for (auto c : a.kids(n)) { if (!first) o += ","; first = false; o += pcanon(a, c); } return o + "]"; }
+    case WOTR_SET: case WOTR_FROZENSET: case WOTR_DICT: {
+        std::vector<std::string> parts; const auto ks = a.kids(n);
+        if (v.tag == WOTR_DICT) for (size_t i = 0; i + 1 < ks.size(); i += 2) parts.push_back(pcanon(a, ks[i]) + ":" + pcanon(a, ks[i + 1]));
+        else for (auto c : ks) parts.push_back(pcanon(a, c));
+        std::sort(parts.begin(), parts.end());
+        std::string o = v.tag == WOTR_DICT ? "{" : "<"; for (size_t i = 0; i < parts.size(); ++i) { if (i) o += ","; o += parts[i]; }
+        return o + (v.tag == WOTR_DICT ? "}" : ">");
+    }
+    case WOTR_OBJECT: {
+        const auto ks = a.kids(n);
+        for (size_t i = 1; i + 1 < ks.size(); i += 2) if (a.text(ks[i]) == "__dict__") {
+            const auto d = a.kids(ks[i + 1]);
+            for (size_t j = 0; j + 1 < d.size(); j += 2) if (a.g.values[d[j]].tag == WOTR_STRING && a.text(d[j]) == "name") return "o" + a.text(d[j + 1]);
+        }
+        const std::string t = a.text(ks[0]); return "o" + t.substr(t.rfind('.') + 1);
+    }
+    default: return "?";
+    }
+}
+pyobj::Graph export_graph(const void* h) {
+    pyobj::Graph g;
+    const size_t nv = wotr_snapshot_node_count(h), ne = wotr_snapshot_edge_count(h), nb = wotr_snapshot_byte_count(h);
+    g.values.resize(nv); g.edges.resize(ne); g.bytes.resize(nb); g.root = wotr_snapshot_root(h);
+    wotr_snapshot_export(h, g.values.data(), nv, g.edges.data(), ne, g.bytes.data(), nb);
+    return g;
+}
+std::vector<std::string> menu_rows(const void* menu) {
+    const pyobj::Graph g = export_graph(menu);
+    G a{g};
+    std::vector<std::string> rows;
+    for (auto row : a.kids(g.root)) {
+        const auto parts = a.kids(row);
+        rows.push_back(std::to_string(g.values[parts[0]].integer) + "|" + a.text(parts[1]) + "|" + pcanon(a, parts[2]));
+    }
+    return rows;
+}
+
 }  // namespace
+
+extern "C" void* awasm_graph_create(const uint8_t* p);
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: bs_parity FIXTURES_DIR [--verbose]\n"); return 2; }
@@ -105,11 +155,27 @@ int main(int argc, char** argv) {
     pyobj::Obj* protos = model.decode(pgraph);
     awad::Adapter adapter(model, tables, protos);
     auto data = slurp(dir + "/build_state.awb");
-    const bool v2 = std::memcmp(data.data(), "AWB2", 4) == 0;   // AWB2: each case also carries the set-up (phase 3b)
+    const bool v3 = std::memcmp(data.data(), "AWB3", 4) == 0;   // AWB3: and the engine's menus
+    const bool v2 = v3 || std::memcmp(data.data(), "AWB2", 4) == 0;   // AWB2: each case also carries the set-up (phase 3b)
+    // the observation tables for the box's menus (tables.awg beside the fixtures)
+    void* obs_tables = nullptr;
+    if (v3) {
+        auto tb = slurp(dir + "/tables.awg");
+        uint32_t tc; std::memcpy(&tc, &tb[4], 4);
+        size_t q = 8;
+        for (uint32_t i = 0; i < tc; ++i) {
+            uint32_t n; std::memcpy(&n, &tb[q], 4); const std::string name(reinterpret_cast<const char*>(&tb[q + 4]), n);
+            const uint8_t* counts = &tb[q + 4 + n];
+            uint64_t nv, ne, nb; std::memcpy(&nv, counts, 8); std::memcpy(&ne, counts + 8, 8); std::memcpy(&nb, counts + 16, 8);
+            if (name == "observation") { obs_tables = awasm_graph_create(counts); wotr_snapshot_prepare_observation_tables(obs_tables); }
+            q += 4 + n + 32 + 40 * nv + 8 * ne + nb;
+        }
+    }
+    size_t menu_checked = 0, menu_same = 0, proj_same = 0, menu_rows_total = 0;
     uint32_t count; std::memcpy(&count, &data[4], 4);
     size_t searched = 0, setup_ported = 0, setup_same = 0;
     size_t off = 8, identical = 0, equal = 0;
-    struct SetupRef { std::string dec, label, flag; pyobj::Graph graph; };
+    struct SetupRef { std::string dec, label, flag; pyobj::Graph graph; std::vector<std::string> legal, projected; };
     std::vector<SetupRef> setups;
     double secs = 0;
     for (uint32_t c = 0; c < count; ++c) {
@@ -135,7 +201,12 @@ int main(int argc, char** argv) {
                 const pyobj::Graph want_setup = pyobj::read_graph(&data[off]);
                 uint64_t a, b2, c2; std::memcpy(&a, &data[off], 8); std::memcpy(&b2, &data[off + 8], 8); std::memcpy(&c2, &data[off + 16], 8);
                 off += 32 + 40 * a + 8 * b2 + c2;
-                setups.push_back({part[0], part[1], part[2], want_setup});
+                std::vector<std::string> menus[2];
+                if (v3) for (int q = 0; q < 2; ++q) {
+                    uint32_t rows; std::memcpy(&rows, &data[off], 4); off += 4;
+                    for (uint32_t r = 0; r < rows; ++r) { uint32_t n; std::memcpy(&n, &data[off], 4); menus[q].emplace_back(reinterpret_cast<const char*>(&data[off + 4]), n); off += 4 + n; }
+                }
+                setups.push_back({part[0], part[1], part[2], want_setup, menus[0], menus[1]});
             } else setups.push_back({});
         }
         memo.rng = wotr_random_create(words.data(), 624, index, hg, bits);
@@ -162,6 +233,39 @@ int main(int argc, char** argv) {
                     setup_same += sg && sl;
                     if (!(sg && sl)) std::printf("case %u: set-up of %s differs: %s%s\n", c, dec.get("kind")->s.c_str(),
                                                  sl ? "" : "label/flag; ", sg ? "" : diff(G{gs}, gs.root, G{ref.graph}, ref.graph.root, "state").c_str());
+                    if (v3 && sg && sl && !su.label.empty()) {   // the box's menu on the state as set up, under the phase flag
+                        if (!su.flag.empty()) model.set_attr(st, su.flag, model.boolean(true));
+                        const pyobj::Graph gf = model.encode(st);
+                        void* sn = wotr_snapshot_create(gf.values.data(), gf.values.size(), gf.edges.data(), gf.edges.size(), gf.bytes.data(), gf.bytes.size(), gf.root);
+                        void* full = sn ? wotr_snapshot_full_actions(sn, obs_tables, memo.side) : nullptr;
+                        ++menu_checked;
+                        if (!full) std::printf("case %u (%s): the box's menu failed: %s\n", c, dec.get("kind")->s.c_str(), wotr_snapshot_last_error());
+                        else {
+                            const auto rows = menu_rows(full);
+                            menu_rows_total += rows.size();
+                            void* meta = nullptr;
+                            void* sel = wotr_snapshot_project_policy(sn, full, memo.side, &meta);
+                            std::vector<std::string> prow = sel ? menu_rows(sel) : std::vector<std::string>{};
+                            if (prow.empty()) prow = rows;
+                            const bool ms = rows == ref.legal, ps = prow == ref.projected;
+                            menu_same += ms; proj_same += ps;
+                            if (!ms || !ps) {
+                                std::printf("case %u (%s, flag %s): menu %s (%zu rows, Python %zu), projected %s (%zu, Python %zu)\n", c,
+                                            dec.get("kind")->s.c_str(), su.flag.c_str(), ms ? "same" : "DIFFERENT", rows.size(), ref.legal.size(),
+                                            ps ? "same" : "DIFFERENT", prow.size(), ref.projected.size());
+                                if (verbose && !ms) {
+                                    for (size_t i = 0; i < std::max(rows.size(), ref.legal.size()) && i < 400; ++i) {
+                                        const std::string x = i < rows.size() ? rows[i] : "-", y = i < ref.legal.size() ? ref.legal[i] : "-";
+                                        if (x != y) { std::printf("   row %zu: box %s\n          python %s\n", i, x.substr(0, 300).c_str(), y.substr(0, 300).c_str()); break; }
+                                    }
+                                }
+                            }
+                            if (sel) wotr_snapshot_destroy(sel);
+                            if (meta) wotr_snapshot_destroy(meta);
+                            wotr_snapshot_destroy(full);
+                        }
+                        if (sn) wotr_snapshot_destroy(sn);
+                    }
                 }
             }
             if (!same) {
@@ -188,6 +292,8 @@ int main(int argc, char** argv) {
     std::printf("%s: %u cases, %zu byte-identical, %zu equal field by field (sets as sets); %.1f ms a state%s\n",
                 equal == count ? "PASS" : "FAIL", count, identical, equal, count ? 1e3 * secs / count : 0.0,
                 v2 ? (" (" + std::to_string(searched) + " with the set-up recorded; " + std::to_string(setup_ported) + " of a ported kind, " +
-                      std::to_string(setup_same) + " set up byte-identically)").c_str() : "");
+                      std::to_string(setup_same) + " set up byte-identically" +
+                      (v3 ? "; menus: " + std::to_string(menu_checked) + " checked, " + std::to_string(menu_same) + " row for row as Python's get_legal_actions, " +
+                            std::to_string(proj_same) + " projected as project_ai_actions; " + std::to_string(menu_rows_total) + " rows" : std::string()) + ")").c_str() : "");
     return equal == count ? 0 : 1;
 }

@@ -16,11 +16,12 @@ Writes into --out:
                       harvest_decisions.py runs it): the view (JSON), the memo before (side, its Random's state,
                       the per-turn flags), the state built (graph)
 
-awb: b'AWB2' (AWB1: without the set-up part), u32 count, per case: u32 json bytes, json, u32 side, rng (624 u32, u32 index, i32 has_gauss, u64 bits),
+awb: b'AWB3' (AWB1: without the set-up part; AWB2: without the menus), u32 count, per case: u32 json bytes, json, u32 side, rng (624 u32, u32 index, i32 has_gauss, u64 bits),
      u8 messenger_used, u8 fellowship_acted, u8 in_mordor, graph (awg record): the state,
      u32 searched (1 when the adapter set the decision up and searched this state), then when 1: u32 + the decide
      message's decision (JSON), u32 + the set-up's label, u32 + its phase flag ('' none), graph: the state as set up
-     (before the flag is set; the reference for the set-up's port)
+     (before the flag is set; the reference for the set-up's port), then two menus (get_legal_actions under the
+     flag; project_ai_actions of it): u32 rows, each u32 + its canonical text (canon_action)
 Run it with PYTHONHASHSEED=0 in the environment and without -I (which ignores it): the AI server's launcher sets it,
 and a Python set's order depends on it.
 """
@@ -117,6 +118,35 @@ def main():
     ef.write_awg(os.path.join(out, 'prototypes.awg'), [('prototypes', snapshot.encode_graph(ai, protos))])
     print('tables and %d prototypes written' % len(protos), file=sys.stderr)
 
+    # a menu row as a canonical text (the C++ side writes the box's rows the same way, adapter/menu.cpp)
+    import enum
+
+    def canon(v):
+        if v is None:
+            return 'N'
+        if v is True:
+            return 'T'
+        if v is False:
+            return 'F'
+        if isinstance(v, enum.Enum):
+            return 'e' + v.name
+        if isinstance(v, int):
+            return 'i%d' % v
+        if isinstance(v, float):
+            return 'f' + repr(v)
+        if isinstance(v, str):
+            return 's%d:%s' % (len(v.encode('utf-8')), v)
+        if isinstance(v, (list, tuple)):
+            return '[' + ','.join(canon(x) for x in v) + ']'
+        if isinstance(v, dict):
+            return '{' + ','.join(sorted(canon(k) + ':' + canon(x) for k, x in v.items())) + '}'
+        if isinstance(v, (set, frozenset)):
+            return '<' + ','.join(sorted(canon(x) for x in v)) + '>'
+        return 'o' + str(getattr(v, 'name', type(v).__name__))
+
+    def canon_action(a):
+        return '%d|%s|%s' % (a.die_idx, a.action_type, canon(a.params or {}))
+
     # 3. build_state cases from the transcripts
     cases, count = [], [0]
     build0 = wpb.build_state
@@ -146,8 +176,27 @@ def main():
         if last['st'] is st and cases:
             text = json.dumps(dec, sort_keys=False).encode('utf-8')
             lb, fb = str(label).encode('utf-8'), (flag or '').encode('utf-8')
-            cases[-1][1] = (struct.pack('<I', len(text)) + text + struct.pack('<I', len(lb)) + lb +
-                            struct.pack('<I', len(fb)) + fb + ef.graph_bytes('setup', snapshot.encode_graph(ai, st)))
+            setup = (struct.pack('<I', len(text)) + text + struct.pack('<I', len(lb)) + lb +
+                     struct.pack('<I', len(fb)) + fb + ef.graph_bytes('setup', snapshot.encode_graph(ai, st)))
+            # the engine's menu as the adapter takes it: get_legal_actions under the phase flag, then
+            # project_ai_actions (LeagueSearcher.choose's menu); each row as canon_action
+            from ai_policies import project_ai_actions
+            rs = random.getstate()
+            try:
+                with wpb._Phase(st, flag):
+                    legal = list(ai.get_legal_actions(st, self.memo.side))
+                    projected = list(project_ai_actions(st, self.memo.side, legal).actions) or legal
+                rows = [legal, projected]
+            except Exception as error:
+                rows = [[], []]
+                print('menu failed: %s' % error, file=sys.stderr)
+            random.setstate(rs)
+            for menu in rows:
+                setup += struct.pack('<I', len(menu))
+                for act in menu:
+                    c = canon_action(act).encode('utf-8')
+                    setup += struct.pack('<I', len(c)) + c
+            cases[-1][1] = setup
         last['st'] = None
         return search_map0(self, st, dec, label, flag, left)
     wpb.AlphaWotrBot._search_and_map = search_and_map
@@ -173,7 +222,7 @@ def main():
                     break
         print('%s: %d cases' % (os.path.basename(path), len(cases) - before), file=sys.stderr, flush=True)
     with open(os.path.join(out, 'build_state.awb'), 'wb') as f:
-        f.write(b'AWB2' + struct.pack('<I', len(cases)))
+        f.write(b'AWB3' + struct.pack('<I', len(cases)))
         for b, setup in cases:
             f.write(b + struct.pack('<I', int(bool(setup))) + setup)
     print('wrote %d build_state cases (%d set up and searched)' % (len(cases), sum(1 for c in cases if c[1])), file=sys.stderr)
