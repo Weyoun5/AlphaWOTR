@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // AlphaWOTR on WebAssembly as a stdio protocol bot (one JSON message a line in, one reply a line out), for
-// `cli referee` (proc:) and the transcript checks.   node aw-stdio.mjs DATA_DIR [--sims N]
+// `cli referee` (proc:) and the transcript checks.   node aw-stdio.mjs DATA_DIR [--sims N] [--module FILE.mjs]
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -14,7 +14,9 @@ const si = args.indexOf('--sims');
 const sims = si >= 0 ? Number(args[si + 1]) : 300;
 const files = {};
 for (const name of DATA_FILES) files[name] = new Uint8Array(fs.readFileSync(path.join(dir, name)));
-const { default: createModule } = await import(path.join(here, '..', 'build', 'alphawotr.mjs'));
+const mi = args.indexOf('--module');   // another build of the module (e.g. alphawotr-simd.mjs)
+const modulePath = mi >= 0 ? path.resolve(args[mi + 1]) : path.join(here, '..', 'build', 'alphawotr.mjs');
+const { default: createModule } = await import(modulePath);
 const bot = await createBot(createModule, files, { sims });
 const rl = readline.createInterface({ input: process.stdin });
 for await (const line of rl) {

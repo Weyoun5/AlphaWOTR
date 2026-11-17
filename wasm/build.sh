@@ -68,7 +68,7 @@ if [ "$MODE" = native ]; then
 else
   source "${EMSDK:-$HOME/Projects/BehindMedia/emsdk}/emsdk_env.sh" >/dev/null 2>&1
   CXX="em++ -std=c++17 -O2 -fwasm-exceptions $ARCH $NUMERIC $INC"
-  LINK="em++ -O2 -fwasm-exceptions $ARCH"
+  LINK="em++ -O2 -fwasm-exceptions $ARCH ${AW_PROFILE:+--profiling-funcs} ${AW_MALLOC:+-sMALLOC=$AW_MALLOC}"   # AW_PROFILE=1: function names for profiles
 fi
 pids=()
 for u in "$SRC/cpp/position.cpp" "$HERE/driver/box_unity.cpp" "$SRC/cpp/random_stream.cpp" "$HERE/driver/wasm_api.cpp" \
