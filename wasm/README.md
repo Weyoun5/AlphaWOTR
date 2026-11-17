@@ -61,6 +61,22 @@ Phase 2 (2026-11-17): the search in the module
 The recordings are large (about 70 MB a search: every request's observations and action rows); they stay out of git.
 Results and the wasm32 decision: docs/AlphaWOTR-Wasm-Plan.md section 6b (behindmedia repository).
 
-Next (phase 2, rest): ai._strictly_better in C++ (the replays use the recorded verdicts); the driver's own
-build_config and seeds (own_model's seat seeds, rng_streams.derive_seed, the search stream) so a decision needs no
-recording; then phase 3 (the state from the protocol view).
+Phase 2 finished, phase 3 begun (2026-11-17, second run)
+--------------------------------------------------------
+- driver/strictly_better.inc   ai._strictly_better (THE SAME BUT BETTER, the siege ban) on the box's graphs
+- driver/setup.h               the live search configuration, the own-value seed (derive_seed: SHA-256), the
+                               search stream Random(seed): a decision from a state alone
+- adapter/pyobj.h              a mutable model of the engine's object graph, encoded exactly as encode_graph
+                               (CPython set order under PYTHONHASHSEED=0)
+- adapter/build_state.cpp      the adapter's build_state + _build_cards, line for line, on prototypes
+- adapter/bs_parity.cpp        against the Python adapter's states (byte for byte)
+- tools/record_build_state.py  adapter.json, prototypes.awg, build_state.awb (run WITHOUT -I and with
+                               PYTHONHASHSEED=0, as their launcher runs Python)
+
+    replay FIXTURES --setup --live [FILES]            a decision from the state, the side and two seeds
+    replay FIXTURES --verdicts FIXTURES/verdicts2.awv the same-but-better verdicts against Python's
+    PYTHONHASHSEED=0 venv/bin/python -s wasm/tools/record_build_state.py --alpha CHECKOUT --out wasm/fixtures T.protocol.jsonl ...
+    wasm/build/native/bs_parity wasm/fixtures         (node wasm/build/bs_parity.js wasm/fixtures)
+
+Next: the pending decision's set-up (SETUPS, _battle, _sail_in; record_build_state.py's AWB2 records carry the
+states the adapter set up and searched), then the menu, the option matching and the same pick from the view alone.

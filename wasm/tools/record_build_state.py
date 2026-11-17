@@ -16,8 +16,13 @@ Writes into --out:
                       harvest_decisions.py runs it): the view (JSON), the memo before (side, its Random's state,
                       the per-turn flags), the state built (graph)
 
-awb: b'AWB1', u32 count, per case: u32 json bytes, json, u32 side, rng (624 u32, u32 index, i32 has_gauss, u64 bits),
-     u8 messenger_used, u8 fellowship_acted, u8 in_mordor, graph (awg record): the state
+awb: b'AWB2' (AWB1: without the set-up part), u32 count, per case: u32 json bytes, json, u32 side, rng (624 u32, u32 index, i32 has_gauss, u64 bits),
+     u8 messenger_used, u8 fellowship_acted, u8 in_mordor, graph (awg record): the state,
+     u32 searched (1 when the adapter set the decision up and searched this state), then when 1: u32 + the decide
+     message's decision (JSON), u32 + the set-up's label, u32 + its phase flag ('' none), graph: the state as set up
+     (before the flag is set; the reference for the set-up's port)
+Run it with PYTHONHASHSEED=0 in the environment and without -I (which ignores it): the AI server's launcher sets it,
+and a Python set's order depends on it.
 """
 import argparse
 import copy
@@ -112,8 +117,23 @@ def main():
             b = struct.pack('<I', len(text)) + text + struct.pack('<I', 0 if side is FP else 1) + rb
             b += struct.pack('<BBB', int(mu), int(fa), int(im))
             b += ef.graph_bytes('state', snapshot.encode_graph(ai, st))
-            cases.append(b)
+            cases.append([b, b''])
+            last['st'] = st
+        else:
+            last['st'] = None
         return st
+    last = {'st': None}
+    search_map0 = wpb.AlphaWotrBot._search_and_map
+
+    def search_and_map(self, st, dec, label, flag, left):
+        if last['st'] is st and cases:
+            text = json.dumps(dec, sort_keys=False).encode('utf-8')
+            lb, fb = str(label).encode('utf-8'), (flag or '').encode('utf-8')
+            cases[-1][1] = (struct.pack('<I', len(text)) + text + struct.pack('<I', len(lb)) + lb +
+                            struct.pack('<I', len(fb)) + fb + ef.graph_bytes('setup', snapshot.encode_graph(ai, st)))
+        last['st'] = None
+        return search_map0(self, st, dec, label, flag, left)
+    wpb.AlphaWotrBot._search_and_map = search_and_map
     wpb.build_state = build_state
     from core import own_model
     choose0 = own_model.OwnModelSearch.choose
@@ -136,10 +156,10 @@ def main():
                     break
         print('%s: %d cases' % (os.path.basename(path), len(cases) - before), file=sys.stderr, flush=True)
     with open(os.path.join(out, 'build_state.awb'), 'wb') as f:
-        f.write(b'AWB1' + struct.pack('<I', len(cases)))
-        for b in cases:
-            f.write(b)
-    print('wrote %d build_state cases' % len(cases), file=sys.stderr)
+        f.write(b'AWB2' + struct.pack('<I', len(cases)))
+        for b, setup in cases:
+            f.write(b + struct.pack('<I', int(bool(setup))) + setup)
+    print('wrote %d build_state cases (%d set up and searched)' % (len(cases), sum(1 for c in cases if c[1])), file=sys.stderr)
 
 
 if __name__ == '__main__':

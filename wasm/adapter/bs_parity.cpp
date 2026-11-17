@@ -105,7 +105,9 @@ int main(int argc, char** argv) {
     pyobj::Obj* protos = model.decode(pgraph);
     awad::Adapter adapter(model, tables, protos);
     auto data = slurp(dir + "/build_state.awb");
+    const bool v2 = std::memcmp(data.data(), "AWB2", 4) == 0;   // AWB2: each case also carries the set-up (phase 3b)
     uint32_t count; std::memcpy(&count, &data[4], 4);
+    size_t searched = 0;
     size_t off = 8, identical = 0, equal = 0;
     double secs = 0;
     for (uint32_t c = 0; c < count; ++c) {
@@ -121,6 +123,16 @@ int main(int argc, char** argv) {
         const pyobj::Graph want = pyobj::read_graph(&data[off]);
         uint64_t nv, ne, nb; std::memcpy(&nv, &data[off], 8); std::memcpy(&ne, &data[off + 8], 8); std::memcpy(&nb, &data[off + 16], 8);
         off += 32 + 40 * nv + 8 * ne + nb;
+        if (v2) {
+            uint32_t has; std::memcpy(&has, &data[off], 4); off += 4;
+            if (has) {
+                ++searched;
+                for (int part = 0; part < 3; ++part) { uint32_t n; std::memcpy(&n, &data[off], 4); off += 4 + n; }
+                uint32_t sl; std::memcpy(&sl, &data[off], 4); off += 4 + sl;
+                uint64_t a, b2, c2; std::memcpy(&a, &data[off], 8); std::memcpy(&b2, &data[off + 8], 8); std::memcpy(&c2, &data[off + 16], 8);
+                off += 32 + 40 * a + 8 * b2 + c2;
+            }
+        }
         memo.rng = wotr_random_create(words.data(), 624, index, hg, bits);
         std::string why;
         bool same = false, eq = false;
@@ -153,7 +165,8 @@ int main(int argc, char** argv) {
         identical += same; equal += same || eq;
         if (!same && (verbose || !eq)) std::printf("case %u: %s%s\n", c, eq ? "equal up to set order (not byte-identical) " : "", why.c_str());
     }
-    std::printf("%s: %u cases, %zu byte-identical, %zu equal field by field (sets as sets); %.1f ms a state\n",
-                equal == count ? "PASS" : "FAIL", count, identical, equal, count ? 1e3 * secs / count : 0.0);
+    std::printf("%s: %u cases, %zu byte-identical, %zu equal field by field (sets as sets); %.1f ms a state%s\n",
+                equal == count ? "PASS" : "FAIL", count, identical, equal, count ? 1e3 * secs / count : 0.0,
+                v2 ? (" (" + std::to_string(searched) + " with the set-up recorded, for phase 3b)").c_str() : "");
     return equal == count ? 0 : 1;
 }
