@@ -12,6 +12,9 @@ struct ArmyMoveRequest {
     bool take_leaders=true,pass=false,mouth_muster=false,card_followup=false; // -1 denotes absent optional count
     // E5-01 (D5 2026-10-22): the row's 'leader_set' - the non-Nazgul figures that move (am_FigureSet below)
     std::vector<std::pair<std::tuple<std::string,std::string,std::string>,int64_t>> leader_set;bool has_leader_set=false;
+    // L1104-W06 (ai._execute_action unit_set / game_logic.move_army chosen_units): the units an AI seat's unit rule
+    // names (ai_units.pick) - only they fill the counts of a split move
+    std::vector<std::pair<std::tuple<std::string,std::string,std::string>,int64_t>> unit_set;bool has_unit_set=false;
 };
 bool am_plain(const Snapshot& s,uint64_t leader){
     const auto type=object_type(s,leader);
@@ -287,12 +290,23 @@ std::unique_ptr<Snapshot> apply_army_move(const Snapshot& source,const Snapshot&
             for(auto l:src_leaders)(am_saruman(s,l) || am_leader_side(s,l)!=req.side?kept_leaders:moving_leaders).push_back(l);
         }else{
             std::vector<uint64_t> kept_elite,kept_regular,held,enemy,moved_elite,moved_regular;
+            // L1104-W06: a unit_set names the units (army_move_participants.selected: first matches in roster
+            // order among the side's nation-filtered pool; its kinds must agree with the counts); only they move
+            std::set<uint64_t> named_units;
+            if(req.has_unit_set){
+                std::vector<uint64_t> pool;
+                for(auto u:src_units)if(ctx_unit_side(s,u)==req.side && (!restricted||eligible_units.count(u)) && nation_ok(obs_attr(s,u,"nation")))pool.push_back(u);
+                const auto named=am_pick(s,pool,req.unit_set,true);
+                int64_t nr=0,ne=0;for(auto u:named)(enum_is(s,obs_attr(s,u,"kind"),"game_state.UnitKind","REGULAR")?nr:ne)++;
+                require(nr==mr && ne==me,"unit_set disagrees with the unit counts");
+                named_units.insert(named.begin(),named.end());
+            }
             for(auto u:src_units){
                 if(ctx_unit_side(s,u)!=req.side || (restricted&&!eligible_units.count(u))){enemy.push_back(u);continue;}
                 if(!nation_ok(obs_attr(s,u,"nation"))){held.push_back(u);continue;}
                 const bool reg=enum_is(s,obs_attr(s,u,"kind"),"game_state.UnitKind","REGULAR");
                 auto& moved=reg?moved_regular:moved_elite;auto& kept=reg?kept_regular:kept_elite;
-                (static_cast<int64_t>(moved.size())<(reg?mr:me)?moved:kept).push_back(u);
+                (static_cast<int64_t>(moved.size())<(reg?mr:me) && (!req.has_unit_set||named_units.count(u))?moved:kept).push_back(u);
             }
             require(static_cast<int64_t>(moved_regular.size())==mr && static_cast<int64_t>(moved_elite.size())==me,"requested units cannot cross nation border");
             moving_units=moved_elite;moving_units.insert(moving_units.end(),moved_regular.begin(),moved_regular.end());

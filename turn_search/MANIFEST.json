@@ -48,8 +48,8 @@
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/action_clone.inc"
   },
   "native_w2x/box/cpp/action_dispatch.inc": {
-   "sha256": "c6112f3172617e8b5421cb944aeceb6cc650a6f04d9f3b2adc8bc76eca2fd9c1",
-   "bytes": 37765,
+   "sha256": "1b48bc2ef697fc8b7a4d1a7a2c53e807fbc68e1b810c974b368ab936740a673f",
+   "bytes": 38065,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/action_dispatch.inc"
   },
   "native_w2x/box/cpp/action_features.inc": {
@@ -88,8 +88,8 @@
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/army_attack_menu.inc"
   },
   "native_w2x/box/cpp/army_move.inc": {
-   "sha256": "3a813ba90b898852ac8bc752b75a5c4c7075eda46854923bfa359c1e729aa33c",
-   "bytes": 31719,
+   "sha256": "2843aaebd8c404a2c987c0943411491edb8c4077eff3471edaef6a06b603ce6d",
+   "bytes": 32942,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/army_move.inc"
   },
   "native_w2x/box/cpp/army_move_menu.inc": {
