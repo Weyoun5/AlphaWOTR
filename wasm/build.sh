@@ -15,8 +15,8 @@
 #           (wasm targets; output names get -simd). The engine stays scalar: compiled with -msimd128 it replayed the
 #           same searches but was no faster (2026-11-17: 72.7 s against 70.1 s for the 18 selftest searches)
 #
-# Their sources are copied into build/src-<target> and the patches in patches/ are applied to the copy (sed scripts,
-# documented at their top; '# file:' names the file, '# targets:' the targets they apply to), so a new release of
+# Their sources are copied into build/src-<target> and the patches in patches/ are applied to the copy (sed scripts
+# or unified diffs, documented at their top; '# file:' names a sed script's file, '# targets:' the targets), so a new release of
 # theirs is taken by re-running this script; a patch that changes nothing fails the build loudly.
 # Numeric flags are the box's own (build_portable.py NUMERIC): no FMA contraction, no fast-math, libm pow/log.
 # Single-threaded, no mimalloc (the allocator unit is not compiled, as on the Mac). EMSDK: emsdk's folder.
@@ -45,12 +45,17 @@ SRC="$OUT/src-$MODE"
 rm -rf "$SRC" && mkdir -p "$SRC" && cp -R "$BOX/cpp" "$BOX/include" "$SRC/"
 # the turn search box's C++ port of combat_dist.exact_distribution (same release), for the COMBAT_DIST replies
 cp "$ROOT/turn_search/native_w2x/box/cpp/combat_kernel.inc" "$ROOT/turn_search/native_w2x/box/cpp/chance_driver.inc" "$SRC/cpp/"
-for p in "$HERE"/patches/*.sed; do
+for p in "$HERE"/patches/*; do
   grep -Eq "^# targets:.* $MODE( |$)" "$p" || continue
-  f=$(sed -n 's/^# file: //p' "$p")
-  before=$(shasum "$SRC/$f" | cut -d' ' -f1)
-  sed -i '' -f "$p" "$SRC/$f"
-  [ "$before" != "$(shasum "$SRC/$f" | cut -d' ' -f1)" ] || { echo "patch $(basename "$p") changed nothing in $f" >&2; exit 1; }
+  case "$p" in
+    *.sed)
+      f=$(sed -n 's/^# file: //p' "$p")
+      before=$(shasum "$SRC/$f" | cut -d' ' -f1)
+      sed -i '' -f "$p" "$SRC/$f"
+      [ "$before" != "$(shasum "$SRC/$f" | cut -d' ' -f1)" ] || { echo "patch $(basename "$p") changed nothing in $f" >&2; exit 1; } ;;
+    *.diff)   # a unified diff of the box's files (paths native_backend/live_search_oct19/...): patch -p3 on the copy
+      patch -s -p3 -d "$SRC" --forward --no-backup-if-mismatch < "$p" || { echo "patch $(basename "$p") does not apply" >&2; exit 1; } ;;
+  esac
 done
 
 INC="-I$SRC/include -I$SRC/cpp -I$HERE/nn -I$HERE/driver -I$HERE/adapter"
