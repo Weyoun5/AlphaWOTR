@@ -58,7 +58,8 @@ for p in "$HERE"/patches/*; do
   esac
 done
 
-INC="-I$SRC/include -I$SRC/cpp -I$HERE/nn -I$HERE/driver -I$HERE/adapter"
+COMMIT=$(git -C "$HERE" rev-parse --short=7 HEAD 2>/dev/null || echo unknown)
+INC="-DAW_COMMIT=\"$COMMIT\" -I$SRC/include -I$SRC/cpp -I$HERE/nn -I$HERE/driver -I$HERE/adapter"
 OBJ="$OUT/obj-$MODE$SUFFIX"
 mkdir -p "$OBJ"
 if [ "$MODE" = native ]; then

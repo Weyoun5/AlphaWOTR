@@ -14,7 +14,6 @@
 #include <cctype>
 #include <set>
 
-extern "C" void* awasm_apply_descriptor_random(const void* state, const void* tables, const void* menu, const void* random, int32_t side, int64_t index, void** random_out, void** events);
 using pyobj::Obj;
 using awjson::Value;
 
@@ -440,7 +439,7 @@ Adapter::MovePlan Adapter::army_move_plan(Obj* st, const Row& a, const Memo& mem
     const uint32_t limb = 1;
     void* rng = wotr_random_create_seeded(&limb, 1);
     void* rng_out = nullptr; void* events = nullptr;
-    void* after = (a.menu && obs_tables && rng) ? awasm_apply_descriptor_random(sn, obs_tables, a.menu, rng, memo.side, a.index, &rng_out, &events) : nullptr;
+    void* after = (a.menu && obs_tables && rng) ? wotr_snapshot_apply_descriptor_random(sn, obs_tables, a.menu, rng, memo.side, a.index, &rng_out, &events) : nullptr;
     if (!after && std::getenv("AW_BOT_DEBUG")) std::fprintf(stderr, "[plan] army_move_plan: apply failed: %s\n", wotr_snapshot_last_error());
     if (rng_out) wotr_random_destroy(rng_out);
     if (events) wotr_snapshot_destroy(events);

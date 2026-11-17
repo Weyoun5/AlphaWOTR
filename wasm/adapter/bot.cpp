@@ -15,9 +15,12 @@
 
 extern "C" int64_t awasm_snapshot_root_count(const void* handle);
 
-extern "C" void* awasm_apply_descriptor_random(const void* state, const void* tables, const void* menu, const void* random, int32_t side, int64_t index, void** random_out, void** events);
 using awjson::Value;
 using namespace awad::opt;
+
+#ifndef AW_COMMIT
+#define AW_COMMIT "unknown"
+#endif
 
 namespace awbot {
 namespace {
@@ -114,7 +117,7 @@ std::string Bot::handle(const Value& msg) {
     }
     if (ty == "hello")
         return "{\"type\":\"hello\",\"id\":" + json_of(at(msg, "id")) + ",\"protocol\":\"wotr-bot/0.1\",\"name\":\"AlphaWOTR\","
-               "\"version\":\"corpus_live-v52/protocol-1/wasm\",\"author\":\"AlphaWOTR (protocol adapter, WebAssembly)\",\"events\":true,"
+               "\"version\":\"v0.2.0/mc200_fpwin_shwin-s1/protocol-2/wasm-" AW_COMMIT "\",\"author\":\"AlphaWOTR (protocol adapter, WebAssembly)\",\"events\":true,"
                "\"options\":[{\"name\":\"sims\",\"type\":\"int\",\"default\":" + std::to_string(sims) + ",\"min\":1,\"max\":100000}]}";
     if (ty == "options") {
         const Value& v = or_empty(msg, "values");
@@ -315,7 +318,7 @@ pyobj::Obj* Bot::apply_copy(const void* sn, const void* menu, int64_t index, con
     const bool own = rng == nullptr;
     if (own) { if (!own_rng) { const uint32_t z = 0; own_rng = wotr_random_create_seeded(&z, 1); } rng = own_rng; }
     void* rng_out = nullptr; void* events = nullptr;
-    void* after = awasm_apply_descriptor_random(sn, ad.obs_tables, menu, rng, memo.side, index, &rng_out, &events);
+    void* after = wotr_snapshot_apply_descriptor_random(sn, ad.obs_tables, menu, rng, memo.side, index, &rng_out, &events);
     if (events) wotr_snapshot_destroy(events);
     if (rng_out) { if (own) { wotr_random_destroy(own_rng); own_rng = rng_out; } else wotr_random_destroy(rng_out); }
     if (!own) wotr_random_destroy(rng);
