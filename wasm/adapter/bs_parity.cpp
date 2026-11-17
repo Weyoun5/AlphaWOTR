@@ -349,6 +349,7 @@ int main(int argc, char** argv) {
                                     std::vector<size_t> mapped;
                                     for (size_t ri = 0; ri < mts.size(); ++ri) { if (mts[ri].ok) mapped.push_back(ri); else banned.insert(rows[ri]); }
                                     std::string how_cpp; int64_t answer = -1; std::map<std::string, std::string> got;
+                                    void* units_menu = nullptr;   // the unit rule's action (a one-row menu), when it named units
                                     const auto t0 = std::chrono::steady_clock::now();
                                     if (mapped.empty()) { how_cpp = "default"; }
                                     else {
@@ -391,21 +392,43 @@ int main(int argc, char** argv) {
                                                             else if (outright == -2) got["certain_error"] = wotr_snapshot_last_error();
                                                         }
                                                     }
-                                                    // ai_units: not ported yet
+                                                    // the seat's unit rule (ai_units.pick) on the pick, unless its action is banned
+                                                    if (!pick.empty()) {
+                                                        auto it = std::find(rows.begin(), rows.end(), pick);
+                                                        int changed = 0;
+                                                        void* um = it == rows.end() ? nullptr : awdec::units(box, sn, memo.side, full, int64_t(it - rows.begin()), &changed);
+                                                        if (changed == -1) got["units_error"] = wotr_snapshot_last_error();
+                                                        if (um) {
+                                                            const std::string ur = menu_rows(um)[0];
+                                                            got["units"] = ur;
+                                                            if (!banned.count(ur)) { pick = ur; units_menu = um; } else wotr_snapshot_destroy(um);
+                                                        }
+                                                    }
                                                 }
                                             }
                                             got["pick"] = pick;
                                             how_cpp = "search";
                                             size_t at_i = mapped[0];
-                                            for (size_t q : mapped) if (rows[q] == pick) { at_i = q; break; }
+                                            bool found = false;
+                                            for (size_t q : mapped) if (rows[q] == pick) { at_i = q; found = true; break; }
                                             answer = mts[at_i].o_none ? -1 : mts[at_i].o;
+                                            if (!found && units_menu) {   // an action not in the menu as such: matched by itself
+                                                const pyobj::Graph ug = export_graph(units_menu);
+                                                G gu{ug};
+                                                const auto parts = gu.kids(gu.kids(ug.root)[0]);
+                                                awad::Adapter::Row row; row.die = ug.values[parts[0]].integer; row.type = gu.text(parts[1]);
+                                                row.params = to_value(gu, parts[2]); row.menu = units_menu; row.index = 0;
+                                                const auto mt = adapter.map_action(dec.get("kind")->s, st, dec, row, memo);
+                                                if (mt.ok) { answer = mt.o_none ? -1 : mt.o; got["units_matched"] = "1"; }
+                                            }
+                                            if (units_menu) wotr_snapshot_destroy(units_menu);
                                         }
                                     }
                                     dec_secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                                     ++dec_total;
                                     const bool same = answer == ref.answer;
                                     dec_same += same;
-                                    for (const char* k : {"search", "raw", "pick", "certain_outright"}) {
+                                    for (const char* k : {"search", "raw", "pick", "certain_outright", "units"}) {
                                         if (!got.count(k)) continue;
                                         const awjson::Value* w = ref.stages.get(k);
                                         ++stage_total[k];
@@ -468,7 +491,7 @@ int main(int argc, char** argv) {
                             std::to_string(proj_same) + " projected as project_ai_actions; " + std::to_string(menu_rows_total) + " rows" : std::string()) +
                       (v5 ? "; decisions: " + std::to_string(dec_same) + " of " + std::to_string(dec_total) + " the adapter's answer (search pick " +
                             std::to_string(stage_same["search"]) + "/" + std::to_string(stage_total["search"]) + ", final pick " + std::to_string(stage_same["pick"]) + "/" +
-                            std::to_string(stage_total["pick"]) + ", " + std::to_string(dec_total ? dec_secs / dec_total * 1e3 : 0.0) + " ms a decision)" : std::string()) +
+                            std::to_string(stage_total["pick"]) + ", unit rule " + std::to_string(stage_same["units"]) + "/" + std::to_string(stage_total["units"]) + ", " + std::to_string(dec_total ? dec_secs / dec_total * 1e3 : 0.0) + " ms a decision)" : std::string()) +
                       (v4 ? "; matching: " + std::to_string(match_same) + " of " + std::to_string(match_rows) + " rows as map_action (" + std::to_string(match_unported) +
                             " of a kind not ported), " + std::to_string(match_cases_same) + " of " + std::to_string(match_cases) + " decisions entirely" : std::string()) + ")").c_str() : "");
     return equal == count ? 0 : 1;

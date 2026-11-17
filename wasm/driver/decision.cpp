@@ -17,6 +17,8 @@ extern "C" int64_t awasm_snapshot_root_count(const void* handle);
 extern "C" int64_t awasm_certain_line(const void* state, const void* tables, const void* menu, int32_t side, int64_t own,
                                       int (*priors)(void*, const void*, int32_t, const void*, float*, size_t), void* user);
 
+extern "C" void* awasm_ai_units(const void* state, const void* tables, const void* menu, int32_t side, int64_t index, int32_t* changed);
+
 namespace awdec {
 namespace {
 
@@ -265,6 +267,13 @@ int priors(void* user, const void* state, int32_t side, const void* menu, float*
 
 int64_t certain_line(Box& box, const void* state, int side, const void* menu, int64_t own) {
     return awasm_certain_line(state, box.obs, menu, side, own, priors, &box);
+}
+
+void* units(Box& box, const void* state, int side, const void* menu, int64_t index, int* changed) {
+    int32_t c = -1;
+    void* out = awasm_ai_units(state, box.obs, menu, side, index, &c);
+    *changed = c;
+    return out;
 }
 
 }  // namespace awdec

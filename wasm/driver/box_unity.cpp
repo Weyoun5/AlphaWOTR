@@ -9,3 +9,4 @@
 // board.sanitize for the adapter's port (adapter/adapter.h)
 std::string awad_sanitize(const std::string& name) { return sanitize_name(name); }
 #include "certain_line.inc"
+#include "ai_units.inc"

@@ -195,17 +195,24 @@ struct Search {
         std::map<std::string, int64_t> want;
         auto e = end_own.find(dst); if (e != end_own.end()) for (const auto& [k, v] : e->second) want[k] += v;
         auto w = now.find(dst); if (w != now.end()) for (const auto& [k, v] : w->second) want[k] -= v;
-        std::shared_ptr<Snapshot> clone(action_clone(s));     // ai.clone_state (its defaults and aliases)
-        const auto list = obs_attr(*clone, army, "units");
-        std::vector<uint64_t> first, rest;
-        for (auto u : units) {
+        std::shared_ptr<Snapshot> clone(action_clone(s));     // ai.clone_state (its defaults and aliases): its own node ids
+        uint64_t carmy = missing;
+        const auto centries = child_edges(*clone, obs_attr(*clone, clone->root, "armies"));
+        for (size_t j = 0; j + 1 < centries.size(); j += 2) if (sanitize_name(text(*clone, centries[j])) == src) { carmy = centries[j + 1]; break; }
+        if (carmy == missing) return state;
+        const auto list = obs_attr(*clone, carmy, "units");
+        const auto cunits = child_edges(*clone, list);
+        if (cunits.size() != units.size()) return state;
+        std::vector<size_t> first, rest;   // positions in the roster
+        for (size_t j = 0; j < units.size(); ++j) {
+            const auto u = units[j];
             const std::string k = awsb::member(s, obs_attr(s, u, "nation")) + "/" + awsb::member(s, obs_attr(s, u, "kind"));
             auto it = want.find(k);
-            if (it != want.end() && it->second > 0) { --it->second; first.push_back(u); } else rest.push_back(u);
+            if (it != want.end() && it->second > 0) { --it->second; first.push_back(j); } else rest.push_back(j);
         }
         first.insert(first.end(), rest.begin(), rest.end());
         const auto& node = clone->nodes[list];
-        for (size_t j = 0; j < first.size(); ++j) clone->edges[node.offset + j] = first[j];
+        for (size_t j = 0; j < first.size(); ++j) clone->edges[node.offset + j] = cunits[first[j]];
         return clone;
     }
     bool fits(const Menu& m, size_t i, const std::vector<std::string>& regs, const awsb::Board& now) {
@@ -249,8 +256,10 @@ struct Search {
             if (out_()) break;
             ++applies;
             std::pair<Snap, bool> after;
-            try { after = apply(c, *picked(state, menu, i, now), menu, i, side); } catch (...) { continue; }
-            if (after.second) continue;
+            try { after = apply(c, *picked(state, menu, i, now), menu, i, side); }
+            catch (const std::exception& e) { if (DEBUG) std::fprintf(stderr, "[cl]   apply raised: %s\n", e.what()); continue; }
+            catch (...) { if (DEBUG) std::fprintf(stderr, "[cl]   apply raised\n"); continue; }
+            if (after.second) { if (DEBUG) std::fprintf(stderr, "[cl]   apply drew a random number\n"); continue; }
             if (!pass) {
                 const awsb::Board board = own(*after.first);
                 bool sets = false;

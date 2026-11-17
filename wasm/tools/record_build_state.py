@@ -47,6 +47,8 @@ def main():
     ap.add_argument('--alpha', required=True)
     ap.add_argument('--out', required=True)
     ap.add_argument('--every', type=int, default=5)
+    ap.add_argument('--log', help='phase 4: every message the bot handled (JSONL), each decide with its answer, how '
+                    'and the searches it ran (seat seed, index, search seed, sims), for the whole-transcript parity')
     ap.add_argument('transcripts', nargs='*')
     a = ap.parse_args()
     alpha, out = os.path.abspath(a.alpha), os.path.abspath(a.out)
@@ -227,6 +229,7 @@ def main():
         last['stages'] = None
         n = len(cases)
         o, how, info = decide0(self, dec, view, left)
+        last['how'] = how
         if last.get('searched') and len(cases) == n + 1 and cases[-1][1]:
             # the adapter's answer and its search (seat seed, search index, search seed, simulations; none: -1 ...)
             sr = last.get('search') or (0, 0, 0, -1)
@@ -248,6 +251,7 @@ def main():
         seed = 9000000 + len(cases) * 16 + (last.get('nsearch') or 0)
         last['nsearch'] = (last.get('nsearch') or 0) + 1
         last['search'] = (int(self.seed), int(self.index), seed, sims)
+        last.setdefault('searches', []).append(list(last['search']))
         random.seed(seed)
         result = choose0(self, st, side, num_simulations=sims)
         stage('search', result[0] if result else None)
@@ -292,6 +296,7 @@ def main():
     wpb.LeagueSearcher.choose = league
     own_model.OwnModelSearch.choose = choose
     searcher = wpb.LeagueSearcher(300, None, 1, 1, 'mc200_fpwin_shwin')
+    log = open(a.log, 'w', encoding='utf-8') if a.log else None
     for path in transcripts:
         bot = wpb.AlphaWotrBot(searcher, names)
         before = len(cases)
@@ -300,11 +305,22 @@ def main():
                 rec = json.loads(line)
                 if rec.get('dir') != 'out':
                     continue
+                m = json.loads(rec['line'])
+                last['searches'], last['how'] = [], None
                 try:
-                    bot.handle(json.loads(rec['line']))
+                    reply = bot.handle(m)
                 except SystemExit:
                     break
+                if log is not None:
+                    item = {'transcript': os.path.basename(path), 'm': m}
+                    if m.get('type') == 'decide':
+                        item.update(o=(reply or {}).get('o'), how=((reply or {}).get('info') or {}).get('how'), searches=last['searches'],
+                                    plan=None if bot.plan is None else type(bot.plan).__name__,
+                                    work=bot.work is not None)
+                    log.write(json.dumps(item, separators=(',', ':')) + '\n')
         print('%s: %d cases' % (os.path.basename(path), len(cases) - before), file=sys.stderr, flush=True)
+    if log is not None:
+        log.close()
     with open(os.path.join(out, 'build_state.awb'), 'wb') as f:
         f.write(b'AWB5' + struct.pack('<I', len(cases)))
         for item in cases:

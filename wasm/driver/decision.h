@@ -37,4 +37,8 @@ int priors(void* user, const void* state, int32_t side, const void* menu, float*
 // THE CERTAIN LINE at strength 1 (driver/certain_line.inc): the row of `menu` to play outright instead of `own`, -1
 int64_t certain_line(Box& box, const void* state, int side, const void* menu, int64_t own);
 
+// ai_units.pick (driver/ai_units.inc) for the row `index` of `menu`: the action naming the units the seat's rule takes,
+// as a one-row menu (owned), or null: *changed 0 played as it came, -1 an error (the rule's failure keeps the pick)
+void* units(Box& box, const void* state, int side, const void* menu, int64_t index, int* changed);
+
 }  // namespace awdec
