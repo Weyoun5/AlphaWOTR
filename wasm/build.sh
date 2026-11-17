@@ -71,12 +71,12 @@ else
 fi
 pids=()
 for u in "$SRC/cpp/position.cpp" "$HERE/driver/box_unity.cpp" "$SRC/cpp/random_stream.cpp" "$HERE/driver/wasm_api.cpp" \
-         "$HERE/driver/replay.cpp" "$HERE/nn/nn_parity.cpp" "$HERE/adapter/build_state.cpp" "$HERE/adapter/matching.cpp" "$HERE/adapter/bs_parity.cpp"; do
+         "$HERE/driver/replay.cpp" "$HERE/nn/nn_parity.cpp" "$HERE/adapter/build_state.cpp" "$HERE/adapter/matching.cpp" "$HERE/adapter/bs_parity.cpp" "$HERE/driver/decision.cpp"; do
   $CXX -c "$u" -o "$OBJ/$(basename "${u%.cpp}").o" & pids+=($!)
 done
 $CXX $NNFLAGS -c "$HERE/nn/awnet.cpp" -o "$OBJ/awnet.o" & pids+=($!)
 for p in "${pids[@]}"; do wait "$p"; done
-BOXOBJ="$OBJ/position.o $OBJ/box_unity.o $OBJ/random_stream.o $OBJ/wasm_api.o $OBJ/awnet.o $OBJ/build_state.o $OBJ/matching.o"
+BOXOBJ="$OBJ/position.o $OBJ/box_unity.o $OBJ/random_stream.o $OBJ/wasm_api.o $OBJ/awnet.o $OBJ/build_state.o $OBJ/matching.o $OBJ/decision.o"
 
 if [ "$MODE" = native ]; then
   mkdir -p "$OUT/native"

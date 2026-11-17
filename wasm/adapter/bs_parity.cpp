@@ -6,6 +6,7 @@
 // against the Python state's graph: byte for byte ("identical"), else field by field with sets compared as sets
 // ("equal": Python's set iteration order is its hash table's), else the first differing field's path.
 #include "adapter.h"
+#include "decision.h"
 #include "wotr_random.h"
 
 #include <algorithm>
@@ -181,7 +182,8 @@ int main(int argc, char** argv) {
     pyobj::Obj* protos = model.decode(pgraph);
     awad::Adapter adapter(model, tables, protos);
     auto data = slurp(dir + "/build_state.awb");
-    const bool v4 = std::memcmp(data.data(), "AWB4", 4) == 0;   // AWB4: and the option matching, the answer, the search
+    const bool v5 = std::memcmp(data.data(), "AWB5", 4) == 0;   // AWB5: and the stages of the adapter's decision
+    const bool v4 = v5 || std::memcmp(data.data(), "AWB4", 4) == 0;   // AWB4: and the option matching, the answer, the search
     const bool v3 = v4 || std::memcmp(data.data(), "AWB3", 4) == 0;   // AWB3: and the engine's menus
     const bool v2 = v3 || std::memcmp(data.data(), "AWB2", 4) == 0;   // AWB2: each case also carries the set-up (phase 3b)
     // the observation tables for the box's menus (tables.awg beside the fixtures)
@@ -204,7 +206,19 @@ int main(int argc, char** argv) {
     size_t searched = 0, setup_ported = 0, setup_same = 0;
     size_t off = 8, identical = 0, equal = 0;
     struct MatchRef { int64_t o; bool plan, chain; };
-    struct SetupRef { std::string dec, label, flag; pyobj::Graph graph; std::vector<std::string> legal, projected; std::vector<MatchRef> match; int64_t answer = -1; std::string how; };
+    struct SetupRef { std::string dec, label, flag; pyobj::Graph graph; std::vector<std::string> legal, projected; std::vector<MatchRef> match; int64_t answer = -1; std::string how;
+                      uint64_t seat = 0; uint32_t index = 0; uint64_t seed = 0; int64_t sims = -1; awjson::Value stages; };
+    // the decision on the module (driver/decision.h), against the adapter's answer and its stages
+    awdec::Box box;
+    bool decide = false;
+    if (v5) {
+        std::string err;
+        const std::string nets = std::ifstream(dir + "/net_fp.awn").good() ? dir : dir + "/..";
+        decide = box.load(dir + "/tables.awg", nets, err);
+        if (!decide) std::printf("decisions not checked: %s\n", err.c_str());
+    }
+    std::map<std::string, size_t> stage_same, stage_total;
+    size_t dec_total = 0, dec_same = 0, dec_skipped = 0; double dec_secs = 0;
     size_t match_rows = 0, match_same = 0, match_unported = 0, match_cases = 0, match_cases_same = 0;
     std::vector<SetupRef> setups;
     double secs = 0;
@@ -237,13 +251,16 @@ int main(int argc, char** argv) {
                     for (uint32_t r = 0; r < rows; ++r) { uint32_t n; std::memcpy(&n, &data[off], 4); menus[q].emplace_back(reinterpret_cast<const char*>(&data[off + 4]), n); off += 4 + n; }
                 }
                 std::vector<MatchRef> match; int64_t answer = -1; std::string how;
+                uint64_t sr_seat = 0, sr_seed = 0; uint32_t sr_index = 0; int64_t sr_sims = -1; awjson::Value stages;
                 if (v4) {   // the option matching of each legal row, the answer, the search
                     uint32_t rows; std::memcpy(&rows, &data[off], 4); off += 4;
                     for (uint32_t r = 0; r < rows; ++r) { MatchRef mr; std::memcpy(&mr.o, &data[off], 8); mr.plan = data[off + 8]; mr.chain = data[off + 9]; off += 10; match.push_back(mr); }
                     std::memcpy(&answer, &data[off], 8); off += 8; uint32_t hl; std::memcpy(&hl, &data[off], 4); how.assign(reinterpret_cast<const char*>(&data[off + 4]), hl); off += 4 + hl;
+                    std::memcpy(&sr_seat, &data[off], 8); std::memcpy(&sr_index, &data[off + 8], 4); std::memcpy(&sr_seed, &data[off + 12], 8); std::memcpy(&sr_sims, &data[off + 20], 8);
                     off += 8 + 4 + 8 + 8;
+                    if (v5) { uint32_t jl; std::memcpy(&jl, &data[off], 4); stages = awjson::parse(std::string(reinterpret_cast<const char*>(&data[off + 4]), jl)); off += 4 + jl; }
                 }
-                setups.push_back({part[0], part[1], part[2], want_setup, menus[0], menus[1], match, answer, how});
+                setups.push_back({part[0], part[1], part[2], want_setup, menus[0], menus[1], match, answer, how, sr_seat, sr_index, sr_seed, sr_sims, stages});
             } else setups.push_back({});
         }
         memo.rng = wotr_random_create(words.data(), 624, index, hg, bits);
@@ -319,6 +336,79 @@ int main(int argc, char** argv) {
                                                     rows[ri].substr(0, 160).c_str(), (long long)got_o, int(mt.has_plan), int(mt.chain), (long long)want.o, int(want.plan), int(want.chain));
                                 }
                                 ++match_cases; match_cases_same += all_same;
+                                if (decide && all_same) {   // LeagueSearcher.choose and _search_and_map's tail on the module
+                                    std::vector<awad::Adapter::Matched> mts;
+                                    for (size_t ri = 0; ri < rowsn.size(); ++ri) {
+                                        const auto parts = ga.kids(rowsn[ri]);
+                                        awad::Adapter::Row row; row.die = mg.values[parts[0]].integer; row.type = ga.text(parts[1]);
+                                        row.params = to_value(ga, parts[2]); row.menu = full; row.index = int64_t(ri);
+                                        mts.push_back(adapter.map_action(dec.get("kind")->s, st, dec, row, memo));
+                                    }
+                                    std::set<std::string> banned;
+                                    std::vector<size_t> mapped;
+                                    for (size_t ri = 0; ri < mts.size(); ++ri) { if (mts[ri].ok) mapped.push_back(ri); else banned.insert(rows[ri]); }
+                                    std::string how_cpp; int64_t answer = -1; std::map<std::string, std::string> got;
+                                    const auto t0 = std::chrono::steady_clock::now();
+                                    if (mapped.empty()) { how_cpp = "default"; }
+                                    else {
+                                        bool single = true;
+                                        for (size_t q : mapped) single &= mts[q].o == mts[mapped[0]].o && mts[q].o_none == mts[mapped[0]].o_none && !mts[q].has_plan && !mts[q].chain;
+                                        if (single) { how_cpp = "single"; answer = mts[mapped[0]].o_none ? -1 : mts[mapped[0]].o; }
+                                        else {
+                                            std::string pick;
+                                            if (mapped.size() == 1) pick = rows[mapped[0]];
+                                            else {
+                                                // allowed: the projected menu's rows not banned (else the legal menu's)
+                                                std::vector<int64_t> allowed_idx;   // indices into `rows`
+                                                for (const auto& pr : prow) if (!banned.count(pr)) { auto it = std::find(rows.begin(), rows.end(), pr); if (it != rows.end()) allowed_idx.push_back(int64_t(it - rows.begin())); }
+                                                if (allowed_idx.empty()) for (size_t ri = 0; ri < rows.size(); ++ri) if (!banned.count(rows[ri])) allowed_idx.push_back(int64_t(ri));
+                                                if (allowed_idx.size() == 1) pick = rows[size_t(allowed_idx[0])];
+                                                else if (!allowed_idx.empty()) {
+                                                    const auto pk = awdec::search(box, sn, memo.side, ref.sims > 0 ? ref.sims : 8, ref.seat, ref.index, ref.seed, 0);
+                                                    std::string act;
+                                                    if (!pk.error.empty()) act = "ERROR " + pk.error;
+                                                    else { const auto mr = menu_rows(pk.menu); act = pk.index >= 0 && size_t(pk.index) < mr.size() ? mr[size_t(pk.index)] : "?"; wotr_snapshot_destroy(pk.menu); }
+                                                    got["search"] = act;
+                                                    std::string hit;
+                                                    for (auto ai : allowed_idx) if (rows[size_t(ai)] == act) { hit = act; break; }
+                                                    if (hit.empty()) {   // the search's pick has no referee counterpart: the net's own choice among the allowed
+                                                        void* sub = awdec::menu_rows(full, allowed_idx);
+                                                        const int64_t ri = sub ? awdec::raw(box, sn, memo.side, sub) : -1;
+                                                        if (sub) wotr_snapshot_destroy(sub);
+                                                        if (ri >= 0) hit = rows[size_t(allowed_idx[size_t(ri)])];
+                                                        got["raw"] = hit;
+                                                    }
+                                                    pick = hit;   // the certain line and ai_units: not ported yet
+                                                }
+                                            }
+                                            got["pick"] = pick;
+                                            how_cpp = "search";
+                                            size_t at_i = mapped[0];
+                                            for (size_t q : mapped) if (rows[q] == pick) { at_i = q; break; }
+                                            answer = mts[at_i].o_none ? -1 : mts[at_i].o;
+                                        }
+                                    }
+                                    dec_secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                                    ++dec_total;
+                                    const bool same = answer == ref.answer;
+                                    dec_same += same;
+                                    for (const char* k : {"search", "raw", "pick"}) {
+                                        if (!got.count(k)) continue;
+                                        const awjson::Value* w = ref.stages.get(k);
+                                        ++stage_total[k];
+                                        stage_same[k] += w && w->kind == awjson::Value::Str && w->s == got[k];
+                                    }
+                                    if (!same || verbose) {
+                                        const awjson::Value* co = ref.stages.get("certain_outright");
+                                        const awjson::Value* un = ref.stages.get("units");
+                                        const awjson::Value* pp = ref.stages.get("pick");
+                                        std::printf("case %u (%s): answer C++ %lld, Python %lld%s%s%s%s\n", c, dec.get("kind")->s.c_str(), (long long)answer, (long long)ref.answer,
+                                                    (co && co->kind == awjson::Value::Str) ? " [Python: certain line outright]" : "",
+                                                    (un && pp && un->kind == awjson::Value::Str && pp->kind == awjson::Value::Str && un->s == pp->s && got.count("pick") && got["pick"] != pp->s) ? " [Python: unit rule]" : "",
+                                                    got.count("search") && ref.stages.get("search") && ref.stages.get("search")->s != got["search"] ? " [search differs]" : "",
+                                                    got.count("raw") ? " [raw]" : "");
+                                    }
+                                }
                             }
                             if (sel) wotr_snapshot_destroy(sel);
                             if (meta) wotr_snapshot_destroy(meta);
@@ -355,6 +445,9 @@ int main(int argc, char** argv) {
                       std::to_string(setup_same) + " set up byte-identically" +
                       (v3 ? "; menus: " + std::to_string(menu_checked) + " checked, " + std::to_string(menu_same) + " row for row as Python's get_legal_actions, " +
                             std::to_string(proj_same) + " projected as project_ai_actions; " + std::to_string(menu_rows_total) + " rows" : std::string()) +
+                      (v5 ? "; decisions: " + std::to_string(dec_same) + " of " + std::to_string(dec_total) + " the adapter's answer (search pick " +
+                            std::to_string(stage_same["search"]) + "/" + std::to_string(stage_total["search"]) + ", final pick " + std::to_string(stage_same["pick"]) + "/" +
+                            std::to_string(stage_total["pick"]) + ", " + std::to_string(dec_total ? dec_secs / dec_total * 1e3 : 0.0) + " ms a decision)" : std::string()) +
                       (v4 ? "; matching: " + std::to_string(match_same) + " of " + std::to_string(match_rows) + " rows as map_action (" + std::to_string(match_unported) +
                             " of a kind not ported), " + std::to_string(match_cases_same) + " of " + std::to_string(match_cases) + " decisions entirely" : std::string()) + ")").c_str() : "");
     return equal == count ? 0 : 1;
