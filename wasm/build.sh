@@ -1,71 +1,93 @@
 #!/bin/bash
 # Build AlphaWOTR's native search box (native_backend/live_search_oct19) for WebAssembly, plus our parts.
 #
-#   wasm/build.sh [wasm32|wasm64|native]     (default wasm32)
+#   wasm/build.sh [wasm32|wasm64|native] [--simd]    (default wasm32)
 #
-#   wasm32  build/alphawotr.mjs + .wasm        their sources with the patches in patches/ (32-bit size_t and pointers)
-#   wasm64  build/alphawotr64.mjs + .wasm      their sources UNCHANGED, -sMEMORY64 (64-bit size_t and pointers, as on
-#                                              the 64-bit hosts their selftest certifies); browser support is narrower
-#   native  build/native/nn_parity             the network parity test with this Mac's clang
-#   each wasm target also builds build/nn_parity[64].js, the network parity test as a Node program.
+#   wasm32  build/alphawotr.mjs + .wasm       32-bit size_t and pointers
+#   wasm64  build/alphawotr64.mjs + .wasm     -sMEMORY64: 64-bit size_t and pointers, as on the hosts their selftest
+#                                             certifies; browser support is narrower
+#   native  build/native/                     the same patched sources with this Mac's clang (parity reference,
+#                                             and the threaded controller beside the single-thread one)
+#   each target also builds the test programs: nn_parity (network against torch), replay (recorded searches);
+#   for wasm they are Node programs (build/nn_parity[64].js, build/replay[64].js) reading the host's files.
+#   --simd: the network with wasm SIMD (-msimd128) (wasm targets; output names get -simd)
 #
-# Their sources are copied into build/src-<target> and patches are applied to the copy (sed scripts, documented at
-# their top, the file named in a '# file:' line), so a new release of theirs is taken by re-running this script; a
-# patch that changes nothing fails the build loudly.
+# Their sources are copied into build/src-<target> and the patches in patches/ are applied to the copy (sed scripts,
+# documented at their top; '# file:' names the file, '# targets:' the targets they apply to), so a new release of
+# theirs is taken by re-running this script; a patch that changes nothing fails the build loudly.
 # Numeric flags are the box's own (build_portable.py NUMERIC): no FMA contraction, no fast-math, libm pow/log.
 # Single-threaded, no mimalloc (the allocator unit is not compiled, as on the Mac). EMSDK: emsdk's folder.
+# At most 7 compilers at once (the machine is shared).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$HERE")"
 BOX="$ROOT/native_backend/live_search_oct19"
 OUT="$HERE/build"
 MODE="${1:-wasm32}"
+SIMD=0; [ "${2:-}" = "--simd" ] && SIMD=1
 NUMERIC="-ffp-contract=off -fno-fast-math -fno-builtin-pow -fno-builtin-log"
 
-if [ "$MODE" = native ]; then
-  mkdir -p "$OUT/native"
-  c++ -std=c++17 -O2 $NUMERIC -I"$HERE/nn" -o "$OUT/native/nn_parity" "$HERE/nn/awnet.cpp" "$HERE/nn/nn_parity.cpp"
-  echo "built $OUT/native/nn_parity"
-  exit 0
-fi
-
 case "$MODE" in
-  wasm32) SUFFIX=""; ARCH=""; PATCHES=("$HERE"/patches/*.sed) ;;
-  wasm64) SUFFIX="64"; ARCH="-sMEMORY64=1"; PATCHES=() ;;
+  wasm32) SUFFIX="" ; ARCH="" ;;
+  wasm64) SUFFIX="64"; ARCH="-sMEMORY64=1" ;;
+  native) SUFFIX="" ; ARCH="" ;;
   *) echo "unknown target $MODE" >&2; exit 2 ;;
 esac
+NNFLAGS=""
+if [ $SIMD = 1 ]; then
+  [ "$MODE" = native ] && { echo "--simd is for the wasm targets" >&2; exit 2; }
+  NNFLAGS="-msimd128"; SUFFIX="$SUFFIX-simd"
+fi
 SRC="$OUT/src-$MODE"
 rm -rf "$SRC" && mkdir -p "$SRC" && cp -R "$BOX/cpp" "$BOX/include" "$SRC/"
-for p in ${PATCHES[@]+"${PATCHES[@]}"}; do
+for p in "$HERE"/patches/*.sed; do
+  grep -Eq "^# targets:.* $MODE( |$)" "$p" || continue
   f=$(sed -n 's/^# file: //p' "$p")
   before=$(shasum "$SRC/$f" | cut -d' ' -f1)
   sed -i '' -f "$p" "$SRC/$f"
   [ "$before" != "$(shasum "$SRC/$f" | cut -d' ' -f1)" ] || { echo "patch $(basename "$p") changed nothing in $f" >&2; exit 1; }
 done
 
-source "${EMSDK:-$HOME/Projects/BehindMedia/emsdk}/emsdk_env.sh" >/dev/null 2>&1
 INC="-I$SRC/include -I$HERE/nn -I$HERE/driver"
-OBJ="$OUT/obj-$MODE"
+OBJ="$OUT/obj-$MODE$SUFFIX"
 mkdir -p "$OBJ"
-EMXX="em++ -std=c++17 -O2 -fwasm-exceptions $ARCH $NUMERIC $INC"
+if [ "$MODE" = native ]; then
+  CXX="c++ -std=c++17 -O2 -fexceptions $NUMERIC $INC"
+  LINK="c++"
+else
+  source "${EMSDK:-$HOME/Projects/BehindMedia/emsdk}/emsdk_env.sh" >/dev/null 2>&1
+  CXX="em++ -std=c++17 -O2 -fwasm-exceptions $ARCH $NUMERIC $INC"
+  LINK="em++ -O2 -fwasm-exceptions $ARCH"
+fi
 pids=()
-for u in "$SRC/cpp/position.cpp" "$SRC/cpp/snapshot.cpp" "$SRC/cpp/random_stream.cpp" "$HERE/nn/awnet.cpp" \
-         "$HERE/driver/wasm_api.cpp"; do
-  $EMXX -c "$u" -o "$OBJ/$(basename "${u%.cpp}").o" & pids+=($!)
+for u in "$SRC/cpp/position.cpp" "$SRC/cpp/snapshot.cpp" "$SRC/cpp/random_stream.cpp" "$HERE/driver/wasm_api.cpp" \
+         "$HERE/driver/replay.cpp" "$HERE/nn/nn_parity.cpp"; do
+  $CXX -c "$u" -o "$OBJ/$(basename "${u%.cpp}").o" & pids+=($!)
 done
+$CXX $NNFLAGS -c "$HERE/nn/awnet.cpp" -o "$OBJ/awnet.o" & pids+=($!)
 for p in "${pids[@]}"; do wait "$p"; done
+BOXOBJ="$OBJ/position.o $OBJ/snapshot.o $OBJ/random_stream.o $OBJ/wasm_api.o $OBJ/awnet.o"
+
+if [ "$MODE" = native ]; then
+  mkdir -p "$OUT/native"
+  $LINK -o "$OUT/native/nn_parity" "$OBJ/awnet.o" "$OBJ/nn_parity.o"
+  $LINK -o "$OUT/native/replay" $BOXOBJ "$OBJ/replay.o"
+  ls -la "$OUT/native/nn_parity" "$OUT/native/replay"
+  exit 0
+fi
 EXPORTS='["_malloc","_free","_wotr_abi_version","_wotr_snapshot_abi_version","_wotr_search_controller_abi_version",
 "_wotr_snapshot_destroy","_wotr_snapshot_last_error","_wotr_snapshot_prepare_observation_tables",
 "_wotr_snapshot_prepare_action_tables_v53","_wotr_snapshot_full_actions","_wotr_snapshot_encode_state_v53",
 "_wotr_snapshot_encode_actions_v53","_awasm_graph_create","_awasm_snapshot_root_count","_awnet_load","_awnet_free",
 "_awnet_last_error","_awnet_forward","_awnet_obs_dim","_awnet_act_dim"]'
 EXPORTS=$(echo "$EXPORTS" | tr -d '\n')
-em++ -O2 -fwasm-exceptions $ARCH -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,worker,web \
+$LINK -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,worker,web \
   -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=64MB -sSTACK_SIZE=4MB \
   -sEXPORTED_FUNCTIONS="$EXPORTS" \
   -sEXPORTED_RUNTIME_METHODS='["HEAPU8","HEAPF32","HEAP32","HEAP64","UTF8ToString"]' \
-  "$OBJ"/*.o -o "$OUT/alphawotr$SUFFIX.mjs"
-# the network parity test as a Node program (reads the fixtures from the host file system)
-em++ -O2 -fwasm-exceptions $ARCH -sALLOW_MEMORY_GROWTH=1 -sNODERAWFS=1 -sENVIRONMENT=node "$OBJ/awnet.o" \
-  "$HERE/nn/nn_parity.cpp" $INC $NUMERIC -std=c++17 -o "$OUT/nn_parity$SUFFIX.js"
-ls -la "$OUT/alphawotr$SUFFIX.mjs" "$OUT/alphawotr$SUFFIX.wasm" "$OUT/nn_parity$SUFFIX.js" "$OUT/nn_parity$SUFFIX.wasm"
+  $BOXOBJ -o "$OUT/alphawotr$SUFFIX.mjs"
+# the test programs as Node programs (they read the fixtures from the host file system)
+NODEPROG="-sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=8MB -sNODERAWFS=1 -sENVIRONMENT=node"
+$LINK $NODEPROG "$OBJ/awnet.o" "$OBJ/nn_parity.o" -o "$OUT/nn_parity$SUFFIX.js"
+$LINK $NODEPROG $BOXOBJ "$OBJ/replay.o" -o "$OUT/replay$SUFFIX.js"
+ls -la "$OUT/alphawotr$SUFFIX.wasm" "$OUT/nn_parity$SUFFIX.wasm" "$OUT/replay$SUFFIX.wasm"
