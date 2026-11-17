@@ -16,12 +16,14 @@ Writes into --out:
                       harvest_decisions.py runs it): the view (JSON), the memo before (side, its Random's state,
                       the per-turn flags), the state built (graph)
 
-awb: b'AWB3' (AWB1: without the set-up part; AWB2: without the menus), u32 count, per case: u32 json bytes, json, u32 side, rng (624 u32, u32 index, i32 has_gauss, u64 bits),
+awb: b'AWB4' (AWB1: without the set-up part; AWB2: without the menus; AWB3: without the matching), u32 count, per case: u32 json bytes, json, u32 side, rng (624 u32, u32 index, i32 has_gauss, u64 bits),
      u8 messenger_used, u8 fellowship_acted, u8 in_mordor, graph (awg record): the state,
      u32 searched (1 when the adapter set the decision up and searched this state), then when 1: u32 + the decide
      message's decision (JSON), u32 + the set-up's label, u32 + its phase flag ('' none), graph: the state as set up
      (before the flag is set; the reference for the set-up's port), then two menus (get_legal_actions under the
-     flag; project_ai_actions of it): u32 rows, each u32 + its canonical text (canon_action)
+     flag; project_ai_actions of it): u32 rows, each u32 + its canonical text (canon_action), then the matching of
+     every legal row (u32 rows; per row i64 option or -1, u8 has_plan, u8 chain), then the adapter's answer
+     (i64 option or -1, u32 + how) and its search (u64 seat seed, u32 search index, u64 search seed, i64 sims or -1)
 Run it with PYTHONHASHSEED=0 in the environment and without -I (which ignores it): the AI server's launcher sets it,
 and a Python set's order depends on it.
 """
@@ -87,7 +89,9 @@ def main():
         card_title={cid: cards_mod_title(cid) for cid in names.card_out},
         combat_effect_kind={cid: combat_kind(cid) for cid in names.card_out},
         hidden_cc=ai._HIDDEN_CC,
-        fp_region={k: bool(gl.is_fp_region(k)) for k in wpb.BOARD._regions})
+        fp_region={k: bool(gl.is_fp_region(k)) for k in wpb.BOARD._regions},
+        face_by_value={f.value: f.name for f in gs.ActionDieFace},
+        nation_value={n.name: n.value for n in gs.Nation})
     with open(os.path.join(out, 'adapter.json'), 'w', encoding='utf-8') as f:
         json.dump(tables, f, sort_keys=True, ensure_ascii=False)
 
@@ -196,16 +200,50 @@ def main():
                 for act in menu:
                     c = canon_action(act).encode('utf-8')
                     setup += struct.pack('<I', len(c)) + c
+            # the option matching of every row of the menu (map_action): the option, a plan, a chain
+            setup += struct.pack('<I', len(rows[0]))
+            for act in rows[0]:
+                try:
+                    mt = self.map_action(st, dec, act)
+                except Exception:
+                    mt = None
+                o = -1 if mt is None or mt.o is None else int(mt.o)
+                setup += struct.pack('<qBB', o, int(mt is not None and mt.has_plan()),
+                                     int(mt is not None and bool(mt.chain)))
+            random.setstate(rs)
             cases[-1][1] = setup
+            last['searched'] = True
         last['st'] = None
         return search_map0(self, st, dec, label, flag, left)
     wpb.AlphaWotrBot._search_and_map = search_and_map
+    decide0 = wpb.AlphaWotrBot._decide
+
+    def _decide(self, dec, view, left):
+        last['searched'] = False
+        last['search'] = None
+        n = len(cases)
+        o, how, info = decide0(self, dec, view, left)
+        if last.get('searched') and len(cases) == n + 1 and cases[-1][1]:
+            # the adapter's answer and its search (seat seed, search index, search seed, simulations; none: -1 ...)
+            sr = last.get('search') or (0, 0, 0, -1)
+            hb = str(how).encode('utf-8')
+            cases[-1][1] += struct.pack('<q', -1 if o is None else int(o)) + struct.pack('<I', len(hb)) + hb
+            cases[-1][1] += struct.pack('<QIQq', *sr)
+            cases[-1].append(True)
+        return o, how, info
+    wpb.AlphaWotrBot._decide = _decide
     wpb.build_state = build_state
     from core import own_model
     choose0 = own_model.OwnModelSearch.choose
 
     def choose(self, st, side, *, num_simulations=300):
-        return choose0(self, st, side, num_simulations=min(8, num_simulations))
+        # a seeded 8-simulation search (the harness's convention: random.seed(search seed) before it), recorded
+        sims = min(8, num_simulations)
+        seed = 9000000 + len(cases) * 16 + (last.get('nsearch') or 0)
+        last['nsearch'] = (last.get('nsearch') or 0) + 1
+        last['search'] = (int(self.seed), int(self.index), seed, sims)
+        random.seed(seed)
+        return choose0(self, st, side, num_simulations=sims)
     own_model.OwnModelSearch.choose = choose
     searcher = wpb.LeagueSearcher(300, None, 1, 1, 'mc200_fpwin_shwin')
     for path in transcripts:
@@ -222,8 +260,11 @@ def main():
                     break
         print('%s: %d cases' % (os.path.basename(path), len(cases) - before), file=sys.stderr, flush=True)
     with open(os.path.join(out, 'build_state.awb'), 'wb') as f:
-        f.write(b'AWB3' + struct.pack('<I', len(cases)))
-        for b, setup in cases:
+        f.write(b'AWB4' + struct.pack('<I', len(cases)))
+        for item in cases:
+            b, setup = item[0], item[1]
+            if setup and len(item) < 3:     # set up and searched but no answer recorded (an error in the decision)
+                setup += struct.pack('<q', -1) + struct.pack('<I', 4) + b'none' + struct.pack('<QIQq', 0, 0, 0, -1)
             f.write(b + struct.pack('<I', int(bool(setup))) + setup)
     print('wrote %d build_state cases (%d set up and searched)' % (len(cases), sum(1 for c in cases if c[1])), file=sys.stderr)
 

@@ -25,6 +25,7 @@ struct Tables {
     std::map<std::string, std::set<std::string>> adjacent;              // BOARD.adjacent
     std::map<std::string, std::string> card_title, combat_effect_kind;  // card id -> title, combat.combat_effect_kind
     std::string hidden_cc;                                              // ai._HIDDEN_CC
+    std::map<std::string, std::string> face_by_value, nation_value;     // ActionDieFace value -> member; Nation member -> value
     void load(const awjson::Value& j);
     std::string card(const std::string& key) const { auto it = card_in.find(key); return it == card_in.end() ? "" : it->second; }
 };
@@ -47,6 +48,14 @@ public:
     // match: the set-up answered by a rule (Match(o)): the option's 'o' (or none when has_match and o is None)
     struct Setup { bool ported = false; std::string label, flag; bool has_match = false; bool match_none = false; int64_t match = 0; };
     Setup setup(const std::string& kind, pyobj::Obj* st, const awjson::Value& dec, const awjson::Value& view, const Memo& memo);
+    // an engine row of the box's menu: die, action type, parameters (an Enum as "\x01enum:MEMBER")
+    // menu, index: the box's menu snapshot and the row's index in it (the plans that apply the action on a copy)
+    struct Row { int64_t die = -1; std::string type; awjson::Value params; const void* menu = nullptr; int64_t index = -1; };
+    const void* obs_tables = nullptr;   // the box's prepared observation tables (for the plans that apply an action)
+    // map_action's Match: ok (an option matched; o_none: its 'o' is None), has_plan, chain; unported: not yet
+    struct Matched { bool ok = false, o_none = false, has_plan = false, chain = false, unported = false; int64_t o = -1; };
+    Matched map_action(const std::string& kind, pyobj::Obj* st, const awjson::Value& dec, const Row& row, const Memo& memo);
+    std::string slug(const std::string& key) const;
 
 private:
     pyobj::Model& m;
@@ -67,6 +76,14 @@ private:
     int leader_side(pyobj::Obj* leader);
     pyobj::Obj* sail_in(pyobj::Obj* st, const awjson::Value& b, const std::string& frm, const std::string& reg, int atk);
     pyobj::Obj* battle(pyobj::Obj* st, const awjson::Value& view, const Memo& memo, const std::string& phase, int64_t rounds_fought);
+    static std::string pstr_of(const awjson::Value& v, const char* k);
+    struct Figures { std::map<std::pair<std::string, std::string>, int64_t> units; std::set<std::string> chars; };
+    Figures figures(pyobj::Obj* st, const std::string& key, int side);
+    // army_move_plan: (ok, everything, from slug, to slug); ok false = None
+    struct MovePlan { bool ok = false, everything = false; };
+    MovePlan army_move_plan(pyobj::Obj* st, const Row& a, const Memo& memo);
+    void choice_tokens(const awjson::Value& v, std::set<std::pair<std::string, std::string>>& out);
+    int64_t score_options(const awjson::Value& dec, const std::set<std::pair<std::string, std::string>>& toks, bool empty);
     Setup setup_card_choice(pyobj::Obj* st, const awjson::Value& dec, const awjson::Value& view, const Memo& memo);
 };
 

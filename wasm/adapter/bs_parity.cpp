@@ -119,6 +119,32 @@ std::string pcanon(const G& a, uint64_t n) {
     default: return "?";
     }
 }
+// a graph value as the adapter's Python sees it, in JSON terms (an Enum as "\x01" "enum:MEMBER", an object as its name)
+awjson::Value to_value(const G& a, uint64_t n) {
+    const auto& v = a.g.values[n];
+    awjson::Value out;
+    switch (v.tag) {
+    case WOTR_NONE: break;
+    case WOTR_BOOL: out.kind = awjson::Value::Bool; out.b = v.integer != 0; break;
+    case WOTR_INT: out.kind = awjson::Value::Int; out.i = v.integer; break;
+    case WOTR_FLOAT: out.kind = awjson::Value::Real; out.d = v.real; break;
+    case WOTR_STRING: out.kind = awjson::Value::Str; out.s = a.text(n); break;
+    case WOTR_ENUM: out.kind = awjson::Value::Str; out.s = "\x01" "enum:" + a.text(a.kids(n)[1]); break;
+    case WOTR_LIST: case WOTR_TUPLE: case WOTR_SET: case WOTR_FROZENSET:
+        out.kind = awjson::Value::Arr; for (auto c : a.kids(n)) out.arr.push_back(to_value(a, c)); break;
+    case WOTR_DICT: {
+        out.kind = awjson::Value::Obj; const auto ks = a.kids(n);
+        for (size_t i = 0; i + 1 < ks.size(); i += 2) {
+            const auto& kv = a.g.values[ks[i]];
+            const std::string key = kv.tag == WOTR_STRING ? a.text(ks[i]) : (kv.tag == WOTR_INT ? std::to_string(kv.integer) : pcanon(a, ks[i]));
+            out.obj.emplace_back(key, to_value(a, ks[i + 1]));
+        }
+        break;
+    }
+    default: out.kind = awjson::Value::Str; out.s = pcanon(a, n).substr(1); break;
+    }
+    return out;
+}
 pyobj::Graph export_graph(const void* h) {
     pyobj::Graph g;
     const size_t nv = wotr_snapshot_node_count(h), ne = wotr_snapshot_edge_count(h), nb = wotr_snapshot_byte_count(h);
@@ -155,7 +181,8 @@ int main(int argc, char** argv) {
     pyobj::Obj* protos = model.decode(pgraph);
     awad::Adapter adapter(model, tables, protos);
     auto data = slurp(dir + "/build_state.awb");
-    const bool v3 = std::memcmp(data.data(), "AWB3", 4) == 0;   // AWB3: and the engine's menus
+    const bool v4 = std::memcmp(data.data(), "AWB4", 4) == 0;   // AWB4: and the option matching, the answer, the search
+    const bool v3 = v4 || std::memcmp(data.data(), "AWB3", 4) == 0;   // AWB3: and the engine's menus
     const bool v2 = v3 || std::memcmp(data.data(), "AWB2", 4) == 0;   // AWB2: each case also carries the set-up (phase 3b)
     // the observation tables for the box's menus (tables.awg beside the fixtures)
     void* obs_tables = nullptr;
@@ -171,11 +198,14 @@ int main(int argc, char** argv) {
             q += 4 + n + 32 + 40 * nv + 8 * ne + nb;
         }
     }
+    adapter.obs_tables = obs_tables;
     size_t menu_checked = 0, menu_same = 0, proj_same = 0, menu_rows_total = 0;
     uint32_t count; std::memcpy(&count, &data[4], 4);
     size_t searched = 0, setup_ported = 0, setup_same = 0;
     size_t off = 8, identical = 0, equal = 0;
-    struct SetupRef { std::string dec, label, flag; pyobj::Graph graph; std::vector<std::string> legal, projected; };
+    struct MatchRef { int64_t o; bool plan, chain; };
+    struct SetupRef { std::string dec, label, flag; pyobj::Graph graph; std::vector<std::string> legal, projected; std::vector<MatchRef> match; int64_t answer = -1; std::string how; };
+    size_t match_rows = 0, match_same = 0, match_unported = 0, match_cases = 0, match_cases_same = 0;
     std::vector<SetupRef> setups;
     double secs = 0;
     for (uint32_t c = 0; c < count; ++c) {
@@ -206,7 +236,14 @@ int main(int argc, char** argv) {
                     uint32_t rows; std::memcpy(&rows, &data[off], 4); off += 4;
                     for (uint32_t r = 0; r < rows; ++r) { uint32_t n; std::memcpy(&n, &data[off], 4); menus[q].emplace_back(reinterpret_cast<const char*>(&data[off + 4]), n); off += 4 + n; }
                 }
-                setups.push_back({part[0], part[1], part[2], want_setup, menus[0], menus[1]});
+                std::vector<MatchRef> match; int64_t answer = -1; std::string how;
+                if (v4) {   // the option matching of each legal row, the answer, the search
+                    uint32_t rows; std::memcpy(&rows, &data[off], 4); off += 4;
+                    for (uint32_t r = 0; r < rows; ++r) { MatchRef mr; std::memcpy(&mr.o, &data[off], 8); mr.plan = data[off + 8]; mr.chain = data[off + 9]; off += 10; match.push_back(mr); }
+                    std::memcpy(&answer, &data[off], 8); off += 8; uint32_t hl; std::memcpy(&hl, &data[off], 4); how.assign(reinterpret_cast<const char*>(&data[off + 4]), hl); off += 4 + hl;
+                    off += 8 + 4 + 8 + 8;
+                }
+                setups.push_back({part[0], part[1], part[2], want_setup, menus[0], menus[1], match, answer, how});
             } else setups.push_back({});
         }
         memo.rng = wotr_random_create(words.data(), 624, index, hg, bits);
@@ -260,6 +297,29 @@ int main(int argc, char** argv) {
                                     }
                                 }
                             }
+                            if (v4 && ms) {   // the option matching, row by row, against the adapter's map_action
+                                const pyobj::Graph mg = export_graph(full);
+                                G ga{mg};
+                                const auto rowsn = ga.kids(mg.root);
+                                bool all_same = true;
+                                for (size_t ri = 0; ri < rowsn.size() && ri < ref.match.size(); ++ri) {
+                                    const auto parts = ga.kids(rowsn[ri]);
+                                    awad::Adapter::Row row;
+                                    row.die = mg.values[parts[0]].integer; row.type = ga.text(parts[1]); row.params = to_value(ga, parts[2]);
+                                    row.menu = full; row.index = int64_t(ri);
+                                    const auto mt = adapter.map_action(dec.get("kind")->s, st, dec, row, memo);
+                                    ++match_rows;
+                                    if (mt.unported) { ++match_unported; all_same = false; continue; }
+                                    const MatchRef& want = ref.match[ri];
+                                    const int64_t got_o = (mt.ok && !mt.o_none) ? mt.o : -1;
+                                    const bool same = got_o == want.o && (mt.ok ? mt.has_plan : false) == want.plan && (mt.ok ? mt.chain : false) == want.chain;
+                                    match_same += same; all_same &= same;
+                                    if (!same && verbose)
+                                        std::printf("case %u (%s) row %zu %s: C++ o=%lld plan=%d chain=%d, Python o=%lld plan=%d chain=%d\n", c, dec.get("kind")->s.c_str(), ri,
+                                                    rows[ri].substr(0, 160).c_str(), (long long)got_o, int(mt.has_plan), int(mt.chain), (long long)want.o, int(want.plan), int(want.chain));
+                                }
+                                ++match_cases; match_cases_same += all_same;
+                            }
                             if (sel) wotr_snapshot_destroy(sel);
                             if (meta) wotr_snapshot_destroy(meta);
                             wotr_snapshot_destroy(full);
@@ -294,6 +354,8 @@ int main(int argc, char** argv) {
                 v2 ? (" (" + std::to_string(searched) + " with the set-up recorded; " + std::to_string(setup_ported) + " of a ported kind, " +
                       std::to_string(setup_same) + " set up byte-identically" +
                       (v3 ? "; menus: " + std::to_string(menu_checked) + " checked, " + std::to_string(menu_same) + " row for row as Python's get_legal_actions, " +
-                            std::to_string(proj_same) + " projected as project_ai_actions; " + std::to_string(menu_rows_total) + " rows" : std::string()) + ")").c_str() : "");
+                            std::to_string(proj_same) + " projected as project_ai_actions; " + std::to_string(menu_rows_total) + " rows" : std::string()) +
+                      (v4 ? "; matching: " + std::to_string(match_same) + " of " + std::to_string(match_rows) + " rows as map_action (" + std::to_string(match_unported) +
+                            " of a kind not ported), " + std::to_string(match_cases_same) + " of " + std::to_string(match_cases) + " decisions entirely" : std::string()) + ")").c_str() : "");
     return equal == count ? 0 : 1;
 }

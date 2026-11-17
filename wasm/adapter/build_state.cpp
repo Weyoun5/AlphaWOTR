@@ -43,6 +43,7 @@ void Tables::load(const Value& j) {
     for (const auto& kv : at(j, "adjacent").obj) for (const auto& x : kv.second.arr) adjacent[kv.first].insert(x.s);
     strmap("card_title", card_title); strmap("combat_effect_kind", combat_effect_kind);
     hidden_cc = at(j, "hidden_cc").s;
+    strmap("face_by_value", face_by_value); strmap("nation_value", nation_value);
 }
 
 Adapter::Adapter(pyobj::Model& model, const Tables& tables, Obj* prototypes) : m(model), t(tables), protos(prototypes) {}
