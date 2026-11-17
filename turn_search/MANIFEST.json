@@ -183,13 +183,13 @@
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/combat_descriptor.inc"
   },
   "native_w2x/box/cpp/combat_entry_action.inc": {
-   "sha256": "4af45c58265e8a083ca7db62b90020539d59fa359bbeddc0759899b4f27e1498",
-   "bytes": 8552,
+   "sha256": "79a9eeec8e85c224bc549ddcc89a14a2dea4b3c7a0407d65725e1ae07bfd6d59",
+   "bytes": 9472,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/combat_entry_action.inc"
   },
   "native_w2x/box/cpp/combat_entry_menu.inc": {
-   "sha256": "99373cb3c7f405f1f1bf4586d4358951b9dbea417cb991c154aa08ec2332553e",
-   "bytes": 9339,
+   "sha256": "59ae1d45514ec74caffbf7ce91f8079e7a6be5716defda13df136a9617d0ca11",
+   "bytes": 10123,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/combat_entry_menu.inc"
   },
   "native_w2x/box/cpp/combat_envelope.inc": {
@@ -938,8 +938,8 @@
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/saruman_muster.inc"
   },
   "native_w2x/box/cpp/search_controller.inc": {
-   "sha256": "128820961b4bdff6e2cb664b505e17a7fc8660f961423dd6fcec743250f0c44f",
-   "bytes": 175887,
+   "sha256": "d11e7af9c9c8c9537099e8893b517dc752b5669daf37fe0ec4fce06b5578f660",
+   "bytes": 175889,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/search_controller.inc"
   },
   "native_w2x/box/cpp/search_controller_exports.inc": {

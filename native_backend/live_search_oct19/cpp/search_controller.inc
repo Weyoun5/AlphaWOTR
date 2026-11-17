@@ -1886,7 +1886,7 @@ struct Controller {
             }
             if(!node->children.empty()||(overlay&&node->state&&node->side==overlay_opp)){
                 if(node==root&&!force_idx.empty()){
-                    size_t fp9=NO_ID;
+                    uint64_t fp9=NO_ID;
                     for(size_t i9:force_idx){Node* c9=root->children[i9];
                         if(c9->proven==0&&c9->visit_count<force_cap&&(fp9==NO_ID||c9->visit_count<root->children[fp9]->visit_count))fp9=i9;}
                     if(fp9!=NO_ID){root->children[fp9]->forced_visits+=1;node=root->children[fp9];path.push_back(node);continue;}
