@@ -10,7 +10,9 @@
 #                                             and the threaded controller beside the single-thread one)
 #   each target also builds the test programs: nn_parity (network against torch), replay (recorded searches);
 #   for wasm they are Node programs (build/nn_parity[64].js, build/replay[64].js) reading the host's files.
-#   --simd: the network with wasm SIMD (-msimd128) (wasm targets; output names get -simd)
+#   --simd: wasm SIMD (-msimd128) for every unit: the network's explicit SIMD path (nn/awnet.cpp, the scalar build's
+#           bits) and the compiler's vectorisation elsewhere (no reassociation: the replay test shows the same search)
+#           (wasm targets; output names get -simd)
 #
 # Their sources are copied into build/src-<target> and the patches in patches/ are applied to the copy (sed scripts,
 # documented at their top; '# file:' names the file, '# targets:' the targets they apply to), so a new release of
@@ -33,13 +35,14 @@ case "$MODE" in
   native) SUFFIX="" ; ARCH="" ;;
   *) echo "unknown target $MODE" >&2; exit 2 ;;
 esac
-NNFLAGS=""
 if [ $SIMD = 1 ]; then
   [ "$MODE" = native ] && { echo "--simd is for the wasm targets" >&2; exit 2; }
-  NNFLAGS="-msimd128"; SUFFIX="$SUFFIX-simd"
+  ARCH="$ARCH -msimd128"; SUFFIX="$SUFFIX-simd"
 fi
 SRC="$OUT/src-$MODE"
 rm -rf "$SRC" && mkdir -p "$SRC" && cp -R "$BOX/cpp" "$BOX/include" "$SRC/"
+# the turn search box's C++ port of combat_dist.exact_distribution (same release), for the COMBAT_DIST replies
+cp "$ROOT/turn_search/native_w2x/box/cpp/combat_kernel.inc" "$ROOT/turn_search/native_w2x/box/cpp/chance_driver.inc" "$SRC/cpp/"
 for p in "$HERE"/patches/*.sed; do
   grep -Eq "^# targets:.* $MODE( |$)" "$p" || continue
   f=$(sed -n 's/^# file: //p' "$p")
@@ -48,7 +51,7 @@ for p in "$HERE"/patches/*.sed; do
   [ "$before" != "$(shasum "$SRC/$f" | cut -d' ' -f1)" ] || { echo "patch $(basename "$p") changed nothing in $f" >&2; exit 1; }
 done
 
-INC="-I$SRC/include -I$HERE/nn -I$HERE/driver"
+INC="-I$SRC/include -I$SRC/cpp -I$HERE/nn -I$HERE/driver"
 OBJ="$OUT/obj-$MODE$SUFFIX"
 mkdir -p "$OBJ"
 if [ "$MODE" = native ]; then
@@ -60,13 +63,13 @@ else
   LINK="em++ -O2 -fwasm-exceptions $ARCH"
 fi
 pids=()
-for u in "$SRC/cpp/position.cpp" "$SRC/cpp/snapshot.cpp" "$SRC/cpp/random_stream.cpp" "$HERE/driver/wasm_api.cpp" \
+for u in "$SRC/cpp/position.cpp" "$HERE/driver/box_unity.cpp" "$SRC/cpp/random_stream.cpp" "$HERE/driver/wasm_api.cpp" \
          "$HERE/driver/replay.cpp" "$HERE/nn/nn_parity.cpp"; do
   $CXX -c "$u" -o "$OBJ/$(basename "${u%.cpp}").o" & pids+=($!)
 done
-$CXX $NNFLAGS -c "$HERE/nn/awnet.cpp" -o "$OBJ/awnet.o" & pids+=($!)
+$CXX -c "$HERE/nn/awnet.cpp" -o "$OBJ/awnet.o" & pids+=($!)
 for p in "${pids[@]}"; do wait "$p"; done
-BOXOBJ="$OBJ/position.o $OBJ/snapshot.o $OBJ/random_stream.o $OBJ/wasm_api.o $OBJ/awnet.o"
+BOXOBJ="$OBJ/position.o $OBJ/box_unity.o $OBJ/random_stream.o $OBJ/wasm_api.o $OBJ/awnet.o"
 
 if [ "$MODE" = native ]; then
   mkdir -p "$OUT/native"
@@ -79,7 +82,7 @@ EXPORTS='["_malloc","_free","_wotr_abi_version","_wotr_snapshot_abi_version","_w
 "_wotr_snapshot_destroy","_wotr_snapshot_last_error","_wotr_snapshot_prepare_observation_tables",
 "_wotr_snapshot_prepare_action_tables_v53","_wotr_snapshot_full_actions","_wotr_snapshot_encode_state_v53",
 "_wotr_snapshot_encode_actions_v53","_awasm_graph_create","_awasm_snapshot_root_count","_awnet_load","_awnet_free",
-"_awnet_last_error","_awnet_forward","_awnet_obs_dim","_awnet_act_dim"]'
+"_awnet_last_error","_awnet_forward","_awnet_obs_dim","_awnet_act_dim","_awasm_combat_reply"]'
 EXPORTS=$(echo "$EXPORTS" | tr -d '\n')
 $LINK -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,worker,web \
   -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=64MB -sSTACK_SIZE=4MB \

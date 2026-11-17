@@ -60,6 +60,7 @@ private:
     bool scaled2_ = false;
     std::vector<int32_t> esrc_, edst_;
     std::vector<float> dis_;
+    std::vector<float> f1t_, fdt_;        // [198 * 192], [198 * 128]: feature columns of the first policy layers, transposed
     std::vector<float> card1_, card_d_;   // [97 * 192], [97 * 128]: card-embedding parts of the first policy layers
 };
 

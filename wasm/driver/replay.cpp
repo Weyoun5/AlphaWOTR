@@ -1,6 +1,6 @@
 // Replays native searches recorded by wasm/tools/record_searches.py in this build of the box.
 //
-//   replay FIXTURES_DIR [--threaded] [--live] [--limit N] [FILE.aws ...]
+//   replay FIXTURES_DIR [--threaded] [--live] [--kernel] [--limit N] [FILE.aws ...]
 //
 // recorded (default): the controller gets the recorded root state, tables, configuration and search RNG; every
 //   request it makes must equal the recorded one bit for bit (operation, side, purpose, leaf ids, offsets,
@@ -10,6 +10,8 @@
 //   "same but better" verdicts) must be the recorded one.
 // live: the replies come from this module's network (awnet) and value net; only the pick is compared (a reply that
 //   differs in the last bits may change the tree), with the visit share of the recorded pick.
+// --kernel: the combat distributions (COMBAT_DIST) from the module's combat kernel (driver/combat_reply.inc) instead of
+//   the recorded Python replies; in recorded mode the search must still be identical. Always on with --live.
 // --threaded: the box's own threaded controller (native only); default: the single-thread provider (wasm patch 0003).
 #include "aw_controller_abi.h"
 #include "awnet.h"
@@ -28,6 +30,7 @@
 #include <dirent.h>
 
 extern "C" void* awasm_graph_create(const uint8_t* p);
+extern "C" void* awasm_combat_reply(const void* tables, const void* payload);
 
 namespace {
 
@@ -126,11 +129,42 @@ template <class T> bool same(const T* a, const T* b, size_t n) { return n == 0 |
 
 struct Context {
     const Search* s; size_t next = 0; std::string mismatch;
-    bool live = false; size_t obs_dim = 0, act_dim = 0;
+    bool live = false, kernel = false; size_t obs_dim = 0, act_dim = 0; const void* obs_tables = nullptr;
+    uint64_t dist_requests = 0, dist_same_graph = 0; double kernel_seconds = 0;
     const awnet::Net* net = nullptr; const awnet::Net* vnet = nullptr; double eps = 0.0;
     double nn_seconds = 0; uint64_t leaves = 0, rows = 0, requests = 0;
     std::vector<std::unique_ptr<void, void (*)(void*)>> keep;
 };
+
+std::vector<uint8_t> export_graph(const void* h);
+
+// Two exported graphs equal as values (tags, scalars, text, children in order), whatever their node sharing:
+// encode_graph shares one node between references to one Python object (the empty tuple, an interned string).
+struct GraphView {
+    const WotrValue* v; const uint64_t* e; const uint8_t* b; uint64_t root;
+    explicit GraphView(const std::vector<uint8_t>& g) {
+        uint64_t c[4]; std::memcpy(c, g.data(), 32);
+        v = reinterpret_cast<const WotrValue*>(&g[32]); e = reinterpret_cast<const uint64_t*>(&g[32 + 40 * c[0]]);
+        b = &g[32 + 40 * c[0] + 8 * c[1]]; root = c[3];
+    }
+};
+bool same_value(const GraphView& x, uint64_t i, const GraphView& y, uint64_t j, int depth = 0) {
+    const WotrValue &a = x.v[i], &c = y.v[j];
+    if (depth > 200 || a.tag != c.tag || a.count != c.count) return false;
+    switch (a.tag) {
+    case WOTR_NONE: return true;
+    case WOTR_BOOL: case WOTR_INT: return a.integer == c.integer;
+    case WOTR_FLOAT: return std::memcmp(&a.real, &c.real, 8) == 0;
+    case WOTR_STRING: case WOTR_BYTES: case WOTR_BIGINT: return std::memcmp(x.b + a.offset, y.b + c.offset, a.count) == 0;
+    default:
+        for (uint64_t k = 0; k < a.count; ++k) if (!same_value(x, x.e[a.offset + k], y, y.e[c.offset + k], depth + 1)) return false;
+        return true;
+    }
+}
+bool same_graph_value(const std::vector<uint8_t>& g, const std::vector<uint8_t>& h) {
+    GraphView x(g), y(h);
+    return same_value(x, x.root, y, y.root);
+}
 
 void fail(Context& c, const std::string& why) { if (c.mismatch.empty()) c.mismatch = why; }
 
@@ -141,11 +175,30 @@ int answer(void* user, void* ctl) {
     if (wotr_search_controller_request(ctl, &q)) { fail(c, std::string("request: ") + wotr_snapshot_last_error()); return 1; }
     ++c.requests;
     if (q.operation == awabi::OP_DIST) {
-        if (c.live) { fail(c, "live combat distributions are not wired yet"); return 1; }
-        if (c.next >= c.s->events.size() || c.s->events[c.next].kind != 2) { fail(c, "unexpected COMBAT_DIST request"); return 1; }
-        const DistEvent& d = c.s->events[c.next++].d;
-        if (q.leaf_ids[0] != d.leaf || q.model_side != d.side) fail(c, "COMBAT_DIST request differs");
-        void* reply = awasm_graph_create(d.reply);
+        ++c.dist_requests;
+        const DistEvent* d = nullptr;
+        if (!c.live) {
+            if (c.next >= c.s->events.size() || c.s->events[c.next].kind != 2) { fail(c, "unexpected COMBAT_DIST request"); return 1; }
+            d = &c.s->events[c.next++].d;
+            if (q.leaf_ids[0] != d->leaf || q.model_side != d->side) fail(c, "COMBAT_DIST request differs");
+        }
+        void* reply = nullptr;
+        if (c.kernel || c.live) {
+            const auto t0 = std::chrono::steady_clock::now();
+            void* payload = wotr_search_controller_request_payload(ctl);
+            if (!payload) { fail(c, std::string("request_payload: ") + wotr_snapshot_last_error()); return 1; }
+            reply = awasm_combat_reply(c.obs_tables, payload);
+            wotr_snapshot_destroy(payload);
+            c.kernel_seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (!reply) { fail(c, std::string("combat kernel: ") + wotr_snapshot_last_error()); return 1; }
+            if (d) {   // the kernel's reply against the Python service's, value for value
+                void* rec = awasm_graph_create(d->reply);
+                c.dist_same_graph += same_graph_value(export_graph(rec), export_graph(reply));
+                wotr_snapshot_destroy(rec);
+            }
+        } else {
+            reply = awasm_graph_create(d->reply);
+        }
         if (!reply) { fail(c, "reply graph"); return 1; }
         const int rc = wotr_search_controller_submit_payload(ctl, q.request_id, reply);
         wotr_snapshot_destroy(reply);
@@ -218,12 +271,13 @@ std::vector<uint8_t> export_graph(const void* h) {
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: replay FIXTURES_DIR [--threaded] [--live] [--limit N] [FILE.aws ...]\n"); return 2; }
     const std::string dir = argv[1];
-    bool threaded = false, live = false; size_t limit = 0;
+    bool threaded = false, live = false, kernel = false; size_t limit = 0;
     std::vector<std::string> files;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--threaded") threaded = true;
         else if (a == "--live") live = true;
+        else if (a == "--kernel") kernel = true;
         else if (a == "--limit" && i + 1 < argc) limit = std::stoul(argv[++i]);
         else files.push_back(a);
     }
@@ -273,7 +327,7 @@ int main(int argc, char** argv) {
         WotrOwnValueConfig own{}; std::memcpy(&own, s.own.data(), std::min(sizeof(own), s.own.size()));
         void* root = awasm_graph_create(s.root);
         void* rng = wotr_random_create(s.rng.words.data(), 624, s.rng.index, s.rng.has_gauss, s.rng.bits);
-        Context c; c.s = &s; c.live = live; c.obs_dim = OBS; c.act_dim = ACT;
+        Context c; c.s = &s; c.live = live; c.kernel = kernel; c.obs_dim = OBS; c.act_dim = ACT; c.obs_tables = obs_t;
         c.net = &nets[s.side]; c.vnet = &vnets[s.side]; c.eps = cfg.opponent_policy_epsilon;
         const auto t0 = std::chrono::steady_clock::now();
         void* ctl = wotr_search_controller_create_own_value(root, obs_t, act_t, menu_t, hunt_t, rng, &cfg, &own);
@@ -332,11 +386,13 @@ int main(int argc, char** argv) {
                 ok = view_same && rng_same && menu_same && pick == s.pick && c.next == s.events.size();
                 detail = std::string("root view ") + (view_same ? "identical" : "DIFFERENT") + ", rng " + (rng_same ? "identical" : "DIFFERENT") +
                          ", root menu " + (menu_same ? "identical" : "DIFFERENT") + ", " + std::to_string(c.next) + "/" + std::to_string(s.events.size()) + " requests";
+                if (kernel && c.dist_requests)
+                    detail += ", combat kernel " + std::to_string(c.dist_requests) + " replies (" + std::to_string(c.dist_same_graph) + " equal to Python's in value)";
             } else {
                 ok = pick == s.pick;
                 char buf[160];
-                std::snprintf(buf, sizeof buf, "%llu requests, %llu leaves, %llu rows, network %.2f s", (unsigned long long)c.requests,
-                              (unsigned long long)c.leaves, (unsigned long long)c.rows, c.nn_seconds);
+                std::snprintf(buf, sizeof buf, "%llu requests (%llu combat), %llu leaves, %llu rows, network %.2f s", (unsigned long long)c.requests,
+                              (unsigned long long)c.dist_requests, (unsigned long long)c.leaves, (unsigned long long)c.rows, c.nn_seconds);
                 detail = buf;
             }
         } else {

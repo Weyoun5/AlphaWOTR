@@ -6,6 +6,9 @@
 #include <map>
 #include <memory>
 #include <stdexcept>
+#ifdef __wasm_simd128__
+#include <wasm_simd128.h>
+#endif
 
 namespace awnet {
 namespace {
@@ -77,7 +80,33 @@ struct Reader {
     }
 };
 
-// y[o] = b[o] + sum_i W[o][i] x[i], float accumulation in 8 partial sums (vectorisable without reassociation flags).
+// y[o] = b[o] + sum_i W[o][i] x[i], float accumulation in 8 partial sums, lane k taking the terms i = k mod 8, then
+// ((a0+a1)+(a2+a3))+((a4+a5)+(a6+a7)) and the tail in order. The wasm SIMD path keeps exactly these lanes (two f32x4
+// accumulators, lanes 0-3 and 4-7) and this order, so it gives the scalar build's bits.
+#ifdef __wasm_simd128__
+inline float dot(const float* w, const float* x, int n) {
+    v128_t lo = wasm_f32x4_splat(0.0f), hi = wasm_f32x4_splat(0.0f);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        lo = wasm_f32x4_add(lo, wasm_f32x4_mul(wasm_v128_load(w + i), wasm_v128_load(x + i)));
+        hi = wasm_f32x4_add(hi, wasm_f32x4_mul(wasm_v128_load(w + i + 4), wasm_v128_load(x + i + 4)));
+    }
+    float s = ((wasm_f32x4_extract_lane(lo, 0) + wasm_f32x4_extract_lane(lo, 1)) +
+               (wasm_f32x4_extract_lane(lo, 2) + wasm_f32x4_extract_lane(lo, 3))) +
+              ((wasm_f32x4_extract_lane(hi, 0) + wasm_f32x4_extract_lane(hi, 1)) +
+               (wasm_f32x4_extract_lane(hi, 2) + wasm_f32x4_extract_lane(hi, 3)));
+    for (; i < n; ++i) s += w[i] * x[i];
+    return s;
+}
+// y[0..n) += v * row[0..n)  (each element: one multiply, one add, in the scalar order)
+inline void axpy(float* y, const float* row, float v, int n) {
+    const v128_t vv = wasm_f32x4_splat(v);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) wasm_v128_store(y + i, wasm_f32x4_add(wasm_v128_load(y + i), wasm_f32x4_mul(wasm_v128_load(row + i), vv)));
+    for (; i < n; ++i) y[i] += row[i] * v;
+}
+#else
+inline void axpy(float* y, const float* row, float v, int n) { for (int i = 0; i < n; ++i) y[i] += row[i] * v; }
 inline float dot(const float* w, const float* x, int n) {
     float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     int i = 0;
@@ -87,6 +116,7 @@ inline float dot(const float* w, const float* x, int n) {
     for (; i < n; ++i) s += w[i] * x[i];
     return s;
 }
+#endif
 
 inline float relu(float x) { return x > 0.0f ? x : 0.0f; }
 
@@ -143,6 +173,13 @@ bool Net::load(const uint8_t* data, size_t size, std::string& error) {
         const auto& emb = t("card_embedding.weight").f;
         const auto& w1 = t("spatial_action_scorer.0.weight").f;
         const auto& wd = t("policy_delta.0.weight").f;
+        // the feature columns of the first policy layers, transposed (column-major) for the fast path's row updates
+        const int F = act_dim_ - 1;
+        f1t_.assign(size_t(F) * 192, 0.0f); fdt_.assign(size_t(F) * 128, 0.0f);
+        for (int k = 0; k < F; ++k) {
+            for (int o = 0; o < 192; ++o) f1t_[size_t(k) * 192 + o] = w1[size_t(o) * in + 320 + k];
+            for (int o = 0; o < 128; ++o) fdt_[size_t(k) * 128 + o] = wd[size_t(o) * in + 320 + k];
+        }
         card1_.assign(97 * 192, 0.0f); card_d_.assign(97 * 128, 0.0f);
         for (int c = 0; c < 97; ++c) {
             for (int o = 0; o < 192; ++o) card1_[c * 192 + o] = dot(&w1[size_t(o) * in + coff], &emb[c * 16], 16);
@@ -278,8 +315,12 @@ void Net::logits(const Body& b, const float* actions, const int64_t* regions, si
     const int A = act_dim_, F = A - 1, rin = 256 + 64 + F + 16;
     const auto& emb = t("card_embedding.weight").f;
     std::vector<float> combined(rin), z1(192), z2(64), zd(128);
-    const auto& w1 = t("spatial_action_scorer.0.weight").f;
-    const auto& wd = t("policy_delta.0.weight").f;
+    const float* s3w = t("spatial_action_scorer.3.weight").f.data();
+    const float* s3b = t("spatial_action_scorer.3.bias").f.data();
+    const float* s5w = t("spatial_action_scorer.5.weight").f.data();
+    const float* s5b = t("spatial_action_scorer.5.bias").f.data();
+    const float* d2w = t("policy_delta.2.weight").f.data();
+    const float* d2b = t("policy_delta.2.bias").f.data();
     for (size_t r = 0; r < rows; ++r) {
         const float* row = actions + r * A;
         const int64_t reg = regions[r];
@@ -300,18 +341,17 @@ void Net::logits(const Body& b, const float* actions, const int64_t* regions, si
                 if (k == card_col_) continue;
                 const float v = row[k];
                 if (v == 0.0f) continue;
-                const int col = 320 + (k < card_col_ ? k : k - 1);
-                for (int o = 0; o < 192; ++o) z1[o] += w1[size_t(o) * rin + col] * v;
-                for (int o = 0; o < 128; ++o) zd[o] += wd[size_t(o) * rin + col] * v;
+                const size_t col = size_t(k < card_col_ ? k : k - 1);
+                axpy(z1.data(), &f1t_[col * 192], v, 192);
+                axpy(zd.data(), &fdt_[col * 128], v, 128);
             }
         }
         for (float& v : z1) v = relu(v);
-        linear("spatial_action_scorer.3", z1.data(), 192, 64, z2.data());
+        for (int o = 0; o < 64; ++o) z2[o] = dot(&s3w[size_t(o) * 192], z1.data(), 192) + s3b[o];
         for (float& v : z2) v = relu(v);
-        float s, d;
-        linear("spatial_action_scorer.5", z2.data(), 64, 1, &s);
+        const float s = dot(s5w, z2.data(), 64) + s5b[0];
         for (float& v : zd) v = relu(v);
-        linear("policy_delta.2", zd.data(), 128, 1, &d);
+        const float d = dot(d2w, zd.data(), 128) + d2b[0];
         out[r] = s + d;
     }
 }

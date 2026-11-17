@@ -39,9 +39,28 @@ Results of 2026-11-17 (emsdk 7.0.0, Node 24.19):
   logits 1.6e-5 relative (torch's own float32 logits differ from float64 by 1.05e-5 relative); the same top action
   on every leaf. wasm (no SIMD yet): 1.3 ms a leaf body, 5.4 us an action row on the fast path.
 
-Next (phase 2): the search in the module. The controller runs its search on a std::thread and waits on a condition
-variable for each network evaluation (cpp/search_controller.inc, await_reply); single-threaded wasm needs a patch that
-calls an inference callback in place of the wait. Then the orchestrator's root (build_config, the own-value context,
-build_visit_info, select_root_action, ai._strictly_better) and the combat-distribution replies (the turn search's box
-has them in C++: turn_search/native_w2x/box/cpp/combat_kernel.inc, kernel_expand.inc), checked by replaying Python's
-recorded replies (bit-identical root visits) and then with our network (same picks on the selftest and a larger set).
+Phase 2 (2026-11-17): the search in the module
+----------------------------------------------
+- patches/0003, 0004     the single-thread controller: a provider answers each request inside advance()
+- driver/aw_controller_abi.h   the controller's structs and exports for the module's C++
+- driver/box_unity.cpp   the live box's snapshot.cpp + the turn search box's combat kernel + driver/combat_reply.inc
+                         (the COMBAT_DIST replies computed in the module: awasm_combat_reply)
+- driver/select.h        build_visit_info + ai.select_root_action (temperature 0) in C++
+- driver/replay.cpp      replays recorded searches: recorded replies (bit-identical search), --kernel (the module's
+                         combat distributions), --live (the module's network and value nets; same pick?)
+- tools/record_searches.py   records whole native searches (live settings) through hooks on the controller binding
+- tools/harvest_decisions.py real decisions from protocol transcripts (the Python adapter run offline)
+
+    venv/bin/python -I wasm/tools/record_searches.py --alpha CHECKOUT --out wasm/fixtures            # selftest, 3 seeds
+    venv/bin/python -I wasm/tools/harvest_decisions.py --alpha CHECKOUT --out wasm/fixtures/harvest.pkl T1.protocol.jsonl ...
+    venv/bin/python -I wasm/tools/record_searches.py --alpha CHECKOUT --out wasm/fixtures --set harvest --seeds 1 --positions wasm/fixtures/harvest.pkl
+    wasm/build.sh native && wasm/build.sh wasm32 && wasm/build.sh wasm32 --simd
+    wasm/build/native/replay wasm/fixtures [--kernel|--live] [FILES.aws]
+    node wasm/build/replay[-simd].js wasm/fixtures [--kernel|--live] [FILES.aws]
+
+The recordings are large (about 70 MB a search: every request's observations and action rows); they stay out of git.
+Results and the wasm32 decision: docs/AlphaWOTR-Wasm-Plan.md section 6b (behindmedia repository).
+
+Next (phase 2, rest): ai._strictly_better in C++ (the replays use the recorded verdicts); the driver's own
+build_config and seeds (own_model's seat seeds, rng_streams.derive_seed, the search stream) so a decision needs no
+recording; then phase 3 (the state from the protocol view).
