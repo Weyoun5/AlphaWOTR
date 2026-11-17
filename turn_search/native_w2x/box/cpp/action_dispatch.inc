@@ -102,7 +102,7 @@ std::unique_ptr<Snapshot> apply_native_descriptor_inner(const Snapshot& s,const 
     }
     if(!ctx_none(s,obs_attr(s,s.root,"pending_card_followup",false))&&(kind=="army_move"||kind=="army_attack"||kind=="followup_done"))throw std::invalid_argument("Card army follow-up requires owned RNG");
     if(kind=="army_move"){
-        ad_keys(actions,p,{"from","to","side","n_regular","n_elite","n_leaders","n_nazgul","take_leaders","mouth_muster","leader_set"});
+        ad_keys(actions,p,{"from","to","side","n_regular","n_elite","n_leaders","n_nazgul","take_leaders","mouth_muster","leader_set","unit_set"});
         ArmyMoveRequest req;req.side=side;req.die_index=index;req.from=ad_text(actions,p,"from");req.to=ad_text(actions,p,"to");
         req.regular=ad_int(actions,p,"n_regular");req.elite=ad_int(actions,p,"n_elite");
         req.leaders=ad_int(actions,p,"n_leaders");req.nazgul=ad_int(actions,p,"n_nazgul");
@@ -113,6 +113,9 @@ std::unique_ptr<Snapshot> apply_native_descriptor_inner(const Snapshot& s,const 
         // E5-01 (D5 2026-10-22): a which-figure row names its non-Nazgul figures
         const auto chosen=field(actions,p,"leader_set",false);
         if(chosen!=missing&&!ctx_none(actions,chosen)){req.leader_set=am_parse_figure_set(actions,chosen,false);req.has_leader_set=true;}
+        // L1104-W06: an AI seat's unit rule names the units of a split move (never a menu row)
+        const auto units=field(actions,p,"unit_set",false);
+        if(units!=missing&&!ctx_none(actions,units)){req.unit_set=am_parse_figure_set(actions,units,true);req.has_unit_set=true;}
         return apply_army_move(s,t,req);
     }
     if(kind=="elven_ring"){
