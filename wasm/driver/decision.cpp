@@ -14,6 +14,8 @@ extern "C" void* awasm_graph_create(const uint8_t* p);
 extern "C" void* awasm_combat_reply(const void* tables, const void* payload);
 extern "C" int awasm_strictly_better(const void* state, const void* tables, const void* menu, int32_t side, int64_t* out, size_t k);
 extern "C" int64_t awasm_snapshot_root_count(const void* handle);
+extern "C" int64_t awasm_certain_line(const void* state, const void* tables, const void* menu, int32_t side, int64_t own,
+                                      int (*priors)(void*, const void*, int32_t, const void*, float*, size_t), void* user);
 
 namespace awdec {
 namespace {
@@ -243,6 +245,26 @@ int64_t raw(Box& box, const void* state, int side, const void* menu) {
     const size_t chosen_i = awselect::move_to_better(first, better);
     wotr_snapshot_destroy(sel);
     return pos[size_t(order[chosen_i])];
+}
+
+int priors(void* user, const void* state, int32_t side, const void* menu, float* out, size_t n) {
+    Box& box = *static_cast<Box*>(user);
+    std::vector<float> obs(OBS), acts(n * ACT);
+    std::vector<int64_t> regs(n);
+    if (wotr_snapshot_encode_state_v53(state, box.obs, side, obs.data(), OBS) ||
+        wotr_snapshot_encode_actions_v53(state, box.obs, menu, box.act, side, acts.data(), acts.size(), regs.data(), n)) return 1;
+    awnet::Body b;
+    box.net[side].body(obs.data(), b, true);
+    std::vector<float> logits(n);
+    box.net[side].logits(b, acts.data(), regs.data(), n, logits.data(), true);
+    awnet::Net::softmax(logits.data(), n, out);
+    float sum = 0.0f; for (size_t i = 0; i < n; ++i) sum += out[i];
+    for (size_t i = 0; i < n; ++i) out[i] = out[i] / (sum + 1e-10f);
+    return 0;
+}
+
+int64_t certain_line(Box& box, const void* state, int side, const void* menu, int64_t own) {
+    return awasm_certain_line(state, box.obs, menu, side, own, priors, &box);
 }
 
 }  // namespace awdec

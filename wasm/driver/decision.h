@@ -31,4 +31,10 @@ int64_t raw(Box& box, const void* state, int side, const void* menu);
 // a menu snapshot of the rows `indices` of `menu` (native_menu_rows), owned
 void* menu_rows(const void* menu, const std::vector<int64_t>& indices);
 
+// _get_priors_and_value's priors of the rows of `menu` (no projection); user: the Box. 0 on success
+int priors(void* user, const void* state, int32_t side, const void* menu, float* out, size_t n);
+
+// THE CERTAIN LINE at strength 1 (driver/certain_line.inc): the row of `menu` to play outright instead of `own`, -1
+int64_t certain_line(Box& box, const void* state, int side, const void* menu, int64_t own);
+
 }  // namespace awdec

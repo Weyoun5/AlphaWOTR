@@ -167,6 +167,7 @@ std::vector<std::string> menu_rows(const void* menu) {
 }  // namespace
 
 extern "C" void* awasm_graph_create(const uint8_t* p);
+extern "C" int64_t awasm_snapshot_root_count(const void* handle);
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: bs_parity FIXTURES_DIR [--verbose]\n"); return 2; }
@@ -378,7 +379,19 @@ int main(int argc, char** argv) {
                                                         if (ri >= 0) hit = rows[size_t(allowed_idx[size_t(ri)])];
                                                         got["raw"] = hit;
                                                     }
-                                                    pick = hit;   // the certain line and ai_units: not ported yet
+                                                    pick = hit;
+                                                    // THE CERTAIN LINE over the projected menu (the adapter's `menu`), then the ban check
+                                                    void* pmenu = (sel && awasm_snapshot_root_count(sel) > 0) ? sel : full;
+                                                    if (!hit.empty()) {
+                                                        int64_t own_i = -1;
+                                                        for (size_t q = 0; q < prow.size(); ++q) if (prow[q] == hit) { own_i = int64_t(q); break; }
+                                                        if (own_i >= 0) {
+                                                            const int64_t outright = awdec::certain_line(box, sn, memo.side, pmenu, own_i);
+                                                            if (outright >= 0) { got["certain_outright"] = prow[size_t(outright)]; if (!banned.count(prow[size_t(outright)])) pick = prow[size_t(outright)]; }
+                                                            else if (outright == -2) got["certain_error"] = wotr_snapshot_last_error();
+                                                        }
+                                                    }
+                                                    // ai_units: not ported yet
                                                 }
                                             }
                                             got["pick"] = pick;
@@ -392,7 +405,7 @@ int main(int argc, char** argv) {
                                     ++dec_total;
                                     const bool same = answer == ref.answer;
                                     dec_same += same;
-                                    for (const char* k : {"search", "raw", "pick"}) {
+                                    for (const char* k : {"search", "raw", "pick", "certain_outright"}) {
                                         if (!got.count(k)) continue;
                                         const awjson::Value* w = ref.stages.get(k);
                                         ++stage_total[k];
@@ -407,6 +420,14 @@ int main(int argc, char** argv) {
                                                     (un && pp && un->kind == awjson::Value::Str && pp->kind == awjson::Value::Str && un->s == pp->s && got.count("pick") && got["pick"] != pp->s) ? " [Python: unit rule]" : "",
                                                     got.count("search") && ref.stages.get("search") && ref.stages.get("search")->s != got["search"] ? " [search differs]" : "",
                                                     got.count("raw") ? " [raw]" : "");
+                                        if (!same) {
+                                            const awjson::Value* cl = ref.stages.get("certain_last");
+                                            std::string last;
+                                            if (cl) for (const auto& kv : cl->obj) last += kv.first + "=" + (kv.second.kind == awjson::Value::Str ? kv.second.s : std::to_string(kv.second.kind == awjson::Value::Int ? kv.second.i : -9)) + " ";
+                                            std::printf("   C++ certain %s%s\n   Python certain %s; %s\n   hit/search %s\n", got.count("certain_outright") ? got["certain_outright"].c_str() : "-",
+                                                        got.count("certain_error") ? (" error " + got["certain_error"]).c_str() : "",
+                                                        co && co->kind == awjson::Value::Str ? co->s.c_str() : "-", last.c_str(), got.count("search") ? got["search"].c_str() : "-");
+                                        }
                                     }
                                 }
                             }
