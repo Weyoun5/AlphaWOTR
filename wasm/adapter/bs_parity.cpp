@@ -107,8 +107,10 @@ int main(int argc, char** argv) {
     auto data = slurp(dir + "/build_state.awb");
     const bool v2 = std::memcmp(data.data(), "AWB2", 4) == 0;   // AWB2: each case also carries the set-up (phase 3b)
     uint32_t count; std::memcpy(&count, &data[4], 4);
-    size_t searched = 0;
+    size_t searched = 0, setup_ported = 0, setup_same = 0;
     size_t off = 8, identical = 0, equal = 0;
+    struct SetupRef { std::string dec, label, flag; pyobj::Graph graph; };
+    std::vector<SetupRef> setups;
     double secs = 0;
     for (uint32_t c = 0; c < count; ++c) {
         uint32_t len; std::memcpy(&len, &data[off], 4); off += 4;
@@ -127,11 +129,14 @@ int main(int argc, char** argv) {
             uint32_t has; std::memcpy(&has, &data[off], 4); off += 4;
             if (has) {
                 ++searched;
-                for (int part = 0; part < 3; ++part) { uint32_t n; std::memcpy(&n, &data[off], 4); off += 4 + n; }
+                std::string part[3];
+                for (int q = 0; q < 3; ++q) { uint32_t n; std::memcpy(&n, &data[off], 4); part[q].assign(reinterpret_cast<const char*>(&data[off + 4]), n); off += 4 + n; }
                 uint32_t sl; std::memcpy(&sl, &data[off], 4); off += 4 + sl;
+                const pyobj::Graph want_setup = pyobj::read_graph(&data[off]);
                 uint64_t a, b2, c2; std::memcpy(&a, &data[off], 8); std::memcpy(&b2, &data[off + 8], 8); std::memcpy(&c2, &data[off + 16], 8);
                 off += 32 + 40 * a + 8 * b2 + c2;
-            }
+                setups.push_back({part[0], part[1], part[2], want_setup});
+            } else setups.push_back({});
         }
         memo.rng = wotr_random_create(words.data(), 624, index, hg, bits);
         std::string why;
@@ -144,6 +149,21 @@ int main(int argc, char** argv) {
             secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             same = got.values.size() == want.values.size() && got.edges == want.edges && got.bytes == want.bytes &&
                    std::memcmp(got.values.data(), want.values.data(), 40 * got.values.size()) == 0 && got.root == want.root;
+            if (v2 && !setups.empty() && !setups.back().dec.empty()) {   // the set-up, where its kind is ported
+                const SetupRef& ref = setups.back();
+                const awjson::Value dec = awjson::parse(ref.dec);
+                const auto su = adapter.setup(dec.get("kind") ? dec.get("kind")->s : "", st, dec, view, memo);
+                if (su.ported) {
+                    ++setup_ported;
+                    const pyobj::Graph gs = model.encode(st);
+                    const bool sg = gs.edges == ref.graph.edges && gs.bytes == ref.graph.bytes && gs.values.size() == ref.graph.values.size() &&
+                                    std::memcmp(gs.values.data(), ref.graph.values.data(), 40 * gs.values.size()) == 0;
+                    const bool sl = su.label == ref.label && su.flag == ref.flag;
+                    setup_same += sg && sl;
+                    if (!(sg && sl)) std::printf("case %u: set-up of %s differs: %s%s\n", c, dec.get("kind")->s.c_str(),
+                                                 sl ? "" : "label/flag; ", sg ? "" : diff(G{gs}, gs.root, G{ref.graph}, ref.graph.root, "state").c_str());
+                }
+            }
             if (!same) {
                 why = diff(G{got}, got.root, G{want}, want.root, "state"); eq = why.empty();
                 if (eq && verbose) {   // the first node that differs, for the set order
@@ -167,6 +187,7 @@ int main(int argc, char** argv) {
     }
     std::printf("%s: %u cases, %zu byte-identical, %zu equal field by field (sets as sets); %.1f ms a state%s\n",
                 equal == count ? "PASS" : "FAIL", count, identical, equal, count ? 1e3 * secs / count : 0.0,
-                v2 ? (" (" + std::to_string(searched) + " with the set-up recorded, for phase 3b)").c_str() : "");
+                v2 ? (" (" + std::to_string(searched) + " with the set-up recorded; " + std::to_string(setup_ported) + " of a ported kind, " +
+                      std::to_string(setup_same) + " set up byte-identically)").c_str() : "");
     return equal == count ? 0 : 1;
 }

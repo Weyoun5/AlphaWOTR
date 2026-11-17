@@ -37,6 +37,10 @@ public:
     Adapter(pyobj::Model& model, const Tables& tables, pyobj::Obj* prototypes);
     // build_state(view, memo, names): a GameState for the view (the model's object)
     pyobj::Obj* build_state(const awjson::Value& view, Memo& memo);
+    // SETUPS[kind](bot, st, dec, view): the question set up on the state; false when the kind is not ported yet.
+    // label / flag: the search label and the phase flag ('' none) the Python returns
+    struct Setup { bool ported = false; std::string label, flag; };
+    Setup setup(const std::string& kind, pyobj::Obj* st, const awjson::Value& dec, const awjson::Value& view, const Memo& memo);
 
 private:
     pyobj::Model& m;

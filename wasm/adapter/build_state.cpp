@@ -414,4 +414,23 @@ void Adapter::build_cards(Obj* st, const Value& view, Memo& memo) {
     m.set_attr(st, "persistent_cards", pcs);
 }
 
+// SETUPS (the adapter's lines 1879-2272), ported kind by kind
+Adapter::Setup Adapter::setup(const std::string& kind, Obj* st, const Value& dec, const Value& view, const Memo& memo) {
+    (void)dec; (void)view;
+    Setup r;
+    if (kind == "ACTION") {                       // setup_action
+        m.set_attr(st, "pending_combat", m.none());
+        m.set_attr(st, "dice_rolled", m.boolean(true));
+        r.ported = true; r.label = "action";
+    } else if (kind == "HUNT_ALLOCATION") {       // setup_hunt_allocation
+        r.ported = true; r.label = "eye"; r.flag = "_eye_allocation_phase";
+    } else if (kind == "DISCARD_EXCESS_CARD") {   // setup_discard
+        Obj* d = m.dict();
+        m.dict_set(d, m.str("side"), side_enum(memo.side));
+        m.set_attr(st, "pending_discard", d);
+        r.ported = true; r.label = "discard";
+    }
+    return r;
+}
+
 }  // namespace awad
