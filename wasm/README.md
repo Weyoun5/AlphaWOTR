@@ -1,82 +1,136 @@
-AlphaWOTR in WebAssembly (branch wasm-port)
-===========================================
+AlphaWOTR in WebAssembly
+========================
 
-AlphaWOTR's strength-1 decision (the league nets with their value nets, the native tree search, the certain line,
-the unit rules) running inside a browser Web Worker, as a client of the WotR Bot Protocol (the protocol adapter,
-protocol/wotr_protocol_bot.py, ported). The plan, the phases and the decisions: docs/AlphaWOTR-Wasm-Plan.md in the
-War of the Ring (behindmedia) repository. This folder holds the port; nothing outside it is changed.
+AlphaWOTR's strength-1 decision running in a web browser: the league nets with their value nets, the native tree
+search (`native_backend/live_search_oct19`), the certain line and the unit rules, compiled with Emscripten and run in
+a Web Worker. The worker is a client of the WotR Bot Protocol: it speaks the same messages as
+`protocol/wotr_protocol_bot.py`, so a web page, or a referee through `worker/aw-stdio.mjs`, can play against it.
 
-Phase 1 (2026-11-17): the foundation
-------------------------------------
-- build.sh             builds the box (native_backend/live_search_oct19, copied and patched in build/) with
-                       Emscripten: wasm32 (patches/*.sed applied) or wasm64 (-sMEMORY64, unchanged sources); and the
-                       network parity test (native or wasm)
-- patches/             sed scripts applied to the copy, each documented at its top
-- nn/awnet.{h,cpp}     the network forward pass in C++ (no torch): WOTRValueNet 'base' in eval mode, a direct and a
-                       factored ("fast") policy path
-- nn/nn_parity.cpp     the C++ forward pass against torch on recorded leaves
-- driver/wasm_api.cpp  the module's own C surface (graph loading, menu size, the network)
-- smoke/smoke.mjs      Node smoke test: their engine and encoders and our network in wasm against the native library
-                       and torch on the selftest positions
-- tools/export_fixtures.py   weights (awn), tables and positions (awg), references (awr), from a checkout with the
-                       native library built (formats documented at its top)
-- tools/torch_f64_error.py   torch's own float32 error against float64 (the scale of the parity bound)
+Everything is in this folder; nothing outside it is changed. AlphaWOTR's C++ is not edited in place: `build.sh`
+copies it into `build/` and applies the patches of `patches/` to the copy.
 
-Run (on a Mac with the venv of wotr-alpha and emsdk in ~/Projects/BehindMedia/emsdk):
 
-    venv/bin/python -I wasm/tools/export_fixtures.py --alpha ~/Projects/BehindMedia/wotr-alpha/alphawotr-041313c --out wasm/fixtures
-    wasm/build.sh wasm32 && wasm/build.sh wasm64 && wasm/build.sh native
-    wasm/build/native/nn_parity wasm/fixtures
-    node wasm/build/nn_parity.js wasm/fixtures
-    node wasm/smoke/smoke.mjs                              # wasm32
-    node wasm/smoke/smoke.mjs wasm/build/alphawotr64.mjs   # wasm64
+Layout
+------
 
-Results of 2026-11-17 (emsdk 7.0.0, Node 24.19):
-- smoke: 6 of 6 positions PASS on wasm32 and wasm64: the full menu's row count equals the native library's, the v53
-  observation and every action row and region are bit-identical, priors within 3e-7 of torch, the value net's value
-  within 1e-6, the same top action.
-- network parity (906 leaves, 19,586 action rows; native and wasm alike): backbone 1.3e-6, values 7e-7, priors 5.5e-6,
-  logits 1.6e-5 relative (torch's own float32 logits differ from float64 by 1.05e-5 relative); the same top action
-  on every leaf. wasm (no SIMD yet): 1.3 ms a leaf body, 5.4 us an action row on the fast path.
+    build.sh               builds the module (wasm32, optionally with SIMD), the 64-bit variant and a native build of
+                           the same patched sources (the parity reference); also the test programs
+    patches/               sed scripts applied to the copy of the sources, each documented at its top:
+      0001                   pointer-width asserts that hold on 32-bit
+      0003, 0004             a single-threaded search controller (a provider answers each request inside advance())
+                             and its export
+      0006                   a cached name lookup (speed)
+                           A patch that changes nothing fails the build, so a release that moved the code is noticed.
+    nn/                    the network's forward pass in C++ (no torch): the value net 'base' in eval mode, a direct
+                           and a factored policy path; SIMD with --simd
+    driver/                the module's C++ around the search: the controller's ABI, the combat replies computed in
+                           the module, the root selection, the certain line, the unit rules, "strictly better", the
+                           live search's set-up and seeds, the decision as a whole (decision.cpp), the C API
+                           (wasm_api.cpp), the replay of recorded searches (replay.cpp)
+    adapter/               the protocol adapter's Python ported to C++: the state built from the protocol's view
+                           (build_state.cpp, on a model of the engine's object graph, pyobj.h), matching the
+                           protocol's options to actions (matching.cpp), plans and chains (plans.cpp), the bot
+                           (bot.cpp: the protocol messages in and out)
+    worker/                alphawotr-worker.js (the Web Worker), alphawotr-core.mjs (shared with Node),
+                           aw-stdio.mjs (a stdio protocol bot), test.html + serve.py (a browser check)
+    tools/                 Python that exports the data and records the references from a checkout of AlphaWOTR
+    smoke/                 a Node smoke test of the module against the native library and torch
 
-Phase 2 (2026-11-17): the search in the module
-----------------------------------------------
-- patches/0003, 0004     the single-thread controller: a provider answers each request inside advance()
-- driver/aw_controller_abi.h   the controller's structs and exports for the module's C++
-- driver/box_unity.cpp   the live box's snapshot.cpp + the turn search box's combat kernel + driver/combat_reply.inc
-                         (the COMBAT_DIST replies computed in the module: awasm_combat_reply)
-- driver/select.h        build_visit_info + ai.select_root_action (temperature 0) in C++
-- driver/replay.cpp      replays recorded searches: recorded replies (bit-identical search), --kernel (the module's
-                         combat distributions), --live (the module's network and value nets; same pick?)
-- tools/record_searches.py   records whole native searches (live settings) through hooks on the controller binding
-- tools/harvest_decisions.py real decisions from protocol transcripts (the Python adapter run offline)
+Each ported Python function names its source file and line.
 
-    venv/bin/python -I wasm/tools/record_searches.py --alpha CHECKOUT --out wasm/fixtures            # selftest, 3 seeds
-    venv/bin/python -I wasm/tools/harvest_decisions.py --alpha CHECKOUT --out wasm/fixtures/harvest.pkl T1.protocol.jsonl ...
-    venv/bin/python -I wasm/tools/record_searches.py --alpha CHECKOUT --out wasm/fixtures --set harvest --seeds 1 --positions wasm/fixtures/harvest.pkl
-    wasm/build.sh native && wasm/build.sh wasm32 && wasm/build.sh wasm32 --simd
-    wasm/build/native/replay wasm/fixtures [--kernel|--live] [FILES.aws]
-    node wasm/build/replay[-simd].js wasm/fixtures [--kernel|--live] [FILES.aws]
 
-The recordings are large (about 70 MB a search: every request's observations and action rows); they stay out of git.
-Results and the wasm32 decision: docs/AlphaWOTR-Wasm-Plan.md section 6b (behindmedia repository).
+Requirements
+------------
 
-Phase 2 finished, phase 3 begun (2026-11-17, second run)
---------------------------------------------------------
-- driver/strictly_better.inc   ai._strictly_better (THE SAME BUT BETTER, the siege ban) on the box's graphs
-- driver/setup.h               the live search configuration, the own-value seed (derive_seed: SHA-256), the
-                               search stream Random(seed): a decision from a state alone
-- adapter/pyobj.h              a mutable model of the engine's object graph, encoded exactly as encode_graph
-                               (CPython set order under PYTHONHASHSEED=0)
-- adapter/build_state.cpp      the adapter's build_state + _build_cards, line for line, on prototypes
-- adapter/bs_parity.cpp        against the Python adapter's states (byte for byte)
-- tools/record_build_state.py  adapter.json, prototypes.awg, build_state.awb (run WITHOUT -I and with
-                               PYTHONHASHSEED=0, as their launcher runs Python)
+- Emscripten (tested with emsdk 7.0.0); `EMSDK` pointing at emsdk's folder.
+- Node 24 (for the tests and `aw-stdio.mjs`).
+- For the data and the references: a checkout of AlphaWOTR with its Python environment and the native library built
+  (`native_backend/live_search_oct19/build_portable.py`).
 
-    replay FIXTURES --setup --live [FILES]            a decision from the state, the side and two seeds
-    replay FIXTURES --verdicts FIXTURES/verdicts2.awv the same-but-better verdicts against Python's
-    PYTHONHASHSEED=0 venv/bin/python -s wasm/tools/record_build_state.py --alpha CHECKOUT --out wasm/fixtures T.protocol.jsonl ...
-    wasm/build/native/bs_parity wasm/fixtures         (node wasm/build/bs_parity.js wasm/fixtures)
 
-Next: the pending decision's set-up (SETUPS, _battle, _sail_in; record_build_state.py's AWB2 records carry the
-states the adapter set up and searched), then the menu, the option matching and the same pick from the view alone.
+Build
+-----
+
+    wasm/build.sh wasm32 --simd     build/alphawotr-simd.mjs + .wasm: the module the browser loads
+    wasm/build.sh wasm32            the same without SIMD
+    wasm/build.sh wasm64            -sMEMORY64 (64-bit, as on the hosts the selftest certifies; narrower browser support)
+    wasm/build.sh native            build/native/: the same patched sources with the host's compiler (parity reference)
+
+The numeric flags are the native build's own (`build_portable.py`): no FMA contraction, no fast-math, libm pow/log.
+Single-threaded, no mimalloc.
+
+
+The data
+--------
+
+The worker loads seven data files from one folder (about 24 MB with the module, 17 MB compressed):
+
+    net_fp.awn, net_sh.awn          the seats' league nets (weights only)
+    value_fp.awn, value_sh.awn      the value nets bound to them
+    tables.awg                      the static native tables (observation, actions)
+    adapter.json, prototypes.awg    the adapter's name tables and the objects build_state creates
+
+Exported from a checkout of AlphaWOTR (ALPHA below):
+
+    python -I wasm/tools/export_fixtures.py --alpha ALPHA --out DATA
+    PYTHONHASHSEED=0 python -s wasm/tools/record_build_state.py --alpha ALPHA --out DATA [TRANSCRIPTS ...]
+
+`record_build_state.py` runs without `-I` and with `PYTHONHASHSEED=0`, as the launcher runs Python (the set order of
+the object graph depends on it); given protocol transcripts it also records build_state references for the parity
+check. `export_fixtures.py` also writes test positions and references. The file formats are described at the top of
+the two scripts.
+
+
+Run
+---
+
+A protocol bot on stdin/stdout (one JSON message a line), e.g. under a referee:
+
+    node wasm/worker/aw-stdio.mjs DATA --sims 300 [--module build/alphawotr-simd.mjs]
+
+In a page: start `worker/alphawotr-worker.js` as a module worker, post `{init: {base: URL, sims}}` once (URL: the
+folder with the module and the data files, fetched from there and cached by the browser), then `{line: MESSAGE}` for
+each referee message; the worker posts `{ready}` (or `{error}`), then `{line: REPLY}` for each reply. The SIMD build
+needs WebAssembly SIMD (every current browser).
+
+A browser check: in a folder with the worker's files, `data/` (the module and the data) and a protocol transcript
+`t1.jsonl`, run `python3 serve.py 8000` and open `http://localhost:8000/test.html` (`?t=FILE` for another
+transcript): the page plays the transcript's decisions through the worker and posts the result to `result.json`.
+
+
+Parity with the Python
+----------------------
+
+    wasm/build/native/nn_parity DATA         the network against torch on recorded leaves (also node build/nn_parity.js)
+    node wasm/smoke/smoke.mjs                the engine, the encoders and the network against the native library
+    wasm/build/native/replay DATA [--kernel|--live] [FILES.aws]    recorded native searches replayed in the module
+    wasm/build/native/bs_parity DATA         build_state against the Python adapter's, byte for byte
+
+Recording searches and real decisions for these: `tools/record_searches.py`, `tools/harvest_decisions.py`.
+
+Results with v0.2.0 (2026-11-17):
+
+- the network: 906 leaves, 19,586 action rows; values within 7e-7, priors within 5.5e-6 of torch (torch's own float32
+  error is about 1e-5 relative); the same top action on every leaf;
+- searches: identical with recorded replies; with the module's own network and combat replies, the same picks;
+- decisions: 2,729 of 2,729 real decisions from protocol transcripts the same as the Python adapter's;
+- games: 98 paired games through a referee against the Python adapter at the same settings (strength 1, 100
+  simulations): 55.1% +- 9.1 for the module, 0 illegal answers and 0 timeouts in about 17,500 decisions;
+- speed: about 1.5 s a decision at 300 simulations in Chrome.
+
+A known difference: Emscripten's libm can differ from another platform's in the last bit of `pow`, `log` or `exp`,
+which can flip a very close choice, as between the native platforms themselves.
+
+
+A new release of AlphaWOTR
+--------------------------
+
+1. Rebase this branch on the release.
+2. `wasm/build.sh`: a patch that no longer applies fails here.
+3. Export the data again and run the parity checks above.
+4. Compare the Python on the decision path since the last release (`orchestrator.py`, `own_model.py`,
+   `certain_line.py`, `ai_units.py`, `strength.py`, the protocol adapter) and port what changed. An unknown
+   controller request kind, table schema or checkpoint contract is refused loudly rather than guessed.
+5. Whole games through a referee and a short match against the Python adapter before the module is used.
+
+License: AlphaWOTR's (MIT).
