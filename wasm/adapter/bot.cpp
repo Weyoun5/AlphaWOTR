@@ -83,16 +83,24 @@ void Bot::set_memo_rng(const std::vector<uint32_t>& words, uint32_t index, bool 
     memo.rng = wotr_random_create(words.data(), words.size(), index, has_gauss ? 1 : 0, bits);
 }
 
+// LeagueSearcher.budget (branch ours, b2445d1): from 5 s a decision 80% of the clock less 0.3 s, under 5 s a quarter
+// less 0.1 s; the first search of a kind at most half the clock (from 5 s); a kind not timed yet takes the slowest
+// measured rate or FIRST_RATE (60 a second), never a faster kind's
 int64_t Bot::budget(const std::string& kind, std::optional<double> left_ms) const {
+    constexpr double FIRST_RATE = 60.0;
     int64_t n = sims;
     std::optional<double> limit = max_seconds;
     if (left_ms) {
-        const double room = std::max(0.5, (*left_ms / 1000.0) * 0.4 - 0.2);
+        const double left = *left_ms / 1000.0;
+        double room = left >= 5.0 ? std::max(0.5, left * 0.8 - 0.3) : std::max(0.25, left * 0.25 - 0.1);
+        if (left >= 5.0 && !rates.count(kind)) room = std::min(room, std::max(0.5, left * 0.5 - 0.2));
         limit = limit ? std::min(*limit, room) : room;
     }
-    if (limit && !rates.empty()) {
+    if (limit) {
         auto it = rates.find(kind);
-        double rate = (it != rates.end() && it->second) ? it->second : std::min_element(rates.begin(), rates.end(), [](auto& a, auto& b) { return a.second < b.second; })->second;
+        double rate = FIRST_RATE;
+        if (it != rates.end() && it->second) rate = it->second;
+        else for (const auto& [k, r] : rates) rate = std::min(rate, r);
         n = std::min<int64_t>(n, std::max<int64_t>(8, int64_t(rate * *limit)));
     }
     return n;
@@ -147,6 +155,16 @@ std::string Bot::decide(const Value& msg) {
     const Value& dec = at(msg, "decision");
     last = Trace();
     const auto left = decision_ms(or_empty(msg, "clock"), clock_kind);
+    {   // AlphaWotrBot._deadline: a per-decision clock's answer deadline (MARGIN_MS 200)
+        const Value& clock = or_empty(msg, "clock");
+        const Value* l = clock.get("left_ms");
+        answer_deadline.reset();
+        if (l && !l->is_null() && clock_kind == "per_decision" && !clock.get("deadline") && !clock.get("opponent_ms")) {
+            const double ms = l->kind == Value::Real ? l->d : double(l->as_int());
+            answer_deadline = std::chrono::steady_clock::now() +
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(std::max(0.0, (ms - 200.0) / 1000.0)));
+        }
+    }
     std::optional<int64_t> o; std::string how;
     try { std::tie(o, how) = decide_(dec, or_empty(msg, "view"), left); }
     catch (const std::exception& e) { how = "error"; last.note = e.what(); o.reset(); }
@@ -265,12 +283,16 @@ std::string Bot::choose(Menu& mn, const std::set<std::string>& banned, const std
         const SearchArgs sa = next_search ? next_search(n) : SearchArgs{own_seed, uint32_t(last.searches), own_seed ^ 0x9e3779b97f4a7c15ULL, n};
         ++last.searches;
         const auto ts = std::chrono::steady_clock::now();
-        const auto pk = awdec::search(box, mn.sn, memo.side, sa.sims, sa.seat, sa.index, sa.seed, 0);
+        // the menu as this decision worked it out (LeagueSearcher.choose's `legal`, passed on: worked out once)
+        awdec::Projection given;
+        if (speed_fixes && mn.sel) given = {mn.sel, mn.meta};
+        auto pk = awdec::search(box, mn.sn, memo.side, sa.sims, sa.seat, sa.index, sa.seed, 0, given);
         if (!pk.error.empty()) throw std::runtime_error("search: " + pk.error);
         const auto mr = awgt::menu_rows(pk.menu);
         act = pk.index >= 0 && size_t(pk.index) < mr.size() ? mr[size_t(pk.index)] : "";
-        wotr_snapshot_destroy(pk.menu);
+        awdec::release(pk);
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
+        last.search_s += secs;
         if (sa.sims >= 8 && secs > 0.05) {   // the rate: the slowest of the last three searches of this kind
             auto& rc = recent[label];
             if (rc.size() > 2) rc.erase(rc.begin(), rc.end() - 2);
@@ -293,7 +315,17 @@ std::string Bot::choose(Menu& mn, const std::set<std::string>& banned, const std
         int64_t own_i = -1;
         for (size_t q = 0; q < mn.prow.size(); ++q) if (mn.prow[q] == hit) { own_i = int64_t(q); break; }
         if (own_i >= 0) {
-            const int64_t outright = awdec::certain_line(box, mn.sn, memo.side, pmenu, own_i);
+            // its time: this port's cap, and on a per-decision clock the answer's deadline less AFTER (40 ms)
+            double seconds = speed_fixes ? certain_seconds : 0.0;
+            if (speed_fixes && answer_deadline) {
+                const double room = std::chrono::duration<double>(*answer_deadline - std::chrono::steady_clock::now()).count() - 0.04;
+                seconds = std::max(1e-6, seconds > 0 ? std::min(seconds, room) : room);
+            }
+            int cut = 0;
+            const auto tc = std::chrono::steady_clock::now();
+            const int64_t outright = awdec::certain_line(box, mn.sn, memo.side, pmenu, own_i, seconds, &cut);
+            last.certain_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tc).count();
+            ++last.certain_n; last.certain_cut = std::max(last.certain_cut, cut);
             if (outright >= 0 && !banned.count(mn.prow[size_t(outright)])) pick = mn.prow[size_t(outright)];
         }
     }
@@ -335,7 +367,9 @@ std::pair<std::optional<int64_t>, std::string> Bot::search_and_map(pyobj::Obj* s
     using Matched = awad::Adapter::Matched;
     const std::string kind = at(dec, "kind").s;
     if (!flag.empty()) m.set_attr(st, flag, m.boolean(true));
+    const auto tm = std::chrono::steady_clock::now();
     auto mn = menu_of(m, st, ad.obs_tables, memo.side);
+    last.menu_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tm).count();
     if (mn->rows.empty()) return {std::nullopt, "default"};
     std::vector<Matched> mts;   // every row matched to an option (map_action), the rest banned
     for (size_t ri = 0; ri < mn->rowsn.size(); ++ri) {
@@ -403,7 +437,9 @@ std::optional<std::pair<std::optional<int64_t>, std::string>> Bot::chain(const V
     using Matched = awad::Adapter::Matched;
     const std::string kind = at(dec, "kind").s;
     std::unique_ptr<Menu> mn;
+    const auto tm = std::chrono::steady_clock::now();
     try { mn = menu_of(m, work, ad.obs_tables, memo.side); } catch (...) { return std::nullopt; }
+    last.menu_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - tm).count();
     if (mn->rows.empty() || !chain_fits(work, dec, *mn)) return std::nullopt;
     std::vector<Matched> mts;
     for (size_t ri = 0; ri < mn->rowsn.size(); ++ri) {

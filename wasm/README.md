@@ -118,6 +118,16 @@ Results with v0.2.0 (2026-11-17):
   simulations): 55.1% +- 9.1 for the module, 0 illegal answers and 0 timeouts in about 17,500 decisions;
 - speed: about 1.5 s a decision at 300 simulations in Chrome.
 
+`wasm/build/native/bot_parity FIXTURES/p4 FIXTURES` plays recorded protocol transcripts through the bot and compares
+every answer with the Python adapter's (`--timing FILE` writes one line a decision; `--before` runs it as before the
+speed fixes below; `--sims N` times the bot at its own simulations).
+
+**The certain line's time and the menu (2026-11-18).** As the Python adapter of branch `ours` does, a decision's menu
+is worked out once (the search takes the bot's projection, `awdec::Projection`), and the certain line is bounded by
+time: their `SECONDS` (15 s), on a per-decision clock the answer's deadline less 40 ms (`certain_line.DEADLINE`), and
+the module's own cap `certain_seconds` (1 s; `aw_create`'s config), so it cannot hold a decision up for seconds. A line
+the cap cuts gives no verdict, which can only keep the search's own pick.
+
 A known difference: Emscripten's libm can differ from another platform's in the last bit of `pow`, `log` or `exp`,
 which can flip a very close choice, as between the native platforms themselves.
 
@@ -125,7 +135,7 @@ which can flip a very close choice, as between the native platforms themselves.
 A new release of AlphaWOTR
 --------------------------
 
-1. Rebase this branch on the release.
+1. Rebase this branch (`ours`, the one branch every build of ours follows; CHANGES-OURS.md) on the release.
 2. `wasm/build.sh`: a patch that no longer applies fails here.
 3. Export the data again and run the parity checks above.
 4. Compare the Python on the decision path since the last release (`orchestrator.py`, `own_model.py`,

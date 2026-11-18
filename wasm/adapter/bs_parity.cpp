@@ -268,10 +268,10 @@ int main(int argc, char** argv) {
                                                 if (allowed_idx.empty()) for (size_t ri = 0; ri < rows.size(); ++ri) if (!banned.count(rows[ri])) allowed_idx.push_back(int64_t(ri));
                                                 if (allowed_idx.size() == 1) pick = rows[size_t(allowed_idx[0])];
                                                 else if (!allowed_idx.empty()) {
-                                                    const auto pk = awdec::search(box, sn, memo.side, ref.sims > 0 ? ref.sims : 8, ref.seat, ref.index, ref.seed, 0);
+                                                    auto pk = awdec::search(box, sn, memo.side, ref.sims > 0 ? ref.sims : 8, ref.seat, ref.index, ref.seed, 0, sel ? awdec::Projection{sel, meta} : awdec::Projection{});   // the menu worked out once
                                                     std::string act;
                                                     if (!pk.error.empty()) act = "ERROR " + pk.error;
-                                                    else { const auto mr = menu_rows(pk.menu); act = pk.index >= 0 && size_t(pk.index) < mr.size() ? mr[size_t(pk.index)] : "?"; wotr_snapshot_destroy(pk.menu); }
+                                                    else { const auto mr = menu_rows(pk.menu); act = pk.index >= 0 && size_t(pk.index) < mr.size() ? mr[size_t(pk.index)] : "?"; awdec::release(pk); }
                                                     got["search"] = act;
                                                     std::string hit;
                                                     for (auto ai : allowed_idx) if (rows[size_t(ai)] == act) { hit = act; break; }

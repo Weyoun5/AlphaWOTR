@@ -1,6 +1,11 @@
 // Phase 4: the bot on the module over whole transcripts, against the Python adapter's answers.
 //
-//   bot_parity FIXTURES_DIR TABLES_DIR [--verbose] [--max N]
+//   bot_parity FIXTURES_DIR TABLES_DIR [--verbose] [--max N] [--before] [--certain-seconds S] [--timing FILE] [--sims N]
+//
+// --before: the bot as before the 2026-11-18 speed fixes (Bot::speed_fixes false); --certain-seconds: the certain
+// line's cap (Bot::certain_seconds, default 1; 0 none); --timing: one line a decision (TSV: transcript, decision,
+// kind, how, ms, search ms, certain-line ms, certain lines, cut, answer, Python's answer, menu ms); --sims: every
+// search with N simulations instead of the Python's (a timing run: the answers then differ from the Python's).
 //
 // FIXTURES_DIR: adapter.json, prototypes.awg and transcripts.jsonl (record_build_state.py --log: every message the
 // Python bot handled, each decide with its answer, how, the searches it ran and whether a plan or a chain followed);
@@ -31,9 +36,14 @@ std::vector<uint8_t> slurp(const std::string& path) {
 int main(int argc, char** argv) {
     if (argc < 3) { std::fprintf(stderr, "usage: bot_parity FIXTURES_DIR TABLES_DIR [--verbose] [--max N]\n"); return 2; }
     const std::string dir = argv[1], tdir = argv[2];
-    bool verbose = false; long max_dec = -1;
+    bool verbose = false, before = false; long max_dec = -1, sims_override = -1; double certain_seconds = -1;
+    FILE* timing = nullptr;
     for (int i = 3; i < argc; ++i) {
         if (std::string(argv[i]) == "--verbose") verbose = true;
+        else if (std::string(argv[i]) == "--before") before = true;
+        else if (std::string(argv[i]) == "--sims" && i + 1 < argc) sims_override = std::atol(argv[++i]);
+        else if (std::string(argv[i]) == "--certain-seconds" && i + 1 < argc) certain_seconds = std::atof(argv[++i]);
+        else if (std::string(argv[i]) == "--timing" && i + 1 < argc) { timing = std::fopen(argv[++i], "w"); if (!timing) { std::perror("timing"); return 2; } }
         else if (std::string(argv[i]) == "--max" && i + 1 < argc) max_dec = std::atol(argv[++i]);
     }
     auto tj = slurp(dir + "/adapter.json");
@@ -70,6 +80,9 @@ int main(int argc, char** argv) {
             adapter = std::make_unique<awad::Adapter>(*model, tables, protos);
             adapter->obs_tables = box.obs;
             bot = std::make_unique<awbot::Bot>(*model, *adapter, tables, box);
+            bot->speed_fixes = !before;
+            if (certain_seconds >= 0) bot->certain_seconds = certain_seconds;
+            if (sims_override > 0) bot->sims = sims_override;   // the bot's own budget (the small kinds' 100, the clock rule)
             in_step = true;
         }
         const awjson::Value& m = *item.get("m");
@@ -110,13 +123,20 @@ int main(int argc, char** argv) {
             return wotr_random_create(words.data(), words.size(), uint32_t(r.arr[0].arr.back().as_int()), hg ? 1 : 0, bits);
         };
         bool args_off = false;
-        bot->next_search = [&](int64_t) { if (args.empty()) { args_off = true; return awbot::SearchArgs{0, 0, 1, 8}; } auto a = args.front(); args.pop_front(); return a; };
+        bot->next_search = [&](int64_t n) { if (args.empty()) { args_off = true; return awbot::SearchArgs{0, 0, 1, sims_override > 0 ? n : 8}; } auto a = args.front(); args.pop_front(); if (sims_override > 0) a.sims = n; return a; };
         const auto t0 = std::chrono::steady_clock::now();
         bot->handle(m);
-        secs += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const double dsecs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        secs += dsecs;
         const auto& tr_ = bot->last;
         const int64_t want = item.get("o") && !item.get("o")->is_null() ? item.get("o")->as_int() : -1;
         const std::string how = item.get("how") && item.get("how")->kind == awjson::Value::Str ? item.get("how")->s : "?";
+        if (timing) {
+            const auto* dk = m.get("decision");
+            std::fprintf(timing, "%s\t%zu\t%s\t%s\t%.3f\t%.3f\t%.3f\t%d\t%d\t%lld\t%lld\t%.3f\n", tr.c_str(), total,
+                         dk && dk->get("kind") ? dk->get("kind")->s.c_str() : "?", tr_.how.c_str(), dsecs * 1e3, tr_.search_s * 1e3,
+                         tr_.certain_s * 1e3, tr_.certain_n, tr_.certain_cut, tr_.o ? (long long)*tr_.o : -1LL, (long long)want, tr_.menu_s * 1e3);
+        }
         const bool py_plan = item.get("plan") && !item.get("plan")->is_null();
         const bool py_work = item.get("work") && item.get("work")->truthy();
         if (!tr_.unported.empty()) {
@@ -152,5 +172,6 @@ int main(int argc, char** argv) {
     for (const auto& [k, v] : cpp_how_diff) std::printf(" [%s] %zu", k.c_str(), v);
     std::printf("; engine actions on the copy off %zu (Python's drew from its Random %zu times)", applies_off_n, total_drew);
     std::printf("; search arguments off %zu; %.1f ms a decision\n", search_args_off, total ? secs / total * 1e3 : 0.0);
+    if (timing) std::fclose(timing);
     return same == stepped ? 0 : 1;
 }

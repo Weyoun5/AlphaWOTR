@@ -15,7 +15,8 @@ extern "C" void* awasm_combat_reply(const void* tables, const void* payload);
 extern "C" int awasm_strictly_better(const void* state, const void* tables, const void* menu, int32_t side, int64_t* out, size_t k);
 extern "C" int64_t awasm_snapshot_root_count(const void* handle);
 extern "C" int64_t awasm_certain_line(const void* state, const void* tables, const void* menu, int32_t side, int64_t own,
-                                      int (*priors)(void*, const void*, int32_t, const void*, float*, size_t), void* user);
+                                      int (*priors)(void*, const void*, int32_t, const void*, float*, size_t), void* user,
+                                      double seconds, int32_t* cut);
 
 extern "C" void* awasm_ai_units(const void* state, const void* tables, const void* menu, int32_t side, int64_t index, int32_t* changed);
 
@@ -91,19 +92,22 @@ void* int_list(const std::vector<int64_t>& xs) {
     return wotr_snapshot_create(v.data(), v.size(), e.data(), e.size(), nullptr, 0, 0);
 }
 
+// the projection's metadata: forced? ((forced_reason, reasons): a forced_reason not None)
+bool forced_of(const void* meta) {
+    if (!meta) return false;
+    const size_t nv = wotr_snapshot_node_count(meta);
+    std::vector<WotrValue> v(nv); std::vector<uint64_t> e(wotr_snapshot_edge_count(meta)); std::vector<uint8_t> b(wotr_snapshot_byte_count(meta));
+    wotr_snapshot_export(meta, v.data(), nv, e.data(), e.size(), b.data(), b.size());
+    const auto& root = v[wotr_snapshot_root(meta)];
+    return root.count >= 1 && v[e[root.offset]].tag != WOTR_NONE;
+}
+
 // project_ai_actions on a menu: (the selected rows, forced)
 std::pair<void*, bool> project(const void* state, const void* menu, int side) {
     void* meta = nullptr;
     void* sel = wotr_snapshot_project_policy(state, menu, side, &meta);
-    bool forced = false;
-    if (meta) {
-        const size_t nv = wotr_snapshot_node_count(meta);
-        std::vector<WotrValue> v(nv); std::vector<uint64_t> e(wotr_snapshot_edge_count(meta)); std::vector<uint8_t> b(wotr_snapshot_byte_count(meta));
-        wotr_snapshot_export(meta, v.data(), nv, e.data(), e.size(), b.data(), b.size());
-        const auto& root = v[wotr_snapshot_root(meta)];
-        forced = root.count >= 1 && v[e[root.offset]].tag != WOTR_NONE;   // (forced_reason, reasons)
-        wotr_snapshot_destroy(meta);
-    }
+    const bool forced = forced_of(meta);
+    if (meta) wotr_snapshot_destroy(meta);
     return {sel, forced};
 }
 
@@ -143,17 +147,21 @@ void* menu_rows(const void* menu, const std::vector<int64_t>& indices) {
 }
 
 Pick search(Box& box, const void* state, int side, int64_t sims, uint64_t seat_seed, uint32_t index, uint64_t search_seed,
-            int turn_owner) {
+            int turn_owner, Projection given) {
     Pick pk;
     const auto t0 = std::chrono::steady_clock::now();
     // orchestrator.native_search: the policy projection of the full menu; forced -> its first row, no search
-    void* full = wotr_snapshot_full_actions(state, box.obs, side);
-    if (!full) { pk.error = std::string("full menu: ") + wotr_snapshot_last_error(); return pk; }
-    auto [sel, forced] = project(state, full, side);
-    wotr_snapshot_destroy(full);
-    if (!sel) { pk.error = std::string("projection: ") + wotr_snapshot_last_error(); return pk; }
-    if (forced) { pk.menu = sel; pk.index = 0; pk.forced = true; return pk; }
-    wotr_snapshot_destroy(sel);
+    if (given.sel) {   // the caller's projection of this state's menu (the same rows: worked out once a decision)
+        if (forced_of(given.meta)) { pk.menu = const_cast<void*>(given.sel); pk.borrowed = true; pk.index = 0; pk.forced = true; return pk; }
+    } else {
+        void* full = wotr_snapshot_full_actions(state, box.obs, side);
+        if (!full) { pk.error = std::string("full menu: ") + wotr_snapshot_last_error(); return pk; }
+        auto [sel, forced] = project(state, full, side);
+        wotr_snapshot_destroy(full);
+        if (!sel) { pk.error = std::string("projection: ") + wotr_snapshot_last_error(); return pk; }
+        if (forced) { pk.menu = sel; pk.index = 0; pk.forced = true; return pk; }
+        wotr_snapshot_destroy(sel);
+    }
     WotrSearchConfig cfg = awsetup::search_config(side, sims, turn_owner);
     WotrOwnValueConfig own = awsetup::own_config(seat_seed, index);
     uint32_t limbs[2] = {uint32_t(search_seed), uint32_t(search_seed >> 32)};
@@ -189,6 +197,8 @@ Pick search(Box& box, const void* state, int side, int64_t sims, uint64_t seat_s
     pk.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return pk;
 }
+
+void release(Pick& pk) { if (pk.menu && !pk.borrowed) wotr_snapshot_destroy(pk.menu); pk.menu = nullptr; }
 
 int64_t raw(Box& box, const void* state, int side, const void* menu) {
     // project_ai_actions over the given menu: forced -> its first row
@@ -265,8 +275,11 @@ int priors(void* user, const void* state, int32_t side, const void* menu, float*
     return 0;
 }
 
-int64_t certain_line(Box& box, const void* state, int side, const void* menu, int64_t own) {
-    return awasm_certain_line(state, box.obs, menu, side, own, priors, &box);
+int64_t certain_line(Box& box, const void* state, int side, const void* menu, int64_t own, double seconds, int* cut) {
+    int32_t c = 0;
+    const int64_t r = awasm_certain_line(state, box.obs, menu, side, own, priors, &box, seconds, &c);
+    if (cut) *cut = c;
+    return r;
 }
 
 void* units(Box& box, const void* state, int side, const void* menu, int64_t index, int* changed) {

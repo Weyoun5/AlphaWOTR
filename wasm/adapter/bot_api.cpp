@@ -2,7 +2,8 @@
 //
 //   aw_create(config_json) -> handle (null: aw_last_error())
 //       {"dir": the folder holding adapter.json, prototypes.awg, tables.awg and the nets (net_fp.awn, ...),
-//        "sims": the simulations of a full decision (300), "max_seconds": a cap per decision (none)}
+//        "sims": the simulations of a full decision (300), "max_seconds": a cap per decision (none),
+//        "certain_seconds": the certain line's time cap (1; 0 none: their counts and 15 s only)}
 //   aw_message(handle, line) -> the reply line ('' none; valid until the next call)
 //   aw_destroy(handle)
 // A new_game starts a new object model for the game (the adapter's states of the last game are freed).
@@ -29,6 +30,7 @@ struct Instance {
     std::unique_ptr<awbot::Bot> bot;
     int64_t sims = 300;
     std::optional<double> max_seconds;
+    double certain_seconds = 1.0;
     std::string out;
     std::map<std::string, double> rates;
     void fresh() {   // a new object model and bot (the measured rates and the options carried over)
@@ -39,7 +41,7 @@ struct Instance {
         adapter = std::make_unique<awad::Adapter>(*model, tables, p);
         adapter->obs_tables = box.obs;
         bot = std::make_unique<awbot::Bot>(*model, *adapter, tables, box);
-        bot->sims = sims; bot->max_seconds = max_seconds; bot->rates = rates;
+        bot->sims = sims; bot->max_seconds = max_seconds; bot->rates = rates; bot->certain_seconds = certain_seconds;
     }
 };
 }  // namespace
@@ -62,6 +64,8 @@ void* aw_create(const char* config_json) {
         if (cfg.get("sims")) in->sims = cfg.get("sims")->as_int();
         if (cfg.get("max_seconds") && !cfg.get("max_seconds")->is_null())
             in->max_seconds = cfg.get("max_seconds")->kind == awjson::Value::Real ? cfg.get("max_seconds")->d : double(cfg.get("max_seconds")->as_int());
+        if (const auto* cs = cfg.get("certain_seconds"); cs && !cs->is_null())
+            in->certain_seconds = cs->kind == awjson::Value::Real ? cs->d : double(cs->as_int());
         in->fresh();
         return in.release();
     } catch (const std::exception& e) { last_error = e.what(); return nullptr; }

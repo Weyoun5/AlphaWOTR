@@ -7,7 +7,11 @@
 //   _pick (_greedy_prior_action)     the projection's first row when forced, else the highest prior (first of ties)
 //   ai._outcome / _at_least_as_good  awsb::outcome / awsb::at_least_as_good (strictly_better.inc)
 // The priors come from the module's network through a callback (the box carries no network).
-// Bounds: APPLIES 2000 and MENUS 400 as in the Python; its 15-second wall-clock cut is not reproduced.
+// Bounds: APPLIES 2000 and MENUS 400 as in the Python, its SECONDS (15 s from the search's start), and its DEADLINE
+// (fork branch tournament-deadline: past it the reference line gives no verdict and the search stops, cut): the caller
+// passes the time the certain line may take (`seconds`, <= 0 none), which the bot derives from the decision's clock
+// and its own cap (adapter/bot.cpp, Bot::certain_seconds).
+#include <chrono>
 extern "C" {
 // priors of the rows of `menu` (no projection) for `side`: out[n]; 0 on success
 typedef int (*aw_priors_fn)(void* user, const void* state, int32_t side, const void* menu, float* out, size_t n);
@@ -19,7 +23,13 @@ constexpr int OWN_ACTIONS = 2, STEPS = 40;
 constexpr uint64_t APPLIES = 2000, MENUS = 400;
 using Snap = std::shared_ptr<const Snapshot>;
 
-struct Ctx { const Snapshot& t; aw_priors_fn priors; void* user; };
+using Clock = std::chrono::steady_clock;
+constexpr double SECONDS = 15.0;
+
+// until: DEADLINE as a steady-clock point (Clock::time_point::max() none); cut: what stopped the line (0 nothing, 1 a
+// count, 2 the time: SECONDS or the deadline)
+struct Ctx { const Snapshot& t; aw_priors_fn priors; void* user; Clock::time_point until = Clock::time_point::max(); mutable int cut = 0; };
+bool late(const Ctx& c) { return c.until != Clock::time_point::max() && Clock::now() > c.until; }
 
 struct Menu { Snap snap; size_t n = 0; };
 size_t rows_of(const Snapshot& m) { return child_edges(m, m.root).size(); }
@@ -120,6 +130,7 @@ Reference reference(const Ctx& c, const Snapshot& state, int side, const Menu& m
     int owner = side, begun = 1;
     bool finished = false;
     for (int step = 0; step < STEPS; ++step) {
+        if (late(c)) { c.cut = 2; return r; }   // (TOURNAMENT-DEADLINE: out of time, no verdict)
         const auto [d, fresh] = decider(*cur, owner);
         if (d < 0) { finished = true; break; }
         if (fresh) {
@@ -152,9 +163,17 @@ struct Search {
     const Ctx& c; int side; const Reference& ref;
     const awsb::Board& end_own; bool strict;
     uint64_t applies = 0, menus = 0; bool cut = false;
+    Clock::time_point began = Clock::now();
     Search(const Ctx& c_, int side_, const Reference& ref_) : c(c_), side(side_), ref(ref_), end_own(ref_.key.q.own),
         strict(!ref_.roll && !ref_.decision) {}
-    bool out() { if (applies >= APPLIES || menus >= MENUS) cut = true; return cut; }
+    bool out() {
+        if (!cut) {
+            if (applies >= APPLIES || menus >= MENUS) c.cut = 1;
+            else if (std::chrono::duration<double>(Clock::now() - began).count() > SECONDS || late(c)) c.cut = 2;
+            cut = c.cut != 0;
+        }
+        return cut;
+    }
     awsb::Board own(const Snapshot& s) { std::string rest; awsb::Quantities q; if (!awsb::outcome(s, side, rest, q)) throw std::runtime_error("unkeyed"); return q.own; }
     bool reached(const Snapshot& s, int owner) {
         const End got = end(s, side, owner);
@@ -361,10 +380,15 @@ int64_t certain(const Ctx& c, const Snapshot& state, int side, const Menu& menu,
 extern "C" {
 // THE CERTAIN LINE at strength 1: -> the row of `menu` (the adapter's projected menu) to play outright instead of
 // `own`, -1 for none, -2 on error (wotr_snapshot_last_error)
+// seconds: the time it may take (<= 0: no limit but the counts and SECONDS); cut (may be null): 0, or what stopped it
+// (1 a count, 2 the time)
 WOTR_API int64_t awasm_certain_line(const void* state, const void* tables, const void* menu, int32_t side, int64_t own,
-                                    aw_priors_fn priors, void* user) {
+                                    aw_priors_fn priors, void* user, double seconds, int32_t* cut) {
+    if (cut) *cut = 0;
     return checked<int64_t>([&]() -> int64_t {
         awcl::Ctx c{snapshot(tables), priors, user};
+        if (seconds > 0) c.until = awcl::Clock::now() + std::chrono::duration_cast<awcl::Clock::duration>(std::chrono::duration<double>(seconds));
+        struct Report { awcl::Ctx& c; int32_t* cut; ~Report() { if (cut) *cut = c.cut; } } report{c, cut};
         awcl::Menu m;
         m.snap = awcl::Snap(std::make_shared<Snapshot>(snapshot(menu)));
         m.n = awcl::rows_of(*m.snap);

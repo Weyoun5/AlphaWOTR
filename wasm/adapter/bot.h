@@ -2,6 +2,7 @@
 // _search_and_map, _apply_copy, _chain, chain_fits, chain_over, diff_answer) and LeagueSearcher.choose at strength 1,
 // over the adapter's port (adapter.h), the plans (plans.h) and the decision on the box (driver/decision.h).
 #pragma once
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -43,9 +44,21 @@ public:
     std::function<void*()> next_apply_rng;
     // LeagueSearcher.budget(kind, left_ms)
     int64_t budget(const std::string& kind, std::optional<double> left_ms) const;
+    // The certain line's time (seconds; <= 0 none): this port's own cap in the browser. Their Python bounds it by
+    // counts and 15 s (certain_line.SECONDS), and on a per-decision clock by the answer's deadline less 40 ms
+    // (certain_line.DEADLINE, the tournament adapter); the port keeps both and adds this cap, so a line the engine
+    // searches long cannot hold a decision up for seconds (profiling the tournament bot, 2026-11-18: up to 0.8 s).
+    double certain_seconds = 1.0;
+    // false: as before the 2026-11-18 speed fixes (the search works the menu out again; the certain line bounded by
+    // its counts and 15 s only): the measurements' "before"
+    bool speed_fixes = true;
 
-    // the last decision, for the harness: the answer, how, and what was not ported ('' all of it)
-    struct Trace { std::optional<int64_t> o; std::string how, unported, engine, note; int searches = 0, applies = 0; } last;
+    // the last decision, for the harness: the answer, how, and what was not ported ('' all of it); the time of its
+    // searches, of its certain lines (and whether a bound cut one: 1 a count, 2 the time)
+    struct Trace {
+        std::optional<int64_t> o; std::string how, unported, engine, note; int searches = 0, applies = 0;
+        double search_s = 0, certain_s = 0, menu_s = 0; int certain_n = 0, certain_cut = 0;   // menu_s: the decision's menu worked out
+    } last;
     bool has_plan() const { return bool(plan); }
     bool has_work() const { return work != nullptr; }
     void drop_plan() { plan.reset(); }
@@ -61,6 +74,9 @@ private:
     awad::Memo memo;
     bool in_game = false;
     std::string clock_kind;
+    // the answer's deadline on a per-decision clock (AlphaWotrBot._deadline: the decide's arrival + the clock less
+    // MARGIN_MS); none on other clocks
+    std::optional<std::chrono::steady_clock::time_point> answer_deadline;
     awad::PlanPtr plan;
     pyobj::Obj* work = nullptr;        // the engine's state of an ongoing chain
     pyobj::Obj* work_base = nullptr;   // ... and the state it started from
