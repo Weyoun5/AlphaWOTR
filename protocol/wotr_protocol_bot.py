@@ -911,12 +911,35 @@ class LeagueSearcher(Searcher):
     out of the menu the certain line and the turn search see; a search
     pick among them falls back to the net's own choice among the rest."""
 
+    FIRST_RATE = 60.0       # simulations a second until one is measured
+
+    # The deadline (a per-decision clock, the bot tournament; 2026-11-18):
+    # the native search stops at a deadline (their search's stop, fork
+    # branch tournament-deadline) instead of being sized from rates alone.
+    # Kept back after the search: what follows it, measured per kind (the
+    # last simulation after the stop, the search's own tail - THE SAME BUT
+    # BETTER over the root menu -, the unit rule, the matching) as 1.5 x the
+    # most of its last KEEP (it varies about threefold within a kind: an
+    # Action 5-70 ms on an M4 core), and an allowance for
+    # the certain line (its recent mean, at most a sixth of the time left),
+    # which itself stops at the answer's deadline less AFTER.
+    AFTER = 0.04            # after the certain line: the unit rule, the answer
+    FIRST_TAIL = 0.12       # the tail of a kind not seen yet (no kind seen)
+    FIRST_CERTAIN = 0.05    # the certain line's allowance, a kind not seen yet
+    SHAPE = 1.3             # the simulation budget: the rate's estimate x this
+    KEEP = 8                # recent figures kept per kind
+
     def __init__(self, sims, max_seconds, threads=1, strength=1,
                  nets='mc200_fpwin_shwin', bridge=None, workers='auto'):
         self.sims = int(sims)
         self.max_seconds = max_seconds
         self.rates = {}
         self.recent = {}
+        self.deadline = None    # the answer's deadline (time.monotonic())
+        self.loop_rates = {}    # kind -> recent simulations a second
+        self.tails = {}         # kind -> recent seconds after the search
+        self.certains = {}      # kind -> recent seconds of the certain line
+        self.pending = None     # this decision's figures until it is answered
         self.position = int(strength)
         self.net_tag = nets
         bridge = os.path.abspath(bridge or os.path.join(
@@ -939,8 +962,10 @@ class LeagueSearcher(Searcher):
                 side, own_model.load_own_net(nets, side),
                 seed=random.getrandbits(64))
         self.seats = own_model.SeatSearches(self.searches)
-        log('league nets %s loaded in %.1f s (search: %s)' % (
-            nets, time.time() - t0, self.seats.backend))
+        self.can_stop = self._can_stop()
+        log('league nets %s loaded in %.1f s (search: %s; %s)' % (
+            nets, time.time() - t0, self.seats.backend,
+            'stops at a deadline' if self.can_stop else 'no deadline stop'))
         self.ts = False
         if self.position >= 2:
             cfg = turn_search.config()
@@ -954,17 +979,113 @@ class LeagueSearcher(Searcher):
         n = self.sims
         limit = self.max_seconds
         if left_ms is not None:
-            room = max(0.5, (left_ms / 1000.0) * 0.4 - 0.2)
+            # From 5 s a decision 80% of the clock less 0.3 s (the bot
+            # tournament, 2026-11-18: as our bots, which keep back a tenth);
+            # under 5 s a quarter: a search's time per simulation varies over
+            # three times within a kind (an Army move from Gorgoroth 2.2 s
+            # against a 0.6 s aim at 2 s a decision)
+            left = left_ms / 1000.0
+            room = max(0.5, left * 0.8 - 0.3) if left >= 5.0 else \
+                max(0.25, left * 0.25 - 0.1)
+            if left >= 5.0 and kind not in self.rates:
+                # The first search of a kind in a game (each tournament game
+                # is a fresh container): at most half the clock, its rate
+                # unknown (Test 3, 2026-11-18: a hand-limit discard's first
+                # search took over 5.1 s against a 3.7 s aim)
+                room = min(room, max(0.5, left * 0.5 - 0.2))
             limit = room if limit is None else min(limit, room)
-        if limit is not None and self.rates:
-            rate = self.rates.get(kind) or min(self.rates.values())
+        if limit is not None:
+            # a kind not timed yet gets a cautious rate (and never a faster
+            # kind's): a first Action search at 300 simulations took 2.5 s on
+            # one M4 core (a tournament bot in a 1-CPU container), and one at
+            # the Hunt allocation's much faster rate 2.4 s: both timed out at
+            # 2 s a decision
+            rate = self.rates.get(kind) or min(
+                list(self.rates.values()) + [self.FIRST_RATE])
             n = min(n, max(8, int(rate * limit)))
         return n
 
-    def choose(self, st, side, kind, banned, flag=None, left_ms=None):
+    def _can_stop(self):
+        """Their checkout's search stops at a deadline (fork branch
+        tournament-deadline: OwnModelSearch.choose's `deadline`, the native
+        library's request_stop)?  Else a per-decision clock is met by
+        budget() alone, as before."""
+        import inspect
+        try:
+            search = self.searches[FP]
+            if 'deadline' not in inspect.signature(search.choose).parameters \
+                    or search.native is None:
+                return False
+            import controller_binding
+            return bool(controller_binding.has_capability(
+                search.native.resources(ai).lib, 'stop'))
+        except Exception as e:
+            log('deadline stop: not available (%s: %s)' % (
+                type(e).__name__, e))
+            return False
+
+    @staticmethod
+    def _keep(table, kind, value, keep):
+        table[kind] = (table.get(kind) or [])[-(keep - 1):] + [value]
+
+    def reserve(self, kind, room):
+        """Seconds kept back after the search for what follows it (see
+        AFTER): 1.5 x the tail's most of the last KEEP (a kind not seen: the
+        most of any kind, else FIRST_TAIL), plus the certain line's
+        allowance (its recent mean, at most a sixth of `room`), plus AFTER."""
+        tails = self.tails.get(kind) or \
+            [max(v) for v in self.tails.values() if v] or [self.FIRST_TAIL]
+        certain = self.certains.get(kind)
+        certain = sum(certain) / len(certain) if certain else \
+            self.FIRST_CERTAIN
+        return max(tails) * 1.5 + min(certain, room / 6.0) + self.AFTER
+
+    def deadline_plan(self, kind, now=None):
+        """(simulations, the search's deadline) for a decision with an
+        answer deadline (self.deadline): the search stops at the answer's
+        deadline less the reserve (at least 30% of the time left, so a
+        kind's slow tail never starves its search); the simulation count
+        only shapes the search (their free-action floor is a quarter of
+        it), from the kind's measured rate x SHAPE, capped by --sims."""
+        now = time.monotonic() if now is None else now
+        room = self.deadline - now
+        if self.max_seconds is not None:
+            room = min(room, self.max_seconds)
+        until = now + max(room - self.reserve(kind, room), 0.3 * room, 0.0)
+        rates = self.loop_rates.get(kind)
+        rate = sum(rates) / len(rates) if rates else min(
+            [min(v) for v in self.loop_rates.values() if v] +
+            [self.FIRST_RATE])
+        n = min(self.sims, max(8, int(rate * (until - now) * self.SHAPE)))
+        return n, until
+
+    def settle(self, done=None):
+        """After the answer is made: what followed the search, measured
+        for the next decisions of its kind (deadline_plan)."""
+        p, self.pending = self.pending, None
+        if p is None:
+            return
+        done = time.monotonic() if done is None else done
+        timing = p.get('timing') or {}
+        if timing.get('loop') and timing.get('simulations_run'):
+            self._keep(self.loop_rates, p['kind'],
+                       timing['simulations_run'] / max(timing['loop'], 1e-3),
+                       3)
+        if p.get('returned') is not None:
+            tail = (timing.get('stop_to_end') or 0.0) + \
+                (timing.get('tail') or 0.0) + \
+                (done - p['returned']) - (p.get('certain') or 0.0)
+            self._keep(self.tails, p['kind'], max(0.0, tail), self.KEEP)
+        if p.get('certain') is not None:
+            self._keep(self.certains, p['kind'], p['certain'], self.KEEP)
+
+    def choose(self, st, side, kind, banned, flag=None, left_ms=None,
+               legal=None):
         from ai_policies import project_ai_actions, action_policy_key
         with _Phase(st, flag):
-            legal = list(ai.get_legal_actions(st, side))
+            # (the caller's menu of this state and phase when it has it)
+            legal = list(legal) if legal is not None else \
+                list(ai.get_legal_actions(st, side))
             menu = list(project_ai_actions(st, side, legal).actions) or legal
             allowed = [a for a in menu if act_key(a) not in banned]
             if not allowed:
@@ -973,7 +1094,11 @@ class LeagueSearcher(Searcher):
                 return None, {'note': 'no allowed action'}
             if len(allowed) == 1:
                 return allowed[0], {'sims': 0, 'secs': 0.0}
-            budget = self.budget(kind, left_ms)
+            until = None
+            if self.deadline is not None and self.can_stop:
+                budget, until = self.deadline_plan(kind)
+            else:
+                budget = self.budget(kind, left_ms)
             sims, setting = self.strength.plan(self.position, allowed, budget)
             if not self.ts:
                 setting = None
@@ -983,17 +1108,29 @@ class LeagueSearcher(Searcher):
             t0 = time.time()
             how = 'search'
             value = None
+            timing = None
             if sims:
-                act, info = search.choose(st, side, num_simulations=sims)
+                if until is not None:
+                    act, info = search.choose(st, side, num_simulations=sims,
+                                              deadline=until)
+                else:
+                    act, info = search.choose(st, side, num_simulations=sims)
                 try:
                     if info is not None:
                         value = float(info['q_values'][int(info['played'])])
                 except Exception:
                     value = None
+                try:
+                    timing = dict(info['search_timing'])
+                except Exception:
+                    timing = None
             else:
                 act = search.raw(st, side, allowed)
             secs = time.time() - t0
-            if sims >= 8 and secs > 0.05:
+            if until is not None:
+                self.pending = {'kind': kind, 'timing': timing,
+                                'returned': time.monotonic()}
+            if until is None and sims >= 8 and secs > 0.05:
                 r = sims / secs
                 recent = (self.recent.get(kind) or [])[-2:] + [r]
                 self.recent[kind] = recent
@@ -1018,6 +1155,16 @@ class LeagueSearcher(Searcher):
             # referee counterpart keeps the search's pick)
             seats = self.turn_search.Seats(self._menu, self.seats)
             outright = None
+            line = None
+            if self.deadline is not None:
+                # the certain line stops at the answer's deadline less what
+                # follows it (their certain_line.DEADLINE, fork branch
+                # tournament-deadline; an older checkout ignores it)
+                line = getattr(self.turn_search, 'certain_line', None)
+                if line is not None and hasattr(line, 'DEADLINE'):
+                    line.DEADLINE = self.deadline - self.AFTER
+                else:
+                    line = None
             try:
                 outright, favoured = self.turn_search.certain(
                     ai, seats, st, side, None, menu, hit)
@@ -1028,6 +1175,9 @@ class LeagueSearcher(Searcher):
                 log('  certain line / turn search failed: %s: %s' % (
                     type(e).__name__, e))
                 pick = hit
+            finally:
+                if line is not None:
+                    line.DEADLINE = None
             if act_key(pick) in banned:
                 log('  certain line / turn search chose %s, which has no '
                     'referee counterpart: keeps %s' % (
@@ -1037,15 +1187,23 @@ class LeagueSearcher(Searcher):
                 how += ' + %s' % ('certain line' if outright is not None
                                   else 'turn search')
             ts_secs = time.time() - t1
+            if self.pending is not None:
+                self.pending['certain'] = ts_secs
             try:
                 units = self.ai_units.pick(ai, st, side, pick)
                 if units is not pick and act_key(units) not in banned:
                     pick = units
             except Exception as e:
                 log('  unit rule failed: %s: %s' % (type(e).__name__, e))
-        return pick, {'sims': sims, 'secs': round(secs, 2),
-                      'ts': setting, 'ts_secs': round(ts_secs, 2),
-                      'value': value, 'how': how}
+        out = {'sims': sims, 'secs': round(secs, 2),
+               'ts': setting, 'ts_secs': round(ts_secs, 2),
+               'value': value, 'how': how}
+        if timing is not None:
+            # the simulations the search ran (a deadline may stop it before
+            # its budget `sims`), and whether the deadline stopped it
+            out['run'] = timing.get('simulations_run')
+            out['stopped'] = timing.get('stopped')
+        return pick, out
 
     @staticmethod
     def _menu(st, side):
@@ -1565,11 +1723,19 @@ class AlphaWotrBot(object):
 
     # -- one decision --------------------------------------------------
 
+    MARGIN_MS = 200     # a per-decision clock: answered this long before it
+
     def decide(self, m):
         dec = m['decision']
         t0 = time.time()
         self.t0 = t0
+        # the line's arrival (the transport sets it before parsing): the
+        # referee's clock runs from its sending
+        arrived, self.arrived = getattr(self, 'arrived', None), None
+        if arrived is None:
+            arrived = time.monotonic()
         left = self._decision_ms(m.get('clock') or {})
+        self.searcher.deadline = self._deadline(m.get('clock') or {}, arrived)
         how = 'search'
         info = {}
         o = None
@@ -1588,6 +1754,9 @@ class AlphaWotrBot(object):
             how = 'default' if how != 'error' else 'error-default'
             info['rule'] = rule
             self.plan = None
+        if hasattr(self.searcher, 'settle'):
+            self.searcher.settle()
+        self.searcher.deadline = None
         secs = time.time() - t0
         if self.stats is not None:
             self.stats.count(dec['kind'], how, secs, info)
@@ -1608,7 +1777,7 @@ class AlphaWotrBot(object):
         out = {'type': 'choice', 'id': m['id'], 'o': o,
                'fingerprint': dec.get('fingerprint'),
                'info': {'how': how}}
-        for k in ('sims', 'value'):
+        for k in ('sims', 'run', 'value'):
             if info.get(k) is not None:
                 out['info'][k] = info[k]
         if info.get('engine'):
@@ -1687,6 +1856,17 @@ class AlphaWotrBot(object):
             return min(left / 16.0 + inc / 2.0, left / 4.0)
         return left
 
+    def _deadline(self, clock, arrived):
+        """A per-decision clock (the bot tournament): the answer's deadline,
+        time.monotonic() at the line's arrival + the clock less MARGIN_MS
+        (the owner's 200 ms, as our tournament bots); the search stops in
+        time for it.  Other clocks: None (the search sized by budget())."""
+        left = clock.get('left_ms')
+        if left is None or self.clock_kind != 'per_decision' or \
+                'deadline' in clock or 'opponent_ms' in clock:
+            return None
+        return arrived + max(0.0, (left - self.MARGIN_MS) / 1000.0)
+
     def _left(self, left):
         """The clock left for this decision once the matching is done."""
         if left is None:
@@ -1736,7 +1916,10 @@ class AlphaWotrBot(object):
             a, mt = mapped[0]
         else:
             action, sinfo = self.searcher.choose(st, me, label, banned, flag,
-                                                 self._left(left))
+                                                 self._left(left), legal=acts) \
+                if isinstance(self.searcher, LeagueSearcher) else \
+                self.searcher.choose(st, me, label, banned, flag,
+                                     self._left(left))
             info.update(sinfo)
             a, mt = None, None
             if action is not None:
@@ -3200,6 +3383,7 @@ class Stats(object):
 
 def run_stdio(bot, out):
     for line in sys.stdin:
+        bot.arrived = time.monotonic()
         line = line.strip()
         if not line:
             continue
@@ -3314,12 +3498,14 @@ def run_websocket(bot, url, token, idle=None):
     try:
         while True:
             text = ws.receive()
+            arrived = time.monotonic()
             if text is None:
                 log('the referee closed the connection')
                 return False
             for line in text.splitlines():
                 if not line.strip():
                     continue
+                bot.arrived = arrived
                 m = json.loads(line)
                 answer = bot.handle(m)
                 if answer is not None:
@@ -3378,6 +3564,10 @@ def main(argv=None):
     ap.add_argument('--max-seconds', type=float, default=None,
                     help='cap on the seconds per decision (the referee '
                     'clock is respected as well)')
+    ap.add_argument('--margin-ms', type=int, default=None,
+                    help='a per-decision clock: answer this long before '
+                    'it runs out (default %d; the search stops in time for '
+                    'it)' % AlphaWotrBot.MARGIN_MS)
     ap.add_argument('--threads', type=int, default=1,
                     help='torch threads (default 1)')
     ap.add_argument('--engine', choices=('league', 'corpus'), default='league',
@@ -3433,6 +3623,8 @@ def main(argv=None):
     dlog = open(args.log, 'a', encoding='utf-8') if args.log else None
     bot = AlphaWotrBot(searcher, names, verbose=args.verbose, decision_log=dlog,
                        seek=seek)
+    if args.margin_ms is not None:
+        bot.MARGIN_MS = max(0, args.margin_ms)
     try:
         if args.connect and args.reconnect:
             run_online(bot, args.connect, token)
