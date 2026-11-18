@@ -1,4 +1,4 @@
-// The AlphaWOTR worker (docs/AlphaWOTR-Wasm-Plan.md section 2): a protocol bot in a module worker. The page posts
+// The AlphaWOTR worker: a protocol bot in a module worker. The page posts
 // {init: {base, sims}} once, then {line} for each referee message; the worker posts {ready} (or {error}) and {line}
 // for each reply. The data files are fetched from `base` (cached by the browser).
 import createModule from './alphawotr.mjs';

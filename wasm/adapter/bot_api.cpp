@@ -1,4 +1,4 @@
-// The module's API for the worker (docs/AlphaWOTR-Wasm-Plan.md section 2): one bot per handle, synchronous.
+// The module's API for the worker: one bot per handle, synchronous.
 //
 //   aw_create(config_json) -> handle (null: aw_last_error())
 //       {"dir": the folder holding adapter.json, prototypes.awg, tables.awg and the nets (net_fp.awn, ...),
