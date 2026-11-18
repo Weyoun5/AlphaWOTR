@@ -147,9 +147,9 @@
     "experiments/combat_search_adapter/native_facts.py": "5183b1f9ae5ea4a9204f57c1a6634e3df2fbeed6791ac440590545c0510dc1fd",
     "experiments/forced_hunt/chance_tables.py": "d1cd2a18aa6c371df326432c7d5191e5fee13ceb80d2ad5746d40e86ee6eee30",
     "experiments/forced_hunt/native_forcing.py": "5948fcee65142796d8c29930c3834fa19fbe8314b5c150180e29dac5b6218941",
-    "experiments/native_search_core/inference/controller_binding.py": "0b3ec35b6903e71cfccd412a8698c274dcf219e661182df5e16267cd4a141373",
+    "experiments/native_search_core/inference/controller_binding.py": "d4693600e73d2714e76618f542cf59e6c7675da2af16efc5f2523b4868a28f58",
     "experiments/native_search_core/inference/numeric_bridge.py": "5774176288a44e623459e4f69c5c36a57c6386747444d87a21e9316cf62bb3dc",
-    "experiments/native_search_core/own_value_controller_sep13/orchestration/orchestrator.py": "69e4296856fbf5b79cadab3bd4beb6106ab79b681e47d0ad274fcec6ced99084",
+    "experiments/native_search_core/own_value_controller_sep13/orchestration/orchestrator.py": "69a56627b9cb76235bbf234390b86deccd489bb0aad6e9b46bb1cd1e2f35fa98",
     "experiments/native_search_core/own_value_controller_sep13/own_binding.py": "ad8136d1d77676ef5882bb4ffb964eccf4718802d118fd322a1a372f4a2df14c",
     "experiments/native_search_core/own_value_numeric_sep13/root_numeric.py": "acd011c3bc797082e2364f01765154077471727a0beecdd11b887ff9d64a3fb1",
     "experiments/search_adapter_contract/menu_view.py": "fd02dcb95182edfc1daf4897a0010118a03069eb2070de98fe9ebb5f5d317342",
@@ -523,6 +523,21 @@
       "name": "experiments/native_search_core/own_value_controller_sep13/orchestration/orchestrator.py",
       "before": "c34d7fb13fc0d854d7d2d838ac7f190f712369a29b382ede519ea40c3648fc34",
       "after": "69e4296856fbf5b79cadab3bd4beb6106ab79b681e47d0ad274fcec6ced99084"
+    }
+  ],
+  "base_reference_tournament_deadline": "e2668805d87abc447278b921d99c5791531b0b5348bb4f54a9d07430223c8174",
+  "tournament_deadline": [
+    {
+      "table": "native_boundary_sha256",
+      "name": "experiments/native_search_core/inference/controller_binding.py",
+      "before": "0b3ec35b6903e71cfccd412a8698c274dcf219e661182df5e16267cd4a141373",
+      "after": "d4693600e73d2714e76618f542cf59e6c7675da2af16efc5f2523b4868a28f58"
+    },
+    {
+      "table": "native_boundary_sha256",
+      "name": "experiments/native_search_core/own_value_controller_sep13/orchestration/orchestrator.py",
+      "before": "69e4296856fbf5b79cadab3bd4beb6106ab79b681e47d0ad274fcec6ced99084",
+      "after": "69a56627b9cb76235bbf234390b86deccd489bb0aad6e9b46bb1cd1e2f35fa98"
     }
   ]
 }
