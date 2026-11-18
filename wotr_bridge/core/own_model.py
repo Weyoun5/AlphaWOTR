@@ -93,7 +93,9 @@ class OwnModelSearch:
         # (a real decision, not the search's in-tree twin: an option that is the same but worse is never played)
         return ai._greedy_prior_action(state, side, self.net, list(menu), decision=True)
 
-    def choose(self, state, side, *, num_simulations=300):
+    def choose(self, state, side, *, num_simulations=300, deadline=None):
+        """deadline (TOURNAMENT-DEADLINE, native backend): a time.monotonic() value at which the search stops and
+        answers from the tree it has (at least one simulation); None = all num_simulations, as before."""
         import ai,own_search,rng_streams
         if side is not self.side:
             raise ValueError('Own-model live search belongs to its configured seat')
@@ -135,8 +137,9 @@ class OwnModelSearch:
                                 num_simulations=num_simulations,temperature=0.0,add_noise=False,**cpuct_kw)
                 else:
                     context.native_seed=seed
+                    deadline_kw={} if deadline is None else {'deadline':deadline}
                     result=self.native.native_mcts_search(ai,state,side,fp,sh,
-                                num_simulations=num_simulations,temperature=0.0,add_noise=False,**cpuct_kw)
+                                num_simulations=num_simulations,temperature=0.0,add_noise=False,**cpuct_kw,**deadline_kw)
                     if result is None:
                         result=(None,None)
                 record['passed']=True
@@ -225,11 +228,13 @@ class SeatSearches:
             raise ValueError('AI vs AI search has no seat %r' % (side,))
         return search.raw(state, side, menu)
 
-    def choose(self, state, side, *, num_simulations=300):
+    def choose(self, state, side, *, num_simulations=300, deadline=None):
         search = self.searches.get(side)
         if search is None:
             raise ValueError('AI vs AI search has no seat %r' % (side,))
-        return search.choose(state, side, num_simulations=num_simulations)
+        if deadline is None:
+            return search.choose(state, side, num_simulations=num_simulations)
+        return search.choose(state, side, num_simulations=num_simulations, deadline=deadline)
 
     def _counters(self, name):
         return {side.name: getattr(search, name)

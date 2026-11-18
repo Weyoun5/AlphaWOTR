@@ -41,6 +41,8 @@ STEPS = 40               # decisions of one line, at most
 APPLIES = 2000           # options applied per decision in the search, at most
 MENUS = 400              # menus built per decision in the search, at most
 SECONDS = 15.0
+DEADLINE = None          # TOURNAMENT-DEADLINE: a time.monotonic() value set by a caller on a clock (the protocol adapter's
+                         # per-decision clock); past it the reference line gives no verdict and the search stops (cut)
 REGION_KEYS = ('from', 'to', 'region')
 LAST = {}                # the last decision's figures (the log line, reports)
 
@@ -93,7 +95,8 @@ class _Search(object):
         self.began, self.cut = time.perf_counter(), False
 
     def out(self):
-        if self.applies >= APPLIES or self.menus >= MENUS or time.perf_counter() - self.began > SECONDS:
+        if self.applies >= APPLIES or self.menus >= MENUS or time.perf_counter() - self.began > SECONDS or \
+                (DEADLINE is not None and time.monotonic() > DEADLINE):
             self.cut = True
         return self.cut
 
@@ -221,6 +224,8 @@ def _reference(ai, seats, state, side, own):
     cur, rolled = ai._apply_action_detect_rng(state, own)
     kind, owner, begun, replies = ('roll' if rolled else None), side, 1, []
     for _ in range(STEPS):
+        if DEADLINE is not None and time.monotonic() > DEADLINE:
+            return None                          # (TOURNAMENT-DEADLINE: out of time, no verdict)
         d, fresh = _decider(ai, cur, owner)
         if d is None:
             break
