@@ -48,8 +48,8 @@
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/action_clone.inc"
   },
   "native_w2x/box/cpp/action_dispatch.inc": {
-   "sha256": "c6112f3172617e8b5421cb944aeceb6cc650a6f04d9f3b2adc8bc76eca2fd9c1",
-   "bytes": 37765,
+   "sha256": "1b48bc2ef697fc8b7a4d1a7a2c53e807fbc68e1b810c974b368ab936740a673f",
+   "bytes": 38065,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/action_dispatch.inc"
   },
   "native_w2x/box/cpp/action_features.inc": {
@@ -88,8 +88,8 @@
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/army_attack_menu.inc"
   },
   "native_w2x/box/cpp/army_move.inc": {
-   "sha256": "3a813ba90b898852ac8bc752b75a5c4c7075eda46854923bfa359c1e729aa33c",
-   "bytes": 31719,
+   "sha256": "2843aaebd8c404a2c987c0943411491edb8c4077eff3471edaef6a06b603ce6d",
+   "bytes": 32942,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/army_move.inc"
   },
   "native_w2x/box/cpp/army_move_menu.inc": {
@@ -183,13 +183,13 @@
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/combat_descriptor.inc"
   },
   "native_w2x/box/cpp/combat_entry_action.inc": {
-   "sha256": "4af45c58265e8a083ca7db62b90020539d59fa359bbeddc0759899b4f27e1498",
-   "bytes": 8552,
+   "sha256": "79a9eeec8e85c224bc549ddcc89a14a2dea4b3c7a0407d65725e1ae07bfd6d59",
+   "bytes": 9472,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/combat_entry_action.inc"
   },
   "native_w2x/box/cpp/combat_entry_menu.inc": {
-   "sha256": "99373cb3c7f405f1f1bf4586d4358951b9dbea417cb991c154aa08ec2332553e",
-   "bytes": 9339,
+   "sha256": "59ae1d45514ec74caffbf7ce91f8079e7a6be5716defda13df136a9617d0ca11",
+   "bytes": 10123,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/combat_entry_menu.inc"
   },
   "native_w2x/box/cpp/combat_envelope.inc": {
@@ -938,8 +938,8 @@
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/saruman_muster.inc"
   },
   "native_w2x/box/cpp/search_controller.inc": {
-   "sha256": "128820961b4bdff6e2cb664b505e17a7fc8660f961423dd6fcec743250f0c44f",
-   "bytes": 175887,
+   "sha256": "d11e7af9c9c8c9537099e8893b517dc752b5669daf37fe0ec4fce06b5578f660",
+   "bytes": 175889,
    "source": "claude_bugscan_2026-10-21/turnsearch_1114/native_w2x/box/cpp/search_controller.inc"
   },
   "native_w2x/box/cpp/search_controller_exports.inc": {

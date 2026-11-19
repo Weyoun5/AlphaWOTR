@@ -125,6 +125,12 @@ WOTR_API void* wotr_search_controller_root_plan_menu(const void* ctl){
 WOTR_API int wotr_search_controller_set_root_plan(void* ctl,const uint64_t* indices,uint64_t count,uint64_t floor,uint64_t probe,double drop){
     return checked<int>([&](){sc::controller(ctl).set_root_plan(indices,count,floor,probe,drop);return 0;},-1);
 }
+/* TOURNAMENT-DEADLINE (additive, ABI stays 1): ask a running search to stop.  Callable at any time (between
+   advances: the worker is parked at its suspension boundary); the search ends at its next simulation boundary once at
+   least one simulation ran, then completes as usual (root, root_menu, rng readable; simulations_run < budget). */
+WOTR_API int wotr_search_controller_request_stop(void* ctl){
+    return checked<int>([&](){sc::controller(ctl).stop_requested.store(true,std::memory_order_relaxed);return 0;},-1);
+}
 WOTR_API int wotr_search_controller_root_plan_result(const void* ctl,uint64_t* served,uint64_t* dropped_count,const uint64_t** dropped){
     return checked<int>([&](){sc::controller(ctl).root_plan_result(served,dropped_count,dropped);return 0;},-1);
 }

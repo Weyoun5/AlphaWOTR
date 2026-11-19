@@ -10,6 +10,7 @@
 // Source anchors (static_r3 ai.py) are quoted next to each port.  Unsupported
 // branches (SHARED_ABI.md section 0) throw sc::Refusal("unported: <branch>").
 #include <thread>
+#include <atomic>
 #include <array>
 #include <list>
 #include <numeric>
@@ -497,6 +498,10 @@ struct Controller {
     std::thread worker;std::mutex mu;std::condition_variable cv;
     enum class Phase{Idle,Running,RequestPending,RootPriorsPending,ReplyReady,Resumed,Complete,Failed,Cancelled,RootPlanPending};Phase phase=Phase::Idle;   // ReplyReady: a reply is stored (the submit calls / set_root_priors / set_root_plan); Resumed: advance() released the worker, the only phase the worker resumes on (R18 C36)
     std::string error;uint64_t request_counter=0;RequestData request;ReplyData reply;bool cancel=false;
+    // TOURNAMENT-DEADLINE: set by wotr_search_controller_request_stop (the caller's deadline passed); the main loop
+    // ends at the next simulation boundary once at least one simulation ran, and the search completes as usual
+    // (simulations_run < budget).  Never set: the search exactly as before.
+    std::atomic<bool> stop_requested{false};
     std::unique_ptr<Snapshot> pending_payload;DistReply dist_reply;          // op-4 (COMBAT_DIST) payload / decoded reply
     std::vector<double> rp_priors;std::vector<uint8_t> rp_free;             // 9.4 root-priors exchange buffers
     // LIVE1104 S03 root plan (WOTR_ROOT_BREADTH native port of wotr_bridge/live/l1104_root_breadth.py RootBreadth.serve).
@@ -1886,7 +1891,7 @@ struct Controller {
             }
             if(!node->children.empty()||(overlay&&node->state&&node->side==overlay_opp)){
                 if(node==root&&!force_idx.empty()){
-                    size_t fp9=NO_ID;
+                    uint64_t fp9=NO_ID;
                     for(size_t i9:force_idx){Node* c9=root->children[i9];
                         if(c9->proven==0&&c9->visit_count<force_cap&&(fp9==NO_ID||c9->visit_count<root->children[fp9]->visit_count))fp9=i9;}
                     if(fp9!=NO_ID){root->children[fp9]->forced_visits+=1;node=root->children[fp9];path.push_back(node);continue;}
@@ -2009,13 +2014,14 @@ struct Controller {
         if(cfg.leaf_batch>1){
             int64_t done=0;
             while(done<num_simulations&&root->proven==0){
+                if(done>0&&stop_requested.load(std::memory_order_relaxed))break;   // TOURNAMENT-DEADLINE
                 const int64_t k=std::min(cfg.leaf_batch,num_simulations-done);PendingEvals coll;pending_box=&coll;
                 try{for(int64_t i=0;i<k;++i){if(root->proven!=0)break;simulate_from(root,{root});++done;}}
                 catch(...){pending_box=nullptr;throw;}
                 pending_box=nullptr;flush_pending(coll);
             }
         }else{
-            for(int64_t sim=0;sim<num_simulations;++sim){if(root->proven!=0)break;simulate_from(root,{root});}
+            for(int64_t sim=0;sim<num_simulations;++sim){if(root->proven!=0)break;if(sim>0&&stop_requested.load(std::memory_order_relaxed))break;simulate_from(root,{root});}   // TOURNAMENT-DEADLINE: the stop check
         }
         overlay.reset();
     }

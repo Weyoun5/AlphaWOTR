@@ -164,6 +164,11 @@ OPTIONAL_SYMBOLS = {
         'wotr_search_controller_root_plan_result': ([P, C.POINTER(C.c_uint64), C.POINTER(C.c_uint64),
                                                      C.POINTER(C.POINTER(C.c_uint64))], C.c_int),
     },
+    # TOURNAMENT-DEADLINE: ask a running search to stop at its next simulation boundary (at least one simulation
+    # runs); it then completes as usual with simulations_run < budget.  Used by native_search(deadline=...).
+    'stop': {
+        'wotr_search_controller_request_stop': ([P], C.c_int),
+    },
 }
 _CONFIGURED = set()
 _CAPABILITIES = {}
@@ -613,6 +618,17 @@ class Controller:
                     self._pointer, values.ctypes.data_as(C.POINTER(C.c_double)), C.c_uint64(values.shape[0])):
                 raise _error(self._lib)
             self._root_priors_pending = False
+
+    def request_stop(self):
+        """TOURNAMENT-DEADLINE (capability 'stop'): the search ends at its next simulation boundary once at least one
+        simulation ran; keep advancing until STATUS_COMPLETE, then read the root as usual."""
+        if not self.capabilities.get('stop'):
+            raise ControllerUnavailable('request_stop requires the TOURNAMENT-DEADLINE export; this library lacks it')
+        with self._lock:
+            self._require_open()
+            if self._lib.wotr_search_controller_request_stop(self._pointer):
+                raise _error(self._lib)
+            self.stop_requested = True
 
     # -- LIVE1104 S03 root plan (capability 'root_plan') --
     def _require_root_plan(self, name):

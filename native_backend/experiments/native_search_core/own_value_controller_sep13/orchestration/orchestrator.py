@@ -1187,7 +1187,11 @@ def _build(ai):
 
     def native_search(state, side, fp_net, sh_net, num_simulations=100, c_puct=None, temperature=1.0,
                       add_noise=True, hot_regions=None, bonus_sims=0, determinize=True,
-                      _native=None, _owned=None, _session=None):
+                      _native=None, _owned=None, _session=None, _deadline=None):
+        # TOURNAMENT-DEADLINE: _deadline (time.monotonic() seconds) or None.  Once it passes, the controller is asked
+        # to stop (capability 'stop'): the search ends at its next simulation boundary (at least one simulation) and
+        # its tail runs as for a complete search; num_simulations stays the budget it is shaped by.
+        entered = time.monotonic()
         if c_puct is None:
             c_puct = ai._C_PUCT
         res = resources(ai)
@@ -1293,8 +1297,15 @@ def _build(ai):
                         raise Unsupported('WOTR_ROOT_BREADTH=1 needs the LIVE1104 S03 root plan exports (status 3, '
                                           'set_root_plan); this controller library lacks them')
                     ctl.request_root_plan()
+                stop_capable = bool(ctl.capabilities.get('stop'))
+                stopped_at = None
+                loop_started = time.monotonic()
                 while True:
                     guard.before_advance(ctl)
+                    if _deadline is not None and stopped_at is None and stop_capable and \
+                            time.monotonic() >= _deadline:
+                        ctl.request_stop()           # TOURNAMENT-DEADLINE
+                        stopped_at = time.monotonic()
                     status = ctl.advance()
                     if status == binding.STATUS_COMPLETE:
                         break
@@ -1340,6 +1351,7 @@ def _build(ai):
                     ctl.submit(bridge.run(Request.from_view(view)))
                 if add_noise and not noised_once and not reused:
                     raise RuntimeError('add_noise was accepted but the controller never paused for root priors')
+                loop_ended = time.monotonic()
                 # 3. root view + root menu -> Actions once, encodings over the input state.
                 root = ctl.root()
                 if root.children < 1:
@@ -1414,6 +1426,14 @@ def _build(ai):
                 'reply_identity':'RGK1','reply_cache_charge':'wire_plus_512_per_row_plus_4096',
                 'reply_panels_per_visit':context.panels,'belief_worlds_per_panel':context.world_count,
                 'leaf_batch':1,'tree_reuse':False,'stats':counters.get('own_value_search',{})}
+            # TOURNAMENT-DEADLINE: the search's timing and size (seconds from entry; None without a deadline asked)
+            visit_info['search_timing'] = {
+                'simulations_run': int(root.simulations_run), 'budget': int(root.budget),
+                'stopped': stopped_at is not None,
+                'deadline_supported': stop_capable if _deadline is not None else None,
+                'setup': round(loop_started - entered, 4), 'loop': round(loop_ended - loop_started, 4),
+                'tail': round(time.monotonic() - loop_ended, 4),
+                'stop_to_end': None if stopped_at is None else round(loop_ended - stopped_at, 4)}
             result = root_actions[idx], visit_info
             if _session is not None:
                 _session.result = result
@@ -1437,14 +1457,16 @@ def _decorated(ai):
 
 
 def native_mcts_search(ai, state, side, fp_net, sh_net, num_simulations=100, c_puct=None, temperature=1.0,
-                       add_noise=True, hot_regions=None, bonus_sims=0, determinize=True, session=None):
-    """Drop-in for ai.mcts_search(state, side, fp_net, sh_net, ...) over the native controller."""
+                       add_noise=True, hot_regions=None, bonus_sims=0, determinize=True, session=None, deadline=None):
+    """Drop-in for ai.mcts_search(state, side, fp_net, sh_net, ...) over the native controller.
+    deadline (TOURNAMENT-DEADLINE): a time.monotonic() value; past it the search stops at its next simulation
+    boundary (at least one simulation) and answers from the tree it has; None = the whole budget, as before."""
     res = resources(ai)
     root_object, native, owned = _resolve_root(ai, state, res)
     try:
         return _decorated(ai)(root_object, side, fp_net, sh_net, num_simulations, c_puct, temperature,
                               add_noise, hot_regions, bonus_sims, determinize,
-                              _native=native, _owned=owned, _session=session)
+                              _native=native, _owned=owned, _session=session, _deadline=deadline)
     finally:
         if owned is not None:
             owned.close()

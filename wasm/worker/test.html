@@ -1,0 +1,31 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>AlphaWOTR worker check</title>
+<pre id="log">starting</pre>
+<script type="module">
+// Plays a recorded transcript's referee messages through the AlphaWOTR worker and reports the answers' legality.
+const log = (s) => { document.getElementById('log').textContent += '\n' + s; };
+const params = new URLSearchParams(location.search);
+const sims = Number(params.get('sims') || 30);
+const lines = (await (await fetch(params.get('t') || 't1.jsonl')).text()).split('\n').filter((l) => l.trim());
+const decides = lines.map((l) => JSON.parse(l)).filter((m) => m.type === 'decide');
+const w = new Worker(new URL('alphawotr-worker.js', location.href), { type: 'module' });
+const t0 = performance.now();
+let tReady = 0, choices = [], illegal = 0;
+const done = (extra) => fetch('/result', { method: 'POST', body: JSON.stringify({ decides: decides.length, choices: choices.length, illegal,
+  load_ms: Math.round(tReady - t0), ms_per_decision: choices.length ? Math.round((performance.now() - tReady) / choices.length) : null, ...extra }) });
+w.onmessage = (e) => {
+  const d = e.data;
+  if (d.error) { log('error ' + d.error); done({ error: d.error }); return; }
+  if (d.ready) { tReady = performance.now(); log('ready in ' + Math.round(tReady - t0) + ' ms'); for (const l of lines) w.postMessage({ line: l }); return; }
+  if (d.line) {
+    const m = JSON.parse(d.line);
+    if (m.type !== 'choice') return;
+    const dec = decides[choices.length];
+    if (!dec || dec.id !== m.id || !dec.decision.options.some((o) => o.o === m.o)) illegal++;
+    choices.push(m);
+    if (choices.length === decides.length) { log('done: ' + choices.length + ' answers, ' + illegal + ' illegal'); done({}); }
+  }
+};
+w.postMessage({ init: { base: new URL('./data/', location.href).href, sims } });
+</script>
