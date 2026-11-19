@@ -37,6 +37,13 @@ OTHER
   (github.com/behindmedia/wotr-protocol):
     python -I protocol/wotr_protocol_bot.py
     python -I protocol/wotr_protocol_bot.py --connect wss://wotr.behindmedia.com/referee --token TOKEN
+    It plays as the AI server does (league nets, native search, certain line;
+    --strength 2-4 adds the turn search, --nets picks the pair).  Off Windows,
+    build the two search libraries once first:
+      python native_backend/live_search_oct19/build_portable.py
+      python turn_search/native_w2x/box/build_portable.py
+    Online as a standing bot: --token-file KEYFILE --reconnect --seek JSON.
+    Test: python -I protocol/test_corsairs.py
 
 CREDITS / LICENSE
   AlphaWOTR code: MIT - see LICENSE.
